@@ -82,6 +82,10 @@ python scripts/check_docs.py docs
 
 ---
 
+### 合并 agent 分支
+
+`pwsh scripts/merge-agent.ps1 -Name <name>`：先审差异、检查单写者文件、在 agent 工作树内跑 fmt/clippy/test，全绿才合并。加 -DryRun 只看不合并。
+
 ### 多代理协作
 
 并行开发时每个 Agent 用独立 worktree（`scripts/new-agent-worktree.ps1`），规则见 [docs/integrations/agent-worktrees.md](docs/integrations/agent-worktrees.md)。
@@ -91,7 +95,8 @@ python scripts/check_docs.py docs
 | 里程碑 | 状态 |
 |---|---|
 | W1 仓库骨架 + CI + 契约层 + 端侧核心逻辑 | ✅ 本次 |
-| W2 鉴权、并发闸门、流式代理、三协议适配 | ⬜ 下一步 |
+| W2 鉴权、三协议适配、课表解析 | 🚧 进行中（3 个 agent worktree 并行） |
+| W2b 并发闸门、流式代理、抽样记账 | ⬜ |
 | W3 Flutter WebView 登录与取数、本地 SQLite | ⬜ |
 | W4 课表解析与日历、工具调用闭环 | ⬜ |
 | W5 知识库与 RAG、Benchmark 基线 | ⬜ |
