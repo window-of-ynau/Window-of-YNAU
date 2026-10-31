@@ -19,15 +19,27 @@
 use serde_json::{json, Map, Value};
 use yunong_shared::{ChatMessage, ChatRequest, Chunk, Role, ToolCallRef, ToolSpec};
 
-use super::{finish_reason, openai_usage, partial_json, system_prompt};
+use super::{finish_reason, openai_usage, partial_json, system_prompt, BuildOptions};
+
+/// 构造请求体（默认开关，测试与普通调用方用）。
+pub(super) fn build(request: &ChatRequest) -> Value {
+    build_with(request, &BuildOptions::default())
+}
 
 /// 构造请求体。
-pub(super) fn build(request: &ChatRequest) -> Value {
+///
+/// `options.report_usage` 决定是否带 `stream_options: {"include_usage": true}`：
+/// OpenAI 只在打开它时才在流里回报 `usage`，不开就只能靠端侧估算。
+pub(super) fn build_with(request: &ChatRequest, options: &BuildOptions) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(request.model));
     body.insert("stream".into(), json!(request.stream));
     // 三家字段名不同：Completions 用 max_tokens（Responses 才是 max_output_tokens）。
     body.insert("max_tokens".into(), json!(request.max_output_tokens));
+    if options.report_usage {
+        // 只有 OpenAI 需要在流外声明"请在流里回报 usage"；Anthropic/Responses 默认就给。
+        body.insert("stream_options".into(), json!({ "include_usage": true }));
+    }
 
     // 系统提示必须落在 messages[0]：先抽出来放最前，再按原顺序拼其余消息。
     let mut messages = Vec::with_capacity(request.messages.len());
