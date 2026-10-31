@@ -35,6 +35,6 @@ pub mod prelude {
     pub use crate::keystore::{SecretKind, SecretStore};
     pub use crate::memory::{Blob, BlobKind, MemoryStore, Message};
     pub use crate::parse::{parse_timetable, ParseError};
-    pub use crate::protocols::{build_body, parse_event};
+    pub use crate::protocols::{build_body, parse_events};
     pub use crate::tools::{ToolCall, ToolOutcome, ToolRegistry};
 }

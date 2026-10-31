@@ -6,16 +6,18 @@
 //! - 流式开关：`stream`；输出上限：`max_tokens`
 //! - 工具调用：assistant 的 `tool_use` block；工具结果：user 的 `tool_result` block
 //!
-//! # 损失点（契约缺口的落点）
+//! # 契约落点（`docs/design/contract-gaps.md`）
 //!
-//! - `tool_result.is_error` 表达不出来（`ChatMessage` 没有 `ok`）：失败只能靠文本。
-//! - `tool_use.input` 必须是 **JSON 对象**，而 `ChatMessage.content` 是字符串：
-//!   非法 JSON 时降级成 `{}`（原始文本丢弃）——这是 Anthropic 独有的限制，
-//!   Completions/Responses 的 `arguments` 是字符串可以原样透传。
-//! - assistant 的可见文本与 `tool_use` 不能共存（同上条的 content 复用）。
+//! - **C1 已解决（ADR-16）**：assistant 的可见文本编成 `text` block、工具调用编成
+//!   `tool_use` block，两者可以共存于同一条消息的 `content` 数组（数组化只在有调用时发生，
+//!   纯文本仍是字符串）。并行调用 = 多个 `tool_use` block。
+//! - `tool_result.is_error` 表达不出来（`ChatMessage` 没有 `ok`）：失败只能靠文本（缺口 C3）。
+//! - `tool_use.input` 必须是 **JSON 对象**（缺口 C5）：`Value::String`（未聚合完的片段）
+//!   没有位置可放，只能降级成 `{}`——这是 Anthropic 独有的限制，
+//!   Completions / Responses 的 `arguments` 是字符串可以原样透传。
 //! - Anthropic 要求 `tool_result` 必须紧跟对应的 `tool_use`：连续的工具结果会被
 //!   合并进**同一条** user 消息（多个 block），否则上游会 400。
-//! - `ChatRequest` 没有 `temperature`：不发送该字段。
+//! - `ChatRequest` 没有 `temperature`：不发送该字段（缺口 C2）。
 
 use serde_json::{json, Map, Value};
 use yunong_shared::{ChatMessage, ChatRequest, Chunk, Role, ToolSpec};
@@ -89,27 +91,33 @@ fn encode_message(message: &ChatMessage) -> Value {
     }
 }
 
-/// assistant：带 `tool_call_id` + `name` 视为工具调用（content 放 arguments JSON），
-/// 否则当普通文本。
+/// assistant：可见文本与工具调用**可以共存**（C1）。
+///
+/// 无工具调用时保持最简形状（`content` 是字符串）；有调用时 `content` 变成 block 数组：
+/// 有文本才发 `text` block，随后每个调用一个 `tool_use` block。
 fn encode_assistant(message: &ChatMessage) -> Value {
-    match (message.tool_call_id.as_deref(), message.name.as_deref()) {
-        (Some(call_id), Some(name)) => json!({
-            "role": "assistant",
-            "content": [{
-                "type": "tool_use",
-                "id": call_id,
-                "name": name,
-                // input 必须是对象：非法 JSON 只能降级成 {}（见模块注释）。
-                "input": tool_input(&message.content),
-            }],
-        }),
-        _ => json!({ "role": "assistant", "content": message.content }),
+    if message.tool_calls.is_empty() {
+        return json!({ "role": "assistant", "content": message.content });
     }
+    let mut blocks = Vec::with_capacity(message.tool_calls.len() + 1);
+    if !message.content.is_empty() {
+        blocks.push(json!({ "type": "text", "text": message.content }));
+    }
+    for call in &message.tool_calls {
+        blocks.push(json!({
+            "type": "tool_use",
+            "id": call.id,
+            "name": call.name,
+            // input 必须是对象：未聚合完的片段只能降级成 {}（见模块注释）。
+            "input": tool_input(&call.arguments),
+        }));
+    }
+    json!({ "role": "assistant", "content": blocks })
 }
 
 /// 工具结果 block。
 fn tool_result_block(message: &ChatMessage) -> Value {
-    // tool_use_id 是必填；缺失时只能用空串（`validate` 应在前置阶段拦住，见交付说明）。
+    // tool_use_id 是必填；缺失时只能用空串（`ChatRequest::validate` 会在发请求前拦住）。
     let call_id = message.tool_call_id.as_deref().unwrap_or_default();
     json!({
         "type": "tool_result",
@@ -118,9 +126,13 @@ fn tool_result_block(message: &ChatMessage) -> Value {
     })
 }
 
-/// arguments 文本 → `input` 对象。
-fn tool_input(raw: &str) -> Value {
-    serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::Object(Map::new()))
+/// `arguments` → `input` 对象。Anthropic 只接受 JSON 对象（C5）：
+/// 未聚合完的 `Value::String` 片段在这里没有位置，只能降级成 `{}`。
+fn tool_input(arguments: &Value) -> Value {
+    match arguments {
+        Value::Object(_) => arguments.clone(),
+        _ => Value::Object(Map::new()),
+    }
 }
 
 /// 工具声明：`tools[]{name, description, input_schema}`。
@@ -139,20 +151,18 @@ fn encode_tools(tools: &[ToolSpec]) -> Value {
     )
 }
 
-/// 解析一条 Anthropic 流式事件。
+/// 解析一条 Anthropic 流式事件 → **0..n 个** `Chunk`（缺口 C6）。
 ///
-/// # usage 的取舍（契约缺口）
+/// # usage 与结束原因同事件（C6 的核心案例）
 ///
-/// Anthropic 把 usage **拆在两个事件**里：
-/// - `message_start` 给 `usage.input_tokens`（还有 output_tokens，但那只是**占位值**，
+/// Anthropic 把 usage 拆在两个事件里：
+/// - `message_start` 给 `usage.input_tokens`（那里的 `output_tokens` 只是**占位值**，
 ///   真实输出计数在 `message_delta`）；
-/// - `message_delta` 同时给 `delta.stop_reason` **和** `usage.output_tokens`。
+/// - `message_delta` **同时**给 `delta.stop_reason` 和 `usage.output_tokens`。
 ///
-/// 一次 `data` 只能返回一个 `Chunk`，`message_delta` 这里选择 **返回 `Done`**
-/// （`stop_reason` 是结束原因的唯一来源，丢了它 `max_tokens` / `tool_use` 就都退化成
-/// `Stop`），代价是真实的 `output_tokens` 被丢弃——调用方要么按文本长度估算
-/// （`estimated = true`），要么在 `gateway` 层直接读原始 JSON 的 `usage`。
-/// `message_start` 则返回 `Usage`（`input_tokens` 真实）。
+/// 旧实现只能二选一：要么丢结束原因（`max_tokens` / `tool_use` 退化成 `Stop`），
+/// 要么丢真实输出 token 数（成本监控失真）。现在返回 `[Usage, Done]`——
+/// `Done` 必末（§10），所以 `Usage` 排在它前面。合并口径见 `yunong_shared::Usage`。
 ///
 /// # 工具调用分片
 ///
@@ -161,33 +171,50 @@ fn encode_tools(tools: &[ToolSpec]) -> Value {
 /// - `content_block_delta` 的 `input_json_delta.partial_json`：**只有参数片段**，
 ///   没有 id/name。本函数无状态，`id`/`name` 留空，`arguments` 返回片段
 ///   （`Value::String`）；调用方需按 `index` 关联到之前的 `content_block_start`。
-pub(super) fn parse(value: &Value) -> Option<Chunk> {
+pub(super) fn parse(value: &Value) -> Vec<Chunk> {
     match value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default()
     {
-        "message_start" => value
-            .get("message")
-            .and_then(|m| m.get("usage"))
-            .and_then(openai_usage),
-        "content_block_start" => tool_use_start(value),
-        "content_block_delta" => content_block_delta(value),
-        "message_delta" => {
-            let raw = value
-                .get("delta")
-                .and_then(|d| d.get("stop_reason"))
-                .and_then(Value::as_str)?;
-            Some(Chunk::Done {
-                finish: finish_reason(raw),
-            })
-        }
-        // `error` 事件在 `parse_event` 里已由 upstream_error 拦下，这里兜底。
-        "error" => super::upstream_error(value),
+        "message_start" => option_chunk(
+            value
+                .get("message")
+                .and_then(|m| m.get("usage"))
+                .and_then(openai_usage),
+        ),
+        "content_block_start" => option_chunk(tool_use_start(value)),
+        "content_block_delta" => option_chunk(content_block_delta(value)),
+        "message_delta" => message_delta(value),
+        // `error` 事件在 `parse_events` 里已由 upstream_error 拦下，这里兜底。
+        "error" => option_chunk(super::upstream_error(value)),
         // message_stop / ping / content_block_stop / 未知事件：没有新增信息
-        // （§9 要求心跳 → None）。
-        _ => None,
+        // （§9 要求心跳 → 空 Vec）。
+        _ => Vec::new(),
     }
+}
+
+/// `message_delta`：结束原因与 usage 在**同一个事件**里，两个都要给（`[Usage, Done]`）。
+fn message_delta(value: &Value) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
+    if let Some(usage) = value.get("usage").and_then(openai_usage) {
+        chunks.push(usage);
+    }
+    if let Some(raw) = value
+        .get("delta")
+        .and_then(|d| d.get("stop_reason"))
+        .and_then(Value::as_str)
+    {
+        chunks.push(Chunk::Done {
+            finish: finish_reason(raw),
+        });
+    }
+    super::done_last(chunks)
+}
+
+/// 最多产出一个 chunk 的分支：收成 `Vec`，免得每处都写 `Option` 包装。
+fn option_chunk(chunk: Option<Chunk>) -> Vec<Chunk> {
+    chunk.into_iter().collect()
 }
 
 fn tool_use_start(value: &Value) -> Option<Chunk> {
@@ -247,11 +274,20 @@ fn content_block_delta(value: &Value) -> Option<Chunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::{fixture_request, fixture_tool_round, FIXTURE_SYSTEM};
-    use yunong_shared::{FinishReason, Protocol};
+    use crate::protocols::{
+        fixture_request, fixture_text_and_tool_round, fixture_tool_round, FIXTURE_SYSTEM,
+    };
+    use yunong_shared::{FinishReason, Protocol, ToolCallRef};
 
     fn body() -> Value {
         build(&fixture_request(Protocol::AnthropicMessages))
+    }
+
+    /// 单 chunk 事件收成 `Option`；顺带断言"这条事件确实只产出一个 chunk"。
+    fn parse_one(data: &str) -> Option<Chunk> {
+        let mut chunks = parse(&serde_json::from_str(data).unwrap());
+        assert!(chunks.len() <= 1, "该事件应只有一个 chunk：{chunks:?}");
+        chunks.pop()
     }
 
     // ---------- build_body ----------
@@ -310,14 +346,49 @@ mod tests {
         assert_eq!(result["content"][0]["content"], r#"{"courses":[]}"#);
     }
 
-    // ---------- parse_event ----------
+    /// C1：assistant「边说边调工具」→ `content` 数组里 `text` block + `tool_use` block 共存。
+    #[test]
+    fn text_and_tool_use_blocks_coexist() {
+        let body = build(&fixture_text_and_tool_round(Protocol::AnthropicMessages));
+        let assistant = &body["messages"].as_array().unwrap()[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"][0]["type"], "text");
+        assert_eq!(assistant["content"][0]["text"], "我先查一下课表");
+        assert_eq!(assistant["content"][1]["type"], "tool_use");
+        assert_eq!(assistant["content"][1]["id"], "call_1");
+        assert_eq!(assistant["content"][1]["input"]["weekday"], 3);
+    }
+
+    /// C1：并行多调用 = 多个 `tool_use` block（文本 + 两个调用）。
+    #[test]
+    fn parallel_tool_use_blocks() {
+        let mut request = fixture_request(Protocol::AnthropicMessages);
+        request.messages.push(ChatMessage::assistant_calls(
+            "稍等",
+            vec![
+                ToolCallRef::new("call_1", "get_courses", serde_json::json!({ "weekday": 3 })),
+                ToolCallRef::new("call_2", "get_calendar", serde_json::json!({})),
+            ],
+        ));
+        let body = build(&request);
+        let messages = body["messages"].as_array().unwrap();
+        // 没有 tool_result 收尾，assistant 就是最后一条。
+        let assistant = messages.last().unwrap();
+        let blocks = assistant["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(blocks[1..].iter().all(|b| b["type"] == "tool_use"));
+        assert_eq!(blocks[2]["name"], "get_calendar");
+    }
+
+    // ---------- parse_events ----------
 
     /// fixture 1：纯文本增量。
     #[test]
     fn text_delta_fixture() {
         let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"下午没课"}}"#;
         assert_eq!(
-            parse(&serde_json::from_str(data).unwrap()),
+            parse_one(data),
             Some(Chunk::Delta {
                 text: "下午没课".into()
             })
@@ -329,7 +400,7 @@ mod tests {
     fn tool_call_fixture() {
         let start = r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_courses","input":{}}}"#;
         assert_eq!(
-            parse(&serde_json::from_str(start).unwrap()),
+            parse_one(start),
             Some(Chunk::ToolCall {
                 id: "toolu_1".into(),
                 name: "get_courses".into(),
@@ -339,7 +410,7 @@ mod tests {
 
         let delta = r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"weekday\":3}"}}"#;
         assert_eq!(
-            parse(&serde_json::from_str(delta).unwrap()),
+            parse_one(delta),
             Some(Chunk::ToolCall {
                 id: String::new(),
                 name: String::new(),
@@ -353,7 +424,7 @@ mod tests {
     fn argument_fragments_stay_raw() {
         let data = r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"weekday\":"}}"#;
         assert_eq!(
-            parse(&serde_json::from_str(data).unwrap()),
+            parse_one(data),
             Some(Chunk::ToolCall {
                 id: String::new(),
                 name: String::new(),
@@ -367,7 +438,7 @@ mod tests {
     fn usage_fixture() {
         let data = r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","usage":{"input_tokens":42,"output_tokens":1}}}"#;
         assert_eq!(
-            parse(&serde_json::from_str(data).unwrap()),
+            parse_one(data),
             Some(Chunk::Usage {
                 tokens_in: 42,
                 tokens_out: 1,
@@ -376,9 +447,11 @@ mod tests {
         );
     }
 
-    /// fixture 4：结束原因（`message_delta.stop_reason`，usage 在此丢弃，见 `parse` 注释）。
+    /// C6 fixture：`message_delta` 同时带 `stop_reason` 与 `usage.output_tokens`。
+    ///
+    /// 旧实现只能二选一（丢 token 数或丢结束原因）；现在两个都给，且 `Done` 在最后。
     #[test]
-    fn finish_reason_fixture() {
+    fn finish_reason_and_usage_in_one_event() {
         let cases = [
             ("tool_use", FinishReason::ToolCalls),
             ("end_turn", FinishReason::Stop),
@@ -391,13 +464,20 @@ mod tests {
             );
             assert_eq!(
                 parse(&serde_json::from_str(&data).unwrap()),
-                Some(Chunk::Done { finish: expected }),
+                vec![
+                    Chunk::Usage {
+                        tokens_in: 0,
+                        tokens_out: 15,
+                        estimated: false,
+                    },
+                    Chunk::Done { finish: expected },
+                ],
                 "stop_reason={raw} 映射错误"
             );
         }
     }
 
-    /// fixture 5a：心跳与收尾事件 → None（§9 要求心跳不暴露给上层）。
+    /// fixture 5a：心跳与收尾事件 → 空 `Vec`（§9 要求心跳不暴露给上层）。
     #[test]
     fn irrelevant_events_are_ignored() {
         for data in [
@@ -406,7 +486,7 @@ mod tests {
             r#"{"type":"content_block_stop","index":0}"#,
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
         ] {
-            assert_eq!(parse(&serde_json::from_str(data).unwrap()), None, "{data}");
+            assert_eq!(parse_one(data), None, "{data}");
         }
     }
 
@@ -415,11 +495,11 @@ mod tests {
     fn error_event_fixture() {
         let data = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
         assert_eq!(
-            crate::protocols::parse_event(Protocol::AnthropicMessages, data),
-            Some(Chunk::Error {
+            crate::protocols::parse_events(Protocol::AnthropicMessages, data),
+            vec![Chunk::Error {
                 code: yunong_shared::ErrorCode::UpstreamError,
                 message: "Overloaded".into(),
-            })
+            }]
         );
     }
 }
