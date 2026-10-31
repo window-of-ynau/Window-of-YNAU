@@ -443,7 +443,7 @@
 | 16 | 课表 → 提示词文本 | `campus_api.py:148-212` | `core::context::schedule`（只注入"今天/本周"摘要）+ 工具 `get_courses` | 附注 |
 | 17 | 周次展开成具体日期 | **无此能力** | `core::calendar::expand::to_instances(term, course)` | 新增 |
 | 18 | 节假日/调休 | **无此能力** | `core::calendar::expand`（读 `terms` 的例外表） | 新增 |
-| 19 | ICS 导出（`UID` 稳定） | **无此能力** | `core::calendar::ics`，`UID = sha1(term|name|weekday|start_period|room)`（[02-系统设计文档 §6.6](../02-系统设计文档.md)） | 新增 |
+| 19 | ICS 导出（`UID` 稳定） | **无此能力** | `core::calendar::ics`，`UID = sha1(term / name / weekday / start_period / room)`（[02-系统设计文档 §6.6](../02-系统设计文档.md)） | 新增 |
 | 20 | 课表查询（按周/星期） | `campus_api.py:215-224`（全量读 + 内存过滤） | `core::index::courses`（SQLite 索引查询） | 新增 |
 | 21 | 私有文档检索（BM25） | **无此能力** | `core::index::bm25`（`trait LocalIndex`，[ADR-09](../04-ADR.md)） | 新增 |
 | 22 | 记忆/画像存储 | `memory_service.py:20-173` | `core::memory`（`memory_items` 取代 `profile.json`） | 不在本文范围 |

@@ -26,11 +26,12 @@ cp deploy/.env.example deploy/.env
 # 编辑 deploy/.env：POSTGRES_PASSWORD 与 DATABASE_URL 里的密码要一致
 
 # 2. 构建并启动（首次会编译 Rust，慢一点）
-docker compose -f deploy/docker-compose.yml up -d --build
+#    --env-file 显式指定，避免"在哪个目录执行 compose"导致读不到变量
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build
 
 # 3. 看状态
-docker compose -f deploy/docker-compose.yml ps
-docker compose -f deploy/docker-compose.yml logs -f server
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml ps
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml logs -f server
 ```
 
 此时 `server` 只绑在宿主机 `127.0.0.1:8080`。真机联调要让手机连过来，把 `deploy/.env` 里的 `SERVER_BIND=0.0.0.0` 打开，或者在 compose 里把端口改成 `"0.0.0.0:8080:8080"`——**仅限内网，别直接开在公网**。
@@ -42,7 +43,7 @@ docker compose -f deploy/docker-compose.yml logs -f server
 ```bash
 # 在仓库根执行；db 没有映射到宿主机端口，所以用 compose exec 送进去
 for f in crates/server/migrations/*.sql; do
-  docker compose -f deploy/docker-compose.yml exec -T db \
+  docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec -T db \
     psql -U yunong -d yunong -v ON_ERROR_STOP=1 -1 -f - < "$f"
 done
 ```
@@ -51,7 +52,14 @@ done
 
 - 顺序执行，别打乱；`CREATE EXTENSION vector` 需要超级用户，compose 里的 `POSTGRES_USER`（yunong）是超级用户，够用。
 - 重跑前确认 SQL 幂等（`IF NOT EXISTS` / 迁移记录表）；非幂等的迁移重复执行会报错，别用 `ON_ERROR_STOP=0` 硬吞。
-- 如果宿主机已经装了 `psql`，也可以直接连——但默认没发布 5432，需要临时在 compose 里映射或用 `docker compose exec`。
+- 如果宿主机已经装了 `psql`，也可以直接连——但默认没发布 5432，需要临时在 compose 里映射或用 `docker compose exec`。映射之后就是常规写法：
+
+```bash
+for f in crates/server/migrations/*.sql; do
+  psql "postgres://yunong@127.0.0.1:5432/yunong" -v ON_ERROR_STOP=1 -1 -f "$f"
+done
+```
+
 - 服务端若自带启动迁移，以它为准；当前按设计由部署方执行（服务端只管运行期查询）。
 
 ## 冒烟验证

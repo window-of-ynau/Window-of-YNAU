@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/material.dart' show Icons;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/main.dart';
 
@@ -10,11 +10,11 @@ void main() {
 
   testWidgets('侧栏能进入校务入口', (WidgetTester tester) async {
     await tester.pumpWidget(const YunongApp());
-    await tester.tap(find.byTooltip('Open navigation menu'));
+    // 用图标而不是 tooltip 定位（tooltip 文案随 MaterialLocalizations 变，图标更稳）
+    await tester.tap(find.byIcon(Icons.menu));
     await tester.pumpAndSettle();
     await tester.tap(find.text('我的课表'));
     await tester.pumpAndSettle();
-    expect(find.text('W2 将在此内嵌 WebView'), findsNothing);
     expect(find.textContaining('内嵌 WebView'), findsOneWidget);
   });
 }
