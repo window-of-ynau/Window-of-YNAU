@@ -1,5 +1,5 @@
 # 主 CI：PR 与 push main 触发；四类检查独立，便于快速定位失败原因
-# 名称保持小写：分支保护的状态检查名是「ci / rust」「ci / flutter」「ci / docs」「ci / migrations」
+# 名称保持小写：分支保护的状态检查名是「ci / rust」「ci / flutter」「ci / docs」「ci / migrations」「ci / pg」
 name: ci
 
 on:
@@ -117,3 +117,58 @@ jobs:
             echo "==> psql -f $f"
             psql -v ON_ERROR_STOP=1 -q -f "$f"
           done < <(printf '%s\n' "${files[@]}" | sort)
+
+  # 真实的 PostgreSQL 上跑 auth 的 SQL：migrations job 只证明"迁移能落"，
+  # 这个 job 证明"注册/登录/刷新/登出/校验这几条 SQL 在真库里真的对"。
+  pg:
+    name: PostgreSQL（auth 真实 SQL 集成测试）
+    runs-on: ubuntu-latest
+    # 与 migrations 同一个镜像：迁移 0001 用了 pgvector 的 vector 类型与 hnsw 索引
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: yunong_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: yunong_test
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunong_test
+      # 用例靠这个开关区分"跳过"与"失败"：CI 里必须真跑，不允许静默跳过
+      YUNONG_PG_TESTS_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: 安装 stable 工具链
+        uses: dtolnay/rust-toolchain@stable
+      - name: 缓存 cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+      # 先按生产的方式用 psql 跑一遍迁移：迁移文件本身得能落（与 migrations job 同款）
+      - name: 按文件名顺序执行 crates/server/migrations/*.sql
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(crates/server/migrations/*.sql)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "没有迁移文件，跳过"
+            exit 0
+          fi
+          while IFS= read -r f; do
+            echo "==> psql -f $f"
+            psql -v ON_ERROR_STOP=1 -q -f "$f"
+          done < <(printf '%s\n' "${files[@]}" | sort)
+      # 用例都带 #[ignore]（没装 PG 的机器上 cargo test 不能红）：
+      # 不加 --include-ignored 就会"绿但一条 SQL 都没跑"，那正是这个 job 要防的事
+      - name: cargo test（auth 的 PostgreSQL 集成测试，含 #[ignore] 用例）
+        run: cargo test -p yunong-server --test pg_auth -- --include-ignored
