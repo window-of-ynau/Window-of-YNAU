@@ -864,3 +864,26 @@ fn timeouts_defaults_are_sane() {
     );
     assert_eq!(defaults.idle, Duration::from_secs(30), "服务端 15s 心跳");
 }
+
+/// `with_usage_reporting(false)`：请求体里**不能**出现 `stream_options`
+/// （第三方兼容网关可能因为未知字段直接 400）。
+#[tokio::test]
+async fn byok_usage_reporting_switch_controls_stream_options() {
+    let server = FakeServer::start(
+        200,
+        "text/event-stream",
+        Vec::new(),
+        vec![Step::Write(completions_finish()), Step::Close],
+    )
+    .await;
+
+    let provider = byok(&server, Protocol::OpenaiCompletions).with_usage_reporting(false);
+    let (_, outcome) = run(&provider, &request(Protocol::OpenaiCompletions), None).await;
+    assert!(outcome.is_ok());
+
+    let body = server.captured().json();
+    assert!(
+        body.get("stream_options").is_none(),
+        "关掉之后不能带 stream_options：{body}"
+    );
+}
