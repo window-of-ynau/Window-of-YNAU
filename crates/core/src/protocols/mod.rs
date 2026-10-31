@@ -33,7 +33,24 @@ use yunong_shared::{ChatMessage, ChatRequest, Chunk, FinishReason, Protocol, Rol
 #[cfg(test)]
 use yunong_shared::ToolCallRef;
 
-/// 构造对应协议的请求体。
+/// 构造请求体时的开关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildOptions {
+    /// 是否让上游在流里回报 `usage`（Completions 的 `stream_options.include_usage`）。
+    ///
+    /// 默认 `true`：不开的话 OpenAI 流里根本没有 usage，记账只能靠估算。
+    /// 上游是**第三方兼容网关**、因为未知字段返回 400 时，由调用方关掉
+    /// （`DirectProvider::with_usage_reporting(false)`）。
+    pub report_usage: bool,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        Self { report_usage: true }
+    }
+}
+
+/// 构造对应协议的请求体（默认开关）。
 ///
 /// 必须处理的差异（见 `docs/03-接口文档.md` §9）：
 /// - 系统提示位置：`messages[0]` / `instructions` / 顶层 `system`
@@ -45,6 +62,15 @@ use yunong_shared::ToolCallRef;
 pub fn build_body(protocol: Protocol, request: &ChatRequest) -> Value {
     match protocol {
         Protocol::OpenaiCompletions => completions::build(request),
+        Protocol::OpenaiResponses => responses::build(request),
+        Protocol::AnthropicMessages => messages::build(request),
+    }
+}
+
+/// [`build_body`] 的可配置版本（目前只有 Completions 的 usage 回报开关）。
+pub fn build_body_with(protocol: Protocol, request: &ChatRequest, options: &BuildOptions) -> Value {
+    match protocol {
+        Protocol::OpenaiCompletions => completions::build_with(request, options),
         Protocol::OpenaiResponses => responses::build(request),
         Protocol::AnthropicMessages => messages::build(request),
     }
@@ -190,6 +216,16 @@ fn openai_usage(usage: &Value) -> Option<Chunk> {
 
 fn token_count(value: Option<&Value>) -> Option<u32> {
     value
+        .and_then(Value::as_u64)
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// 工具调用的序号（C9）：Completions 用 `index`、Responses 用 `output_index`。
+///
+/// 并行调用时，参数分片必须靠它归位——没有序号就只能瞎猜（A 的参数会拼到 B 上）。
+pub(crate) fn call_index(value: &Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
         .and_then(Value::as_u64)
         .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
 }

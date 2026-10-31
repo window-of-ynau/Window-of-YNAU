@@ -16,3 +16,12 @@ uuid = { workspace = true }
 sha2 = "0.10"
 # 课表 HTML 解析（教务页面是机器生成的固定结构，用正则足够且无重依赖）
 regex = "1"
+# 模型网关：HTTP/SSE。rustls 而不是 native-tls —— Android/iOS 上没有 OpenSSL 可交叉编，
+# rustls 在移动端零系统依赖；也不开 http2（SSE 走 HTTP/1.1）。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# 只为了三段超时里的 `tokio::time::timeout`（运行时由调用方提供）
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+# 假 SSE 服务（tokio::net::TcpListener 手写，不引 wiremock）+ #[tokio::test]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }

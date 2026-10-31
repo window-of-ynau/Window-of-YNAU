@@ -286,6 +286,13 @@ pub enum Chunk {
         id: String,
         name: String,
         arguments: serde_json::Value,
+        /// 并行调用时的序号（C9）：Completions 的 `tool_calls[].index`、
+        /// Anthropic 的 `content_block_start.index`、Responses 的 `output_index`。
+        ///
+        /// 有了它，gateway/编排层才能把同一次并行调用的参数分片正确归位（否则 A 的参数
+        /// 会被拼到 B 上）。老客户端不认识该字段：`None` 时**不序列化**，wire 向后兼容。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
     },
     /// 端侧回填的工具结果（第 2 轮请求里出现）
     ToolResult {
@@ -419,6 +426,39 @@ mod tests {
         assert_eq!(back, meta);
     }
 
+    /// C9：`ToolCall.index` 的 wire 兼容。
+    ///
+    /// - 有 `index` → 序列化里出现 `"index":1`，往返不丢；
+    /// - 旧 JSON（没有 `index`）→ 反序列化成 `None`；
+    /// - `None` → **不序列化**（老客户端看不懂新字段也无所谓）。
+    #[test]
+    fn tool_call_index_is_wire_compatible() {
+        let with_index = Chunk::ToolCall {
+            id: "call_1".into(),
+            name: "get_courses".into(),
+            arguments: serde_json::json!({ "weekday": 3 }),
+            index: Some(1),
+        };
+        let json = serde_json::to_string(&with_index).unwrap();
+        assert!(json.contains("\"index\":1"), "{json}");
+        let back: Chunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_index);
+
+        let legacy = r#"{"type":"tool_call","id":"call_1","name":"get_courses","arguments":{}}"#;
+        match serde_json::from_str::<Chunk>(legacy).unwrap() {
+            Chunk::ToolCall { index, .. } => assert_eq!(index, None, "旧 JSON 必须读成 None"),
+            other => panic!("应为 ToolCall：{other:?}"),
+        }
+
+        let no_index = Chunk::ToolCall {
+            id: "c".into(),
+            name: "n".into(),
+            arguments: serde_json::json!({}),
+            index: None,
+        };
+        let json = serde_json::to_string(&no_index).unwrap();
+        assert!(!json.contains("index"), "None 不能出现在 wire 里：{json}");
+    }
     #[test]
     fn tool_result_detection() {
         let mut r = req();

@@ -22,7 +22,7 @@
 use serde_json::{json, Map, Value};
 use yunong_shared::{ChatMessage, ChatRequest, Chunk, Role, ToolSpec};
 
-use super::{finish_reason, openai_usage, partial_json, system_prompt};
+use super::{call_index, finish_reason, openai_usage, partial_json, system_prompt};
 
 /// 构造请求体。
 pub(super) fn build(request: &ChatRequest) -> Value {
@@ -240,6 +240,7 @@ fn tool_use_start(value: &Value) -> Option<Chunk> {
         } else {
             Value::Object(Map::new())
         },
+        index: call_index(value, "index"),
     })
 }
 
@@ -265,6 +266,8 @@ fn content_block_delta(value: &Value) -> Option<Chunk> {
                 id: String::new(),
                 name: String::new(),
                 arguments: partial_json(fragment),
+                // 分片自身带 `index`：并行调用靠它归位（C9）。
+                index: call_index(value, "index"),
             })
         }
         _ => None,
@@ -405,6 +408,7 @@ mod tests {
                 id: "toolu_1".into(),
                 name: "get_courses".into(),
                 arguments: serde_json::json!({}),
+                index: Some(1),
             })
         );
 
@@ -415,6 +419,7 @@ mod tests {
                 id: String::new(),
                 name: String::new(),
                 arguments: serde_json::json!({ "weekday": 3 }),
+                index: Some(1),
             })
         );
     }
@@ -429,6 +434,7 @@ mod tests {
                 id: String::new(),
                 name: String::new(),
                 arguments: Value::String(r#"{"weekday":"#.into()),
+                index: Some(1),
             })
         );
     }
