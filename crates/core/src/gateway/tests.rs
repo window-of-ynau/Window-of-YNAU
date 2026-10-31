@@ -416,10 +416,17 @@ async fn byok_first_event_timeout() {
     )
     .await;
 
-    let provider = byok(&server, Protocol::OpenaiCompletions).with_timeouts(fast_timeouts(150));
+    let provider = byok(&server, Protocol::OpenaiCompletions).with_timeouts(fast_timeouts(400));
     let (_, outcome) = run(&provider, &request(Protocol::OpenaiCompletions), None).await;
     match outcome.unwrap_err() {
-        CoreError::Timeout(message) => assert!(message.contains("没有返回任何数据"), "{message}"),
+        CoreError::Timeout(message) => {
+            // 首事件超时有两条已定义的实现文案，具体走哪条取决于「连上后首字节」与
+            // 「响应头后首个 SSE 事件」哪个先到；CI 与本地可能不同，断言不该锁死一条。
+            assert!(
+                message.contains("没有返回任何数据") || message.contains("没有返回第一个 SSE 事件"),
+                "首事件超时文案应属于两种已定义文案之一：{message}"
+            );
+        }
         other => panic!("应为 Timeout：{other:?}"),
     }
 }
@@ -777,10 +784,17 @@ async fn cloud_first_event_timeout() {
     )
     .await;
 
-    let proxy = CloudProxy::new(server.base_url(), "tok").with_timeouts(fast_timeouts(150));
+    let proxy = CloudProxy::new(server.base_url(), "tok").with_timeouts(fast_timeouts(400));
     let (_, outcome) = run(&proxy, &request(Protocol::OpenaiCompletions), None).await;
     match outcome.unwrap_err() {
-        CoreError::Timeout(message) => assert!(message.contains("没有返回任何数据"), "{message}"),
+        CoreError::Timeout(message) => {
+            // 首事件超时有两条已定义的实现文案，具体走哪条取决于「连上后首字节」与
+            // 「响应头后首个 SSE 事件」哪个先到；CI 与本地可能不同，断言不该锁死一条。
+            assert!(
+                message.contains("没有返回任何数据") || message.contains("没有返回第一个 SSE 事件"),
+                "首事件超时文案应属于两种已定义文案之一：{message}"
+            );
+        }
         other => panic!("应为 Timeout：{other:?}"),
     }
 }
