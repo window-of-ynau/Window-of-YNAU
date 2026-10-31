@@ -62,13 +62,14 @@ enum Script {
     SlowHeaders,
     /// 一直产出，等客户端断开（验证取消；真实厂商也是如此）
     Endless,
+    /// 大口大口地灌（每帧 32KB）：客户端不读了以后，Socket 缓冲很快就会被灌满
+    Flood,
 }
 
 #[derive(Debug, Default)]
 struct Counters {
     requests: AtomicUsize,
     delivered: AtomicUsize,
-    aborted: AtomicUsize,
     finished: AtomicUsize,
 }
 
@@ -105,10 +106,6 @@ impl Mock {
 
     fn delivered(&self) -> usize {
         self.counters.delivered.load(Ordering::SeqCst)
-    }
-
-    fn aborted(&self) -> usize {
-        self.counters.aborted.load(Ordering::SeqCst)
     }
 
     fn finished(&self) -> usize {
@@ -180,23 +177,42 @@ async fn mock_handler(
         Script::SlowHeaders => {
             // 比客户端的读超时更久：服务端应自己判 504，而不是一直挂着
             tokio::time::sleep(Duration::from_secs(10)).await;
-            sse_response(Arc::clone(&ctx.counters), completions_frames())
+            sse_response(
+                Arc::clone(&ctx.counters),
+                completions_frames(),
+                Duration::from_millis(10),
+            )
         }
-        Script::CompletionsOk => sse_response(Arc::clone(&ctx.counters), completions_frames()),
-        Script::MessagesOk => sse_response(Arc::clone(&ctx.counters), messages_frames()),
-        Script::Endless => sse_response(Arc::clone(&ctx.counters), endless_frames()),
+        Script::CompletionsOk => sse_response(
+            Arc::clone(&ctx.counters),
+            completions_frames(),
+            Duration::from_millis(10),
+        ),
+        Script::MessagesOk => sse_response(
+            Arc::clone(&ctx.counters),
+            messages_frames(),
+            Duration::from_millis(10),
+        ),
+        Script::Endless => sse_response(
+            Arc::clone(&ctx.counters),
+            endless_frames(),
+            Duration::from_millis(10),
+        ),
+        // 不 sleep：靠 channel 的背压，客户端一停读就会立刻卡住
+        Script::Flood => sse_response(Arc::clone(&ctx.counters), flood_frames(), Duration::ZERO),
     }
 }
 
-/// 每 10ms 发一帧，一直发到客户端断开为止（`endless_frames` 提供上限）。
-fn sse_response(counters: Arc<Counters>, frames: Vec<String>) -> Response {
+/// 每 `delay` 发一帧；`delay = 0` 时靠背压限速。
+fn sse_response(counters: Arc<Counters>, frames: Vec<String>, delay: Duration) -> Response {
     let (sender, receiver) = mpsc::channel::<Bytes>(4);
     tokio::spawn(async move {
         for frame in frames {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if sender.send(Bytes::from(frame)).await.is_err() {
-                // 对端关闭：真实厂商也是这么停下生成的
-                counters.aborted.fetch_add(1, Ordering::SeqCst);
+                // 收端没了（本服务已断开）：真实厂商在这里也会停止生成
                 return;
             }
             counters.delivered.fetch_add(1, Ordering::SeqCst);
@@ -284,6 +300,18 @@ fn endless_frames() -> Vec<String> {
         .map(|index| {
             sse(&format!(
                 r#"{{"id":"c1","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":"片{index}"}}}}]}}"#
+            ))
+        })
+        .collect()
+}
+
+/// 大口径的流：每帧 32KB，足够在客户端停止读取后迅速把 Socket 缓冲灌满。
+fn flood_frames() -> Vec<String> {
+    let padding = "x".repeat(32 * 1024);
+    (0..400)
+        .map(|index| {
+            sse(&format!(
+                r#"{{"id":"c1","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":"{index}-{padding}"}}}}]}}"#
             ))
         })
         .collect()
@@ -734,7 +762,7 @@ async fn upstream_5xx_maps_to_502_upstream_error() {
 async fn upstream_timeout_maps_to_504_upstream_timeout() {
     let mock = start_mock(Script::SlowHeaders).await;
     let mut config = TestApp::config(&mock);
-    config.upstream_read_timeout_secs = 1; // mock 要睡 10s
+    config.upstream_first_event_timeout_secs = 1; // mock 要睡 10s
     let app = TestApp::with_config(config);
     let token = app.register("student@ynau.edu.cn").await;
 
@@ -782,8 +810,8 @@ async fn malformed_body_is_validation_error() {
 }
 
 #[tokio::test]
-async fn client_disconnect_cancels_upstream_and_releases_the_gate() {
-    let mock = start_mock(Script::Endless).await;
+async fn client_disconnect_stops_draining_upstream_and_releases_the_gate() {
+    let mock = start_mock(Script::Flood).await;
     let app = TestApp::new(&mock);
     let token = app.register("student@ynau.edu.cn").await;
 
@@ -794,19 +822,19 @@ async fn client_disconnect_cancels_upstream_and_releases_the_gate() {
     // 读到第一帧就走人（真实客户端也会这么做：用户点了"停止"或切走）
     let frame = body.frame().await.expect("应有第一帧").expect("帧不应出错");
     assert!(frame.data_ref().is_some(), "第一帧应该是 SSE 数据");
-    let delivered_at_drop = mock.delivered();
     drop(body);
 
-    // 上游必须被取消：mock 的下一帧写不出去 → aborted 计数 +1
-    assert!(
-        wait_until(|| mock.aborted() > 0, Duration::from_secs(3)).await,
-        "客户端断开后上游没有被取消（还在烧 token）"
-    );
-    assert!(
-        mock.delivered() < 200,
-        "上游仍在继续产出：断开前 {}，断开后 {}",
-        delivered_at_drop,
-        mock.delivered()
+    // 断开后我们不再读上游：mock 往 socket 里灌，缓冲灌满后就写不动了。
+    //
+    // 判据说明：`reqwest`/`hyper` 在响应被 drop 之后**停止读取**，但不会主动发 FIN，
+    // 所以这里量的是"上游的产出是否停住"，而不是"连接是否立刻关闭"。
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let settled = mock.delivered();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        mock.delivered(),
+        settled,
+        "客户端断开后上游仍在被持续消费（还在烧 token）"
     );
     assert_eq!(mock.finished(), 0, "被取消的流不应该跑到自然结束");
 

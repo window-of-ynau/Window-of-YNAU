@@ -12,8 +12,12 @@
 //!                                 └─► 抽样记账 / 审计（fire-and-forget，失败不影响流）
 //! ```
 //!
-//! 客户端断开时，响应体被丢弃 → 生产任务写 channel 失败 → 立刻 `drop` 上游连接，
-//! 上游看到对端关闭就停止生成（**不再烧 token**）；闸门名额与记账都在任务收尾时处理。
+//! 客户端断开时：响应体被丢弃 → `sender.closed()` 立刻就绪（`select!` 直接跳出读循环）
+//! → **不再读上游**；`UpstreamStream` 随任务结束被 drop，上游的写入很快会被 TCP 窗口卡住
+//! （不再有 token 被我们消费）。闸门名额与抽样记账都在任务收尾时处理。
+//!
+//! 说明：`reqwest` 在响应被 drop 后停止读取，但**不会主动发 FIN**——连接要等上游自己
+//! 超时或写完才回收。对成本的影响是"厂商的写被背压住"，不是"立刻断开"。
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -38,7 +42,7 @@ use crate::api::request_id::ReqId;
 use crate::auth::Principal;
 use crate::gate::{GateRejection, TurnPermit};
 use crate::state::AppState;
-use crate::upstream::{self, Timeouts, Upstream};
+use crate::upstream::{UpstreamError, UpstreamStream};
 
 /// SSE 通道缓冲：给客户端一点抖动空间，同时保留背压（满了就暂停读上游）。
 const SSE_CHANNEL_CAPACITY: usize = 8;
@@ -120,21 +124,7 @@ pub async fn chat_stream(
     };
 
     // 2) 上游开流：连不上/超时/非 2xx 都在这里变成 502/504 信封
-    let Some(provider) = state.config.upstream.provider(request.protocol) else {
-        return Err(AppError::new(
-            ErrorCode::UpstreamError,
-            format!(
-                "未配置 {:?} 的上游（UPSTREAM_BASE_URL / UPSTREAM_API_KEY）",
-                request.protocol
-            ),
-            &req_id.0,
-        ));
-    };
-    let timeouts = Timeouts {
-        connect: Duration::from_secs(state.config.upstream_connect_timeout_secs),
-        read: Duration::from_secs(state.config.upstream_read_timeout_secs),
-    };
-    let upstream = match upstream::open(request.protocol, provider, &request, timeouts).await {
+    let upstream = match state.upstream.open(request.protocol, &request).await {
         Ok(upstream) => upstream,
         Err(error) => {
             tracing::warn!(
@@ -213,7 +203,7 @@ fn gate_reason(rejection: GateRejection) -> &'static str {
 fn sse_stream(
     state: AppState,
     permit: TurnPermit,
-    mut upstream: Upstream,
+    mut upstream: UpstreamStream,
     request: ChatRequest,
     user_id: Uuid,
     request_id: String,
@@ -225,51 +215,58 @@ fn sse_stream(
         let model = request.model.clone();
         let mut assembler = ChunkAssembler::new(Channel::Plan, request_id.clone(), model.clone());
 
-        'stream: loop {
-            // 心跳也不能越过装配器：Meta 必须仍然是最先出现的事件
-            let next = if heartbeat.is_zero() {
-                upstream.next_chunks().await
-            } else {
-                match tokio::time::timeout(heartbeat, upstream.next_chunks()).await {
-                    Ok(next) => next,
-                    Err(_) => {
+        // 客户端断开时收端被 drop，这个 future 立刻完成：我们立刻停止读上游
+        // （随后 drop `UpstreamStream`，上游的写入会被 TCP 背压卡住）。
+        // 作用域收在这里，是因为 `sender.closed()` 借用了 `sender`，
+        // 后面的 `drop(sender)` 必须等这个借用结束。
+        {
+            let mut client_gone = std::pin::pin!(sender.closed());
+
+            'stream: loop {
+                // 心跳也不能越过装配器：Meta 必须仍然是最先出现的事件
+                let outcome = tokio::select! {
+                    // biased：优先取上游事件，避免"心跳与事件同时就绪"时把事件推迟一轮
+                    biased;
+                    outcome = read_next(&mut upstream, heartbeat) => outcome,
+                    _ = &mut client_gone => break 'stream,
+                };
+
+                match outcome {
+                    ReadOutcome::Ping => {
                         if !forward(&sender, assembler.feed(vec![Chunk::Ping])).await {
                             break 'stream;
                         }
-                        continue;
                     }
-                }
-            };
-
-            match next {
-                Some(Ok(chunks)) => {
-                    if !forward(&sender, assembler.feed(chunks)).await {
-                        break 'stream; // 客户端断开
+                    ReadOutcome::Next(Some(Ok(chunks))) => {
+                        if !forward(&sender, assembler.feed(chunks)).await {
+                            break 'stream; // 客户端断开
+                        }
                     }
-                }
-                Some(Err(error)) => {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        error = %error,
-                        "上游流中断，转成 SSE error 事件"
-                    );
-                    // Error 是终止事件：装配器不会再补 Done（ADR-16）
-                    let chunk = Chunk::Error {
-                        code: error.code(),
-                        message: error.message().to_owned(),
-                    };
-                    forward(&sender, assembler.feed(vec![chunk])).await;
-                    break 'stream;
-                }
-                None => {
-                    // 上游正常关闭但没给结束帧时，装配器补一个 Done
-                    forward(&sender, assembler.finish()).await;
-                    break 'stream;
+                    ReadOutcome::Next(Some(Err(error))) => {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            error = %error,
+                            "上游流中断，转成 SSE error 事件"
+                        );
+                        // Error 是终止事件：装配器不会再补 Done（ADR-16）
+                        let chunk = Chunk::Error {
+                            code: error.code(),
+                            message: error.message().to_owned(),
+                        };
+                        forward(&sender, assembler.feed(vec![chunk])).await;
+                        break 'stream;
+                    }
+                    ReadOutcome::Next(None) => {
+                        // 上游正常关闭但没给结束帧时，装配器补一个 Done
+                        forward(&sender, assembler.finish()).await;
+                        break 'stream;
+                    }
                 }
             }
         }
 
-        // 取消上游：客户端断开时，这一步让厂商立刻停止生成（不继续烧 token）
+        // 取消：客户端断开时我们早就不再读上游了，这一步把响应也释放掉。
+        // （reqwest 不会主动发 FIN，但 socket 缓冲一旦被灌满，厂商的写就会被卡住。）
         drop(upstream);
 
         // 抽样记账：**只写一行**，用装配器合并后的终值（按字段 max 合并）
@@ -292,6 +289,28 @@ fn sse_stream(
     });
 
     SseBody { receiver }
+}
+
+/// 读一步上游的结果。
+enum ReadOutcome {
+    /// 一步事件：`None` 表示上游正常结束
+    Next(Option<Result<Vec<Chunk>, UpstreamError>>),
+    /// 空闲太久：先发一条心跳，再继续等
+    Ping,
+}
+
+/// 读一步上游事件；心跳间隔到了就先回去发 ping。
+///
+/// `UpstreamStream::next_chunks` 是取消安全的：被 `select!` 打断时已解出的事件还在
+/// 它自己的缓冲里，不会丢事件。
+async fn read_next(upstream: &mut UpstreamStream, heartbeat: Duration) -> ReadOutcome {
+    if heartbeat.is_zero() {
+        return ReadOutcome::Next(upstream.next_chunks().await);
+    }
+    match tokio::time::timeout(heartbeat, upstream.next_chunks()).await {
+        Ok(next) => ReadOutcome::Next(next),
+        Err(_) => ReadOutcome::Ping,
+    }
 }
 
 /// 逐条写进 channel；返回 `false` 表示客户端已经断开（收端被 drop）。
