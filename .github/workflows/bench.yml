@@ -1,0 +1,51 @@
+# 评测回归：每天 03:00 UTC 跑一次 + 支持手动触发
+# 设计文档 §10.3 门禁：TTFT 或成本相对 baseline 退化 > 10% 即失败
+name: bench
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+# 只读即可：结果走 artifact，不写回仓库
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: 评测回归（对比 baseline）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 准备输出目录
+        run: mkdir -p bench/results
+      # bench/run.py 只用标准库：刻意不装第三方依赖，保证评测可复现
+      # 退出码：0 无退化 / 1 相对 baseline 退化 / 2 参数错误或服务不可达 —— 非 0 即判失败
+      # 注意：脚本走 HTTP（默认 --base-url http://127.0.0.1:8080），需要先有可用的服务端；
+      # 本 workflow 暂不拉起服务端，若时刻表触发时无服务，会以退出码 2 失败（需另配服务或换离线用例）
+      - name: 执行 smoke 评测并与 baseline 对比
+        run: |
+          python bench/run.py \
+            --cases bench/cases/smoke.jsonl \
+            --baseline bench/baseline.json \
+            --out bench/results/ci.json
+      # 无论通过与否都留档，便于复盘退化曲线
+      - name: 上传评测结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.run_id }}
+          path: bench/results/ci.json
+          if-no-files-found: warn
+          retention-days: 30

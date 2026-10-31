@@ -1,0 +1,72 @@
+name: 功能建议
+description: 提出新功能或改进建议（会先评估是否触及 ADR 边界）
+title: "[Feature] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提建议前建议先读 `docs/04-ADR.md` 与 `docs/01-产品需求文档.md`：
+        涉及**信任域、凭据、契约**的改动需要先有 ADR，不能直接改代码。
+
+  - type: textarea
+    id: background
+    attributes:
+      label: 使用场景
+      description: 谁、在什么情况下、遇到什么麻烦？请描述真实痛点而非方案。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的方案
+      description: 你希望它怎么工作？可以附交互草图或伪代码。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考虑过的替代方案
+      description: 为什么现有的做法不够用？
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 影响范围
+      multiple: true
+      options:
+        - app（Flutter UI）
+        - core（端侧 Rust 核心）
+        - server（服务端）
+        - shared（共享契约）
+        - bench（评测集）
+        - docs（文档）
+        - 部署 / CI
+    validations:
+      required: true
+
+  - type: dropdown
+    id: adr-impact
+    attributes:
+      label: 是否触及 ADR 边界
+      description: 凭据出端、云端落正文、契约变更、许可证相关都算。
+      options:
+        - 不确定（请维护者判断）
+        - 不触及，仅是体验改进
+        - 触及，需要新增或修订 ADR
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前自检
+      options:
+        - label: 我已搜索过已有 issue / ADR，未发现重复
+          required: true
+        - label: 该建议不包含任何凭据或真实校务数据
+          required: true

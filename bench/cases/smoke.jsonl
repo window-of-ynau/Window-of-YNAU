@@ -1,0 +1,12 @@
+{"id":"c01","tags":["timetable"],"question":"下周三下午有课吗","expect":{"tool":"get_courses","contains":["课"]}}
+{"id":"c02","tags":["timetable"],"question":"我这学期每周二上午的课在哪上","expect":{"tool":"get_courses","contains":["课"]}}
+{"id":"c03","tags":["timetable"],"question":"明天有几节课","expect":{"tool":"get_courses","contains":["课"]}}
+{"id":"c04","tags":["timetable"],"question":"第 8 周我还有哪些课","expect":{"tool":"get_courses","contains":["课"]}}
+{"id":"c05","tags":["regulation"],"question":"转专业需要满足什么条件","expect":{"contains":["转专业"]}}
+{"id":"c06","tags":["regulation"],"question":"请假一般是怎么走流程的","expect":{"contains":["请假"]}}
+{"id":"c07","tags":["knowledge"],"question":"学校图书馆的开放时间是什么时候","expect":{"contains":["图书馆"]}}
+{"id":"c08","tags":["knowledge"],"question":"云南农业大学有哪些国家级一流本科专业","expect":{"contains":["专业"]}}
+{"id":"c09","tags":["multiturn"],"question":"刚才说的那几门课，周五下午还上吗","expect":{"contains":["课"]}}
+{"id":"c10","tags":["multiturn"],"question":"你上面列的那些课，哪些是必修的","expect":{"contains":["课"]}}
+{"id":"c11","tags":["tool_failure"],"question":"教务系统登录不上了，你还能查到我的课表吗","expect":{"contains":["课"]}}
+{"id":"c12","tags":["tool_failure"],"question":"课表一直加载失败，是不是要重新同步一下","expect":{"contains":["课"]}}

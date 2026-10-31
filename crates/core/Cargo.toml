@@ -1,0 +1,16 @@
+[package]
+name = "yunong-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "云农之窗端侧核心：本地记忆、上下文、检索、日历、直连网关（供 Flutter FFI 调用）"
+
+[dependencies]
+yunong-shared = { path = "../shared" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+sha2 = "0.10"
