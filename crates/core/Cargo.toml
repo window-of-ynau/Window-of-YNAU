@@ -14,3 +14,5 @@ thiserror = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
 sha2 = "0.10"
+# 课表 HTML 解析（教务页面是机器生成的固定结构，用正则足够且无重依赖）
+regex = "1"

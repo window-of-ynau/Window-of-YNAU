@@ -14,6 +14,8 @@ pub mod gateway;
 pub mod index;
 pub mod keystore;
 pub mod memory;
+pub mod parse;
+pub mod protocols;
 pub mod tools;
 
 pub use error::{CoreError, CoreResult};
@@ -28,9 +30,11 @@ pub mod prelude {
     pub use crate::calendar::{parse_weeks, Course, Occurrence, PeriodTime};
     pub use crate::context::{estimate_tokens, plan_compaction, should_compress, CompactionPlan};
     pub use crate::error::{CoreError, CoreResult};
-    pub use crate::gateway::{DirectProvider, ModelGateway};
+    pub use crate::gateway::{CloudProxy, DirectProvider, ModelGateway};
     pub use crate::index::{Bm25Index, LocalIndex, SearchHit};
     pub use crate::keystore::{SecretKind, SecretStore};
     pub use crate::memory::{Blob, BlobKind, MemoryStore, Message};
+    pub use crate::parse::{parse_timetable, ParseError};
+    pub use crate::protocols::{build_body, parse_event};
     pub use crate::tools::{ToolCall, ToolOutcome, ToolRegistry};
 }
