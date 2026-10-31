@@ -7,6 +7,8 @@ use axum::{
 };
 use yunong_shared::{ApiError, ErrorCode};
 
+use crate::auth::AuthError;
+
 /// HTTP 层错误。`request_id` 由中间件注入，保证与响应头一致。
 #[derive(Debug)]
 pub struct AppError {
@@ -27,6 +29,11 @@ impl AppError {
             inner: err,
             request_id: request_id.to_owned(),
         }
+    }
+
+    /// 鉴权层的错误 → HTTP 错误信封（错误码与状态码都来自契约层）。
+    pub fn from_auth(err: AuthError, request_id: &str) -> Self {
+        Self::new(err.code, err.message, request_id)
     }
 
     pub fn code(&self) -> ErrorCode {
