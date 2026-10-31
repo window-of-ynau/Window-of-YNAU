@@ -10,7 +10,7 @@ description = "云农之窗服务端：鉴权、代理转发、配额、知识�
 yunong-shared = { path = "../shared" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
-tower-http = { version = "0.6", features = ["trace", "request-id", "cors", "limit", "timeout"] }
+tower-http = { version = "0.7", features = ["trace", "request-id", "cors", "limit", "timeout"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { workspace = true }
