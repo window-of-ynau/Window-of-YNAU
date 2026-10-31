@@ -52,6 +52,7 @@ pub fn parse_cloud_event(frame: &SseFrame) -> Option<Chunk> {
         "tool_call" => Some(Chunk::ToolCall {
             id: text(&data, "id").unwrap_or_default(),
             name: text(&data, "name").unwrap_or_default(),
+            index: None,
             arguments: data
                 .get("arguments")
                 .cloned()
@@ -177,6 +178,7 @@ mod tests {
                 id: "c1".into(),
                 name: "get_courses".into(),
                 arguments: serde_json::json!({ "weekday": 3 }),
+                index: None,
             })
         );
         // arguments 缺省是空对象（不要给 null）
@@ -186,6 +188,7 @@ mod tests {
                 id: "c1".into(),
                 name: "x".into(),
                 arguments: serde_json::json!({}),
+                index: None,
             })
         );
         assert_eq!(

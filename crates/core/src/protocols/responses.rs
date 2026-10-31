@@ -21,7 +21,7 @@
 use serde_json::{json, Map, Value};
 use yunong_shared::{ChatMessage, ChatRequest, Chunk, Role, ToolSpec};
 
-use super::{finish_reason, openai_usage, partial_json, system_prompt};
+use super::{call_index, finish_reason, openai_usage, partial_json, system_prompt};
 
 /// 构造请求体。
 pub(super) fn build(request: &ChatRequest) -> Value {
@@ -236,6 +236,7 @@ fn function_call(value: &Value) -> Option<Chunk> {
         id: id.to_owned(),
         name: name.to_owned(),
         arguments: partial_json(arguments),
+        index: call_index(value, "output_index"),
     })
 }
 
@@ -253,6 +254,7 @@ fn arguments_delta(value: &Value) -> Option<Chunk> {
         // name 只出现在 output_item 事件里，本事件拿不到（无状态限制）。
         name: String::new(),
         arguments: partial_json(fragment),
+        index: call_index(value, "output_index"),
     })
 }
 
@@ -405,6 +407,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_courses".into(),
                 arguments: serde_json::json!({}),
+                index: Some(1),
             })
         );
 
@@ -415,6 +418,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_courses".into(),
                 arguments: serde_json::json!({ "weekday": 3 }),
+                index: Some(1),
             })
         );
     }
@@ -429,6 +433,7 @@ mod tests {
                 id: "fc_1".into(),
                 name: String::new(),
                 arguments: Value::String(r#"{"weekday":"#.into()),
+                index: Some(1),
             })
         );
     }

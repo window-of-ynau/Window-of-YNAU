@@ -14,8 +14,9 @@
 | C4 | Completions 的 `tool` 消息与 Responses 的 `function_call_output` **没有 name 位置** | 工具名只能靠 `tool_call_id` 反查；上游若丢 id 就对不上 | 内部保留 `name`（已有字段），编码时按协议能力尽力携带，并在日志里记录丢失 | P2（协议限制，不可消除） |
 | C5 | Anthropic `tool_use.input` 必须是 JSON 对象 | 上游给的是字符串参数时非法 JSON 只能降级 `{}` | 契约层保证 `arguments` 永远是**合法 JSON 值**；端侧执行前校验 schema | P1 |
 | C6 | usage 与结束原因经常在**同一个事件**里（Anthropic `message_delta`、Responses `response.completed`） | `parse_event` 一次只能返回一个 `Chunk`，二选一必丢数据 | 改为 `parse_events(...) -> Vec<Chunk>`，允许一事件多 chunk | **P0** — W2b 已解决（[ADR-16](../04-ADR.md)） |
-| C7 | 无状态解析：工具参数分片（`arguments.delta`）无法跨事件聚合 | 长参数的工具调用会被截断 | 由 `gateway` 持有聚合状态，`parse_events` 保持纯函数并在注释声明 | P1 |
+| C7 | 无状态解析：工具参数分片（`arguments.delta`）无法跨事件聚合 | 长参数的工具调用会被截断 | 由 `gateway` 持有聚合状态，`parse_events` 保持纯函数并在注释声明 | P1 — **定址已由 C9 解决**，跨事件聚合仍需 W3 实现 |
 | C8 | `Meta`/`Ping` 不由适配层产出 | 若客户端依赖 `Meta` 判断通道，缺失会出错 | 明确由 gateway 合成；适配层只产出 `Delta/ToolCall/Usage/Done/Error` | P2（已按此实现，仅需写清） |
+| C9 | `Chunk::ToolCall` 没有序号：并行调用时参数分片无法归位（A 的参数会拼到 B 上） | 并行工具调用只能整体放弃或瞎拼 | `Chunk::ToolCall` 增 `index: Option<u32>`（`None` 不序列化，wire 兼容）；三适配器分别取 `tool_calls[].index` / `content_block_start.index` / `output_index` | **P0** — W2b 已解决（同 ADR-16 的"契约可表达性"边界） |
 
 ## 已解决（W2b）
 

@@ -220,6 +220,16 @@ fn token_count(value: Option<&Value>) -> Option<u32> {
         .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
+/// 工具调用的序号（C9）：Completions 用 `index`、Responses 用 `output_index`。
+///
+/// 并行调用时，参数分片必须靠它归位——没有序号就只能瞎猜（A 的参数会拼到 B 上）。
+pub(crate) fn call_index(value: &Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 /// 上游错误对象 → `Chunk::Error`（§9 只要求归一成 `UpstreamError`）。
 ///
 /// 三家形状：

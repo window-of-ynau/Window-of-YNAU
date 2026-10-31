@@ -19,7 +19,7 @@
 use serde_json::{json, Map, Value};
 use yunong_shared::{ChatMessage, ChatRequest, Chunk, Role, ToolCallRef, ToolSpec};
 
-use super::{finish_reason, openai_usage, partial_json, system_prompt, BuildOptions};
+use super::{call_index, finish_reason, openai_usage, partial_json, system_prompt, BuildOptions};
 
 /// 构造请求体（默认开关，测试与普通调用方用）。
 pub(super) fn build(request: &ChatRequest) -> Value {
@@ -208,6 +208,7 @@ fn tool_call(call: &Value) -> Chunk {
         id: id.to_owned(),
         name: name.to_owned(),
         arguments: partial_json(arguments),
+        index: call_index(call, "index"),
     }
 }
 
@@ -316,6 +317,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_courses".into(),
                 arguments: serde_json::json!({ "weekday": 3 }),
+                index: Some(0),
             })
         );
     }
@@ -330,6 +332,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_courses".into(),
                 arguments: serde_json::json!({}),
+                index: Some(0),
             })
         );
 
@@ -340,6 +343,7 @@ mod tests {
                 id: String::new(),
                 name: String::new(),
                 arguments: Value::String(r#"{"weekday":"#.into()),
+                index: Some(0),
             })
         );
     }
@@ -448,6 +452,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "get_courses".into(),
                     arguments: serde_json::json!({ "weekday": 3 }),
+                    index: Some(0),
                 },
             ]
         );
