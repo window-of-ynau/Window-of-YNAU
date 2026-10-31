@@ -54,6 +54,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let state = AppState::new(config.clone(), db);
+    // 内存后端意味着重启即丢失账号与令牌：启动时必须让人看见。
+    tracing::info!(auth_backend = state.auth.backend_kind(), "鉴权后端已就绪");
     let router = app(state);
 
     let addr: SocketAddr = config.bind.parse()?;
