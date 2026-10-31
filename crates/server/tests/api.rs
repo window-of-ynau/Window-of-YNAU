@@ -503,7 +503,7 @@ async fn me_requires_bearer_token() {
     assert_error(&res, StatusCode::UNAUTHORIZED, "UNAUTHORIZED");
 }
 
-// ============ chat：鉴权通过后仍返回 501 ============
+// ============ chat：鉴权与校验在转发之前（W2b 已接真实转发） ============
 
 #[tokio::test]
 async fn chat_without_token_is_401_not_500() {
@@ -518,8 +518,12 @@ async fn chat_without_token_is_401_not_500() {
     assert_error(&res, StatusCode::UNAUTHORIZED, "UNAUTHORIZED");
 }
 
+/// W2b：`/chat/stream` 不再是 501 占位。
+///
+/// 没有配上游时应给 502 `UPSTREAM_ERROR`（而不是 500/501）；
+/// 真正的转发、闸门与断开取消在 `tests/chat_stream.rs` 里对着 mock 上游验证。
 #[tokio::test]
-async fn chat_with_valid_token_reaches_the_not_implemented_gate() {
+async fn chat_with_valid_token_is_502_when_upstream_is_not_configured() {
     let app = TestApp::new();
     let access = app.access_token(EMAIL).await;
 
@@ -529,7 +533,14 @@ async fn chat_with_valid_token_reaches_the_not_implemented_gate() {
             &access,
         ))
         .await;
-    assert_error(&res, StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED");
+    assert_error(&res, StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR");
+    assert!(
+        res.body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("UPSTREAM_")),
+        "要告诉运维配哪个环境变量：{:?}",
+        res.body
+    );
 }
 
 #[tokio::test]

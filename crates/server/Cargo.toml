@@ -8,8 +8,20 @@ description = "云农之窗服务端：鉴权、代理转发、配额、知识�
 
 [dependencies]
 yunong-shared = { path = "../shared" }
+# 三协议适配（build_body / parse_events）：服务端**只做转发 + 记账**，
+# 协议解析一律复用 core，避免端与服务端各写一份（ADR-13 / ADR-16）。
+yunong-core = { path = "../core" }
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "time",
+    # SSE 代理需要：闸门用的是 Semaphore（sync），上游 socket 用读写扩展（io-util）
+    "sync",
+    "io-util",
+] }
 tower-http = { version = "0.6", features = ["trace", "request-id", "cors", "limit", "timeout"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -17,6 +29,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
+# SSE 响应体是 `Stream`：`Body::from_stream` 要的正是这个 trait（TryStream 同在 futures-core）
+futures-core = "0.3"
 dotenvy = "0.15"
 anyhow = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "migrate"] }
