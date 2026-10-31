@@ -102,3 +102,45 @@ git worktree remove .worktrees/rust-parser                # 收尾
 ```
 
 规则与"单写者文件"清单见 [docs/integrations/agent-worktrees.md](docs/integrations/agent-worktrees.md)。
+
+---
+
+## Python / 实验分支（EXP）
+
+> 写给**只写 Python** 的贡献者（包括 v0 Demo 的原作者）：
+> **你不需要会 Rust，也不需要会 Flutter。**
+
+| 你想做的事 | 该去哪里 |
+|---|---|
+| 修 v0 Demo 的 bug、补文档、补测试 | `experiments/v0-legacy/`（历史留档，不参与构建） |
+| 做新实验（数据抓取、OCR、报告生成…） | `experiments/<你的特性>/` |
+| 改生产代码 | `crates/`（Rust）、`app/`（Flutter）—— 需要对应背景，走正常 PR 评审 |
+
+### 分支模型
+
+``````
+main ──┬────────────────────────────► 生产
+       └── EXP ─────────────────────► 实验（定期 git merge main 保持同步）
+``````
+
+- `EXP` **不是孤立历史**，是从 `main` 分出来的长期分支，所以合并不会打架；
+- `experiments/` 里的代码**不参与 CI 构建**，不会把主线弄红；
+- 成熟实验由维护者评审后提升进主线。
+
+### 三条硬性要求
+
+1. 不放凭据（Cookie / API Key / 学号 / 个人绝对路径）；
+2. 自带 `README.md`（怎么跑、能做什么、不能做什么）；
+3. 有依赖就写 `requirements.txt`。
+
+### 常用命令
+
+``````bash
+git switch EXP
+git merge main                     # 同步主线
+# 在 experiments/ 下写代码
+git add -A && git commit -m "exp: 说明"
+git push origin EXP
+``````
+
+详见 [experiments/README.md](experiments/README.md)。
