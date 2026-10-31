@@ -71,7 +71,7 @@ jobs:
         with:
           persist-credentials: false
       - name: 安装 Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       # 脚本仅用标准库，无需安装依赖
