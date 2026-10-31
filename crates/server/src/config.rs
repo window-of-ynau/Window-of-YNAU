@@ -4,6 +4,9 @@ use std::env;
 
 use yunong_shared::MAX_INPUT_TOKENS;
 
+use crate::upstream::UpstreamConfig;
+
+/// 服务端运行期配置。所有字段都可用环境变量覆盖（见 [`Config::from_env`]）。
 #[derive(Debug, Clone)]
 pub struct Config {
     /// 监听地址
@@ -15,6 +18,20 @@ pub struct Config {
     pub concurrency_limit: usize,
     /// 单轮输入 token 上限（保护毛利）
     pub max_input_tokens: u32,
+
+    // ---- W2b：SSE 代理 ----
+    /// 全局闸门排队上限（毫秒）。`docs/02` §8.1：排队 ≤ 5s 后 429；0 = 不排队、直接拒
+    pub concurrency_queue_ms: u64,
+    /// 连上游超时（秒）
+    pub upstream_connect_timeout_secs: u64,
+    /// 上游首字节 / 空闲超时（秒）：超时 → 504 `UPSTREAM_TIMEOUT`
+    pub upstream_read_timeout_secs: u64,
+    /// SSE 心跳间隔（秒），0 = 不心跳。`docs/03` §10 要求 15s
+    pub sse_heartbeat_secs: u64,
+    /// usage 抽样百分比（0..=100），默认 1 = 1%（ADR-03：抽样成本监控，不是账单）
+    pub usage_sample_percent: u8,
+    /// 套餐通道的上游供应商（三家协议可各配一套；Key 只存在服务端）
+    pub upstream: UpstreamConfig,
 }
 
 impl Config {
@@ -27,10 +44,18 @@ impl Config {
             db_max_connections: env_parse("DB_MAX_CONNECTIONS", 10),
             concurrency_limit: env_parse("CONCURRENCY_LIMIT", 50),
             max_input_tokens: env_parse("MAX_INPUT_TOKENS", MAX_INPUT_TOKENS),
+            concurrency_queue_ms: env_parse("CONCURRENCY_QUEUE_MS", 5_000),
+            upstream_connect_timeout_secs: env_parse("UPSTREAM_CONNECT_TIMEOUT_SECS", 5),
+            upstream_read_timeout_secs: env_parse("UPSTREAM_READ_TIMEOUT_SECS", 30),
+            sse_heartbeat_secs: env_parse("SSE_HEARTBEAT_SECS", 15),
+            usage_sample_percent: env_parse("USAGE_SAMPLE_PERCENT", 1).min(100),
+            upstream: UpstreamConfig::from_env(),
         }
     }
 
-    /// 测试用：不连数据库、端口随机。
+    /// 测试用：不连数据库、端口随机、不排队、不心跳（心跳会让断言难写）。
+    ///
+    /// 上游默认是空的——集成测试自己起 mock 上游，再填 [`Config::upstream`]。
     pub fn for_tests() -> Self {
         Self {
             bind: "127.0.0.1:0".into(),
@@ -38,6 +63,12 @@ impl Config {
             db_max_connections: 1,
             concurrency_limit: 50,
             max_input_tokens: MAX_INPUT_TOKENS,
+            concurrency_queue_ms: 0,
+            upstream_connect_timeout_secs: 2,
+            upstream_read_timeout_secs: 5,
+            sse_heartbeat_secs: 0,
+            usage_sample_percent: 1,
+            upstream: UpstreamConfig::default(),
         }
     }
 }
@@ -66,5 +97,20 @@ mod tests {
         assert!(c.database_url.is_none());
         assert_eq!(c.concurrency_limit, 50);
         assert!(c.max_input_tokens > 0);
+        // 测试环境不排队、不心跳：断言里不能依赖"等 5 秒"这种巧合
+        assert_eq!(c.concurrency_queue_ms, 0);
+        assert_eq!(c.sse_heartbeat_secs, 0);
+        assert!(c.usage_sample_percent <= 100);
+        assert!(c.upstream.is_empty(), "测试默认不配上游");
+    }
+
+    #[test]
+    fn defaults_match_the_design_doc() {
+        // docs/02 §8.1：全局 50 并发、排队 ≤5s；docs/03 §10：15s 心跳
+        let c = Config::from_env();
+        assert!(c.concurrency_limit > 0);
+        assert_eq!(c.sse_heartbeat_secs, 15);
+        assert_eq!(c.usage_sample_percent, 1);
+        assert!(c.upstream_read_timeout_secs > 0);
     }
 }

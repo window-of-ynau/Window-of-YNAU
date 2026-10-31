@@ -2092,6 +2092,7 @@ dependencies = [
  "argon2",
  "axum",
  "dotenvy",
+ "futures-core",
  "hex",
  "http-body-util",
  "serde",
@@ -2105,6 +2106,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "yunong-core",
  "yunong-shared",
 ]
 

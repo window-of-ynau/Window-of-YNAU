@@ -7,10 +7,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod accounting;
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod gate;
 pub mod state;
+pub mod upstream;
 
 use axum::{
     middleware,
