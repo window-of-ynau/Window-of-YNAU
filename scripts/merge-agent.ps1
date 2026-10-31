@@ -29,7 +29,10 @@ $branch = "agent/$Name"
 if (-not (Test-Path $worktree)) {
     throw "找不到工作树：$worktree（先跑 scripts/new-agent-worktree.ps1 -Name $Name）"
 }
-if (-not (git -C $repo show-ref --verify --quiet "refs/heads/$branch")) {
+# 注意：`git show-ref --quiet` 成功时不输出任何内容，所以必须看 $LASTEXITCODE，
+# 不能用 `-not (git ...)` 判断（那样会永远判成"不存在"）。
+git -C $repo show-ref --verify --quiet "refs/heads/$branch"
+if ($LASTEXITCODE -ne 0) {
     throw "找不到分支：$branch"
 }
 
