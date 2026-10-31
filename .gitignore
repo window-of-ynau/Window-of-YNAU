@@ -1,0 +1,40 @@
+# ---- Rust ----
+/target
+**/target
+*.rs.bk
+
+# ---- Flutter / Dart ----
+app/.dart_tool/
+app/build/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/android/.gradle/
+app/windows/flutter/ephemeral/
+app/linux/flutter/ephemeral/
+app/macos/Flutter/ephemeral/
+*.iml
+
+# ---- 凭据与本地数据（绝不要提交）----
+.env
+.env.*
+!.env.example
+deploy/.env
+*.pem
+*.p12
+*.jks
+*.keystore
+secrets/
+
+# ---- 本地数据与产物 ----
+*.db
+*.sqlite
+*.sqlite3
+*.log
+bench/results/
+docs/v0-审计/**/*.tmp
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

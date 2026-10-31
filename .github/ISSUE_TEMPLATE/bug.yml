@@ -1,0 +1,87 @@
+name: 缺陷报告
+description: 报告可复现的 Bug（崩溃、结果错误、性能异常）
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请先搜索是否已有同类 issue。
+        **注意**：安全漏洞请走仓库 Security 标签页的 “Report a vulnerability”（GitHub Security Advisory），不要在此公开。
+        **禁止**粘贴学校账号密码、Cookie/Session、上游 API Key 或任何真实校务数据。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 实际发生了什么？期望的结果是什么？
+      placeholder: 实际：……；期望：……
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 按顺序列出最小复现路径；能稳定复现最好。
+      placeholder: |
+        1. 打开……
+        2. 点击……
+        3. 出现……
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 运行平台
+      options:
+        - Android
+        - Windows
+        - Web
+        - 服务端（Server）
+        - 仅本地核心（Rust core）
+        - 其他 / 不确定
+      default: 0
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / Commit
+      description: App 版本号或 commit short sha；服务端问题请给镜像 tag。
+      placeholder: v1.0.0 (abc1234)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: 模型通道
+      description: 仅与模型调用相关时选择。
+      options:
+        - 不涉及
+        - BYOK（端侧直连）
+        - 套餐（服务端代理）
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 截图（已脱敏）
+      description: 请删除姓名、学号、正文、Cookie、Key 后再粘贴。
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前自检
+      options:
+        - label: 我已搜索过已有 issue，未发现重复
+          required: true
+        - label: 内容已脱敏，不含凭据、正文或真实校务数据
+          required: true

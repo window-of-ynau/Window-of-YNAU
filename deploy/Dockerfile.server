@@ -1,0 +1,65 @@
+# 云农之窗服务端镜像（多阶段）。
+#
+# 约定：
+# - 构建上下文是**仓库根目录**（见 deploy/docker-compose.yml 的 context: ..），
+#   所以下面所有 COPY 路径都相对仓库根。
+# - sqlx 按运行期查询（query/query_as）使用，构建期**不连数据库**，因此这里不需要
+#   DATABASE_URL，也不会有"构建时数据库不可达"的失败。
+# - Cargo.lock 必须提交；应用型 workspace 不锁依赖，线上和本地就不是同一份二进制。
+# - rust:1.97 tag 是否已发布未确认，这里用 `rust:1-slim-bookworm`（跟随 1.x 最新 + Debian 12）。
+#   需要绝对可复现时，改成实测过的 `rust:1.<minor>-slim-bookworm` 并同步 CI。
+# - 构建阶段若某个依赖需要 openssl（openssl-sys），在 builder 里补
+#   `apt-get install -y --no-install-recommends pkg-config libssl-dev`；
+#   运行阶段对应补 `libssl3`。当前默认按 rustls 系假设，只装 ca-certificates。
+
+FROM rust:1-slim-bookworm AS builder
+
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# 依赖缓存层：只复制清单，先用空壳源码把第三方依赖编译掉。
+# 之后改业务代码时这一层仍然命中，不会重编依赖。
+# 假设：core / shared 是 lib crate，server 是 bin crate（产物 target/release/yunong-server）。
+# 新增 crate、或把 [[bin]] path 改到别处时，这里的 COPY 与空壳文件必须同步改，
+# 否则 workspace 解析或目标名会不匹配。
+# ---------------------------------------------------------------------------
+COPY Cargo.toml Cargo.lock ./
+COPY crates/core/Cargo.toml crates/core/Cargo.toml
+COPY crates/server/Cargo.toml crates/server/Cargo.toml
+COPY crates/shared/Cargo.toml crates/shared/Cargo.toml
+
+RUN mkdir -p crates/core/src crates/server/src crates/shared/src \
+    && : > crates/core/src/lib.rs \
+    && : > crates/shared/src/lib.rs \
+    && : > crates/server/src/lib.rs \
+    && printf 'fn main() {}\n' > crates/server/src/main.rs \
+    && cargo build --release -p yunong-server
+
+# ---------------------------------------------------------------------------
+# 源码层：真实的 crates/ 覆盖空壳，只重编 workspace 自身的 crate。
+# ---------------------------------------------------------------------------
+COPY crates ./crates
+
+RUN cargo build --release -p yunong-server
+
+# ---------------------------------------------------------------------------
+# 运行阶段：只要二进制和 CA 证书，不带工具链、不带源码、不带 .env。
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 非 root 运行：固定 uid/gid，便于挂载卷/日志权限对齐；不给登录 shell。
+RUN groupadd --system --gid 10001 yunong \
+    && useradd --system --uid 10001 --gid yunong --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin yunong
+
+COPY --from=builder /app/target/release/yunong-server /usr/local/bin/yunong-server
+
+USER 10001:10001
+
+EXPOSE 8080
+
+# exec 形式，保证 SIGTERM 直达进程，axum 能做 graceful shutdown。
+ENTRYPOINT ["/usr/local/bin/yunong-server"]

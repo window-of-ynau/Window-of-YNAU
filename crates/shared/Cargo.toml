@@ -1,0 +1,12 @@
+[package]
+name = "yunong-shared"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "云农之窗契约层：端、云、文档共用的协议类型（唯一事实来源）"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }

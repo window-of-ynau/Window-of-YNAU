@@ -1,0 +1,28 @@
+# 编辑器统一配置：UTF-8、LF、4 空格缩进
+# 约定见 CONTRIBUTING.md §6；YAML/JSON/Markdown 与 Dart 例外
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# 配置与文档用 2 空格（与既有 .yml/.md 保持一致）
+[*.{yml,yaml,json,md}]
+indent_size = 2
+
+# Dart 的 dart format 固定 2 空格，不要用 4
+[*.dart]
+indent_size = 2
+
+# Makefile 只能用 Tab
+[{Makefile,*.mk}]
+indent_style = tab
+
+# 外部生成的锁定文件不要被编辑器重排
+[{Cargo.lock,pubspec.lock,*.lock}]
+insert_final_newline = true
+trim_trailing_whitespace = false

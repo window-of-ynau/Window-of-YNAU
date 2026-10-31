@@ -1,0 +1,18 @@
+# 不依赖 flutter_lints（避免额外的 pub 依赖，保证离线也能 analyze）
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+  errors:
+    todo: ignore
+
+linter:
+  rules:
+    - avoid_print
+    - avoid_unnecessary_containers
+    - prefer_const_constructors
+    - prefer_const_declarations
+    - prefer_final_locals
+    - unnecessary_this
+    - use_key_in_widget_constructors

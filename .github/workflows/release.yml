@@ -1,0 +1,112 @@
+# 发布：推 v* 标签时构建服务端镜像，并尝试产出 Android APK
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# 顶层最小权限；只有 server-image 为推 GHCR 提权（全仓唯一提权 workflow）
+permissions:
+  contents: read
+
+jobs:
+  # ── 服务端镜像 → GHCR ──────────────────────────────────────────────
+  server-image:
+    name: 服务端镜像（GHCR）
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 启用 buildx
+        uses: docker/setup-buildx-action@v3
+      # 用内置 GITHUB_TOKEN，不额外建 PAT（PAT 是长期凭据，泄露面更大）
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # GHCR 仓库名必须全小写：组织名含大写时用 tr 归一化
+      - name: 计算镜像名（小写）
+        id: image
+        run: |
+          echo "name=ghcr.io/${{ github.repository_owner }}/yunong-server" \
+            | tr '[:upper:]' '[:lower:]' >> "$GITHUB_OUTPUT"
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.server
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Android APK ───────────────────────────────────────────────────
+  # 签名 secrets 一律先经 job 级 env 中转：secrets 上下文不能直接写进 if 表达式
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: 安装 Flutter（stable + 缓存 SDK）
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+      # 四个签名 secret 齐备才走 release 签名
+      - name: 解码 keystore 并写 key.properties
+        if: env.KEYSTORE_BASE64 != ''
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p android/app
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/upload-keystore.jks
+          {
+            echo "storeFile=upload-keystore.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/key.properties
+          # 仅落在 runner 本地工作区，随 job 结束销毁
+      - name: 构建 release APK（已配置签名）
+        if: env.KEYSTORE_BASE64 != ''
+        working-directory: app
+        run: flutter build apk --release
+      # 缺少签名 secrets 时只出 debug 产物：不伪造签名，也不让发布流程变红
+      - name: 构建 debug APK（未配置签名，降级产物）
+        if: env.KEYSTORE_BASE64 == ''
+        working-directory: app
+        run: |
+          echo "::warning::缺少 KEYSTORE_BASE64 等签名 secrets，只产出 debug APK，不可用于发布"
+          flutter build apk --debug
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: yunong-apk-${{ github.ref_name }}
+          path: app/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 14

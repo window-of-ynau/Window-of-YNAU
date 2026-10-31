@@ -1,0 +1,21 @@
+# CODEOWNERS —— 审查归属
+#
+# 说明：`@YOUR_ORG/yunong-maintainers` 是占位团队。
+# 建仓后请先到 GitHub 组织里创建该团队并邀请协作者，然后：
+#   1. 把 YOUR_ORG 替换成真实组织名（或个人用户名，如 @your-name）；
+#   2. 确保被指定的团队/用户拥有本仓库的 Write 权限，否则审查请求不会生效；
+#   3. 分支保护开启 “Require review from Code Owners” 后本文件才会强制生效。
+# 语法：每行 `<路径模式> <所有者...>`，最后匹配的规则优先生效。
+
+# 默认：全仓库归维护者团队
+* @YOUR_ORG/yunong-maintainers
+
+# 契约层最敏感：端与服务端共用，改动需核心维护者把关
+/crates/shared/ @YOUR_ORG/yunong-maintainers
+/docs/04-ADR.md @YOUR_ORG/yunong-maintainers
+/docs/03-接口文档.md @YOUR_ORG/yunong-maintainers
+
+# 数据库迁移与部署：影响线上，单独把关
+/crates/server/migrations/ @YOUR_ORG/yunong-maintainers
+/deploy/ @YOUR_ORG/yunong-maintainers
+/.github/ @YOUR_ORG/yunong-maintainers

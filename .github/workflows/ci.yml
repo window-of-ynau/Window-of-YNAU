@@ -1,0 +1,119 @@
+# 主 CI：PR 与 push main 触发；四类检查独立，便于快速定位失败原因
+# 名称保持小写：分支保护的状态检查名是「ci / rust」「ci / flutter」「ci / docs」「ci / migrations」
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一分支/PR 的旧运行自动取消，省配额
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 顶层最小权限：本 workflow 只读仓库内容，子 job 不另行提权
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust（fmt / clippy / test）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 不把 token 写进 .git/config，后续步骤无从读取
+          persist-credentials: false
+      - name: 安装 stable 工具链（含 rustfmt、clippy）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # 缓存 ~/.cargo 与 target，命中时显著缩短构建
+      - name: 缓存 cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+      - name: cargo fmt（只检查，不写文件）
+        run: cargo fmt --all -- --check
+      - name: cargo clippy（警告即失败）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace
+
+  flutter:
+    name: Flutter（analyze / test）
+    runs-on: ubuntu-latest
+    # 端侧是主交付物之一，明确不允许容错：失败必须阻断
+    continue-on-error: false
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 安装 Flutter（stable + 缓存 SDK）
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: flutter pub get
+        run: flutter pub get
+      - name: flutter analyze
+        run: flutter analyze
+      - name: flutter test
+        run: flutter test
+
+  docs:
+    name: 文档（表格 / 相对链接）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 脚本仅用标准库，无需安装依赖
+      - name: 校验 docs
+        run: python scripts/check_docs.py docs
+
+  migrations:
+    name: 迁移脚本（PG16 + pgvector）
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # runner 自带 psql；ON_ERROR_STOP=1 保证任一条失败即整体失败
+      - name: 按文件名顺序执行 crates/server/migrations/*.sql
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(crates/server/migrations/*.sql)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "没有迁移文件，跳过"
+            exit 0
+          fi
+          while IFS= read -r f; do
+            echo "==> psql -f $f"
+            psql -v ON_ERROR_STOP=1 -q -f "$f"
+          done < <(printf '%s\n' "${files[@]}" | sort)

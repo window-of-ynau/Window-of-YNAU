@@ -1,0 +1,65 @@
+# 云农之窗 · 单机部署（PostgreSQL/pgvector + axum server）
+#
+# 用法：
+#   cp deploy/.env.example deploy/.env    # 填 POSTGRES_PASSWORD 与 DATABASE_URL
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# 项目目录默认按本文件所在目录算，所以 `deploy/.env` 会被自动加载；
+# 从其它目录调用时显式加 --project-directory deploy。
+
+name: yunong
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: yunong
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请先在 deploy/.env 里设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: yunong
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yunong -d yunong"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - internal
+    # 刻意不映射端口：数据库只给 server 用，宿主机和公网都碰不到。
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # db 是 compose 内部服务名，所以 .env 里用 postgres://...@db:5432/...
+      DATABASE_URL: ${DATABASE_URL:?请先在 deploy/.env 里设置 DATABASE_URL}
+      RUST_LOG: ${RUST_LOG:-info}
+      # 套餐按时间授权、不做 token 记账；这里限的是"同时在途流"，不是额度。
+      CONCURRENCY_LIMIT: ${CONCURRENCY_LIMIT:-50}
+      # 单轮输入 token 上限（先拒后转，避免把超额请求发给上游产生费用）。
+      MAX_INPUT_TOKENS: ${MAX_INPUT_TOKENS:-32000}
+      REVIEW_ENABLED: ${REVIEW_ENABLED:-true}
+    ports:
+      # 默认只绑宿主机回环，前面挂 Caddy/Nginx 做 TLS。
+      # 真机联调要局域网直连时，再改成 "0.0.0.0:8080:8080"（或设 SERVER_BIND）。
+      - "${SERVER_BIND:-127.0.0.1}:8080:8080"
+    networks:
+      - internal   # 用 db
+      - edge       # 出网调用模型上游
+    stop_grace_period: 20s
+
+networks:
+  internal:
+    internal: true   # db 只在这个网络里，没有外网出口
+  edge:
+    driver: bridge
+
+volumes:
+  pgdata:
