@@ -1,3 +1,4 @@
+// 内部 API（非对外 HTTP 契约）：parse_event → parse_events，见 ADR-16。
 //! 三协议适配（契约见 `docs/03-接口文档.md` §9 / ADR-13）。
 //!
 //! 这一层只做**纯数据变换**：把内部 `ChatRequest` 编成各家请求体，
@@ -6,25 +7,20 @@
 //! 刻意**不在这里发网络请求**：网络交给 `gateway`，这样适配逻辑可以用 fixture 单测，
 //! 不需要真实 Key、不需要联网。
 //!
-//! # 已知契约缺口
+//! # 契约缺口（登记在 `docs/design/contract-gaps.md`）
 //!
-//! 下面这些点在现有 `yunong_shared` 类型里**无法无损表达**，实现里只能给"最小可用编码"，
-//! 逐条在对应协议的模块注释里写清了损失点：
-//!
-//! 1. `ChatMessage` 没有 `tool_calls` 字段。约定：`role = Assistant` 且同时带
-//!    `tool_call_id` + `name` 的消息表示"模型请求调用工具"，`content` 放 **arguments 的
-//!    JSON 文本**；assistant 的可见文本与工具调用**不能在同一条消息里共存**。
-//! 2. `ChatMessage` 没有 `ok` / `is_error`。工具失败在 Anthropic 的
-//!    `tool_result.is_error` 里表达不出来，只能把失败文本写进 `content`。
-//! 3. `ChatRequest` 没有 `temperature`（§9 的伪代码里有，契约类型没落地）。
-//!    三协议一律**不发送**温度字段，用上游默认值。
-//! 4. `parse_event` 是**无状态**的：一次 `data` 一次调用，工具调用的 `id` / `name` /
-//!    `arguments` 被上游拆到多个事件里时，每次只能给出一部分，见各协议注释。
-//! 5. 一次 `data` 只能产出一个 `Chunk`：上游把"结束原因"和 `usage` 塞进同一个事件时
-//!    必须二选一（Anthropic `message_delta`、Responses `response.completed`）。
-//! 6. `Chunk::Meta` 需要 `channel`（业务概念，来自路由）与 `request_id`，本层拿不到，
-//!    所以**不产出 Meta**，由 `gateway` 注入。同理上游的心跳一律 → `None`
-//!    （§9 要求"空串/心跳/无关事件 → None"）。
+//! - **C1 已解决（ADR-16）**：`ChatMessage::tool_calls` 取代"content 装 arguments"的旧约定，
+//!   assistant 的可见文本与工具调用可以共存，并行多调用也能表达。
+//! - **C6 已解决（ADR-16）**：`parse_events` 一次返回 `Vec<Chunk>`，一个上游事件可以同时
+//!   产出 `Usage` 与 `Done`（顺序固定为 `[.., Usage, Done]`）。
+//! - 仍需实现层变通的点，逐条在对应协议的模块注释里写清：
+//!   1. `ChatMessage` 没有 `ok` / `is_error`（C3）。工具失败在 Anthropic 的
+//!      `tool_result.is_error` 里表达不出来，只能把失败文本写进 `content`。
+//!   2. `ChatRequest` 没有 `temperature`（C2）。三协议一律**不发送**温度字段。
+//!   3. `parse_events` 是**无状态**的（C7）：工具调用的 `id` / `name` / `arguments`
+//!      被上游拆到多个事件里时，每次只能给出一部分，跨事件聚合由 `gateway` 负责。
+//!   4. `Chunk::Meta` 需要 `channel`（业务概念，来自路由）与 `request_id`，本层拿不到，
+//!      所以**不产出 Meta**，由 `gateway` 注入（C8）。上游心跳一律 → 空 `Vec`。
 
 mod completions;
 mod messages;
@@ -32,6 +28,10 @@ mod responses;
 
 use serde_json::{Map, Value};
 use yunong_shared::{ChatMessage, ChatRequest, Chunk, FinishReason, Protocol, Role};
+
+// 只有 fixture 用到（生产路径里 `ChatRequest` 已携带 tool_calls）。
+#[cfg(test)]
+use yunong_shared::ToolCallRef;
 
 /// 构造对应协议的请求体。
 ///
@@ -50,39 +50,69 @@ pub fn build_body(protocol: Protocol, request: &ChatRequest) -> Value {
     }
 }
 
-/// 解析一条流式事件（`data: ` 前缀已剥离；可能是 `[DONE]`）。
+/// 解析一条流式事件（`data: ` 前缀已剥离；可能是 `[DONE]`）→ **0..n 个** `Chunk`。
 ///
-/// 返回 `None` 表示该事件不需要暴露给上层（例如 keep-alive、空 delta、角色首帧）。
+/// 返回空 `Vec` 表示该事件不需要暴露给上层（keep-alive、空 delta、角色首帧……）。
+///
+/// # 为什么是 `Vec`（缺口 C6，ADR-16）
+///
+/// 上游会把"结束原因"和"usage"塞进**同一个事件**：Anthropic 的 `message_delta`
+/// （`stop_reason` + `usage.output_tokens`）、Responses 的 `response.completed`
+/// （`status` + `usage`）、Completions 的 `finish_reason` + `usage` 合并帧。
+/// 一次只能返回一个 `Chunk` 就必然二选一，丢 token 数 = 成本监控失真。
+///
+/// # 顺序保证（全流不变量：`Done` 必末且唯一）
+///
+/// - 同一事件同时含 usage 与结束原因 → `[.., Usage, Done]`（`Done` 在最后，见 [`done_last`]）；
+/// - 同一事件既含文本增量又含工具调用 → `[Delta, ToolCall, ..]`（按上游字段顺序）。
+///
+/// **`[DONE]` 是幂等的收尾标记**：Completions 的 `finish_reason` 帧已经给出 `Done`
+/// （带真实原因），随后还会再来一个 `[DONE]` → 又给一个 `Done{Stop}`。
+/// 因此"`Done` 唯一"由 **`gateway` 去重**保证（首个 `Done` 为准，忽略后续），
+/// 而不是靠丢掉带原因的 `finish_reason`。
 ///
 /// 三协议统一行为（契约测试覆盖）：
-/// - `[DONE]` → `Chunk::Done { finish: Stop }`（Anthropic / Responses 不保证发送它，
+/// - `[DONE]` → `[Chunk::Done { finish: Stop }]`（Anthropic / Responses 不保证发送它，
 ///   缺失时由 `gateway` 在流结束时补发）
-/// - 空串、非 JSON 文本 → `None`
-/// - 顶层 `error` 对象 / `response.failed` → `Chunk::Error { code: UpstreamError, .. }`
+/// - 空串、非 JSON 文本 → 空 `Vec`
+/// - 顶层 `error` 对象 / `response.failed` → `[Chunk::Error { code: UpstreamError, .. }]`
 ///
 /// **无状态**：工具调用参数分片请按各协议注释聚合（本函数对不完整分片返回
 /// `Value::String` 原始片段）。
-pub fn parse_event(protocol: Protocol, data: &str) -> Option<Chunk> {
+pub fn parse_events(protocol: Protocol, data: &str) -> Vec<Chunk> {
     let data = data.trim();
     if data.is_empty() {
-        return None;
+        return Vec::new();
     }
     // 三协议一致：`[DONE]` 视为正常收尾。
     if data == "[DONE]" {
-        return Some(Chunk::Done {
+        return vec![Chunk::Done {
             finish: FinishReason::Stop,
-        });
+        }];
     }
     // 非 JSON（SSE 注释、纯文本心跳）不需要暴露给上层。
-    let value: Value = serde_json::from_str(data).ok()?;
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return Vec::new();
+    };
     if let Some(error) = upstream_error(&value) {
-        return Some(error);
+        return vec![error];
     }
     match protocol {
         Protocol::OpenaiCompletions => completions::parse(&value),
         Protocol::OpenaiResponses => responses::parse(&value),
         Protocol::AnthropicMessages => messages::parse(&value),
     }
+}
+
+/// 把 `Done` 挪到末尾，其余保持相对顺序（`sort_by_key` 是稳定排序）。
+///
+/// 全流不变量 `Done` 必末且唯一：适配器只负责"这个事件里有什么"，
+/// 排序统一在这里做，免得三家各写一遍（也免得某家忘写）。
+fn done_last(mut chunks: Vec<Chunk>) -> Vec<Chunk> {
+    if chunks.len() > 1 && chunks.iter().any(|c| matches!(c, Chunk::Done { .. })) {
+        chunks.sort_by_key(|c| matches!(c, Chunk::Done { .. }));
+    }
+    chunks
 }
 
 /// 系统提示：把上下文里的所有 `system` 消息按原顺序用空行拼成一段。
@@ -242,22 +272,40 @@ fn fixture_request(protocol: Protocol) -> ChatRequest {
     }
 }
 
-/// 工具循环第 2 轮的请求：末尾追加 assistant(tool_call) 与 tool(tool_result)。
+/// 单次工具调用的 fixture（C1：`id` / `name` / `arguments` 三件套）。
+#[cfg(test)]
+fn fixture_tool_calls() -> Vec<ToolCallRef> {
+    vec![ToolCallRef::new(
+        "call_1",
+        "get_courses",
+        serde_json::json!({ "weekday": 3 }),
+    )]
+}
+
+/// 工具循环第 2 轮的请求：末尾追加 assistant(tool_calls) 与 tool(tool_result)。
 #[cfg(test)]
 fn fixture_tool_round(protocol: Protocol) -> ChatRequest {
     let mut request = fixture_request(protocol);
     request.round = 2;
-    request.messages.push(ChatMessage {
-        role: Role::Assistant,
-        content: r#"{"weekday":3}"#.into(),
-        tool_call_id: Some("call_1".into()),
-        name: Some("get_courses".into()),
-    });
+    request
+        .messages
+        .push(ChatMessage::assistant_calls("", fixture_tool_calls()));
     request.messages.push(ChatMessage::tool_result(
         "call_1",
         "get_courses",
         r#"{"courses":[]}"#,
     ));
+    request
+}
+
+/// C1 的"文本 + 工具同轮"：assistant 边说边调工具（三协议共用的契约 fixture）。
+#[cfg(test)]
+fn fixture_text_and_tool_round(protocol: Protocol) -> ChatRequest {
+    let mut request = fixture_tool_round(protocol);
+    // assistant 紧挨在 tool_result 之前。
+    let assistant = request.messages.len() - 2;
+    request.messages[assistant] =
+        ChatMessage::assistant_calls("我先查一下课表", fixture_tool_calls());
     request
 }
 
@@ -277,28 +325,27 @@ mod tests {
         Protocol::AnthropicMessages,
     ];
 
-    /// 三协议对 `[DONE]` 的处理必须一致（契约要求：二选一但三协议一致）。
+    /// 三协议对 `[DONE]` 的处理必须一致（契约要求：三协议一致）。
     #[test]
     fn done_marker_is_uniform_across_protocols() {
         for protocol in ALL {
             assert_eq!(
-                parse_event(protocol, "[DONE]"),
-                Some(Chunk::Done {
+                parse_events(protocol, "[DONE]"),
+                vec![Chunk::Done {
                     finish: FinishReason::Stop
-                }),
+                }],
                 "{protocol:?} 的 [DONE] 处理与契约不一致"
             );
         }
     }
 
-    /// 空串、纯文本心跳、非 JSON 一律不暴露给上层。
+    /// 空串、纯文本心跳、非 JSON 一律不暴露给上层（空 `Vec`，不是 `None`）。
     #[test]
     fn blank_and_non_json_events_are_ignored() {
         for protocol in ALL {
-            assert_eq!(parse_event(protocol, ""), None, "{protocol:?}");
-            assert_eq!(parse_event(protocol, "   \n"), None, "{protocol:?}");
-            assert_eq!(parse_event(protocol, ": keep-alive"), None, "{protocol:?}");
-            assert_eq!(parse_event(protocol, "not-json"), None, "{protocol:?}");
+            for data in ["", "   \n", ": keep-alive", "not-json"] {
+                assert!(parse_events(protocol, data).is_empty(), "{protocol:?}");
+            }
         }
     }
 
@@ -308,14 +355,137 @@ mod tests {
         let data = r#"{"error":{"message":"upstream boom","type":"api_error"}}"#;
         for protocol in ALL {
             assert_eq!(
-                parse_event(protocol, data),
-                Some(Chunk::Error {
+                parse_events(protocol, data),
+                vec![Chunk::Error {
                     code: yunong_shared::ErrorCode::UpstreamError,
                     message: "upstream boom".into(),
-                }),
+                }],
                 "{protocol:?}"
             );
         }
+    }
+
+    /// 全流不变量 + `[DONE]` 去重口径（**t2 gateway 的接口约定**）。
+    ///
+    /// - 每次 `parse_events` 的产出里 `Done` 必在最后（同事件不变量）；
+    /// - Completions 的 `finish_reason` 帧之后还会来一个 `[DONE]`，所以一条完整流会给出
+    ///   **两个** `Done`：`[DONE]` 是幂等收尾标记，**gateway 必须去重**（首个 Done 为准）；
+    /// - 三协议的 usage 分片形态不同，记账层按字段取 max 才能合出完整用量。
+    #[test]
+    fn stream_done_invariant_and_dedup_contract() {
+        /// (名字, 协议, 事件序列, 期望 Done 个数, 期望 usage 分片)
+        type StreamCase = (
+            &'static str,
+            Protocol,
+            &'static [&'static str],
+            usize,
+            Vec<(u32, u32)>,
+        );
+        let streams: [StreamCase; 3] = [
+            (
+                "completions",
+                Protocol::OpenaiCompletions,
+                &[
+                    r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"下"}}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"content":"午没课"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7}}"#,
+                    "[DONE]",
+                ],
+                // finish_reason 帧 + [DONE] → 两个 Done，由 gateway 去重。
+                2,
+                vec![(42, 7)],
+            ),
+            (
+                "responses",
+                Protocol::OpenaiResponses,
+                &[
+                    r#"{"type":"response.output_text.delta","delta":"下午没课"}"#,
+                    r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":42,"output_tokens":7}}}"#,
+                ],
+                1,
+                vec![(42, 7)],
+            ),
+            (
+                "messages",
+                Protocol::AnthropicMessages,
+                &[
+                    r#"{"type":"message_start","message":{"usage":{"input_tokens":42,"output_tokens":1}}}"#,
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"下午没课"}}"#,
+                    r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+                    r#"{"type":"message_stop"}"#,
+                ],
+                1,
+                // usage 是两个事件里各半：input 在 start、output 在 delta。
+                vec![(42, 1), (0, 7)],
+            ),
+        ];
+
+        for (name, protocol, events, expected_dones, expected_usage) in streams {
+            let chunks: Vec<Chunk> = events
+                .iter()
+                .flat_map(|event| parse_events(protocol, event))
+                .collect();
+            assert!(
+                matches!(chunks.last(), Some(Chunk::Done { .. })),
+                "{name}：Done 不在最后一个：{chunks:?}"
+            );
+            assert_eq!(
+                chunks
+                    .iter()
+                    .filter(|c| matches!(c, Chunk::Done { .. }))
+                    .count(),
+                expected_dones,
+                "{name}：{chunks:?}"
+            );
+            let text: String = chunks
+                .iter()
+                .filter_map(|c| match c {
+                    Chunk::Delta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "下午没课", "{name}");
+            let usage: Vec<(u32, u32)> = chunks
+                .iter()
+                .filter_map(|c| match c {
+                    Chunk::Usage {
+                        tokens_in,
+                        tokens_out,
+                        ..
+                    } => Some((*tokens_in, *tokens_out)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(usage, expected_usage, "{name}：usage 分片形态变了");
+        }
+    }
+
+    /// C6 的排序保证：`Done` 永远在末尾，其余保持相对顺序（稳定排序）。
+    #[test]
+    fn done_last_moves_done_to_tail() {
+        let usage = Chunk::Usage {
+            tokens_in: 0,
+            tokens_out: 15,
+            estimated: false,
+        };
+        assert_eq!(
+            done_last(vec![
+                Chunk::Done {
+                    finish: FinishReason::Stop
+                },
+                Chunk::Delta { text: "a".into() },
+                usage.clone(),
+            ]),
+            vec![
+                Chunk::Delta { text: "a".into() },
+                usage,
+                Chunk::Done {
+                    finish: FinishReason::Stop
+                },
+            ]
+        );
+        // 单元素 / 无 Done 的序列原样返回。
+        assert_eq!(done_last(vec![Chunk::Ping]), vec![Chunk::Ping]);
+        assert_eq!(done_last(Vec::new()), Vec::new());
     }
 
     /// 结束原因映射：三家字面量各有不同，但语义同构。

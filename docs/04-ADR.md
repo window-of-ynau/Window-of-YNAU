@@ -268,6 +268,87 @@
 
 ---
 
+## ADR-16 契约可表达性升级：`tool_calls` 与「一事件多 Chunk」
+
+**状态**：已定
+**日期**：2026-10-31
+**决策者**：队长（yunong-w2b）拍板；提案与实现：端侧负责人（lead-client）
+
+### 背景
+
+写三协议适配器时撞到两处 P0 缺口（[`docs/design/contract-gaps.md`](design/contract-gaps.md)
+C1 / C6）。这两条不是"实现写错了"，而是**内部契约表达不了上游语义**：
+
+1. `ChatMessage` 没有 `tool_calls`：assistant 的工具调用只能塞进 `content`，"边说边调工具"
+   与并行多调用都表达不出来，三个适配器各自发明了"`content` 当 arguments 用"的土约定。
+2. `parse_event` 一次只能返回一个 `Chunk`：Anthropic 的 `message_delta`（`stop_reason` +
+   `usage`）与 Responses 的 `response.completed`（**唯一**终态**且**唯一 usage 来源）必须二选一，
+   丢 token 数 = 成本监控失真。
+
+### 决策
+
+1. `ChatMessage` 增加 `tool_calls: Vec<ToolCallRef>`（`id` / `name` / `arguments: serde_json::Value`），
+   `content` 回归**纯文本**；`ToolCallRef` 与 `Chunk::ToolCall` **同构但不共用类型**。
+2. 删除 `parse_event(...) -> Option<Chunk>`，改为 `parse_events(...) -> Vec<Chunk>`；
+   同事件多 Chunk 的顺序固定为 `[.., Usage, Done]`（`Done` 必末且唯一）。
+3. `Usage` 语义硬化（不改类型）：`0` = "本事件未携带该字段"，同一 turn 的多个 `Usage`
+   按字段取 max 合并。
+
+### 边界
+
+- 这条决策**划定**了：内部契约必须能表达"上游一次说了几件事"，而不是让每个适配器自己
+  就地降级；降级点必须写在适配器注释里，不能散落到编排层。
+- **绝不能**越过的线：`Chunk` 的字段是**对外 SSE 的 wire 形状**，不能为了"内部类型整洁"
+  而改（所以 `ToolCallRef` 不替代 `Chunk::ToolCall`）；`parse_events` 是**内部 API**，
+  不是对外 HTTP 契约，端/云各自调用，wire 不受影响。
+- 发起与见证：端侧 `protocols` 产出 `Vec<Chunk>`，`gateway` 消费并注入 `Meta`；
+  云侧只做 SSE 转发，不解析、不落库。
+
+### 越界防范
+
+- **契约测试**：三协议各有 fixture 覆盖"文本 + 工具同轮"与"usage + 结束原因同事件"；
+  `crates/shared` 的单测守着向后兼容（旧 JSON 没有 `tool_calls` 必须能读）与三条结构校验。
+- **编译期**：删掉 `parse_event` 而不是留兼容壳，任何漏改的调用点直接编译失败。
+- **文档**：`docs/03` §9.1~9.3 写死顺序不变量与合并口径；`contract-gaps.md` 留缺口清单。
+- **发请求前失败**：`ChatRequest::validate` 拦住"非 assistant 带 `tool_calls`"、"空 `id`/`name`"、
+  "`role=tool` 缺 `tool_call_id`"，不把这些错误留给上游 400。
+- **`[DONE]` 去重**：`[DONE]` 是幂等收尾标记，Completions 在 `finish_reason` 帧之后还会再来一次；
+  "`Done` 唯一"由 gateway 保证（首个 `Done` 为准），不能靠丢掉带真实原因的 `finish_reason`。
+  契约测试 `stream_done_invariant_and_dedup_contract` 把这条写死。
+
+### 失败模式
+
+| 这一侧塌了 | 系统会怎样 | 用户看到什么 |
+|---|---|---|
+| 适配器忘了把 usage 和 Done 一起返回 | 契约测试失败（fixture 断言 `[Usage, Done]`），合不进去 | 无（CI 阶段拦住） |
+| 聚合层把不完整分片当完整 JSON 发出去 | Completions / Responses 原样转发片段，上游报参数非法 | 明确错误提示（而不是"参数是空的"的假成功） |
+| Anthropic 的 `tool_use.input` 收到字符串片段 | 降级成 `{}`（Anthropic 硬性要求对象），参数丢失 | 工具报"参数缺失"，模型改口重试 |
+| 记账层不做 max 合并 | 只记到 `message_start` 的 input、丢掉 output | token 统计偏低（成本监控失真，非资损） |
+
+### 否决的备选
+
+| 备选 | 否决理由（事实，不是"更复杂"） |
+|---|---|
+| 保留 `parse_event -> Option<Chunk>` 兼容壳 | 只能二选一，留壳必被误用，C6 等于没改；当时全仓无生产调用方，删除成本为零 |
+| assistant 的 arguments 继续塞 `content` | 文本与调用无法共存、并行调用无法表达；三协议各自变通会让契约名存实亡 |
+| 让 `Chunk::ToolCall` 直接复用 `ToolCallRef` | `Chunk` 是对外 SSE 的 wire 形状（`{"type":"tool_call",...}`），内部重构不能改对外契约 |
+| 一事件一 Chunk，在 gateway 里再解析原始 JSON 补 usage | 协议知识泄漏到 gateway，适配层被拆成两半，各家 JSON 形状要在两处维护 |
+
+### 代价（必须诚实地写出来）
+
+- `parse_events` 从 `Option` 变 `Vec`，调用方要处理"一个事件多个 chunk"，gateway 略复杂。
+- `ToolCallRef` 与 `Chunk::ToolCall` 字段重复，靠注释 + 测试防止两边漂移（刻意接受的冗余）。
+- "0 = 未携带"要求记账层不能把单事件 usage 当总量，多了一条合并规则要守。
+- 删掉 `parse_event` 让下游必须同步改名；W2b 按 t1 → t2/t3 顺序串行，实际没有并行撞车。
+
+### 复审条件
+
+- 上游出现"一个事件多个工具调用 + 分片参数"的形态，或接入第四家协议时；
+- 记账精度提高到"按事件逐条对账"（那时需要给 `Usage` 增加来源事件标识）；
+- 若某家改为保证 usage 是累计全量（当前 Anthropic 是分片），max 合并口径需要重新论证。
+
+---
+
 ## 附：决策状态总表
 
 | ADR | 主题 | 状态 |
@@ -286,3 +367,4 @@
 | 12 | 模块化单体单实例 | ✅ 已定 |
 | 13 | 手写薄适配 | ✅ 已定 |
 | 14 | 双许可 + 数据权利 | ✅ 已定 |
+| 16 | 契约可表达性升级（C1 `tool_calls` / C6 一事件多 Chunk） | ✅ 已定 |

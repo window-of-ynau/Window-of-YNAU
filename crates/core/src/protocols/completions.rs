@@ -6,18 +6,18 @@
 //! - 流式开关：`stream`；输出上限：`max_tokens`
 //! - 工具调用：assistant 消息的 `tool_calls[]`；工具结果：`role = "tool"` + `tool_call_id`
 //!
-//! # 损失点（契约缺口的落点）
+//! # 契约落点（`docs/design/contract-gaps.md`）
 //!
-//! - `ChatMessage` 没有 `tool_calls`，assistant 工具调用按模块注释第 1 条的约定拼装：
-//!   `content` 当 **arguments 的 JSON 文本**原样塞进 `function.arguments`。
-//!   因此 **assistant 的可见文本与工具调用不能共存**；两者都有时只能二选一
-//!   （当前实现优先工具调用，文本被丢弃）。
+//! - **C1 已解决（ADR-16）**：assistant 的可见文本与 `tool_calls[]` 可以**同时**出现；
+//!   有调用且文本为空时 `content` 编成 `null`（OpenAI 的推荐形状）。
+//!   并行多调用就是 `tool_calls[]` 里的多个元素，不再需要"二选一"降级。
 //! - OpenAI 在 2023-12 之后从 `role:"tool"` 消息里移除了 `name` 字段，
-//!   所以工具名（`ChatMessage::name`）在工具结果里**丢失**；`tool_call_id` 保留。
-//! - `ChatRequest` 没有 `temperature`：不发送该字段（上游默认值）。
+//!   所以工具名（`ChatMessage::name`）在工具结果里**丢失**；`tool_call_id` 保留（缺口 C4）。
+//! - `ChatRequest` 没有 `temperature`：不发送该字段（上游默认值，缺口 C2）。
+//! - 参数分片无状态（缺口 C7）：完整 JSON 才解析；不完整片段原样给调用方拼接。
 
 use serde_json::{json, Map, Value};
-use yunong_shared::{ChatMessage, ChatRequest, Chunk, Role, ToolSpec};
+use yunong_shared::{ChatMessage, ChatRequest, Chunk, Role, ToolCallRef, ToolSpec};
 
 use super::{finish_reason, openai_usage, partial_json, system_prompt};
 
@@ -56,28 +56,46 @@ fn encode_message(message: &ChatMessage) -> Value {
     }
 }
 
-/// assistant：带 `tool_call_id` + `name` 视为工具调用，否则当普通文本。
+/// assistant：可见文本与工具调用**可以共存**（C1）；`content` 不再兼作 arguments 载体。
+///
+/// - 无 `tool_calls` → 普通文本消息（`content` 永远是字符串）；
+/// - 有 `tool_calls` → `content` 为文本，或文本为空时是 `null`。
 fn encode_assistant(message: &ChatMessage) -> Value {
-    match (message.tool_call_id.as_deref(), message.name.as_deref()) {
-        (Some(call_id), Some(name)) => json!({
-            "role": "assistant",
-            // 有 tool_calls 时 content 必须为 null（否则上游会认为是文本 + 调用，
-            // 而我们的契约里 content 已经被 arguments 占用了）。
-            "content": Value::Null,
-            "tool_calls": [{
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    // 约定见模块注释：content 是 arguments 的 JSON 文本，原样透传。
-                    "arguments": message.content,
-                },
-            }],
-        }),
-        // `tool_call_id`/`name` 缺一个就无法构成合法的 tool_calls，降级成文本消息。
-        // 这是"最小可用编码"，损失的是调用语义（见模块注释）。
-        _ => json!({ "role": "assistant", "content": message.content }),
+    if message.tool_calls.is_empty() {
+        return json!({ "role": "assistant", "content": message.content });
     }
+    let content = if message.content.is_empty() {
+        Value::Null
+    } else {
+        json!(message.content)
+    };
+    json!({
+        "role": "assistant",
+        "content": content,
+        "tool_calls": encode_tool_calls(&message.tool_calls),
+    })
+}
+
+/// `tool_calls[]`：`function.arguments` 是 **JSON 字符串**（不是对象）。
+fn encode_tool_calls(calls: &[ToolCallRef]) -> Value {
+    Value::Array(calls.iter().map(tool_call_json).collect())
+}
+
+fn tool_call_json(call: &ToolCallRef) -> Value {
+    json!({
+        "id": call.id,
+        "type": "function",
+        "function": {
+            "name": call.name,
+            // C5：`arguments` 永远是合法 JSON 值；只有"未聚合完的片段"是 `Value::String`。
+            // 那种情况**原样转发**（不加引号包一层），让上游明确报参数非法，
+            // 而不是静默替换成 `{}` 让模型以为参数是空的。
+            "arguments": match &call.arguments {
+                Value::String(raw) => raw.clone(),
+                value => value.to_string(),
+            },
+        },
+    })
 }
 
 /// 工具结果 → `role:"tool"`。缺 `tool_call_id` 时降级成 user 文本，
@@ -119,11 +137,11 @@ fn encode_tools(tools: &[ToolSpec]) -> Value {
     )
 }
 
-/// 解析一条 `chat.completion.chunk`。
+/// 解析一条 `chat.completion.chunk` → **0..n 个** `Chunk`（缺口 C6）。
 ///
-/// 顺序说明：Completions 的 `finish_reason` 和 `usage` 在**不同** chunk 里
-/// （`stream_options.include_usage` 时 usage 是最后一个独立 chunk，之后还有 `[DONE]`），
-/// 所以这里先看 `finish_reason` 再看 `usage`，两者都能正确落到不同的 `Chunk` 上。
+/// 一个事件里可能同时有：文本增量、**多个**工具调用（并行调用）、`finish_reason`、`usage`。
+/// 产出顺序按上游字段顺序：先 `Delta`，再各 `ToolCall`；`Usage` 排在 `Done` 之前
+/// （`Done` 必末且唯一，排序见 `super::done_last`）。
 ///
 /// 工具调用分片聚合：OpenAI 把一次调用拆成多个 chunk——
 /// 首帧给 `index` + `id` + `function.name`（`arguments` 常为空串），
@@ -131,37 +149,36 @@ fn encode_tools(tools: &[ToolSpec]) -> Value {
 /// 本函数无状态，只返回当前帧：
 /// - `id` / `name` 缺失时给空串（后续帧本来就不带）；
 /// - `arguments` 完整 → 解析成 JSON；不完整 → `Value::String(片段)`，调用方须按
-///   `tool_calls[0].index` 累加字符串，等 `finish_reason == "tool_calls"` 后整体解析。
-pub(super) fn parse(value: &Value) -> Option<Chunk> {
+///   `tool_calls[i].index` 累加字符串，等 `finish_reason == "tool_calls"` 后整体解析。
+pub(super) fn parse(value: &Value) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
     if let Some(choices) = value.get("choices").and_then(Value::as_array) {
         for choice in choices {
+            if let Some(delta) = choice.get("delta") {
+                if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        chunks.push(Chunk::Delta {
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+                // 并行调用：一个 delta 里可以有多个 `tool_calls` 元素，全部给出去。
+                if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                    chunks.extend(calls.iter().map(tool_call));
+                }
+            }
             if let Some(raw) = choice.get("finish_reason").and_then(Value::as_str) {
-                return Some(Chunk::Done {
+                chunks.push(Chunk::Done {
                     finish: finish_reason(raw),
                 });
             }
-            let Some(delta) = choice.get("delta") else {
-                continue;
-            };
-            if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                if !text.is_empty() {
-                    return Some(Chunk::Delta {
-                        text: text.to_owned(),
-                    });
-                }
-            }
-            if let Some(call) = first_tool_call(delta) {
-                return Some(call);
-            }
         }
     }
-    // usage chunk：`choices: []` + `usage: {...}`（`usage` 为 null 时忽略）。
-    value.get("usage").and_then(openai_usage)
-}
-
-fn first_tool_call(delta: &Value) -> Option<Chunk> {
-    let call = delta.get("tool_calls")?.as_array()?.first()?;
-    Some(tool_call(call))
+    // usage 可能是独立的末帧（`choices: []`），也可能和 `finish_reason` 挤在同一个 chunk。
+    if let Some(usage) = value.get("usage").and_then(openai_usage) {
+        chunks.push(usage);
+    }
+    super::done_last(chunks)
 }
 
 fn tool_call(call: &Value) -> Chunk {
@@ -185,11 +202,20 @@ fn tool_call(call: &Value) -> Chunk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::{fixture_request, fixture_tool_round, FIXTURE_SYSTEM};
+    use crate::protocols::{
+        fixture_request, fixture_text_and_tool_round, fixture_tool_round, FIXTURE_SYSTEM,
+    };
     use yunong_shared::{FinishReason, Protocol};
 
     fn body() -> Value {
         build(&fixture_request(Protocol::OpenaiCompletions))
+    }
+
+    /// 单 chunk 事件收成 `Option`；顺带断言"这条事件确实只产出一个 chunk"。
+    fn parse_one(data: &str) -> Option<Chunk> {
+        let mut chunks = parse(&serde_json::from_str(data).unwrap());
+        assert!(chunks.len() <= 1, "该事件应只有一个 chunk：{chunks:?}");
+        chunks.pop()
     }
 
     // ---------- build_body ----------
@@ -254,14 +280,14 @@ mod tests {
         assert_eq!(result["content"], r#"{"courses":[]}"#);
     }
 
-    // ---------- parse_event ----------
+    // ---------- parse_events ----------
 
     /// fixture 1：纯文本增量。
     #[test]
     fn text_delta_fixture() {
         let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"下午没课"},"finish_reason":null}]}"#;
         assert_eq!(
-            parse(&serde_json::from_str(data).unwrap()),
+            parse_one(data),
             Some(Chunk::Delta {
                 text: "下午没课".into()
             })
@@ -273,7 +299,7 @@ mod tests {
     fn tool_call_fixture() {
         let data = r#"{"id":"chatcmpl-2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_courses","arguments":"{\"weekday\":3}"}}]},"finish_reason":null}]}"#;
         assert_eq!(
-            parse(&serde_json::from_str(data).unwrap()),
+            parse_one(data),
             Some(Chunk::ToolCall {
                 id: "call_1".into(),
                 name: "get_courses".into(),
@@ -287,7 +313,7 @@ mod tests {
     fn tool_call_argument_fragments_stay_raw() {
         let first = r#"{"id":"chatcmpl-2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_courses","arguments":""}}]},"finish_reason":null}]}"#;
         assert_eq!(
-            parse(&serde_json::from_str(first).unwrap()),
+            parse_one(first),
             Some(Chunk::ToolCall {
                 id: "call_1".into(),
                 name: "get_courses".into(),
@@ -297,7 +323,7 @@ mod tests {
 
         let fragment = r#"{"id":"chatcmpl-2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"weekday\":"}}]},"finish_reason":null}]}"#;
         assert_eq!(
-            parse(&serde_json::from_str(fragment).unwrap()),
+            parse_one(fragment),
             Some(Chunk::ToolCall {
                 id: String::new(),
                 name: String::new(),
@@ -311,7 +337,7 @@ mod tests {
     fn usage_fixture() {
         let data = r#"{"id":"chatcmpl-3","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}"#;
         assert_eq!(
-            parse(&serde_json::from_str(data).unwrap()),
+            parse_one(data),
             Some(Chunk::Usage {
                 tokens_in: 42,
                 tokens_out: 7,
@@ -325,7 +351,7 @@ mod tests {
     fn finish_reason_fixture() {
         let tool_calls = r#"{"id":"chatcmpl-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
         assert_eq!(
-            parse(&serde_json::from_str(tool_calls).unwrap()),
+            parse_one(tool_calls),
             Some(Chunk::Done {
                 finish: FinishReason::ToolCalls
             })
@@ -334,17 +360,52 @@ mod tests {
         let length =
             r#"{"id":"chatcmpl-4","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#;
         assert_eq!(
-            parse(&serde_json::from_str(length).unwrap()),
+            parse_one(length),
             Some(Chunk::Done {
                 finish: FinishReason::Length
             })
         );
 
         assert_eq!(
-            crate::protocols::parse_event(Protocol::OpenaiCompletions, "[DONE]"),
-            Some(Chunk::Done {
+            crate::protocols::parse_events(Protocol::OpenaiCompletions, "[DONE]"),
+            vec![Chunk::Done {
                 finish: FinishReason::Stop
-            })
+            }]
+        );
+    }
+
+    /// C1：assistant「边说边调工具」——文本与工具调用同轮编码（旧实现二选一，文本会被丢）。
+    #[test]
+    fn text_and_tool_calls_encode_together() {
+        let body = build(&fixture_text_and_tool_round(Protocol::OpenaiCompletions));
+        let assistant = &body["messages"].as_array().unwrap()[2];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"], "我先查一下课表");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["arguments"],
+            r#"{"weekday":3}"#
+        );
+    }
+
+    /// C1：并行多工具调用 → `tool_calls[]` 多个元素（旧契约无法表达）。
+    #[test]
+    fn parallel_tool_calls_encode_as_array() {
+        let mut request = fixture_request(Protocol::OpenaiCompletions);
+        request.messages.push(ChatMessage::assistant_calls(
+            "",
+            vec![
+                ToolCallRef::new("call_1", "get_courses", serde_json::json!({ "weekday": 3 })),
+                ToolCallRef::new("call_2", "get_calendar", serde_json::json!({})),
+            ],
+        ));
+        let body = build(&request);
+        let assistant = body["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(assistant["content"], Value::Null);
+        assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            assistant["tool_calls"][1]["function"]["name"],
+            "get_calendar"
         );
     }
 
@@ -352,13 +413,70 @@ mod tests {
     #[test]
     fn irrelevant_events_are_ignored() {
         let role_frame = r#"{"id":"chatcmpl-5","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#;
-        assert_eq!(parse(&serde_json::from_str(role_frame).unwrap()), None);
+        assert_eq!(parse_one(role_frame), None);
 
         let empty = r#"{"id":"chatcmpl-5","choices":[]}"#;
-        assert_eq!(parse(&serde_json::from_str(empty).unwrap()), None);
+        assert_eq!(parse_one(empty), None);
 
         let null_usage = r#"{"id":"chatcmpl-5","choices":[],"usage":null}"#;
-        assert_eq!(parse(&serde_json::from_str(null_usage).unwrap()), None);
+        assert_eq!(parse_one(null_usage), None);
+    }
+
+    /// C6 fixture：**一个** chunk 同时带文本增量与工具调用 → `[Delta, ToolCall]`。
+    #[test]
+    fn text_and_tool_call_in_one_event() {
+        let data = r#"{"id":"chatcmpl-6","choices":[{"index":0,"delta":{"content":"我先查课表","tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_courses","arguments":"{\"weekday\":3}"}}]},"finish_reason":null}]}"#;
+        assert_eq!(
+            parse(&serde_json::from_str(data).unwrap()),
+            vec![
+                Chunk::Delta {
+                    text: "我先查课表".into()
+                },
+                Chunk::ToolCall {
+                    id: "call_1".into(),
+                    name: "get_courses".into(),
+                    arguments: serde_json::json!({ "weekday": 3 }),
+                },
+            ]
+        );
+    }
+
+    /// C6 fixture：一个 chunk 里的**并行**工具调用全部给出（旧实现只给第一个）。
+    #[test]
+    fn parallel_tool_calls_in_one_event() {
+        let data = r#"{"id":"chatcmpl-7","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_courses","arguments":"{}"}},{"index":1,"id":"call_2","function":{"name":"get_calendar","arguments":"{}"}}]},"finish_reason":null}]}"#;
+        let chunks = parse(&serde_json::from_str(data).unwrap());
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert!(
+            matches!(&chunks[0], Chunk::ToolCall { id, .. } if id == "call_1"),
+            "{chunks:?}"
+        );
+        assert!(
+            matches!(&chunks[1], Chunk::ToolCall { id, .. } if id == "call_2"),
+            "{chunks:?}"
+        );
+    }
+
+    /// C6 fixture：`finish_reason` 与 `usage` 在**同一个** chunk → `[Usage, Done]`。
+    ///
+    /// 顺序不是随便定的：`Done` 必末（§10），所以 `Usage` 必须在它前面。
+    #[test]
+    fn usage_and_finish_reason_in_one_event() {
+        let data = r#"{"id":"chatcmpl-8","choices":[{"index":0,"delta":{"content":"好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}"#;
+        assert_eq!(
+            parse(&serde_json::from_str(data).unwrap()),
+            vec![
+                Chunk::Delta { text: "好".into() },
+                Chunk::Usage {
+                    tokens_in: 42,
+                    tokens_out: 7,
+                    estimated: false,
+                },
+                Chunk::Done {
+                    finish: FinishReason::Stop
+                },
+            ]
+        );
     }
 
     /// fixture 5b：上游错误对象 → `Chunk::Error(UpstreamError)`。
@@ -367,11 +485,11 @@ mod tests {
         let data =
             r#"{"error":{"message":"upstream is overloaded","type":"server_error","code":null}}"#;
         assert_eq!(
-            crate::protocols::parse_event(Protocol::OpenaiCompletions, data),
-            Some(Chunk::Error {
+            crate::protocols::parse_events(Protocol::OpenaiCompletions, data),
+            vec![Chunk::Error {
                 code: yunong_shared::ErrorCode::UpstreamError,
                 message: "upstream is overloaded".into(),
-            })
+            }]
         );
     }
 }

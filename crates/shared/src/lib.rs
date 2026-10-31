@@ -12,7 +12,7 @@ pub mod protocol;
 pub use entitlement::{Channel, Entitlement};
 pub use error::{ApiError, ErrorBody, ErrorCode, ErrorEnvelope};
 pub use protocol::{
-    ChatMessage, ChatRequest, Chunk, FinishReason, Protocol, Role, ToolSpec, Usage,
+    ChatMessage, ChatRequest, Chunk, FinishReason, Protocol, Role, ToolCallRef, ToolSpec, Usage,
 };
 
 /// 单轮输入的 token 上限：保护毛利，也防止一次长上下文烧穿预算（ADR-03）。
