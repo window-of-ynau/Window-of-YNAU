@@ -21,7 +21,7 @@ jobs:
     name: Rust（fmt / clippy / test）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # 不把 token 写进 .git/config，后续步骤无从读取
           persist-credentials: false
@@ -48,7 +48,7 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: 安装 Flutter（stable + 缓存 SDK）
@@ -67,7 +67,7 @@ jobs:
     name: 文档（表格 / 相对链接）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: 安装 Python 3.12
@@ -100,7 +100,7 @@ jobs:
       PGPASSWORD: postgres
       PGDATABASE: postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       # runner 自带 psql；ON_ERROR_STOP=1 保证任一条失败即整体失败
