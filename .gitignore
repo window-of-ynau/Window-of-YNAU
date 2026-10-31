@@ -23,7 +23,11 @@ deploy/.env
 *.p12
 *.jks
 *.keystore
+app/android/key.properties
 secrets/
+
+# ---- 多代理协作（每个 agent 一个工作树）----
+.worktrees/
 
 # ---- 本地数据与产物 ----
 *.db

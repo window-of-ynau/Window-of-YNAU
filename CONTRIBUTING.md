@@ -87,3 +87,18 @@ ADR 变更与代码变更**同 PR 或先后紧邻的 PR**；只改代码不改 A
 - Rust：`rustfmt` 默认风格；公共 API 写中文文档注释，说明边界与失败语义。
 - Dart：`dart format` 默认风格；UI 与 `core` 之间只经 FFI 契约通信。
 - 注释写"为什么"，不写"做了什么"；不要留注释掉的死代码。
+
+---
+
+## 多代理协作（AI Agent 并行开发）
+
+多人 / 多 Agent 同时改一个仓库时，**一个 Agent 一个 Git worktree**，否则会出现写入竞态（文件被互相覆盖，且很难发现）。
+
+```powershell
+pwsh scripts/new-agent-worktree.ps1 -Name rust-parser    # 创建 .worktrees/rust-parser，分支 agent/rust-parser
+git diff main..agent/rust-parser                          # 审阅
+git merge --no-ff agent/rust-parser                       # 合入
+git worktree remove .worktrees/rust-parser                # 收尾
+```
+
+规则与"单写者文件"清单见 [docs/integrations/agent-worktrees.md](docs/integrations/agent-worktrees.md)。

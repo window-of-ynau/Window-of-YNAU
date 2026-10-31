@@ -82,6 +82,10 @@ python scripts/check_docs.py docs
 
 ---
 
+### 多代理协作
+
+并行开发时每个 Agent 用独立 worktree（`scripts/new-agent-worktree.ps1`），规则见 [docs/integrations/agent-worktrees.md](docs/integrations/agent-worktrees.md)。
+
 ## 当前进度
 
 | 里程碑 | 状态 |
