@@ -104,7 +104,7 @@ jobs:
           echo "::warning::缺少 KEYSTORE_BASE64 等签名 secrets，只产出 debug APK，不可用于发布"
           flutter build apk --debug
       - name: 上传 APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: yunong-apk-${{ github.ref_name }}
           path: app/build/app/outputs/flutter-apk/*.apk
