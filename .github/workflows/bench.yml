@@ -1,5 +1,10 @@
-# 评测回归：每天 03:00 UTC 跑一次 + 支持手动触发
+# 评测回归：每天 03:00 UTC + 手动触发
 # 设计文档 §10.3 门禁：TTFT 或成本相对 baseline 退化 > 10% 即失败
+#
+# 为什么要 BENCH_BASE_URL 这个开关：
+# bench 会真的发 HTTP 请求，而 W1 阶段服务端的 /api/v1/chat/stream 还返回 501。
+# 没有可用服务端时，硬跑只会得到 100% 错误率，把 CI 变红却没有信息量。
+# 所以：**没配置 vars.BENCH_BASE_URL 就跳过**，配了才当作门禁。
 name: bench
 
 on:
@@ -24,25 +29,45 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
       - name: 安装 Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: 判断是否具备评测条件
+        id: gate
+        env:
+          BENCH_BASE_URL: ${{ vars.BENCH_BASE_URL }}
+        run: |
+          if [ -z "${BENCH_BASE_URL}" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置仓库变量 BENCH_BASE_URL，本次跳过评测（服务端就绪后在 Settings → Variables 配置）"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "评测目标：${BENCH_BASE_URL}"
+          fi
+
       - name: 准备输出目录
+        if: steps.gate.outputs.run == 'true'
         run: mkdir -p bench/results
+
       # bench/run.py 只用标准库：刻意不装第三方依赖，保证评测可复现
-      # 退出码：0 无退化 / 1 相对 baseline 退化 / 2 参数错误或服务不可达 —— 非 0 即判失败
-      # 注意：脚本走 HTTP（默认 --base-url http://127.0.0.1:8080），需要先有可用的服务端；
-      # 本 workflow 暂不拉起服务端，若时刻表触发时无服务，会以退出码 2 失败（需另配服务或换离线用例）
+      # 退出码：0 无退化 / 1 相对 baseline 退化 / 2 参数错误或服务不可达
       - name: 执行 smoke 评测并与 baseline 对比
+        if: steps.gate.outputs.run == 'true'
+        env:
+          BENCH_BASE_URL: ${{ vars.BENCH_BASE_URL }}
         run: |
           python bench/run.py \
             --cases bench/cases/smoke.jsonl \
             --baseline bench/baseline.json \
+            --base-url "$BENCH_BASE_URL" \
             --out bench/results/ci.json
+
       # 无论通过与否都留档，便于复盘退化曲线
       - name: 上传评测结果
-        if: always()
+        if: always() && steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: bench-results-${{ github.run_id }}

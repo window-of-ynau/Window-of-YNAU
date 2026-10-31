@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_comment": "占位基线：这些数字不是实测结果，只用来把 bench/run.py 的对比流程跑通。首次真实跑通（服务可访问、上游有 Key）后，必须整体替换 expected 值：用 bench/out 里的 summary 覆盖下面的 summary，并把 version +1。替换前请确认那次运行的 error_rate 为 0、用例是完整的 12 条。",
+  "_comment": "占位基线：这些数字不是实测结果，只用来把 bench/run.py 的对比流程跑通。首次真实跑通（服务可访问、上游有 Key）后必须整体替换：用 bench/out 里那次的 summary 覆盖下面的 summary，并把 version 加 1。替换前确认那次全部用例 ok、error_rate 为 0。",
   "summary": {
     "p50_ttft_ms": 900,
     "p95_ttft_ms": 1800,

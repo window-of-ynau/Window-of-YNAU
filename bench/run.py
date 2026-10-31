@@ -5,8 +5,8 @@
 量 TTFT、总耗时、token 与错误，写成 JSON；再跟 `bench/baseline.json` 比一遍，
 用来判断一次重构/升级有没有把"慢、贵、错"带进来。
 
-只依赖 Python 3.8+ 标准库，不连数据库、不读仓库配置、不写仓库文件（--out 除外）。
-不会伪造数据：上游没给 usage 时 token 记 null。
+只依赖 Python 3.8+ 标准库，不连数据库、不读仓库配置；除结果文件（--out，默认
+bench/out/）外不写任何文件。不会伪造数据：上游没给 usage 时 token 记 null。
 
 退出码：
   0  跑完，且相对 baseline 没有退化（baseline 不存在时也返回 0）
@@ -233,7 +233,7 @@ def preflight(base_url, timeout):
             resp.read(1024)
     except urlerror.HTTPError:
         return
-    except (urlerror.URLError, TimeoutError, OSError) as exc:
+    except (urlerror.URLError, TimeoutError, OSError, ValueError) as exc:
         raise ServiceUnavailable("cannot reach %s/healthz: %s" % (base_url, exc))
 
 
@@ -293,6 +293,8 @@ def run_case(base_url, case, timeout, token=None):
             result["error_code"] = "TIMEOUT"
             return result, ""
         raise ServiceUnavailable("cannot reach %s: %s" % (base_url, exc))
+    except ValueError as exc:
+        raise ServiceUnavailable("invalid request URL for %s: %s" % (base_url, exc))
 
     try:
         with resp:
@@ -322,6 +324,9 @@ def run_case(base_url, case, timeout, token=None):
         result["error_code"] = "TIMEOUT"
     except OSError as exc:
         result["error_code"] = "TIMEOUT" if _is_timeout(exc) else "TRANSPORT_ERROR"
+    except Exception as exc:  # 协议层异常（如 chunked 截断）只算这一条用例失败，不让整轮基准崩掉
+        result["error_code"] = "STREAM_ERROR"
+        print("warn: %s: stream error: %s" % (case_id, exc), file=sys.stderr)
 
     result["total_ms"] = _now_ms(t0)
     if first_delta_at is not None:

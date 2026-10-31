@@ -61,7 +61,7 @@ class _HomeShellState extends State<HomeShell> {
 
   @override
   Widget build(BuildContext context) {
-    final entries = CampusEntry.values;
+    const entries = CampusEntry.values;
     final destination = _selected == 0 ? null : entries[_selected - 1];
 
     return Scaffold(

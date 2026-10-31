@@ -2,10 +2,10 @@
 #
 # 用法：
 #   cp deploy/.env.example deploy/.env    # 填 POSTGRES_PASSWORD 与 DATABASE_URL
-#   docker compose -f deploy/docker-compose.yml up -d --build
+#   docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build
 #
-# 项目目录默认按本文件所在目录算，所以 `deploy/.env` 会被自动加载；
-# 从其它目录调用时显式加 --project-directory deploy。
+# 显式 --env-file 是为了不依赖"在哪个目录执行 compose"；变量先来自 deploy/.env，
+# 也可用同名 shell 环境变量覆盖。
 
 name: yunong
 
