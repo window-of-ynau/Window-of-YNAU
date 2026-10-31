@@ -22,7 +22,7 @@ anyhow = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "migrate"] }
 # 鉴权：密码哈希（Argon2id）与令牌摘要（SHA-256 → hex）
 argon2 = "0.5"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 [dev-dependencies]
