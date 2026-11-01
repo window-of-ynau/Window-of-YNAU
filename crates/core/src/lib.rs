@@ -17,6 +17,7 @@ pub mod ics;
 pub mod index;
 pub mod keystore;
 pub mod memory;
+pub mod memory_items;
 pub mod parse;
 pub mod protocols;
 pub mod schedule;
@@ -49,6 +50,9 @@ pub mod prelude {
     pub use crate::index::{Bm25Index, LocalIndex, SearchHit};
     pub use crate::keystore::{SecretKind, SecretStore};
     pub use crate::memory::{Blob, BlobKind, MemoryStore, Message};
+    pub use crate::memory_items::{
+        MemoryDraft, MemoryItem, MemoryItemStore, MemoryKind, MemoryWrite,
+    };
     pub use crate::parse::{parse_timetable, parse_timetable_with_report, ParseError, ParseReport};
     pub use crate::protocols::{build_body, build_body_with, parse_events, BuildOptions};
     pub use crate::schedule::{
