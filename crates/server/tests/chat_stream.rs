@@ -54,10 +54,14 @@ const PASSWORD: &str = "correct-horse-battery";
 enum Script {
     /// 正常 SSE：文本增量 + 「usage 与结束原因同帧」+ `[DONE]`
     CompletionsOk,
+    /// 正常 SSE，但**完全不带 usage**（验证服务端的估算兜底与 estimated 落库）
+    CompletionsNoUsage,
     /// Anthropic Messages 的正常 SSE（验证第二套协议与鉴权头）
     MessagesOk,
-    /// 直接 500
+    /// 直接 500，响应体里塞满内部细节（验证 F3：这些绝不能出现在客户端响应里）
     ServerError,
+    /// 200 但不是 SSE：模拟网关默认页/登录跳转页（验证 F4 的 content-type 校验）
+    HtmlLoginPage,
     /// 迟迟不给响应头（触发 504）
     SlowHeaders,
     /// 一直产出，等客户端断开（验证取消；真实厂商也是如此）
@@ -173,7 +177,20 @@ async fn mock_handler(
     ctx.received.lock().expect("mock 记录锁").push(recorded);
 
     match ctx.script {
-        Script::ServerError => (StatusCode::INTERNAL_SERVER_ERROR, "upstream boom").into_response(),
+        // 响应体里故意塞满内部细节：内网地址、我方环境变量名、上游原文。
+        // 评审 F3 要求这些**一个都不能**出现在客户端响应里（只能进日志）。
+        Script::ServerError => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "http://10.0.3.7:8089/internal/upstream?k=UPSTREAM_API_KEY secret-body-marker",
+        )
+            .into_response(),
+        // 200 + HTML：模拟网关默认页/登录跳转页（评审 F4）
+        Script::HtmlLoginPage => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<html><body>please sign in</body></html>",
+        )
+            .into_response(),
         Script::SlowHeaders => {
             // 比客户端的读超时更久：服务端应自己判 504，而不是一直挂着
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -186,6 +203,11 @@ async fn mock_handler(
         Script::CompletionsOk => sse_response(
             Arc::clone(&ctx.counters),
             completions_frames(),
+            Duration::from_millis(10),
+        ),
+        Script::CompletionsNoUsage => sse_response(
+            Arc::clone(&ctx.counters),
+            completions_frames_without_usage(),
             Duration::from_millis(10),
         ),
         Script::MessagesOk => sse_response(
@@ -262,6 +284,25 @@ fn completions_frames() -> Vec<String> {
         ),
         sse(
             r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":312,"completion_tokens":96}}"#,
+        ),
+        sse("[DONE]"),
+    ]
+}
+
+/// 正常 SSE，但**完全不带 usage**（评审 F2：验证服务端估算兜底并置 estimated=true）。
+fn completions_frames_without_usage() -> Vec<String> {
+    vec![
+        sse(
+            r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#,
+        ),
+        sse(
+            r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"你好"}}]}"#,
+        ),
+        sse(
+            r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"，同学"}}]}"#,
+        ),
+        sse(
+            r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
         ),
         sse("[DONE]"),
     ]
@@ -415,6 +456,17 @@ async fn read_json(response: Response) -> Value {
         .expect("读响应体")
         .to_bytes();
     serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
+
+/// 把响应体读成文本（用在"断言没有泄露"这类检查上——那时它可能不是 JSON）。
+async fn read_text(response: Response) -> String {
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("读响应体")
+        .to_bytes();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// 把整条 SSE 流读成 `(event, data)` 列表。
@@ -758,6 +810,116 @@ async fn upstream_5xx_maps_to_502_upstream_error() {
     );
 }
 
+/// 评审 F3：上游错误的细节（内网地址 / 我方环境变量名 / 上游响应原文）只能进日志，
+/// **绝不能**出现在响应体里。mock 的 500 响应体里刻意塞了三种标记。
+#[tokio::test]
+async fn upstream_error_does_not_leak_internal_details() {
+    let mock = start_mock(Script::ServerError).await;
+    let app = TestApp::new(&mock);
+    let token = app.register("student@ynau.edu.cn").await;
+
+    let response = app.call(chat_request(Some(&token), "turn-1")).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = read_text(response).await;
+
+    assert!(!body.contains("http://"), "泄露了内网上游地址：{body}");
+    // 注意：`UPSTREAM_ERROR` 这个错误码本身是合法的，要查的是**环境变量名**
+    for leaked in [
+        "UPSTREAM_API_KEY",
+        "UPSTREAM_BASE_URL",
+        "UPSTREAM_COMPLETIONS",
+    ] {
+        assert!(!body.contains(leaked), "泄露了环境变量名 {leaked}：{body}");
+    }
+    assert!(
+        !body.contains("secret-body-marker"),
+        "泄露了上游响应原文：{body}"
+    );
+    assert!(!body.contains("10.0.3.7"), "泄露了内网 IP：{body}");
+    // 但错误码与固定文案要在
+    assert!(body.contains("UPSTREAM_ERROR"), "{body}");
+    assert!(body.contains("上游暂时不可用"), "{body}");
+}
+
+/// 评审 F4：2xx 但不是 SSE（登录页/网关默认页）→ 502，而不是 Meta + Done 的"空回答"。
+#[tokio::test]
+async fn non_sse_2xx_maps_to_502_and_never_produces_done() {
+    let mock = start_mock(Script::HtmlLoginPage).await;
+    let app = TestApp::new(&mock);
+    let token = app.register("student@ynau.edu.cn").await;
+
+    let response = app.call(chat_request(Some(&token), "turn-1")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "200 的 HTML 页不能被当成 SSE"
+    );
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !content_type.starts_with("text/event-stream"),
+        "出错时不该还声明 SSE：{content_type}"
+    );
+
+    let body = read_text(response).await;
+    assert!(!body.contains("event: done"), "不能产出 done：{body}");
+    assert!(!body.contains("event: meta"), "不能产出 meta：{body}");
+    assert!(body.contains("UPSTREAM_ERROR"), "{body}");
+    // 上游返回的 HTML 也不能漏进响应体
+    assert!(!body.contains("please sign in"), "{body}");
+}
+
+/// 评审 F4：请求体里的 `stream` 由服务端强制成 true（端侧声明的 false 不作数）。
+#[tokio::test]
+async fn upstream_request_forces_stream_true() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::new(&mock);
+    let token = app.register("student@ynau.edu.cn").await;
+
+    // 客户端偏偏声明 stream=false
+    let mut body: Value = serde_json::from_str(&chat_body("turn-1")).expect("请求体");
+    body["stream"] = json!(false);
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &body.to_string(),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = read_events(response).await;
+
+    let received = mock.last_request();
+    assert_eq!(
+        received.body["stream"], true,
+        "转发给上游的请求体必须强制 stream=true：{}",
+        received.body
+    );
+}
+
+#[tokio::test]
+async fn unconfigured_upstream_is_a_clear_502() {
+    let app = TestApp::with_config(Config::for_tests()); // 没配上游
+    let token = app.register("student@ynau.edu.cn").await;
+
+    let response = app.call(chat_request(Some(&token), "turn-1")).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = read_json(response).await;
+    assert_eq!(body["error"]["code"], "UPSTREAM_ERROR");
+    // 评审 F3：配置细节（该配哪个环境变量）只进日志，不进响应体
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("UPSTREAM_"),
+        "不该把环境变量名发给客户端：{message}"
+    );
+    assert!(message.contains("上游暂时不可用"), "{message}");
+}
+
 #[tokio::test]
 async fn upstream_timeout_maps_to_504_upstream_timeout() {
     let mock = start_mock(Script::SlowHeaders).await;
@@ -770,23 +932,6 @@ async fn upstream_timeout_maps_to_504_upstream_timeout() {
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     let body = read_json(response).await;
     assert_eq!(body["error"]["code"], "UPSTREAM_TIMEOUT");
-}
-
-#[tokio::test]
-async fn unconfigured_upstream_is_a_clear_502() {
-    let app = TestApp::with_config(Config::for_tests()); // 没配上游
-    let token = app.register("student@ynau.edu.cn").await;
-
-    let response = app.call(chat_request(Some(&token), "turn-1")).await;
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = read_json(response).await;
-    assert_eq!(body["error"]["code"], "UPSTREAM_ERROR");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("UPSTREAM_")),
-        "要告诉运维配哪个变量：{body}"
-    );
 }
 
 #[tokio::test]
@@ -856,7 +1001,7 @@ async fn client_disconnect_stops_draining_upstream_and_releases_the_gate() {
 
 // ============ 抽样记账与审计（需要 PostgreSQL，默认 skip） ============
 
-/// 抽样命中：`usage_samples` **恰好一行**，写的是装配器合并后的终值。
+/// 抽样命中：`usage_samples` **一行**，写的是装配器合并后的终值，且带上 `turn_id`。
 #[tokio::test]
 #[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
 async fn pg_sample_writes_one_row_with_merged_usage() {
@@ -881,20 +1026,21 @@ async fn pg_sample_writes_one_row_with_merged_usage() {
         wait_for_rows(&db, "SELECT count(*) FROM usage_samples", 1).await,
         "抽样命中却没有写 usage_samples"
     );
-    // 一个 turn 一行：逐事件写会把成本显著高估
+    // 一轮 = 一行：逐事件写会把成本显著高估；4 轮循环才有 4 行（见下一条用例）
     assert_eq!(
         count(&db.pool, "SELECT count(*) FROM usage_samples").await,
         1,
-        "一个 turn 只能有一行抽样"
+        "一轮上游调用只能有一行抽样"
     );
 
     let row = sqlx::query(
-        "SELECT req_id, model, protocol, channel, round, tokens_in, tokens_out \
+        "SELECT turn_id, req_id, model, protocol, channel, round, tokens_in, tokens_out, estimated \
          FROM usage_samples",
     )
     .fetch_one(&db.pool)
     .await
     .expect("应能读到抽样行");
+    assert_eq!(row.get::<String, _>("turn_id"), "turn-sample-1");
     assert_eq!(row.get::<String, _>("req_id"), request_id);
     assert_eq!(row.get::<String, _>("model"), "mock-model");
     assert_eq!(row.get::<String, _>("protocol"), "openai_completions");
@@ -903,6 +1049,8 @@ async fn pg_sample_writes_one_row_with_merged_usage() {
     // 合并后的终值：与 SSE 里那条 usage 一致
     assert_eq!(row.get::<i32, _>("tokens_in"), 312);
     assert_eq!(row.get::<i32, _>("tokens_out"), 96);
+    // 上游给了 usage → 不是估算
+    assert!(!row.get::<bool, _>("estimated"));
 
     // 放行也要留审计（不含正文，只有动作与目标）
     assert!(
@@ -913,6 +1061,115 @@ async fn pg_sample_writes_one_row_with_merged_usage() {
         )
         .await,
         "放行应留一条 allow 审计"
+    );
+
+    db.finish().await;
+}
+
+/// 评审 F1：`(turn_id, round)` 是幂等键——同一轮重放只**更新**那一行，不同轮各一行。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_sample_is_idempotent_per_round() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mock = start_mock(Script::CompletionsOk).await;
+    let mut config = TestApp::config(&mock);
+    config.usage_sample_percent = 100;
+    let app = TestApp::with_db(config, Some(db.pool.clone()));
+    let token = app.register("replay@ynau.edu.cn").await;
+
+    // 同一 (turn_id, round=1) 连打两次：第二次算"重放"
+    let mut last_request_id = String::new();
+    for _ in 0..2 {
+        let response = app.call(chat_request(Some(&token), "turn-replay")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        last_request_id = header_str(&response, "x-request-id")
+            .expect("必须回写 x-request-id")
+            .to_owned();
+        let _ = read_events(response).await;
+    }
+    assert!(
+        wait_for_rows(&db, "SELECT count(*) FROM usage_samples", 1).await,
+        "同一轮重放只能有一行"
+    );
+    let stored_req_id: String = sqlx::query_scalar("SELECT req_id FROM usage_samples")
+        .fetch_one(&db.pool)
+        .await
+        .expect("应能读到抽样行");
+    assert_eq!(
+        stored_req_id, last_request_id,
+        "upsert 应该被后一次覆盖，而不是各写一行"
+    );
+
+    // 同一 turn 的第 2 轮 → 第二行（4 轮工具循环就是 4 行，成本统计才不漏）
+    let mut body: Value = serde_json::from_str(&chat_body("turn-replay")).expect("请求体");
+    body["round"] = json!(2);
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &body.to_string(),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = read_events(response).await;
+    assert!(
+        wait_for_rows(&db, "SELECT count(*) FROM usage_samples WHERE round = 2", 1).await,
+        "第 2 轮应有自己的一行"
+    );
+    assert_eq!(
+        count(&db.pool, "SELECT count(*) FROM usage_samples").await,
+        2,
+        "两轮 = 两行"
+    );
+
+    db.finish().await;
+}
+
+/// 评审 F2：上游一次 usage 都没给 → 落库用估算值并置 `estimated = true`
+/// （否则库里只有 0/0，分不清"真的是 0"与"没有数据"）。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_sample_marks_estimated_when_upstream_omits_usage() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mock = start_mock(Script::CompletionsNoUsage).await;
+    let mut config = TestApp::config(&mock);
+    config.usage_sample_percent = 100;
+    let app = TestApp::with_db(config, Some(db.pool.clone()));
+    let token = app.register("estimated@ynau.edu.cn").await;
+
+    let response = app.call(chat_request(Some(&token), "turn-estimated")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = read_events(response).await;
+    assert_eq!(
+        events.last().map(|(name, _)| name.as_str()),
+        Some("done"),
+        "没有 usage 也要正常收尾"
+    );
+
+    assert!(
+        wait_for_rows(&db, "SELECT count(*) FROM usage_samples", 1).await,
+        "抽样命中却没有写 usage_samples"
+    );
+    let row = sqlx::query("SELECT tokens_in, tokens_out, estimated FROM usage_samples")
+        .fetch_one(&db.pool)
+        .await
+        .expect("应能读到抽样行");
+    assert!(
+        row.get::<bool, _>("estimated"),
+        "上游没给 usage，必须标 estimated=true"
+    );
+    assert!(
+        row.get::<i32, _>("tokens_in") > 0,
+        "输入 token 应有估算值，而不是 0"
+    );
+    assert!(
+        row.get::<i32, _>("tokens_out") > 0,
+        "输出 token 应有估算值（按已下发的增量文本算），而不是 0"
     );
 
     db.finish().await;
@@ -931,6 +1188,7 @@ async fn pg_usage_write_failure_does_not_break_the_stream() {
     db.execute(
         "CREATE TABLE usage_samples (\
              id bigserial PRIMARY KEY,\
+             turn_id text NOT NULL,\
              user_id uuid REFERENCES users (id) ON DELETE SET NULL,\
              req_id text NOT NULL,\
              model text NOT NULL,\
@@ -939,6 +1197,7 @@ async fn pg_usage_write_failure_does_not_break_the_stream() {
              round smallint NOT NULL DEFAULT 1,\
              tokens_in integer NOT NULL DEFAULT 0,\
              tokens_out integer NOT NULL DEFAULT 0,\
+             estimated boolean NOT NULL DEFAULT false,\
              created_at timestamptz NOT NULL DEFAULT now(),\
              CONSTRAINT usage_samples_never_writable CHECK (false)\
          )",

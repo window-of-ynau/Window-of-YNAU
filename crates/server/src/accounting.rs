@@ -2,8 +2,9 @@
 //!
 //! 两件事，都**绝不阻塞、绝不影响流**：
 //!
-//! - **1% 抽样**：`usage_samples` 每个 turn 最多写一行，写的是合并后的终值
-//!   （[`ChunkAssembler::usage`](yunong_shared::ChunkAssembler)）。逐事件写会把成本显著高估。
+//! - **1% 抽样**：`usage_samples` **每轮（每次上游调用）一行**（4 轮工具循环 = 4 次调用 = 4 行），
+//!   `(turn_id, round)` 是幂等键、写入 upsert，重放不会重复计数。写的是装配器合并后的终值
+//!   （[`ChunkAssembler::usage`](yunong_shared::ChunkAssembler)），逐事件写会显著高估。
 //! - **审计**：`audit_logs` 记"放行"与"拒绝"两类动作（网关拒绝要能事后追查）。
 //!
 //! 两条铁律：写库失败只记 `warn`，不影响已经发给客户端的流；没有数据库（无 DB 模式）
@@ -19,14 +20,20 @@ use uuid::Uuid;
 use yunong_shared::{Channel, Protocol, Usage};
 
 /// 一条抽样样本（对应 `usage_samples` 一行）。
+///
+/// **粒度是"一次上游调用"**，不是"一个 turn"：4 轮工具循环就是 4 次调用、4 行。
+/// `(turn_id, round)` 是幂等键——同一轮重放只会更新那一行（见 `0003_*` 迁移与 `write_sample` 的 upsert）。
 #[derive(Debug, Clone)]
 pub struct UsageSample {
+    /// 一次用户提问的 id（多轮工具循环共享）
+    pub turn_id: String,
     pub user_id: Uuid,
     pub req_id: String,
     pub model: String,
     pub protocol: Protocol,
     pub channel: Channel,
     pub round: u8,
+    /// 合并后的终值；`usage.estimated = true` 表示上游没给 usage、这里是服务端估算
     pub usage: Usage,
 }
 
@@ -122,16 +129,28 @@ impl UsageRecorder {
     }
 
     /// 写一条抽样样本。返回 `Ok(false)` 表示"没有数据库，跳过"。
+    ///
+    /// 写入是 **upsert**：`(turn_id, round)` 唯一，同一轮重放只会覆盖那一行
+    /// （否则客户端重试一次就多算一次成本）。
     pub async fn write_sample(&self, sample: &UsageSample) -> Result<bool, sqlx::Error> {
         let Some(pool) = &self.db else {
             return Ok(false);
         };
-        // 只在终止时才写：一个 turn 一行，且写的是合并后的终值
+        // 只在终止时才写：写的是装配器合并后的终值；上游没给 usage 时是估算值（estimated=true）
         sqlx::query(
             "INSERT INTO usage_samples \
-             (user_id, req_id, model, protocol, channel, round, tokens_in, tokens_out) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             (turn_id, user_id, req_id, model, protocol, channel, round, tokens_in, tokens_out, estimated) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             ON CONFLICT (turn_id, round) DO UPDATE SET \
+               req_id = EXCLUDED.req_id, \
+               model = EXCLUDED.model, \
+               protocol = EXCLUDED.protocol, \
+               channel = EXCLUDED.channel, \
+               tokens_in = EXCLUDED.tokens_in, \
+               tokens_out = EXCLUDED.tokens_out, \
+               estimated = EXCLUDED.estimated",
         )
+        .bind(&sample.turn_id)
         .bind(sample.user_id)
         .bind(&sample.req_id)
         .bind(&sample.model)
@@ -140,6 +159,7 @@ impl UsageRecorder {
         .bind(i16::from(sample.round))
         .bind(sample.usage.tokens_in as i32)
         .bind(sample.usage.tokens_out as i32)
+        .bind(sample.usage.estimated)
         .execute(pool)
         .await?;
         Ok(true)
@@ -255,6 +275,7 @@ mod tests {
             .expect("建 runtime");
         runtime.block_on(async {
             let sample = UsageSample {
+                turn_id: "turn-1".into(),
                 user_id: Uuid::new_v4(),
                 req_id: "req_1".into(),
                 model: "m".into(),

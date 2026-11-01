@@ -534,11 +534,12 @@ async fn chat_with_valid_token_is_502_when_upstream_is_not_configured() {
         ))
         .await;
     assert_error(&res, StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR");
+    // 评审 F3：配置细节（该配哪个环境变量）只进日志，对外只给固定文案
     assert!(
-        res.body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("UPSTREAM_")),
-        "要告诉运维配哪个环境变量：{:?}",
+        res.body["error"]["message"].as_str().is_some_and(
+            |message| !message.contains("UPSTREAM_") && message.contains("上游暂时不可用")
+        ),
+        "不该把环境变量名发给客户端：{:?}",
         res.body
     );
 }
