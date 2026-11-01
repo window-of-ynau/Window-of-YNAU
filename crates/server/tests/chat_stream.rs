@@ -1258,15 +1258,18 @@ async fn pg_schema_guard_rejects_missing_migration() {
     let Some(db) = TestDb::setup().await else {
         return;
     };
-    // 迁移跑全了：自检通过
-    yunong_server::accounting::verify_schema(&db.pool)
+    // 迁移跑全了：自检通过。
+    // 用**不带 public** 的池：开发机/CI 的 public 往往也跑过迁移，带着 public 会让
+    // 下面"删掉列"的断言观察不到（search_path 会先命中 public 的表）。
+    let isolated = db.pool_without_public().await;
+    yunong_server::accounting::verify_schema(&isolated)
         .await
         .expect("0003 已应用，自检应通过");
 
     // 模拟"只跑到 0002"：把 0003 加的列删掉
     db.execute("ALTER TABLE usage_samples DROP COLUMN turn_id")
         .await;
-    let error = yunong_server::accounting::verify_schema(&db.pool)
+    let error = yunong_server::accounting::verify_schema(&isolated)
         .await
         .expect_err("少了 turn_id 必须报错");
     assert!(
@@ -1372,6 +1375,144 @@ async fn pg_sample_marks_estimated_when_upstream_omits_usage() {
     assert!(
         row.get::<i32, _>("tokens_out") > 0,
         "输出 token 应有估算值（按已下发的增量文本算），而不是 0"
+    );
+
+    db.finish().await;
+}
+
+/// W7：**鉴权失败**要留 deny 审计（reason 区分"正常过期"与"令牌无效"）。
+///
+/// 只记"确实带了令牌但被拒"的情况——完全没带令牌的请求不落库（见下一条用例），
+/// 否则等于给攻击者一个免费的写放大入口。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_auth_failure_is_audited() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_db(TestApp::config(&mock), Some(db.pool.clone()));
+
+    let response = app
+        .call(chat_request(Some("not-a-real-token"), "turn-auth"))
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let _ = read_json(response).await;
+
+    assert!(
+        wait_for_rows(
+            &db,
+            "SELECT count(*) FROM audit_logs \
+             WHERE action = 'auth.authenticate' AND decision = 'deny' \
+               AND reason = 'token_invalid'",
+            1
+        )
+        .await,
+        "令牌无效必须留 auth.authenticate/deny 审计"
+    );
+    assert_eq!(
+        count(
+            &db.pool,
+            "SELECT count(*) FROM audit_logs WHERE user_id IS NULL AND decision = 'deny'"
+        )
+        .await,
+        1,
+        "鉴权失败时不知道该是谁，user_id 应为 NULL（不编造）"
+    );
+
+    db.finish().await;
+}
+
+/// W7：完全没带令牌 → 401，但**不写审计**（反写放大）。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_missing_token_is_not_audited() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_db(TestApp::config(&mock), Some(db.pool.clone()));
+
+    let response = app.call(chat_request(None, "turn-noauth")).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 审计是异步 fire-and-forget：给它一点时间，再断言"仍然是 0"
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        count(&db.pool, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "没带令牌的请求不该落审计（否则是免费的写放大入口）"
+    );
+
+    db.finish().await;
+}
+
+/// W7：**上游失败**记 decision=error（不是 deny，否则"被拒绝率"会被上游抖动污染）。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_upstream_failure_is_audited_as_error() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mock = start_mock(Script::ServerError).await;
+    let app = TestApp::with_db(TestApp::config(&mock), Some(db.pool.clone()));
+    let token = app.register("upstream-audit@ynau.edu.cn").await;
+
+    let response = app.call(chat_request(Some(&token), "turn-up")).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _ = read_json(response).await;
+
+    assert!(
+        wait_for_rows(
+            &db,
+            "SELECT count(*) FROM audit_logs \
+             WHERE decision = 'error' AND reason = 'upstream_status_500'",
+            1
+        )
+        .await,
+        "上游 500 必须留 decision=error 审计，reason 只放短码"
+    );
+    // reason 里绝不能出现上游原文 / 内网地址
+    assert_eq!(
+        count(
+            &db.pool,
+            "SELECT count(*) FROM audit_logs \
+             WHERE reason LIKE '%http%' OR reason LIKE '%secret%' OR reason LIKE '%UPSTREAM_%'"
+        )
+        .await,
+        0,
+        "审计的 reason 不能带上游原文（F3/F9 的边界）"
+    );
+
+    db.finish().await;
+}
+
+/// W7：上游在**流中**报错（厂商错误帧）同样记 decision=error。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_upstream_stream_error_is_audited() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mock = start_mock(Script::StreamError).await;
+    let app = TestApp::with_db(TestApp::config(&mock), Some(db.pool.clone()));
+    let token = app.register("stream-error@ynau.edu.cn").await;
+
+    let response = app
+        .call(chat_request(Some(&token), "turn-stream-err"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = read_events(response).await;
+
+    assert!(
+        wait_for_rows(
+            &db,
+            "SELECT count(*) FROM audit_logs \
+             WHERE decision = 'error' AND reason LIKE 'upstream_error_frame_%'",
+            1
+        )
+        .await,
+        "流中的厂商错误帧也要留 error 审计"
     );
 
     db.finish().await;

@@ -134,6 +134,15 @@ pub async fn chat_stream(
                 code = error.code().as_str(),
                 "上游开流失败"
             );
+            // 审计：decision=error（放行了但执行失败），reason 只放短码，不放厂商原文
+            state
+                .accounting
+                .record_audit_detached(AuditEntry::upstream_error(
+                    principal.user_id,
+                    req_id.0.clone(),
+                    request.turn_id.clone(),
+                    error.audit_reason(),
+                ));
             return Err(AppError::new(
                 error.code(),
                 public_upstream_message(error.code()),
@@ -314,6 +323,18 @@ fn sse_stream(
                                 {
                                     emitted_text.push_str(text);
                                 }
+                                Chunk::Error { code, .. } => {
+                                    // 上游在流里报错（厂商错误帧）：同样是"执行失败"，
+                                    // 记 decision=error，reason 只放短码（原文已进日志）。
+                                    state.accounting.record_audit_detached(
+                                        AuditEntry::upstream_error(
+                                            user_id,
+                                            request_id.clone(),
+                                            request.turn_id.clone(),
+                                            format!("upstream_error_frame_{}", code.as_str()),
+                                        ),
+                                    );
+                                }
                                 _ => {}
                             }
                         }
@@ -327,6 +348,15 @@ fn sse_stream(
                             error = %error,
                             "上游流中断，转成 SSE error 事件"
                         );
+                        // 审计：流中断也是上游失败（decision=error），reason 只放短码
+                        state
+                            .accounting
+                            .record_audit_detached(AuditEntry::upstream_error(
+                                user_id,
+                                request_id.clone(),
+                                request.turn_id.clone(),
+                                error.audit_reason(),
+                            ));
                         // Error 是终止事件：装配器不会再补 Done（ADR-16）。
                         // 对外只给错误码 + 固定文案，细节留在上面的日志里（评审 F3）。
                         let chunk = Chunk::Error {
