@@ -155,7 +155,9 @@ fn lock(state: &Mutex<MemoryState>) -> MutexGuard<'_, MemoryState> {
 /// （登录时不区分，注册时返回 422）。
 fn normalize_email(raw: &str) -> Option<String> {
     let email = raw.trim();
-    if email.is_empty() || email.len() > 254 {
+    // R2-F9：账号键用 ASCII 小写（与 `users (lower(email))` 索引一致）。
+    // 之前这里用 Unicode `to_lowercase`、限流键用 `to_ascii_lowercase`，两套口径会对不上。
+    if email.is_empty() || email.len() > 254 || !email.is_ascii() {
         return None;
     }
     if email.chars().any(char::is_whitespace) {

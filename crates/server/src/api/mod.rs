@@ -4,6 +4,7 @@ pub mod auth;
 pub mod auth_guard;
 pub mod body_limit;
 pub mod chat;
+pub mod client_ip;
 pub mod envelope;
 pub mod error;
 pub mod health;

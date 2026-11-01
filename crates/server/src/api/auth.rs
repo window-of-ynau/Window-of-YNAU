@@ -13,8 +13,8 @@ use serde_json::json;
 use uuid::Uuid;
 use yunong_shared::ErrorCode;
 
-use crate::api::{envelope, error::AppError, request_id::ReqId};
-use crate::auth::Principal;
+use crate::api::{client_ip::ClientIp, envelope, error::AppError, request_id::ReqId};
+use crate::auth::{token, Principal};
 use crate::limiter::AuthRoute;
 use crate::state::AppState;
 
@@ -29,6 +29,34 @@ const MAX_EMAIL_BYTES: usize = 254;
 
 /// 刷新令牌的最大字节数：`token::is_well_formed` 之前先挡明显伪造的超长串。
 const MAX_REFRESH_TOKEN_BYTES: usize = 512;
+
+/// 邮箱的基本形态校验（**在限流之前**）。
+///
+/// R2-F9：限流键与账号键必须用同一套归一化。账号侧是 `to_ascii_lowercase`（`users (lower(email))`
+/// 索引是 ASCII 语义），所以这里也只做 ASCII 小写；顺带拒绝非 ASCII 邮箱，
+/// 避免 `Ä@x.com` 与 `ä@x.com` 这类"看起来是同一个账号、实际是两个桶"的歧义。
+fn check_email_shape(email: &str, request_id: &str) -> Result<(), AppError> {
+    if email.len() > MAX_EMAIL_BYTES {
+        return Err(AppError::new(
+            ErrorCode::ValidationError,
+            format!("邮箱长度不能超过 {MAX_EMAIL_BYTES} 字节"),
+            request_id,
+        ));
+    }
+    if !email.is_ascii() {
+        return Err(AppError::new(
+            ErrorCode::ValidationError,
+            "邮箱只支持 ASCII 字符".to_owned(),
+            request_id,
+        ));
+    }
+    Ok(())
+}
+
+/// 登录限流的键：与账号键同口径（ASCII 小写、去首尾空白）。
+fn email_rate_key(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
 
 #[derive(Debug, Deserialize)]
 struct CredentialsRequest {
@@ -60,25 +88,22 @@ struct RefreshBody {
 pub async fn register(
     State(state): State<AppState>,
     Extension(req_id): Extension<ReqId>,
+    Extension(client): Extension<ClientIp>,
     body: Bytes,
 ) -> Result<Response, AppError> {
     let credentials: CredentialsRequest = parse_body(&body, &req_id)?;
     // security 复核 F1：**先卡长度再进限流**（顺序不能反，否则长邮箱已经进了桶表）
-    if credentials.email.len() > MAX_EMAIL_BYTES {
-        return Err(AppError::new(
-            ErrorCode::ValidationError,
-            format!("邮箱长度不能超过 {MAX_EMAIL_BYTES} 字节"),
-            &req_id.0,
-        ));
-    }
-    // 红队 H1：未鉴权端点先过限流（速率闸 + 哈希并发闸），否则匿名并发能把内存打爆
+    check_email_shape(&credentials.email, &req_id.0)?;
+    // 红队 H1 + R2-F6：注册按**客户端 IP** 分桶（原来是全局桶：一个班 40 人同时注册会 30 个 429，
+    // 而匿名者 10 次/分就能把全站注册掐死）。NAT 环境下同出口的多个人共用一个桶，
+    // 这是有意的取舍：宁可让同一间学校的人互相挤一点，也不能让一个人掐死全站。
     state
         .limiter
-        .check_rate(AuthRoute::Register, "global")
+        .check_rate(AuthRoute::Register, &format!("ip:{}", client.0))
         .map_err(|error| error.with_request_id(&req_id.0))?;
     let _hash_slot = state
         .limiter
-        .acquire_hash_slot(HASH_SLOT_WAIT)
+        .acquire_hash_slot(AuthRoute::Register, HASH_SLOT_WAIT)
         .await
         .map_err(|error| error.with_request_id(&req_id.0))?;
     let session = state
@@ -106,21 +131,15 @@ pub async fn login(
 ) -> Result<Response, AppError> {
     let credentials: CredentialsRequest = parse_body(&body, &req_id)?;
     // security 复核 F1：同上——先卡长度，再进限流（这是内存放大器的入口）
-    if credentials.email.len() > MAX_EMAIL_BYTES {
-        return Err(AppError::new(
-            ErrorCode::ValidationError,
-            format!("邮箱长度不能超过 {MAX_EMAIL_BYTES} 字节"),
-            &req_id.0,
-        ));
-    }
-    // 红队 H1：按**规范化邮箱**限速（同一账号被撞库时能立刻收口），再抢一个哈希名额
+    check_email_shape(&credentials.email, &req_id.0)?;
+    // 红队 H1 + R2-F9：按**ASCII 小写规范化邮箱**限速（与账号键同口径），再抢一个哈希名额
     state
         .limiter
-        .check_rate(AuthRoute::Login, &credentials.email.trim().to_lowercase())
+        .check_rate(AuthRoute::Login, &email_rate_key(&credentials.email))
         .map_err(|error| error.with_request_id(&req_id.0))?;
     let _hash_slot = state
         .limiter
-        .acquire_hash_slot(HASH_SLOT_WAIT)
+        .acquire_hash_slot(AuthRoute::Login, HASH_SLOT_WAIT)
         .await
         .map_err(|error| error.with_request_id(&req_id.0))?;
     let session = state
@@ -156,10 +175,15 @@ pub async fn refresh(
             &req_id.0,
         ));
     }
-    // 刷新不哈希（只查库），所以只过速率闸、不占哈希名额
+    // 刷新不哈希（只查库），所以只过速率闸、不占哈希名额。
+    //
+    // R2-F6：按**令牌摘要**分桶（原来是全局桶：匿名者 60 次/分就能永久掐死全站刷新；
+    // 而 1000 在线 / 15min TTL ≈ 67 refresh/min 本就超过 60 的全局上限）。
+    // 用摘要而不是明文，是因为键会进内存表，不该常驻凭据明文。
+    let refresh_key = format!("refresh:{}", &token::hash(&request.refresh_token)[..16]);
     state
         .limiter
-        .check_rate(AuthRoute::Refresh, "global")
+        .check_rate(AuthRoute::Refresh, &refresh_key)
         .map_err(|error| error.with_request_id(&req_id.0))?;
     let session = state
         .auth
