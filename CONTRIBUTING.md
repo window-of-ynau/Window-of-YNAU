@@ -151,6 +151,20 @@ ADR 变更与代码变更**同 PR 或先后紧邻的 PR**；只改代码不改 A
 
 ---
 
+### 角色边界（派活时必须遵守）
+
+| 角色 | 职责范围 | 不做什么 |
+|---|---|---|
+| **lead-server** | `crates/server/**`、`migrations/**`、服务端接口与容器内行为 | 不写 Flutter / 端侧 UI |
+| **lead-client** | `app/**`、`crates/core/**` 中与端侧逻辑相关的部分 | 不写服务端 |
+| **designer** | 渲染与交互视觉，**辅助 lead-client** | 不改取数/合并/入库逻辑 |
+| **core-rust** | `crates/core/**`、必要的 `crates/shared` 提案 | 不写 Flutter |
+| **infra** | `.github/**`、`deploy/**`、`scripts/**`、发布 | 不写业务代码 |
+| **reviewer** | 只读评审、门禁复核、findings | 不改代码 |
+
+派任务时按此边界点名分配；**跨边界任务必须先说明理由并获得确认**，不要"谁空谁上"。
+
+因边界不清已产生过一次返工：课表可视化被派给 lead-server，其实现与 owner 拍板项冲突后被废弃。
 ## 多代理协作（AI Agent 并行开发）
 
 多人 / 多 Agent 同时改一个仓库时，**一个 Agent 一个 Git worktree**，否则会出现写入竞态（文件被互相覆盖，且很难发现）。
