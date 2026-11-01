@@ -147,8 +147,10 @@ class _TimetablePageState extends State<TimetablePage> {
     if (_busy && _courses.isEmpty && _failure == null) {
       return const Center(child: Text('正在解析…'));
     }
-    if (_failure != null) {
-      // 失败时**不显示空态**，也不提示"没课"
+    if (_failure != null && _courses.isEmpty) {
+      // 失败时**不显示空态**，也不提示"没课"。
+      // 但只有"本来就没数据"时才隐藏 body：若之前已导入过课表，列表必须继续显示——
+      // 失败不等于课表消失（见 widget test「导入失败后不清空已有列表」）。
       return const SizedBox.shrink();
     }
     if (_courses.isEmpty) {
