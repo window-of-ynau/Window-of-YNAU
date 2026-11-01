@@ -119,16 +119,21 @@ class ScheduleTemplate {
     required this.cardId,
     required this.years,
     this.weekcount,
+    this.cardIdSource,
   });
 
   final String cardId;
   final String years;
   final int? weekcount;
 
+  /// cardId 从哪来的（xhr / data-cardid / dom-id / initial-state / inline-script）
+  final String? cardIdSource;
+
   factory ScheduleTemplate.fromMessage(Map<String, dynamic> message) => ScheduleTemplate(
         cardId: (message['card_id'] as String?) ?? '',
         years: (message['years'] as String?) ?? '',
         weekcount: _asInt(message['weekcount']),
+        cardIdSource: message['card_id_source'] as String?,
       );
 
   bool get isValid => cardId.isNotEmpty && years.isNotEmpty;
@@ -347,6 +352,134 @@ const String kPortalScheduleScript = r'''
   setTimeout(function () {
     if (!TEMPLATE) { postCaptureTimeout('no_template_20s'); }
   }, TIMEOUT_MS);
+  // ---- cardId 兜底：捕获不到真实请求时，从页面里读 ----
+  //
+  // 已知样例：卡片 DOM id 形如 `timeTableWeekCard_d907dd70`（hash 可能就是 cardId），
+  // 门户是 React 单页，初始状态可能挂在 `__INITIAL_STATE__` / `__NUXT__` 或内联 script 里。
+  function deepFindCardId(value, depth) {
+    if (!value || depth > 6) { return ''; }
+    if (Array.isArray(value)) {
+      for (var i = 0; i < value.length && i < 80; i++) {
+        var found = deepFindCardId(value[i], depth + 1);
+        if (found) { return found; }
+      }
+      return '';
+    }
+    if (typeof value !== 'object') { return ''; }
+    for (var key in value) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) { continue; }
+      if (key.toLowerCase() === 'cardid'
+          && typeof value[key] === 'string' && value[key].length >= 8) {
+        return value[key];
+      }
+      var nested = deepFindCardId(value[key], depth + 1);
+      if (nested) { return nested; }
+    }
+    return '';
+  }
+
+  function termFromDom() {
+    try {
+      var html = document.documentElement.innerHTML || '';
+      var match = html.match(/(20\d{2}-20\d{2}-[12])/);
+      if (match) { return match[1]; }
+    } catch (e) {}
+    try {
+      var nodes = document.querySelectorAll('.ant-select-selection-item, .ant-select span');
+      for (var i = 0; i < nodes.length; i++) {
+        var text = (nodes[i].textContent || '').trim();
+        if (/^20\d{2}-20\d{2}-[12]$/.test(text)) { return text; }
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  function cardIdFromPage() {
+    try {
+      var el = document.querySelector('[data-cardid]');
+      if (el) {
+        var attrValue = el.getAttribute('data-cardid') || '';
+        if (attrValue.length >= 8) { return { cardId: attrValue, source: 'data-cardid' }; }
+      }
+    } catch (e) {}
+    try {
+      var node = document.querySelector('[id*="timeTable"], [id*="kbsz"], [id*="Card"]');
+      if (node) {
+        var attr = node.getAttribute('data-id') || node.getAttribute('data-card-id') || '';
+        if (attr.length >= 8) { return { cardId: attr, source: 'dom-attr' }; }
+        var id = node.id || '';
+        var hash = id.indexOf('_') >= 0 ? id.split('_').pop() : id;
+        if (hash && hash.length >= 8) { return { cardId: hash, source: 'dom-id' }; }
+      }
+    } catch (e) {}
+    var states = [];
+    try { states.push(window.__INITIAL_STATE__); } catch (e) {}
+    try { states.push(window.__NUXT__); } catch (e) {}
+    try { states.push(window.__DATA__); } catch (e) {}
+    for (var i = 0; i < states.length; i++) {
+      var found = deepFindCardId(states[i], 0);
+      if (found) { return { cardId: found, source: 'initial-state' }; }
+    }
+    try {
+      var html = document.documentElement.innerHTML || '';
+      var re = /"cardId"\s*:\s*"([0-9a-zA-Z_-]{8,})"/g;
+      var match = re.exec(html);
+      while (match) {
+        var around = html.slice(Math.max(0, match.index - 200), match.index + 200);
+        if (around.indexOf('课表') >= 0 || around.indexOf('kbsz') >= 0
+            || around.indexOf('timeTable') >= 0 || around.indexOf('schedule') >= 0) {
+          return { cardId: match[1], source: 'inline-script' };
+        }
+        match = re.exec(html);
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function tryFallbackTemplate() {
+    if (TEMPLATE) { return true; }
+    var found = cardIdFromPage();
+    if (!found) { return false; }
+    var years = termFromDom();
+    if (!years) { return false; }
+    TEMPLATE = { cardId: found.cardId, years: years, weekcount: 20, weekcountFromApi: false };
+    DIAG.cardIdPrefix = found.cardId.slice(0, 8);
+    DIAG.cardIdSource = found.source;
+    post({
+      type: 'schedule_template',
+      card_id: found.cardId,
+      years: years,
+      weekcount: 20,
+      card_id_source: found.source
+    });
+    setTimeout(function () { window.__yunongFetchSchedule(); }, 300);
+    return true;
+  }
+
+  // ---- 自动触发：滚动/点击含"课表"的卡片，切换周选择器 ----
+  function autoTrigger() {
+    DIAG.autoTried += 1;
+    try {
+      var nodes = document.querySelectorAll('div, section, li, a, button, span');
+      for (var i = 0; i < nodes.length && i < 4000; i++) {
+        var text = (nodes[i].textContent || '').trim();
+        if (text.length > 0 && text.length <= 40 && text.indexOf('课表') >= 0) {
+          try { nodes[i].scrollIntoView({ block: 'center' }); } catch (e) {}
+          try { nodes[i].click(); } catch (e) {}
+          break;
+        }
+      }
+    } catch (e) {}
+    try {
+      var selects = document.querySelectorAll('.ant-select-selection, .ant-select, select');
+      if (selects.length) { selects[0].click(); }
+    } catch (e) {}
+    tryFallbackTemplate();
+    try { window.__yunongFetchSchedule(); } catch (e) {}
+  }
+
+  setTimeout(function () { if (!TEMPLATE) { autoTrigger(); } }, 3000);
+  setTimeout(function () { if (!TEMPLATE) { autoTrigger(); } }, 8000);
   window.__yunongFetchSchedule = function () {
     if (!TEMPLATE) {
       post({
