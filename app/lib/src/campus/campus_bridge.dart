@@ -24,6 +24,7 @@ class CampusBridge {
     this.onStage,
     this.onScheduleTemplate,
     this.onScheduleApi,
+    this.onStageChange,
   });
 
   final void Function(FetchedPage page) onFetched;
@@ -36,6 +37,9 @@ class CampusBridge {
 
   /// 批量拉周完成（原样交给 Rust 合并）
   final void Function(ScheduleApiResult result)? onScheduleApi;
+
+  /// 阶段变化：`login`（等用户登录，**不抓取**）/ `capture`（登录完成，开始抓）
+  final void Function(String stage, Map<String, dynamic>? diagnostics)? onStageChange;
 
   /// 已经拿到过课表就不再重复触发（抓取脚本可能多轮上报）。
   bool _delivered = false;
@@ -87,6 +91,18 @@ class CampusBridge {
           message: _formatDiagnostics(message['diagnostics']),
         ));
         return true;
+      case 'stage':
+        final stage = (message['stage'] as String?) ?? '';
+        if (stage.isNotEmpty) {
+          onStageChange?.call(
+            stage,
+            message['diagnostics'] is Map<String, dynamic>
+                ? message['diagnostics'] as Map<String, dynamic>
+                : null,
+          );
+        }
+        return true;
+
       case 'schedule_template':
         final template = ScheduleTemplate.fromMessage(message);
         if (template.isValid) {

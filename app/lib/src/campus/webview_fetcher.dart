@@ -160,6 +160,9 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
   Timer? _captureTimer;
   bool _templateCaptured = false;
 
+  /// 阶段：`login`（等用户登录，**不抓取**）/ `capture`（登录完成，开始抓）
+  String _stage = 'login';
+
   /// 已登录但还没拿到课表时的重试抓取（最多 20 次 × 1.5s ≈ 30s）。
   Timer? _grabTimer;
   int _grabAttempts = 0;
@@ -176,6 +179,7 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     onLoginState: _onLoginState,
     onScheduleTemplate: _onScheduleTemplate,
     onScheduleApi: widget.onFetchedSchedule,
+    onStageChange: _onStageChange,
     onStage: (FetchStage stage) {
       widget.onStage?.call(stage);
       if (stage == FetchStage.grabbed) {
@@ -222,9 +226,31 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     }
   }
 
+  /// 登录阶段 → 抓取阶段的切换（**抓取计时只在 capture 阶段才启动**）。
+  void _onStageChange(String stage, Map<String, dynamic>? diagnostics) {
+    if (!mounted) {
+      return;
+    }
+    final isCapture = stage == 'capture';
+    if (_stage != stage) {
+      setState(() => _stage = stage);
+    }
+    if (isCapture) {
+      _startCaptureTimer();
+      unawaited(_controller?.evaluateJavascript(
+        source: 'window.__yunongAutoStart && window.__yunongAutoStart();',
+      ));
+    } else {
+      // 还在登录页：不扫描、不探测、不计抓取超时
+      _stopCaptureTimer();
+    }
+  }
+
   /// 门户接口模式：等模板也有时限（脚本自己也有一段 20s 兜底，这里防注入失败/页面白屏）。
   void _startCaptureTimer() {
-    if (widget.mode != CampusFetchMode.portalApi || _templateCaptured) {
+    if (widget.mode != CampusFetchMode.portalApi ||
+        _templateCaptured ||
+        _stage != 'capture') {
       return;
     }
     _captureTimer?.cancel();
@@ -348,8 +374,8 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-          widget.mode == CampusFetchMode.portalApi && !_probe.isLoggedIn && _probe.state == CampusLoginState.needLogin
-              ? '请先登录；登录后打开一次门户里的课表卡片，会自动抓取'
+          _stage == 'login'
+              ? '请先在页面里完成登录（登录成功后会自动抓取，不需要再点按钮）'
               : _probe.hint,
           style: theme.textTheme.bodySmall,
         ),
@@ -410,15 +436,25 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       if (mounted) {
                         setState(() => _busy = false);
                       }
-                      _startCaptureTimer();
+                      // 服务端 URL 判阶段：还在 SSO 登录页就**不**启动抓取计时/扫描
+                      final host = url?.host ?? '';
+                      final path = url?.path ?? '';
+                      final onLoginPage = isSsoLoginPage(host, path);
+                      if (onLoginPage) {
+                        _stage = 'login';
+                        _stopCaptureTimer();
+                      } else {
+                        _stage = 'capture';
+                        _startCaptureTimer();
+                      }
                       final term = widget.term;
                       if (term != null && term.isNotEmpty) {
                         await _controller?.evaluateJavascript(
                           source: "window.__yunongTerm = '$term';",
                         );
                       }
-                      // 门户模式：立刻跑一次"自动优先"发现流程（不等用户点任何东西）
-                      if (widget.mode == CampusFetchMode.portalApi) {
+                      // 门户模式 + 已离开登录页：立刻跑一次"自动优先"发现流程
+                      if (widget.mode == CampusFetchMode.portalApi && !onLoginPage) {
                         await _controller?.evaluateJavascript(
                           source: 'window.__yunongAutoStart && window.__yunongAutoStart();',
                         );
