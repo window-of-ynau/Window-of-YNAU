@@ -12,6 +12,7 @@ use axum::{
 };
 use yunong_shared::ErrorCode;
 
+use crate::accounting::AuditEntry;
 use crate::api::{error::AppError, request_id::ReqId};
 use crate::auth::BEARER_PREFIX;
 use crate::state::AppState;
@@ -44,7 +45,35 @@ pub async fn require_bearer(
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
-        Err(err) => AppError::from_auth(err, &req_id.0).into_response(),
+        Err(err) => {
+            // 审计（W7）：**只记"确实带了令牌但被拒"**的情况。
+            // 完全没带令牌的请求是海量且无信息量的，逐条落库等于给攻击者一个免费的
+            // 写放大入口；这类请求仍会在 tracing 里留痕（上面那条分支）。
+            // reason 用机器可读短码，绝不放令牌内容或用户输入。
+            if err.code != ErrorCode::Internal {
+                state
+                    .accounting
+                    .record_audit_detached(AuditEntry::auth_deny(
+                        None,
+                        req_id.0.clone(),
+                        auth_deny_reason(err.code),
+                    ));
+            }
+            AppError::from_auth(err, &req_id.0).into_response()
+        }
+    }
+}
+
+/// 鉴权失败 → 审计短码。
+///
+/// `TokenExpired` 单独一类：那是"正常过期"，与"令牌伪造/被吊销"性质不同，
+/// 混在一起会让"疑似攻击"的查询被正常过期淹没。
+fn auth_deny_reason(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::TokenExpired => "token_expired",
+        ErrorCode::Unauthorized => "token_invalid",
+        ErrorCode::Forbidden => "user_forbidden",
+        _ => "auth_failed",
     }
 }
 

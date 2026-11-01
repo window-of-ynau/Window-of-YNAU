@@ -154,6 +154,19 @@ pub struct UpstreamError {
 }
 
 impl UpstreamError {
+    /// 审计用的**机器可读短码**（`audit_logs.reason`）。
+    ///
+    /// 只放分类与状态码，绝不放 `message`——那里面有内网上游地址、环境变量名、
+    /// 厂商响应片段（评审 F3/F9 的边界）。排障时用同一个 `request_id` 去日志里找详情。
+    pub fn audit_reason(&self) -> String {
+        match self.kind {
+            UpstreamErrorKind::Timeout => "upstream_timeout".to_owned(),
+            UpstreamErrorKind::Unavailable => "upstream_unavailable".to_owned(),
+            UpstreamErrorKind::BadStatus(status) => format!("upstream_status_{status}"),
+            UpstreamErrorKind::Protocol => "upstream_protocol".to_owned(),
+        }
+    }
+
     pub fn timeout(message: impl Into<String>) -> Self {
         Self {
             kind: UpstreamErrorKind::Timeout,

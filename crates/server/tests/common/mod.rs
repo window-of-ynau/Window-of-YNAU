@@ -64,6 +64,22 @@ pub struct TestDb {
 }
 
 impl TestDb {
+    /// 只含**本用例 schema** 的池（search_path 不带 `public`）。
+    ///
+    /// 用于"库里到底有没有这一列 / 这一行"这类**结构断言**：开发机和 CI 的 public
+    /// 往往已经跑过迁移，若 search_path 里带着 public，断言会观察到 public 的表而失效。
+    pub async fn pool_without_public(&self) -> PgPool {
+        let options = PgConnectOptions::from_str(&self.url)
+            .unwrap_or_else(|error| panic!("DATABASE_URL 不是合法的连接串：{error}"))
+            .application_name("yunong-pg-tests-isolated")
+            .options([("search_path", self.schema.clone())]);
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap_or_else(|error| panic!("建隔离连接池失败：{error}"))
+    }
+
     /// 没有 `DATABASE_URL` → `None`（用例直接 return，等于优雅跳过）。
     ///
     /// 有 `DATABASE_URL` 却连不上 → panic：这条路是显式开启的，环境坏了必须看得见。

@@ -37,11 +37,16 @@ pub struct UsageSample {
     pub usage: Usage,
 }
 
-/// 审计动作。
+/// 审计结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditDecision {
+    /// 我们放行了。
     Allow,
+    /// 我们**按策略**拒绝了（鉴权失败、闸门拒绝、配额）。
     Deny,
+    /// 放行了但**执行失败**（上游故障）。不是策略拒绝，别混进 deny：
+    /// 否则"被拒绝率"这类指标会被上游抖动污染。
+    Error,
 }
 
 impl AuditDecision {
@@ -49,14 +54,25 @@ impl AuditDecision {
         match self {
             Self::Allow => "allow",
             Self::Deny => "deny",
+            Self::Error => "error",
         }
     }
 }
 
+/// 审计事件类型（`audit_logs.action`）。
+pub mod audit_action {
+    /// 一次对话请求（放行 / 闸门拒绝 / 上游失败）。
+    pub const CHAT_STREAM: &str = "chat.stream";
+    /// 鉴权中间件拒绝了请求（令牌无效 / 过期 / 已吊销 / 用户被停用）。
+    pub const AUTHENTICATE: &str = "auth.authenticate";
+}
+
 /// 一条审计（对应 `audit_logs` 一行）。**不放正文**，只放动作与原因。
+///
+/// `user_id` 可空：鉴权失败时令牌本身就无效，我们不知道（也不该猜）是谁。
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
-    pub user_id: Uuid,
+    pub user_id: Option<Uuid>,
     pub action: String,
     pub target: Option<String>,
     pub decision: AuditDecision,
@@ -68,8 +84,8 @@ impl AuditEntry {
     /// 网关放行。
     pub fn allow(user_id: Uuid, req_id: impl Into<String>, target: impl Into<String>) -> Self {
         Self {
-            user_id,
-            action: "chat.stream".to_owned(),
+            user_id: Some(user_id),
+            action: audit_action::CHAT_STREAM.to_owned(),
             target: Some(target.into()),
             decision: AuditDecision::Allow,
             reason: None,
@@ -85,10 +101,48 @@ impl AuditEntry {
         reason: impl Into<String>,
     ) -> Self {
         Self {
-            user_id,
-            action: "chat.stream".to_owned(),
+            user_id: Some(user_id),
+            action: audit_action::CHAT_STREAM.to_owned(),
             target: Some(target.into()),
             decision: AuditDecision::Deny,
+            reason: Some(reason.into()),
+            req_id: req_id.into(),
+        }
+    }
+
+    /// 鉴权失败：令牌无效/过期/已吊销，或用户被停用。
+    ///
+    /// **只记"确实带了令牌但被拒"的情况**（见 `api::auth_guard`）：完全没带令牌的请求
+    /// 是海量且无信息量的，逐条落库等于给攻击者一个免费的写放大入口。
+    pub fn auth_deny(
+        user_id: Option<Uuid>,
+        req_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            user_id,
+            action: audit_action::AUTHENTICATE.to_owned(),
+            target: None,
+            decision: AuditDecision::Deny,
+            reason: Some(reason.into()),
+            req_id: req_id.into(),
+        }
+    }
+
+    /// 上游失败（超时 / 非 2xx / 不是 SSE / 流中断）。
+    ///
+    /// `reason` 只放**机器可读的短码**，绝不放厂商原文（与 F3/F9 同一条边界）。
+    pub fn upstream_error(
+        user_id: Uuid,
+        req_id: impl Into<String>,
+        target: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            user_id: Some(user_id),
+            action: audit_action::CHAT_STREAM.to_owned(),
+            target: Some(target.into()),
+            decision: AuditDecision::Error,
             reason: Some(reason.into()),
             req_id: req_id.into(),
         }
@@ -347,6 +401,33 @@ mod tests {
         assert_eq!(deny.decision.as_str(), "deny");
         assert_eq!(deny.reason.as_deref(), Some("concurrency_limit"));
         assert_eq!(deny.action, "chat.stream");
+    }
+
+    /// W7：三类事件各自的 action / decision / reason 口径。
+    #[test]
+    fn audit_covers_auth_gate_and_upstream_events() {
+        let user = Uuid::new_v4();
+
+        // 鉴权失败：不知道是谁（令牌本身就无效），所以 user_id 为空
+        let auth = AuditEntry::auth_deny(None, "req_auth", "token_expired");
+        assert_eq!(auth.action, audit_action::AUTHENTICATE);
+        assert_eq!(auth.decision, AuditDecision::Deny);
+        assert_eq!(auth.reason.as_deref(), Some("token_expired"));
+        assert!(auth.user_id.is_none(), "鉴权失败时不该编造 user_id");
+        assert!(auth.target.is_none());
+
+        // 上游失败：既不是放行也不是策略拒绝 → error
+        let upstream = AuditEntry::upstream_error(user, "req_up", "turn-9", "upstream_status_500");
+        assert_eq!(upstream.action, audit_action::CHAT_STREAM);
+        assert_eq!(upstream.decision, AuditDecision::Error);
+        assert_eq!(upstream.decision.as_str(), "error");
+        assert_eq!(upstream.reason.as_deref(), Some("upstream_status_500"));
+        assert_eq!(upstream.user_id, Some(user));
+
+        // 闸门拒绝：策略拒绝 → deny
+        let gate = AuditEntry::deny(user, "req_gate", "turn-9", "user_in_flight");
+        assert_eq!(gate.decision, AuditDecision::Deny);
+        assert_eq!(gate.reason.as_deref(), Some("user_in_flight"));
     }
 
     #[test]
