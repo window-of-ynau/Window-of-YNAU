@@ -157,6 +157,12 @@ void main() {
     )));
     await tester.tap(find.text('导入内置样本'));
     await tester.pumpAndSettle();
+    // 诊断：CI 是唯一能跑 widget test 的环境，先把现场打出来再断言。
+    // ignore: avoid_print
+    print('DIAG after-import texts: '
+        '${tester.widgetList<Text>(find.byType(Text)).map((Text t) => t.data).toList()}');
+    // ignore: avoid_print
+    print('DIAG busy indicator: ${find.byType(LinearProgressIndicator).evaluate().length}');
     expect(find.text('高等数学A'), findsOneWidget);
 
     await tester.tap(find.text('模拟页面改版'));
