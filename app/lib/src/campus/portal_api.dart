@@ -153,6 +153,93 @@ bool isSsoLoginPage(String host, String path) {
   }
   return host.contains('ssoo.ynau.edu.cn') && lowerPath.contains('login');
 }
+/// 抓取阶段"进展"的唯一时间权威（纯 Dart，时间由调用方传入，便于用假时钟单测）。
+///
+/// 之前 bug 的根源是时间戳散落在脚本与 Dart 多处、且各路径重置不一致，
+/// 导致"刚进 capture 就判死"。现在所有阈值与时间戳都集中在这里：
+/// - 进入阶段：重置阶段时间与进展时间；
+/// - 每次重扫开始 / 检测到卡片 DOM / 任何探测返回：调用 [touch]；
+/// - 判死：`stage == 'capture'` 且 `sinceLastProgress >= 15s` 且 `sinceStageEnter >= 3s`。
+class CaptureProgress {
+  CaptureProgress({required DateTime now, String stage = 'login'})
+      : _stage = stage,
+        _stageEnteredAt = now,
+        _lastProgressAt = now,
+        _lastProgress = 'init';
+
+  /// 无进展阈值：15s 什么都没发生才判死。
+  static const Duration noProgressThreshold = Duration(seconds: 15);
+
+  /// 阶段进入下限：刚进 capture 的 3s 内**绝不**判死（防"入口即判死"复现）。
+  static const Duration stageEnterFloor = Duration(seconds: 3);
+
+  String _stage;
+  DateTime _stageEnteredAt;
+  DateTime _lastProgressAt;
+  String _lastProgress;
+
+  String get stage => _stage;
+
+  /// 最后进展是什么（给人看，用于诊断）。
+  String get lastProgress => _lastProgress;
+
+  Duration sinceStageEnter(DateTime now) => now.difference(_stageEnteredAt);
+
+  Duration sinceLastProgress(DateTime now) => now.difference(_lastProgressAt);
+
+  /// 进入（或切换）阶段：时间戳全部重置。
+  void enterStage(String stage, DateTime now) {
+    _stage = stage;
+    _stageEnteredAt = now;
+    _lastProgressAt = now;
+    _lastProgress = '进入阶段 $stage';
+  }
+
+  /// 记一次进展（重扫开始 / 卡片 DOM 出现 / 探测返回 / 周数据返回 …）。
+  void touch(String what, DateTime now) {
+    _lastProgressAt = now;
+    _lastProgress = what;
+  }
+
+  /// 是否该判死（诊断里同时看 [sinceStageEnter] 与 [sinceLastProgress]）。
+  bool shouldTimeout(DateTime now) {
+    if (_stage != 'capture') {
+      return false;
+    }
+    if (sinceStageEnter(now) < stageEnterFloor) {
+      return false;
+    }
+    return sinceLastProgress(now) >= noProgressThreshold;
+  }
+}
+/// 是否该报 `CAPTURE_TIMEOUT`（保留的纯函数入口，语义等同 [CaptureProgress.shouldTimeout]）。
+///
+/// 只有**同时**满足才判死：
+/// - 阶段是 `capture`；
+/// - 进入阶段已 ≥15s（**刚进阶段绝不立刻判死**）；
+/// - 距最后进展 ≥15s；
+/// - 本次没有"扫描到新候选"、也没有探测回包。
+bool shouldReportCaptureTimeout({
+  required String stage,
+  required Duration sinceStageEnter,
+  required Duration sinceLastProgress,
+  int newCandidates = 0,
+  bool probeReturned = false,
+}) {
+  if (stage != 'capture') {
+    return false;
+  }
+  if (sinceStageEnter < CaptureProgress.stageEnterFloor) {
+    return false;
+  }
+  if (sinceLastProgress < CaptureProgress.noProgressThreshold) {
+    return false;
+  }
+  if (newCandidates > 0 || probeReturned) {
+    return false;
+  }
+  return true;
+}
 /// 一个候选 cardId（32 位 hex）+ 它在 HTML 里的上下文（用于排序与诊断，不含凭据）。
 class CardIdCandidate {
   const CardIdCandidate({required this.value, required this.context, required this.order});
@@ -381,7 +468,7 @@ const String kPortalScheduleScript = r'''
   // 诊断用：owner/我们据此判断卡在哪一步（不含任何凭据）
   var DIAG = {
     xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0,
-    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: []
+    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: [], probeParams: null
   };
   // **没有任何"从页面打开算起"的绝对超时**：只有"无进展兜底"（见 watchdog）
   var LAST_PROGRESS = { at: Date.now(), what: 'start' };
@@ -495,7 +582,8 @@ const String kPortalScheduleScript = r'''
       candidates: DIAG.candidates,
       years: DIAG.years || '',
       probeFailed: DIAG.probeFailed,
-      probeResults: DIAG.probeResults
+      probeResults: DIAG.probeResults,
+      probeParams: DIAG.probeParams
     });
   };
 

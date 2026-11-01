@@ -158,11 +158,11 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
 
   /// 门户接口模式下：20s 内没捕获到课表请求就明确报错（绝不静默挂起）。
   Timer? _progressTimer;
-  DateTime _lastProgressAt = DateTime.now();
+  /// 进展/阶段时间的唯一权威（阈值与重置逻辑集中在 CaptureProgress，可单测）
+  CaptureProgress _progress = CaptureProgress(now: DateTime.now());
   bool _templateCaptured = false;
 
-  /// 阶段：`login`（等用户登录，**不抓取**）/ `capture`（登录完成，开始抓）
-  String _stage = 'login';
+  String get _stage => _progress.stage;
 
   /// 已登录但还没拿到课表时的重试抓取（最多 20 次 × 1.5s ≈ 30s）。
   Timer? _grabTimer;
@@ -234,7 +234,9 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     }
     final isCapture = stage == 'capture';
     if (_stage != stage) {
-      setState(() => _stage = stage);
+      setState(() {
+        _progress.enterStage(stage, DateTime.now());
+      });
     }
     _markProgress();
     if (isCapture) {
@@ -254,11 +256,11 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
       return;
     }
     _progressTimer ??= Timer.periodic(const Duration(seconds: 1), (_) async {
-      // 只有 capture 阶段才可能报超时（等待登录/等待卡片永不报）
-      if (_templateCaptured || _stage != 'capture') {
+      if (_templateCaptured) {
         return;
       }
-      if (DateTime.now().difference(_lastProgressAt) < const Duration(seconds: 15)) {
+      // 判死语义集中在 CaptureProgress（有单测：刚进阶段 3s 内、刚有进展都不可能立刻超时）
+      if (!_progress.shouldTimeout(DateTime.now())) {
         return;
       }
       _stopProgressWatchdog();
@@ -278,8 +280,8 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     _progressTimer = null;
   }
 
-  void _markProgress() {
-    _lastProgressAt = DateTime.now();
+  void _markProgress([String what = '进展']) {
+    _progress.touch(what, DateTime.now());
   }
 
   /// 捕获到门户课表接口模板 → 自动批量拉周（用户不需要再点按钮）。
@@ -451,10 +453,10 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       final path = url?.path ?? '';
                       final onLoginPage = isSsoLoginPage(host, path);
                       if (onLoginPage) {
-                        _stage = 'login';
+                        _progress.enterStage('login', DateTime.now());
                       } else {
                         // 已离开登录页：进入"等待卡片"，计时改为无进展兜底（不是绝对 20s）
-                        _stage = 'waiting_card';
+                        _progress.enterStage('waiting_card', DateTime.now());
                         _markProgress();
                         _startProgressWatchdog();
                       }
