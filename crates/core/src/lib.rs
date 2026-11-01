@@ -13,6 +13,7 @@ pub mod calendar;
 pub mod context;
 pub mod error;
 pub mod gateway;
+pub mod ics;
 pub mod index;
 pub mod keystore;
 pub mod memory;
@@ -37,13 +38,14 @@ pub fn version() -> &'static str {
 
 /// 常用导入。
 pub mod prelude {
-    pub use crate::calendar::{parse_weeks, Course, Occurrence, PeriodTime};
+    pub use crate::calendar::{parse_term_start, parse_weeks, Course, IcsEvent};
     pub use crate::context::{estimate_tokens, plan_compaction, should_compress, CompactionPlan};
     pub use crate::error::{CoreError, CoreResult};
     pub use crate::gateway::{
         collect_chunks, ApiKeySource, CloudProxy, DirectProvider, Flow, ModelGateway,
         StreamOutcome, Timeouts,
     };
+    pub use crate::ics::{build_events, export_term_ics, IcsExport};
     pub use crate::index::{Bm25Index, LocalIndex, SearchHit};
     pub use crate::keystore::{SecretKind, SecretStore};
     pub use crate::memory::{Blob, BlobKind, MemoryStore, Message};
