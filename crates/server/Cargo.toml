@@ -34,6 +34,9 @@ futures-core = "0.3"
 dotenvy = "0.15"
 anyhow = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "migrate"] }
+# 上游转发用的 HTTP 客户端：生产上游（DeepSeek / Anthropic）都是 https，
+# TLS 走 rustls + webpki 根证书；刻意不加 `stream` feature——SSE 用 `response.chunk()` 循环读。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # 鉴权：密码哈希（Argon2id）与令牌摘要（SHA-256 → hex）
 argon2 = "0.5"
 sha2 = "0.10"

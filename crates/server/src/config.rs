@@ -1,10 +1,11 @@
 //! 配置：全部来自环境变量，有安全默认值。
 
 use std::env;
+use std::time::Duration;
 
 use yunong_shared::MAX_INPUT_TOKENS;
 
-use crate::upstream::UpstreamConfig;
+use crate::upstream::{Timeouts, UpstreamConfig};
 
 /// 服务端运行期配置。所有字段都可用环境变量覆盖（见 [`Config::from_env`]）。
 #[derive(Debug, Clone)]
@@ -22,10 +23,12 @@ pub struct Config {
     // ---- W2b：SSE 代理 ----
     /// 全局闸门排队上限（毫秒）。`docs/02` §8.1：排队 ≤ 5s 后 429；0 = 不排队、直接拒
     pub concurrency_queue_ms: u64,
-    /// 连上游超时（秒）
+    /// 连上游超时（秒）：DNS + TCP + TLS 握手
     pub upstream_connect_timeout_secs: u64,
-    /// 上游首字节 / 空闲超时（秒）：超时 → 504 `UPSTREAM_TIMEOUT`
-    pub upstream_read_timeout_secs: u64,
+    /// 首事件超时（秒）：响应头 + 第一个 token；推理模型常要 30~60s，超时 → 504
+    pub upstream_first_event_timeout_secs: u64,
+    /// 事件之间允许的最长空转（秒）；**不设总时长上限**，长回答本来就慢
+    pub upstream_idle_timeout_secs: u64,
     /// SSE 心跳间隔（秒），0 = 不心跳。`docs/03` §10 要求 15s
     pub sse_heartbeat_secs: u64,
     /// usage 抽样百分比（0..=100），默认 1 = 1%（ADR-03：抽样成本监控，不是账单）
@@ -45,8 +48,9 @@ impl Config {
             concurrency_limit: env_parse("CONCURRENCY_LIMIT", 50),
             max_input_tokens: env_parse("MAX_INPUT_TOKENS", MAX_INPUT_TOKENS),
             concurrency_queue_ms: env_parse("CONCURRENCY_QUEUE_MS", 5_000),
-            upstream_connect_timeout_secs: env_parse("UPSTREAM_CONNECT_TIMEOUT_SECS", 5),
-            upstream_read_timeout_secs: env_parse("UPSTREAM_READ_TIMEOUT_SECS", 30),
+            upstream_connect_timeout_secs: env_parse("UPSTREAM_CONNECT_TIMEOUT_SECS", 10),
+            upstream_first_event_timeout_secs: env_parse("UPSTREAM_FIRST_EVENT_TIMEOUT_SECS", 90),
+            upstream_idle_timeout_secs: env_parse("UPSTREAM_IDLE_TIMEOUT_SECS", 30),
             sse_heartbeat_secs: env_parse("SSE_HEARTBEAT_SECS", 15),
             usage_sample_percent: env_parse("USAGE_SAMPLE_PERCENT", 1).min(100),
             upstream: UpstreamConfig::from_env(),
@@ -65,10 +69,20 @@ impl Config {
             max_input_tokens: MAX_INPUT_TOKENS,
             concurrency_queue_ms: 0,
             upstream_connect_timeout_secs: 2,
-            upstream_read_timeout_secs: 5,
+            upstream_first_event_timeout_secs: 5,
+            upstream_idle_timeout_secs: 5,
             sse_heartbeat_secs: 0,
             usage_sample_percent: 1,
             upstream: UpstreamConfig::default(),
+        }
+    }
+
+    /// 上游分段超时（语义见 [`Timeouts`]）。
+    pub fn upstream_timeouts(&self) -> Timeouts {
+        Timeouts {
+            connect: Duration::from_secs(self.upstream_connect_timeout_secs),
+            first_event: Duration::from_secs(self.upstream_first_event_timeout_secs),
+            idle: Duration::from_secs(self.upstream_idle_timeout_secs),
         }
     }
 }
@@ -105,12 +119,24 @@ mod tests {
     }
 
     #[test]
+    fn upstream_timeouts_are_staged() {
+        // 分段超时：首事件要能容忍推理模型的冷启动，总时长不设上限
+        let timeouts = Config::from_env().upstream_timeouts();
+        assert_eq!(timeouts.connect, Duration::from_secs(10));
+        assert_eq!(timeouts.first_event, Duration::from_secs(90));
+        assert_eq!(timeouts.idle, Duration::from_secs(30));
+        assert!(
+            timeouts.first_event > timeouts.idle,
+            "首事件预算必须比空闲预算宽"
+        );
+    }
+
+    #[test]
     fn defaults_match_the_design_doc() {
         // docs/02 §8.1：全局 50 并发、排队 ≤5s；docs/03 §10：15s 心跳
         let c = Config::from_env();
         assert!(c.concurrency_limit > 0);
         assert_eq!(c.sse_heartbeat_secs, 15);
         assert_eq!(c.usage_sample_percent, 1);
-        assert!(c.upstream_read_timeout_secs > 0);
     }
 }

@@ -9,6 +9,7 @@ use crate::accounting::UsageRecorder;
 use crate::auth::AuthService;
 use crate::config::Config;
 use crate::gate::TurnGate;
+use crate::upstream::UpstreamClient;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -21,6 +22,8 @@ pub struct AppState {
     pub gate: Arc<TurnGate>,
     /// 1% 抽样记账 + 审计。写库失败只记 warn，不影响对话流。
     pub accounting: Arc<UsageRecorder>,
+    /// 上游客户端：复用一个 `reqwest::Client`（连接池 + TLS 会话复用）。
+    pub upstream: Arc<UpstreamClient>,
     started_at: Instant,
 }
 
@@ -32,12 +35,17 @@ impl AppState {
             Duration::from_millis(config.concurrency_queue_ms),
         ));
         let accounting = Arc::new(UsageRecorder::new(db.clone(), config.usage_sample_percent));
+        let upstream = Arc::new(UpstreamClient::new(
+            config.upstream.clone(),
+            config.upstream_timeouts(),
+        ));
         Self {
             config: Arc::new(config),
             db,
             auth,
             gate,
             accounting,
+            upstream,
             started_at: Instant::now(),
         }
     }
@@ -73,10 +81,18 @@ mod tests {
         let mut config = Config::for_tests();
         config.concurrency_limit = 7;
         config.usage_sample_percent = 3;
+        config.upstream_connect_timeout_secs = 3;
         let state = AppState::new(config, None);
         assert_eq!(state.gate.limit(), 7);
         assert_eq!(state.accounting.sample_percent(), 3);
         assert_eq!(state.gate.in_flight(), 0);
+        // 上游客户端按配置的超时构建（方便测试里调小首事件超时）
+        assert_eq!(state.upstream.timeouts().connect.as_secs(), 3);
+        // 没配上游时，provider 查询是 None（chat 端点会回 502）
+        assert!(state
+            .upstream
+            .provider(yunong_shared::Protocol::OpenaiCompletions)
+            .is_none());
         // 无数据库模式：鉴权自动落到内存后端，本地骨架照样能跑
         assert_eq!(state.auth.backend_kind(), "memory");
     }

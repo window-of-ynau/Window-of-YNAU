@@ -3,8 +3,9 @@
 //! 只做 wire 层的事（行切分、多行 `data` 合并、注释行忽略），不理解 JSON——
 //! 语义交给 `yunong_core::protocols::parse_events`。
 //!
-//! 为什么手写：归一化只需要 `data:` 负载；上游的 `event:` 名字三家都不一样，
-//! 而且 Completions 根本不带 `event:`。少一层依赖，也少一处行为分叉。
+//! 为什么还需要它：HTTP 传输交给 `reqwest`（TLS / 分块解码 / 重定向都是它的事），
+//! 但它只给"没凑齐一行的字节块"。归一化只要 `data:` 负载——上游的 `event:` 名字
+//! 三家都不一样，Completions 干脆不带 `event:`，所以帧切分这一层留着更省事。
 
 /// 增量解码器：可以喂任意切分的字节片段（网络读到的边界不可控）。
 #[derive(Debug, Default)]
