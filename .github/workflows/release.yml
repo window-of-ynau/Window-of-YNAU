@@ -82,7 +82,7 @@ jobs:
             | tr '[:upper:]' '[:lower:]' >> "$GITHUB_OUTPUT"
       # 只 load 到 runner 本地：冒烟通过之后才推，顺序不能反
       - name: 构建（load 到本地，先不推送）
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile.server
