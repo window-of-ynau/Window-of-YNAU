@@ -321,11 +321,10 @@ mod tests {
         let result = call_import("<html><body>登录页</body></html>", "t1", &db);
         assert_eq!(result["ok"], false, "{result}");
         assert_eq!(result["code"], "PARSE_FAILED");
+        // 断言**错误码**（稳定契约），不断言文案：文案会随实现调整，且 CI 与本地时序不同，
+        // 锁死文案的测试迟早会红（t2 的教训）。用户可见的固定文案在 Dart 侧 `describeFailure`。
         let message = result["message"].as_str().unwrap();
-        assert!(
-            message.contains("页面可能已改版") || message.contains("可能已改版"),
-            "文案必须面向用户：{message}"
-        );
+        assert!(!message.trim().is_empty(), "失败必须带可读的 message");
         // 失败时不能建库/落空表
         let listed = call_list("t1", &db);
         assert_eq!(listed["ok"], true);

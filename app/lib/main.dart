@@ -7,6 +7,9 @@
 
 import 'package:flutter/material.dart';
 
+import 'src/campus/timetable_page.dart';
+import 'src/core/timetable_service.dart';
+
 void main() => runApp(const YunongApp());
 
 /// 校务入口（阶段一只做导航；登录与取数在 WebView 里完成，见 ADR-11）。
@@ -161,8 +164,15 @@ class _CampusPane extends StatelessWidget {
 
   final CampusEntry entry;
 
+  /// 课表服务：进程内复用一个实例（核心库只加载一次）。
+  static final TimetableService _service = TimetableService();
+
   @override
   Widget build(BuildContext context) {
+    // 课表入口：真实链路（WebView 抓取 / 调试导入 → Rust 解析 → SQLite → 列表）
+    if (entry == CampusEntry.timetable) {
+      return TimetablePage(service: _service);
+    }
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),

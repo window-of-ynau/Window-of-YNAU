@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!--
+  调试样本：一份结构完整的课表页（与教务系统导出的形态一致）。
+  用途：不依赖 WebView 也能验通「解析 → 落库 → 列表」这条链路。
+  注意：这是**假的课程数据**，不是真实课表。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>学生课表（调试样本）</title>
+</head>
+<body>
+  <h2>2026-2027 学年第一学期 课表</h2>
+  <table id="timetable" class="Nsb_r_list">
+    <tr>
+      <th>节次</th>
+      <th>星期一</th>
+      <th>星期二</th>
+      <th>星期三</th>
+      <th>星期四</th>
+      <th>星期五</th>
+      <th>星期六</th>
+      <th>星期日</th>
+    </tr>
+    <tr>
+      <th>第1节</th>
+      <td>
+        <div class="kbcontent">
+          <font>高等数学A</font>
+          <font title="教师">张老师</font>
+          <font title="周次(节次)">1-16[01-02节]</font>
+          <font title="教室">东校区1教305</font>
+        </div>
+      </td>
+      <td></td>
+      <td>
+        <div class="kbcontent">
+          <font>大学英语</font>
+          <font title="教师">李老师</font>
+          <font title="周次(节次)">1-16[01-02节]</font>
+          <font title="教室">东校区2教101</font>
+        </div>
+      </td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <th>第3节</th>
+      <td></td>
+      <td>
+        <div class="kbcontent">
+          <font>数据结构</font>
+          <font title="教师">王老师</font>
+          <font title="周次(节次)">1-8[03-04节]</font>
+          <font title="教室">信息楼A203</font>
+        </div>
+      </td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+  </table>
+</body>
+</html>
