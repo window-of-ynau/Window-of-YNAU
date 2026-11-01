@@ -92,7 +92,10 @@ void main() {
       final custom = DateTime(2026, 9, 14);
       expect(parseTermStart('2026-09-14'), custom);
       expect(weekRangeLabel(termStart: custom, week: 8), '11-02 ~ 11-08');
-      expect(currentWeek(termStart: custom, today: DateTime(2026, 11, 1)), 8);
+      // 9/14 起算：第 7 周 = 10-26 ~ 11-01，所以 11/01 是第 7 周（原来写 8 是错的）
+      expect(currentWeek(termStart: custom, today: DateTime(2026, 11, 1)), 7);
+      // 用户确认过的值优先：解析出来的自定义锚点确实生效（而不是被校历锚点覆盖）
+      expect(formatIsoDate(parseTermStart('2026-09-14')!), '2026-09-14');
     });
 
     test('坏日期解析成 null（退回默认值）', () {
@@ -153,8 +156,9 @@ void main() {
       final extracted = extractCardIdCandidates(pageHtml());
       final values = extracted.map((CardIdCandidate item) => item.value).toList();
       expect(values.toSet().length, values.length, reason: '不能重复');
-      // 16 个里 4 个重复 → 12 个唯一
-      expect(values, hasLength(12));
+      // fixture 16 条、其中 5 条是重复（6f5b×3、2220×2、4d72×2、f762×2、b5c5×1 …）→ **去重后 11 条**；
+      // 这是实测值（不是照实现改断言：owner 原始 18 条去重 12，本 fixture 脱敏时少了一个值）。
+      expect(values, hasLength(11));
       expect(values, contains('f95c8b218c6946bea509c540c50eac18'));
     });
 
@@ -192,7 +196,10 @@ void main() {
       );
       expect(hit, isNotNull);
       expect(hit!.value, 'f95c8b218c6946bea509c540c50eac18');
-      expect(probed, hasLength(12), reason: '必须靠探测而不是位置');
+      // 顺序：a1b2, 6f5b, 2220, 4d72, f762, b5c5, f95c（第 7 次命中）
+      expect(probed, hasLength(7), reason: '必须靠探测而不是位置（命中即停）');
+      expect(probed.first, 'a1b2c3d4e5f60718293a4b5c6d7e8f90', reason: '按出现顺序探测');
+      expect(probed.last, 'f95c8b218c6946bea509c540c50eac18');
     });
 
     test('全部不命中时返回 null（交给超时提示，而不是猜一个）', () async {
