@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 
 pub mod calendar;
+pub mod chat_ffi;
 pub mod context;
 pub mod error;
 pub mod gateway;

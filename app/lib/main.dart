@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 
 import 'src/campus/campus_entries.dart';
 import 'src/campus/timetable_page.dart';
+import 'src/chat/chat_page.dart';
 import 'src/campus/webview_fetcher.dart';
 import 'src/core/timetable_service.dart';
 
@@ -119,33 +120,12 @@ class _HomeShellState extends State<HomeShell> {
   }
 }
 
-/// 对话主区（占位）。
+/// 对话主区：真正的流式对话（`ChatPage`）。
 class _ChatPane extends StatelessWidget {
   const _ChatPane();
 
   @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Icon(Icons.window, size: 64),
-            const SizedBox(height: 16),
-            Text('你好，我是云农之窗', style: Theme.of(context).textTheme.titleLarge),
-            const SizedBox(height: 8),
-            const Text('问课表、加日程、查规章 —— 一句话就行', textAlign: TextAlign.center),
-            const SizedBox(height: 24),
-            const Text(
-              'W1 骨架：对话与流式将在 W2 接 Rust 核心',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+  Widget build(BuildContext context) => const ChatPage();
 }
 
 /// 校务入口（后续替换为真实 WebView；Cookie 只留在本机，ADR-11）。
@@ -166,6 +146,9 @@ class _CampusPane extends StatelessWidget {
     if (entry == CampusEntry.timetable) {
       return TimetablePage(service: _service, fetcher: _fetcher);
     }
+    return const ChatPage(
+    );
+    // ignore: dead_code
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),

@@ -23,8 +23,9 @@
 //! | `TERM_START_UNKNOWN` | 学期开学日未确认/无法识别（**绝不猜默认日期**） | "请先确认本学期开学日期" |
 //! | `INTERNAL` | 兜底 | "内部错误" |
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
@@ -632,6 +633,129 @@ pub unsafe extern "C" fn yunong_memory_delete(
     })
 }
 
+// ---------------------------------------------------------------------------
+// 流式对话（W7 P0）：回调式 FFI
+// ---------------------------------------------------------------------------
+
+/// 流式回调：`chunk_json` **只在本次回调期间有效**（Rust 分配、Rust 释放，Dart 侧绝不能 free）；
+/// 返回 `1` = 调用方要求取消（停止读取上游），`0` = 继续。
+pub type ChatChunkCallback =
+    unsafe extern "C" fn(chunk_json: *const c_char, user: *mut c_void) -> i32;
+
+static CHAT_CANCEL: OnceLock<crate::chat_ffi::CancelRegistry> = OnceLock::new();
+
+fn chat_cancel_registry() -> &'static crate::chat_ffi::CancelRegistry {
+    CHAT_CANCEL.get_or_init(crate::chat_ffi::CancelRegistry::new)
+}
+
+/// 原始回调指针 + user data 的 `Send` 包装。
+///
+/// 安全前提：`user` 由调用方保证在流结束前有效（Dart 侧是 `NativeCallable.listener` 的
+/// 端口 id，跨线程投递是安全的）；回调本身必须线程安全。
+struct ChatCallback {
+    on_chunk: ChatChunkCallback,
+    user: *mut c_void,
+}
+
+#[allow(unsafe_code)]
+unsafe impl Send for ChatCallback {}
+
+impl ChatCallback {
+    fn emit(&self, json: &str) -> bool {
+        let Ok(text) = CString::new(json.replace('\0', "")) else {
+            return true;
+        };
+        // catch_unwind：Dart 侧回调抛异常不能把 Rust 进程带崩
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            (self.on_chunk)(text.as_ptr(), self.user)
+        }));
+        // 字符串 `text` 在本次调用期间有效，返回后即释放（Dart 侧不得保存指针）
+        drop(text);
+        match result {
+            Ok(value) => value == 0,
+            Err(_) => false,
+        }
+    }
+}
+
+/// 发起一次流式对话，立刻返回 handle（>0）。每个 Chunk 通过 `on_chunk` 回调交付；
+/// 流内的错误也以 `Chunk::Error` 回调，**不会**用返回值/异常表达。
+///
+/// 返回 `0` 表示入参无效（空指针 / 空 JSON）；此时不会启动线程。
+///
+/// # Safety
+///
+/// - `request_json` / `db_path`：NUL 结尾 UTF-8 字符串，调用期间有效；
+/// - `on_chunk`：必须是非空的、线程安全的函数指针；
+/// - `user`：原样回传给回调，生命周期由调用方保证。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_chat_stream(
+    request_json: *const c_char,
+    _db_path: *const c_char,
+    on_chunk: Option<ChatChunkCallback>,
+    user: *mut c_void,
+) -> i64 {
+    let Some(callback) = on_chunk else {
+        return 0;
+    };
+    let Ok(request) = read_arg(request_json, "request_json") else {
+        return 0;
+    };
+    let request = request.to_owned();
+    let handle = chat_cancel_registry().allocate() as i64;
+    let callback = ChatCallback {
+        on_chunk: callback,
+        user,
+    };
+
+    std::thread::spawn(move || {
+        let registry = chat_cancel_registry();
+        let cancelled = || registry.is_cancelled(handle as u64);
+        let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let parsed = match crate::chat_ffi::ChatRunConfig::parse(&request) {
+                Ok(config) => config,
+                Err((code, message)) => {
+                    callback.emit(&crate::chat_ffi::error_chunk_json(code, message));
+                    return;
+                }
+            };
+            let result = crate::chat_ffi::run_stream(parsed, |json| {
+                if cancelled() {
+                    return false;
+                }
+                callback.emit(&json)
+            });
+            if let Err((code, message)) = result {
+                callback.emit(&crate::chat_ffi::error_chunk_json(code, message));
+            }
+        }));
+        if body.is_err() {
+            callback.emit(&crate::chat_ffi::error_chunk_json(
+                yunong_shared::ErrorCode::Internal,
+                "内部错误：流式对话线程发生 panic",
+            ));
+        }
+        registry.release(handle as u64);
+    });
+
+    handle
+}
+
+/// 取消某条流（handle 由 [`yunong_chat_stream`] 返回）。
+///
+/// 可重复调用；流已结束时返回 `1`（幂等，不算错）。
+///
+/// # Safety
+///
+/// 无指针参数，任何线程调用都安全。
+#[no_mangle]
+pub extern "C" fn yunong_chat_cancel(handle: i64) -> i32 {
+    if handle <= 0 {
+        return 1;
+    }
+    chat_cancel_registry().cancel(handle as u64);
+    1
+}
 /// 释放本模块返回的字符串。传 null 是安全的空操作。
 ///
 /// # Safety
@@ -1360,5 +1484,67 @@ mod tests {
             1
         );
         let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+    // ---------------------------------------------------------------------
+    // 流式对话 FFI（W7 P0）
+    // ---------------------------------------------------------------------
+
+    extern "C" fn collect_chunk(chunk_json: *const c_char, user: *mut c_void) -> i32 {
+        let sink = unsafe { &mut *(user as *mut Vec<String>) };
+        let text = unsafe { CStr::from_ptr(chunk_json) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        sink.push(text);
+        0
+    }
+
+    #[test]
+    fn chat_stream_delivers_config_errors_as_chunks() {
+        // 缺 API Key：不应崩，也不应走"返回值报错"，而是回一条 Chunk::Error
+        let json = CString::new(r#"{"channel":"byok","model":"m","messages":[]}"#).unwrap();
+        let db = CString::new(":memory:").unwrap();
+        let mut sink: Vec<String> = Vec::new();
+        let handle = unsafe {
+            yunong_chat_stream(
+                json.as_ptr(),
+                db.as_ptr(),
+                Some(collect_chunk),
+                &mut sink as *mut Vec<String> as *mut c_void,
+            )
+        };
+        assert!(handle > 0, "合法调用必须返回 handle");
+        for _ in 0..400 {
+            if !sink.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!sink.is_empty(), "必须通过回调交付错误");
+        let value: Value = serde_json::from_str(&sink[0]).unwrap();
+        assert_eq!(value["type"], "error");
+        assert!(!value["message"].as_str().unwrap().is_empty());
+        // 收尾：取消（幂等）+ 句柄最终会被回收
+        assert_eq!(yunong_chat_cancel(handle), 1);
+        assert_eq!(yunong_chat_cancel(handle), 1);
+    }
+
+    #[test]
+    fn chat_stream_rejects_null_arguments_without_spawning() {
+        let db = CString::new(":memory:").unwrap();
+        let handle = unsafe {
+            yunong_chat_stream(
+                std::ptr::null(),
+                db.as_ptr(),
+                Some(collect_chunk),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(handle, 0);
+        // 没有回调也返回 0（Dart 侧拿不到流）
+        let json = CString::new("{}").unwrap();
+        let handle =
+            unsafe { yunong_chat_stream(json.as_ptr(), db.as_ptr(), None, std::ptr::null_mut()) };
+        assert_eq!(handle, 0);
     }
 }
