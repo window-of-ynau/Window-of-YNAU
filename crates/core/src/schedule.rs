@@ -153,12 +153,11 @@ pub fn merge(payload: &SchedulePayload) -> MergedSchedule {
     let mut courses: Vec<Course> = Vec::new();
     for (key, by_day) in slots {
         for (day, periods) in by_day {
-            let mut iter = periods.into_iter().peekable();
             let mut range_start: u8 = 0;
             let mut range_end: u8 = 0;
             let mut range_weeks: BTreeSet<u32> = BTreeSet::new();
             let mut open = false;
-            while let Some((period, weeks)) = iter.next() {
+            for (period, weeks) in periods {
                 if open && period == range_end + 1 && weeks == range_weeks {
                     range_end = period;
                     continue;
