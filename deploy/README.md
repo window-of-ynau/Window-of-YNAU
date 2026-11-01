@@ -209,6 +209,9 @@ mock 上游(假 SSE) ← 服务端容器 ← 脚本客户端（注册 → 登录
 
 本地复现（需要 Docker，Windows/macOS/Linux 都行；容器通过 `host.docker.internal` 访问本机 mock）：
 
+> mock 必须监听 `0.0.0.0`：Linux runner 上容器里的 `host.docker.internal` 是 docker 网关 IP，
+> 只绑 `127.0.0.1` 时 CI 连不上（本机 Docker Desktop 会做转发，所以只在 CI 暴露过）。脚本已经这么传参。
+
 ```bash
 docker build -f deploy/Dockerfile.server -t yunong-server:ci .
 python3 scripts/e2e-chat.py --image yunong-server:ci

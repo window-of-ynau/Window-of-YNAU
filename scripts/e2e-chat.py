@@ -230,8 +230,11 @@ def main() -> int:
     try:
         log("1/7 起 mock 上游（本机进程，容器通过 host.docker.internal 访问）")
         mock_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mock-upstream", "mock_upstream.py")
+        # 必须绑 0.0.0.0：Linux runner 上容器的 host.docker.internal 是 docker 网关 IP
+        # （不是宿主机回环），只监听 127.0.0.1 会连不上（本地 Docker Desktop 会做转发，
+        # 所以这个坑只在 CI 上暴露过一次）。mock 只活几秒且不接受真实凭据。
         mock_proc = subprocess.Popen(
-            [sys.executable, mock_script, "--port", str(args.mock_port)],
+            [sys.executable, mock_script, "--host", "0.0.0.0", "--port", str(args.mock_port)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
         )

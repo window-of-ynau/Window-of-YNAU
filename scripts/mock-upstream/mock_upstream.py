@@ -14,8 +14,12 @@
 
 用法::
 
-    python3 scripts/mock-upstream/mock_upstream.py --port 18765
+    python3 scripts/mock-upstream/mock_upstream.py --host 0.0.0.0 --port 18765
     # 然后让服务端把 UPSTREAM_*_URL 指向 http://host.docker.internal:18765
+    #
+    # 注意 `--host 0.0.0.0`：Linux runner 上容器里的 `host.docker.internal` 指向 docker
+    # 网关 IP（不是宿主机回环），只监听 127.0.0.1 会连不上。Docker Desktop 会做转发，
+    # 两种写法本机都能通，所以统一用 0.0.0.0（mock 只活几秒、不接受真实凭据）。
 
 说明：这是 infra 的 CI 闭环专用 mock。仓库里另有 ``crates/core/examples/fake_sse.rs``
 （lead-client 为人工联调加的），它只支持 ok/429/html 三种形态、且不含流内错误帧与挂起，
