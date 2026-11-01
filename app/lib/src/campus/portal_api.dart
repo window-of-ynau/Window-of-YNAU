@@ -39,6 +39,41 @@ const Map<String, String> kSeededTermStarts = <String, String>{
 DateTime? suggestedTermStart(String term) =>
     parseTermStart(kSeededTermStarts[term] ?? '');
 
+/// 展开周次字符串（`1-16` / `1-8,10-16` / `1,3,5`）为周号集合。
+/// 解析不出来就返回空集合（不做猜测）。
+Set<int> expandWeeks(String spec) {
+  final weeks = <int>{};
+  for (final part in spec.split(',')) {
+    final text = part.trim();
+    if (text.isEmpty) {
+      continue;
+    }
+    final dash = text.indexOf('-');
+    if (dash > 0) {
+      final start = int.tryParse(text.substring(0, dash).trim());
+      final end = int.tryParse(text.substring(dash + 1).trim());
+      if (start != null && end != null && start <= end && end - start <= 60) {
+        for (var week = start; week <= end; week++) {
+          weeks.add(week);
+        }
+      }
+      continue;
+    }
+    final single = int.tryParse(text);
+    if (single != null && single > 0) {
+      weeks.add(single);
+    }
+  }
+  return weeks;
+}
+
+/// 这门课在第 `week` 周是否有课。
+bool occursInWeek(String weeksSpec, int week) {
+  if (week < 1) {
+    return false;
+  }
+  return expandWeeks(weeksSpec).contains(week);
+}
 /// 取某天所在周的周一（本地时区，忽略时分秒）。
 DateTime mondayOf(DateTime day) {
   final date = DateTime(day.year, day.month, day.day);

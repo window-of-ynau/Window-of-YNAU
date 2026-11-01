@@ -226,6 +226,31 @@ void main() {
     });
   });
 
+
+  group('周次筛选（默认当前周 + 切周）', () {
+    test('区间展开：1-16 / 1-8,10-16 / 单周 / 空', () {
+      expect(expandWeeks('1-16'), containsAll(<int>[1, 8, 16]));
+      expect(expandWeeks('1-16').length, 16);
+      expect(expandWeeks('1-8,10-16'), isNot(contains(9)));
+      expect(expandWeeks('1-8,10-16').length, 15);
+      expect(expandWeeks('5'), <int>{5});
+      expect(expandWeeks(''), isEmpty);
+      expect(expandWeeks('乱写'), isEmpty);
+    });
+
+    test('某周是否有课', () {
+      expect(occursInWeek('1-16', 8), isTrue);
+      expect(occursInWeek('1-8', 9), isFalse);
+      expect(occursInWeek('1-8,10-16', 9), isFalse);
+      expect(occursInWeek('1-8,10-16', 10), isTrue);
+      expect(occursInWeek('1-8', 0), isFalse);
+    });
+
+    test('默认周：2026-09-07 锚点下 2026-11-01 是第 8 周', () {
+      final week = currentWeek(termStart: DateTime(2026, 9, 7), today: DateTime(2026, 11, 1));
+      expect(week, 8);
+    });
+  });
   group('SSO 登录页判定（登录等待阶段不抓取）', () {
     test('登录页：host+path 都命中', () {
       expect(isSsoLoginPage('ssoo.ynau.edu.cn', '/lyuapServer/login'), isTrue);

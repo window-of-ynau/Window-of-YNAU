@@ -55,6 +55,12 @@ class _TimetablePageState extends State<TimetablePage> {
   /// 确认后持久化到 `terms.starts_on`，下次直接读库。
   DateTime? _termStartDraft;
   bool _termStartSaved = false;
+
+  /// 本学期总周数（来自接口 weekcount；未知时允许自由翻页）
+  int? _weekcount;
+
+  /// 当前查看的周（默认定位到"今天所在周"，算不出来才回第 1 周）
+  int? _selectedWeek;
   String? _notice;
 
   @override
@@ -165,6 +171,64 @@ class _TimetablePageState extends State<TimetablePage> {
     );
   }
 
+  /// 今天所在周（用学期锚点算）；算不出来返回 null。
+  int? get _todayWeek {
+    final draft = _termStartDraft;
+    if (draft == null) {
+      return null;
+    }
+    final week = currentWeek(termStart: draft, today: DateTime.now());
+    if (week == null || week < 1) {
+      return null;
+    }
+    return week;
+  }
+
+  /// 视图默认周：当前周优先；算不出来 / 超出总周数时回第 1 周。
+  int _resolveInitialWeek() {
+    final week = _todayWeek;
+    if (week == null) {
+      return 1;
+    }
+    final total = _weekcount;
+    if (total != null && week > total) {
+      return 1;
+    }
+    return week;
+  }
+
+  int get _week => _selectedWeek ??= _resolveInitialWeek();
+
+  void _changeWeek(int delta) {
+    final next = _week + delta;
+    if (next < 1) {
+      return;
+    }
+    final total = _weekcount;
+    if (total != null && next > total) {
+      return;
+    }
+    setState(() => _selectedWeek = next);
+  }
+
+  /// 当前周要展示的课（按 courses.weeks 过滤）。
+  List<StoredCourse> get _visibleCourses {
+    final week = _week;
+    return _courses
+        .where((StoredCourse course) => occursInWeek(course.weeks, week))
+        .toList(growable: false);
+  }
+
+  bool get _isThisWeek => _todayWeek != null && _week == _todayWeek;
+
+  /// `第 N 周 · 本周（MM-DD ~ MM-DD）`：当前周才带"本周"。
+  String get _weekTitle {
+    final week = _week;
+    final draft = _termStartDraft;
+    final range = draft == null ? '' : weekRangeLabel(termStart: draft, week: week);
+    final suffix = _isThisWeek ? ' · 本周' : '';
+    return range.isEmpty ? '第 $week 周$suffix' : '第 $week 周$suffix（$range）';
+  }
   Widget _buildBody(ThemeData theme) {
     if (_busy && _courses.isEmpty && _failure == null) {
       return const Center(child: Text('正在解析…'));
@@ -197,26 +261,63 @@ class _TimetablePageState extends State<TimetablePage> {
         ),
       );
     }
-    return ListView.separated(
-      padding: const EdgeInsets.all(16),
-      itemCount: _courses.length,
-      separatorBuilder: (_, __) => const Divider(height: 1),
-      itemBuilder: (BuildContext context, int index) {
-        final course = _courses[index];
-        return ListTile(
-          leading: CircleAvatar(child: Text(course.weekdayLabel)),
-          title: Text(course.name),
-          subtitle: Text(<String>[
-            course.periodLabel,
-            course.weeks,
-            if (course.room != null) course.room!,
-            if (course.teacher != null) course.teacher!,
-          ].join(' · ')),
-        );
-      },
+    final visible = _visibleCourses;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        // 周次标题 + 前后切周（"本周"标识让用户不用自己数）
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: Row(
+            children: <Widget>[
+              IconButton(
+                tooltip: '上一周',
+                onPressed: _week > 1 ? () => _changeWeek(-1) : null,
+                icon: const Icon(Icons.chevron_left),
+              ),
+              Expanded(
+                child: Text(
+                  _weekTitle,
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.titleMedium,
+                ),
+              ),
+              IconButton(
+                tooltip: '下一周',
+                onPressed: _week < (_weekcount ?? 1 << 30) ? () => _changeWeek(1) : null,
+                icon: const Icon(Icons.chevron_right),
+              ),
+            ],
+          ),
+        ),
+        if (visible.isEmpty)
+          const Expanded(
+            child: Center(child: Text('本周无课')),
+          )
+        else
+          Expanded(
+            child: ListView.separated(
+              padding: const EdgeInsets.all(16),
+              itemCount: visible.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (BuildContext context, int index) {
+                final course = visible[index];
+                return ListTile(
+                  leading: CircleAvatar(child: Text(course.weekdayLabel)),
+                  title: Text(course.name),
+                  subtitle: Text(<String>[
+                    course.periodLabel,
+                    course.weeks,
+                    if (course.room != null) course.room!,
+                    if (course.teacher != null) course.teacher!,
+                  ].join(' · ')),
+                );
+              },
+            ),
+          ),
+      ],
     );
   }
-
   // ---------------------------------------------------------------------------
   // 取数
   // ---------------------------------------------------------------------------
@@ -247,6 +348,7 @@ class _TimetablePageState extends State<TimetablePage> {
           term: _currentTerm,
         );
         // 学期开始日不做任何推算：默认值 + 用户确认，见卡片
+        _weekcount = outcome.weekcount;
         _notice = _apiNotice(outcome);
         return ImportOutcome(
           term: outcome.term,
