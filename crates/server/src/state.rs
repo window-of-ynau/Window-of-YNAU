@@ -37,7 +37,11 @@ impl AppState {
             config.concurrency_limit,
             Duration::from_millis(config.concurrency_queue_ms),
         ));
-        let accounting = Arc::new(UsageRecorder::new(db.clone(), config.usage_sample_percent));
+        let accounting = Arc::new(UsageRecorder::new(
+            db.clone(),
+            config.usage_sample_percent,
+            config.sample_salt.clone(),
+        ));
         let limiter = Arc::new(AuthLimiter::new(
             config.auth_hash_concurrency,
             config.auth_login_per_min,

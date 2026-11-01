@@ -154,13 +154,16 @@ impl AuditEntry {
 pub struct UsageRecorder {
     db: Option<PgPool>,
     sample_percent: u8,
+    /// 抽样盐（红队 M3）：客户端不可知，避免"挑一个不被抽中的 turn_id"规避监控
+    salt: String,
 }
 
 impl UsageRecorder {
-    pub fn new(db: Option<PgPool>, sample_percent: u8) -> Self {
+    pub fn new(db: Option<PgPool>, sample_percent: u8, salt: impl Into<String>) -> Self {
         Self {
             db,
             sample_percent: sample_percent.min(100),
+            salt: salt.into(),
         }
     }
 
@@ -168,14 +171,25 @@ impl UsageRecorder {
         self.sample_percent
     }
 
-    /// 这个 turn 是否需要抽样落库。确定性判定：同一 turn 永远同一结果。
-    pub fn should_sample(&self, turn_id: &str) -> bool {
+    /// 这个 turn 是否需要抽样落库。确定性判定：同一 `(用户, turn)` 永远同一结果。
+    ///
+    /// 判定输入是 `salt || user_id || turn_id`（红队 M3）：
+    /// - 只用客户端可控的 `turn_id` 时，客户端可以**预计算**哈希，挑一个不命中的 id
+    ///   来规避成本监控（或挑命中的 id 刷写放大）；
+    /// - 盐来自服务端（环境变量或启动随机），客户端拿不到，也就无法预测。
+    ///
+    /// 加盐只影响**新写入**的抽样判定，历史行保留原样、不回填。
+    pub fn should_sample(&self, user_id: Uuid, turn_id: &str) -> bool {
         match self.sample_percent {
             0 => false,
             100 => true,
             percent => {
                 use sha2::{Digest, Sha256};
-                let digest = Sha256::digest(turn_id.as_bytes());
+                let mut hasher = Sha256::new();
+                hasher.update(self.salt.as_bytes());
+                hasher.update(user_id.as_bytes());
+                hasher.update(turn_id.as_bytes());
+                let digest = hasher.finalize();
                 let first = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
                 (first % 100) < u32::from(percent)
             }
@@ -328,35 +342,64 @@ pub async fn verify_schema(pool: &PgPool) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    const TEST_SALT: &str = "test-salt-0123456789";
+
     #[test]
     fn sampling_percent_boundaries() {
-        let none = UsageRecorder::new(None, 0);
+        let user = Uuid::new_v4();
+        let none = UsageRecorder::new(None, 0, TEST_SALT);
         for turn in ["a", "b", "c"] {
-            assert!(!none.should_sample(turn), "0% 永远不抽样");
+            assert!(!none.should_sample(user, turn), "0% 永远不抽样");
         }
-        let all = UsageRecorder::new(None, 100);
+        let all = UsageRecorder::new(None, 100, TEST_SALT);
         for turn in ["a", "b", "c"] {
-            assert!(all.should_sample(turn), "100% 永远抽样");
+            assert!(all.should_sample(user, turn), "100% 永远抽样");
         }
     }
 
     #[test]
     fn sampling_is_deterministic_per_turn() {
-        let recorder = UsageRecorder::new(None, 1);
+        let user = Uuid::new_v4();
+        let recorder = UsageRecorder::new(None, 1, TEST_SALT);
         for turn in ["turn-1", "turn-2", "会话-中文"] {
             assert_eq!(
-                recorder.should_sample(turn),
-                recorder.should_sample(turn),
+                recorder.should_sample(user, turn),
+                recorder.should_sample(user, turn),
                 "同一 turn 的结果必须稳定（重放不重复计数）"
             );
         }
     }
 
+    /// 红队 M3：判定与**服务端盐**绑定——客户端不知道盐，就无法挑 turn_id 规避抽样。
+    ///
+    /// 用例：同一批 turn_id，换一个盐后命中集合必须发生变化（否则说明盐没参与哈希）。
+    #[test]
+    fn sampling_is_salted_so_clients_cannot_predict() {
+        let user = Uuid::new_v4();
+        let turns: Vec<String> = (0..500).map(|i| format!("turn-{i}")).collect();
+        let a = UsageRecorder::new(None, 10, "salt-A-0123456789");
+        let b = UsageRecorder::new(None, 10, "salt-B-0123456789");
+        let hits_a: Vec<bool> = turns.iter().map(|t| a.should_sample(user, t)).collect();
+        let hits_b: Vec<bool> = turns.iter().map(|t| b.should_sample(user, t)).collect();
+        assert_ne!(hits_a, hits_b, "换盐后命中集合必须变化，否则盐没生效");
+
+        // 同一用户同一 turn、同盐 → 稳定（重放不重复计数）
+        assert_eq!(
+            a.should_sample(user, "turn-1"),
+            a.should_sample(user, "turn-1")
+        );
+        // 不同用户同一 turn → 独立判定（不是全站同一条分界线）
+        let other = Uuid::new_v4();
+        let hits_other: Vec<bool> = turns.iter().map(|t| a.should_sample(other, t)).collect();
+        assert_ne!(hits_a, hits_other, "不同用户不应共享同一判定序列");
+    }
+
     #[test]
     fn one_percent_sampling_hits_roughly_one_in_a_hundred() {
-        let recorder = UsageRecorder::new(None, 1);
+        let recorder = UsageRecorder::new(None, 1, TEST_SALT);
+        let user = Uuid::new_v4();
         let hits = (0..10_000)
-            .filter(|index| recorder.should_sample(&format!("turn-{index}")))
+            .filter(|index| recorder.should_sample(user, &format!("turn-{index}")))
             .count();
         // 期望 100，给足抖动区间，避免 flaky
         assert!(
@@ -367,7 +410,7 @@ mod tests {
 
     #[test]
     fn without_database_writes_are_skipped_not_errors() {
-        let recorder = UsageRecorder::new(None, 100);
+        let recorder = UsageRecorder::new(None, 100, TEST_SALT);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

@@ -87,6 +87,34 @@ pub async fn chat_stream(
         .validate()
         .map_err(|(code, message)| AppError::new(code, message, &req_id.0))?;
 
+    // 红队 M4：标识字段的长度上限。**超限 422、不做截断**——静默截断会让审计/抽样里
+    // 的 turn_id 与客户端后续轮次对不上（同一次提问被拆成两个 turn），排查时是灾难。
+    for (field, value) in [
+        ("session_id", request.session_id.as_str()),
+        ("turn_id", request.turn_id.as_str()),
+        ("model", request.model.as_str()),
+    ] {
+        if value.chars().count() > MAX_IDENT_CHARS {
+            return Err(AppError::new(
+                ErrorCode::ValidationError,
+                format!("{field} 超过 {MAX_IDENT_CHARS} 个字符上限"),
+                &req_id.0,
+            ));
+        }
+    }
+
+    // 红队 M5：输出 token 上限由服务端定，不允许客户端把 `max_output_tokens` 放大。
+    if request.max_output_tokens > state.config.max_output_tokens_cap {
+        return Err(AppError::new(
+            ErrorCode::ValidationError,
+            format!(
+                "max_output_tokens 不能超过 {}",
+                state.config.max_output_tokens_cap
+            ),
+            &req_id.0,
+        ));
+    }
+
     // 服务端再守一道：配置可收紧上限，不信任客户端自报。
     // 红队 H2：**不信客户端自报**——取"客户端估值"与"服务端估值"的较大者。
     // 否则把 estimated_input_tokens 填 1，就能把接近 body 上限的正文送进上游。
@@ -172,15 +200,17 @@ pub async fn chat_stream(
     );
 
     let heartbeat = Duration::from_secs(state.config.sse_heartbeat_secs);
-    let body = Body::from_stream(sse_stream(
+    let total_timeout = Duration::from_secs(state.config.stream_total_timeout_secs);
+    let body = Body::from_stream(sse_stream(StreamArgs {
         state,
         permit,
         upstream,
         request,
-        principal.user_id,
-        req_id.0.clone(),
+        user_id: principal.user_id,
+        request_id: req_id.0.clone(),
         heartbeat,
-    ));
+        total_timeout,
+    }));
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -212,6 +242,9 @@ fn gate_reason(rejection: GateRejection) -> &'static str {
         GateRejection::GlobalBusy => "global_busy",
     }
 }
+
+/// 标识类字段（session_id / turn_id / model）的字符数上限（红队 M4）。
+const MAX_IDENT_CHARS: usize = 128;
 
 /// 估算输出 token 时最多累计多少字符（只要够算比例，不必留全文）。
 const MAX_ESTIMATE_CHARS: usize = 64 * 1024;
@@ -289,18 +322,39 @@ fn estimate_usage(request: &ChatRequest, emitted_text: &str) -> Usage {
 }
 
 /// 生产任务：读上游 → 装配 → 写 channel；任务结束（含客户端断开）时取消上游并记账。
-fn sse_stream(
+/// 一条流需要的运行参数（收成结构体，避免一长串位置参数）。
+struct StreamArgs {
     state: AppState,
     permit: TurnPermit,
-    mut upstream: UpstreamStream,
+    upstream: UpstreamStream,
     request: ChatRequest,
     user_id: Uuid,
     request_id: String,
     heartbeat: Duration,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    total_timeout: Duration,
+}
+
+fn sse_stream(args: StreamArgs) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    let StreamArgs {
+        state,
+        permit,
+        upstream,
+        request,
+        user_id,
+        request_id,
+        heartbeat,
+        total_timeout,
+    } = args;
+    let mut upstream = upstream;
     let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(SSE_CHANNEL_CAPACITY);
 
     tokio::spawn(async move {
+        // 总时长守卫：`0` → 永不触发；否则用**绝对截止时间**。
+        // 循环里每次重新 await 也没关系：`sleep_until(deadline)` 的截止点是绝对的，
+        // 不会因为重新创建而"续命"。
+        let total_deadline =
+            (!total_timeout.is_zero()).then(|| tokio::time::Instant::now() + total_timeout);
+        let mut total_timed_out = false;
         let model = request.model.clone();
         let mut assembler = ChunkAssembler::new(Channel::Plan, request_id.clone(), model.clone());
         // 记账用的两个观察量：上游有没有给过 usage；吐出过多长文本（估算出 token 用）
@@ -321,6 +375,12 @@ fn sse_stream(
                     biased;
                     outcome = read_next(&mut upstream, heartbeat) => outcome,
                     _ = &mut client_gone => break 'stream,
+                    // 红队 M5：整条流的总时长上限（不是空闲上限）——"缓慢但一直有 token"
+                    // 的流会把闸门名额长期占住，50 个账号就能让其他人全 429。
+                    _ = wait_until(total_deadline) => {
+                        total_timed_out = true;
+                        break 'stream;
+                    }
                 };
 
                 match outcome {
@@ -392,6 +452,30 @@ fn sse_stream(
             }
         }
 
+        // 红队 M5：总时长到点。按"上游超时"收尾：发终止 error 事件 + 记 error 审计，
+        // 客户端看到的是和 504 同样的码与文案（它只需要知道"这条流不会再有内容了"）。
+        if total_timed_out {
+            tracing::warn!(
+                request_id = %request_id,
+                turn_id = %request.turn_id,
+                seconds = total_timeout.as_secs(),
+                "流总时长超限，主动终止"
+            );
+            state
+                .accounting
+                .record_audit_detached(AuditEntry::upstream_error(
+                    user_id,
+                    request_id.clone(),
+                    request.turn_id.clone(),
+                    "stream_total_timeout",
+                ));
+            let chunk = Chunk::Error {
+                code: ErrorCode::UpstreamTimeout,
+                message: public_upstream_message(ErrorCode::UpstreamTimeout).to_owned(),
+            };
+            let _ = forward(&sender, assembler.feed(vec![chunk])).await;
+        }
+
         // 取消：客户端断开时我们早就不再读上游了，这一步把响应也释放掉。
         // （reqwest 不会主动发 FIN，但 socket 缓冲一旦被灌满，厂商的写就会被卡住。）
         drop(upstream);
@@ -410,7 +494,7 @@ fn sse_stream(
             );
             estimate_usage(&request, &emitted_text)
         };
-        if state.accounting.should_sample(&request.turn_id) {
+        if state.accounting.should_sample(user_id, &request.turn_id) {
             state.accounting.record_sample_detached(UsageSample {
                 turn_id: request.turn_id.clone(),
                 user_id,
@@ -450,6 +534,14 @@ async fn read_next(upstream: &mut UpstreamStream, heartbeat: Duration) -> ReadOu
     match tokio::time::timeout(heartbeat, upstream.next_chunks()).await {
         Ok(next) => ReadOutcome::Next(next),
         Err(_) => ReadOutcome::Ping,
+    }
+}
+
+/// 等到绝对截止时间；`None` 时永远 pending（用于"不限制总时长"）。
+async fn wait_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
