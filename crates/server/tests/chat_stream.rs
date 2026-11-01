@@ -1838,6 +1838,98 @@ async fn same_turn_id_is_independent_across_users() {
     drop(bob_stream);
 }
 
+/// M4：标识字段超长 → 422（**不截断**：截断会让审计/抽样的 turn_id 与后续轮次对不上）。
+#[tokio::test]
+async fn oversized_identifier_is_rejected_with_422() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+    let token = app.register("long-id@ynau.edu.cn").await;
+
+    // 129 个字符，超过 128 上限
+    let payload = json!({
+        "session_id": "s",
+        "turn_id": "t".repeat(129),
+        "round": 1,
+        "model": "m",
+        "protocol": "openai_completions",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "tools": [],
+        "max_output_tokens": 64,
+        "stream": true,
+        "estimated_input_tokens": 1
+    })
+    .to_string();
+
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &payload,
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = read_json(response).await;
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+    assert_eq!(mock.requests(), 0, "超长标识不该打上游");
+}
+
+/// M5-a：`max_output_tokens` 超过服务端上限 → 422（客户端不得自行放大）。
+#[tokio::test]
+async fn max_output_tokens_over_cap_is_rejected() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock)); // 默认 cap = 8192
+    let token = app.register("big-output@ynau.edu.cn").await;
+
+    let mut payload: Value = serde_json::from_str(&chat_body("turn-big-output")).expect("请求体");
+    payload["max_output_tokens"] = json!(8193);
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &payload.to_string(),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = read_json(response).await;
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+    assert_eq!(mock.requests(), 0);
+}
+
+/// M5-b：**总时长**到点 → 发终止 `error` 事件（不是无限占名额），且不再补 `done`。
+#[tokio::test]
+async fn stream_total_timeout_ends_with_error_event() {
+    let mock = start_mock(Script::Endless).await;
+    let mut config = TestApp::config(&mock);
+    config.stream_total_timeout_secs = 1; // 1 秒后主动收尾
+    let app = TestApp::with_config(config);
+    let token = app.register("total-timeout@ynau.edu.cn").await;
+
+    let started = Instant::now();
+    let response = app.call(chat_request(Some(&token), "turn-total")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = read_events(response).await;
+    let elapsed = started.elapsed();
+
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names.last().copied(),
+        Some("error"),
+        "总时长到点必须以 error 收尾：{names:?}"
+    );
+    assert!(!names.contains(&"done"), "错误之后不该再有 done：{names:?}");
+    let last = events
+        .last()
+        .map(|(_, data)| data.as_str())
+        .unwrap_or_default();
+    assert!(last.contains("UPSTREAM_TIMEOUT"), "{last}");
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "应在约 1 秒后收尾，实际 {elapsed:?}"
+    );
+}
+
 /// M2：上游 302 时服务端**不跟随**（不把请求带去它指定的地址）→ 502。
 #[tokio::test]
 async fn redirect_is_not_followed() {

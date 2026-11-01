@@ -45,6 +45,15 @@ pub struct Config {
     /// 请求体字节上限（红队 H2）：`MAX_INPUT_TOKENS` 之外的第二道闸，
     /// 防止"正文塞满 + estimated_input_tokens 填 1"绕过准入。
     pub body_limit_bytes: usize,
+    /// 抽样判定用的**服务端盐**（红队 M3）：客户端拿不到它，所以无法预先算出
+    /// 自己的 turn 会不会被抽中——否则"逐个试 turn_id"就能规避成本监控。
+    pub sample_salt: String,
+    /// 单条 SSE 流的**总时长**上限（秒，红队 M5）；0 = 不限。
+    ///
+    /// 分段超时挡不住"缓慢但一直有 token"的流，那会长期占住闸门名额。
+    pub stream_total_timeout_secs: u64,
+    /// `max_output_tokens` 的服务端上限（红队 M5）：客户端不得自行放大。
+    pub max_output_tokens_cap: u32,
     /// 套餐通道的上游供应商（三家协议可各配一套；Key 只存在服务端）
     pub upstream: UpstreamConfig,
 }
@@ -70,6 +79,19 @@ impl Config {
             auth_register_per_min: env_parse("AUTH_REGISTER_PER_MIN", 10),
             auth_refresh_per_min: env_parse("AUTH_REFRESH_PER_MIN", 60),
             body_limit_bytes: env_parse("YUNONG_BODY_LIMIT_BYTES", 1024 * 1024),
+            sample_salt: env::var("YUNONG_SAMPLE_SALT")
+                .ok()
+                .filter(|value| value.len() >= 16)
+                .unwrap_or_else(|| {
+                    let generated = uuid::Uuid::new_v4().simple().to_string();
+                    tracing::warn!(
+                        "YUNONG_SAMPLE_SALT 未设置（或短于 16 字符）：本次启动用随机盐；\
+                         重启后抽样判定会变（历史行不受影响，也不回填）。生产请固定一个随机串。"
+                    );
+                    generated
+                }),
+            stream_total_timeout_secs: env_parse("STREAM_TOTAL_TIMEOUT_SECS", 600),
+            max_output_tokens_cap: env_parse("MAX_OUTPUT_TOKENS_CAP", 8_192),
             upstream: UpstreamConfig::from_env(),
         }
     }
@@ -96,6 +118,11 @@ impl Config {
             auth_register_per_min: 1000,
             auth_refresh_per_min: 1000,
             body_limit_bytes: 1024 * 1024,
+            // 测试用固定盐：抽样判定在用例之间必须可复现
+            sample_salt: "test-sample-salt-0123456789".into(),
+            // 测试默认不限总时长（长流用例要稳定）；M5 的用例会显式设小
+            stream_total_timeout_secs: 0,
+            max_output_tokens_cap: 8_192,
             upstream: UpstreamConfig::default(),
         }
     }

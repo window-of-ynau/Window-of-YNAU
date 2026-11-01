@@ -96,6 +96,17 @@ services:
       - internal   # 用 db
       - edge       # 出网调用模型上游
     stop_grace_period: 20s
+    # 红队 L3：容器纵深。服务端**不写文件系统**、运行期不需要任何 capability，
+    # 二进制本身已是非 root（Dockerfile 里 USER 10001）。
+    # 这三条都不影响功能，但让"拿到代码执行"更难变成"拿到主机"。
+    read_only: true
+    tmpfs:
+      # 少数库会在 /tmp 落临时文件：只给内存盘，不落宿主机
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
 networks:
   internal:
