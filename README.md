@@ -207,7 +207,7 @@ cargo test -p yunong-core --test real_upstream -- --ignored --nocapture
 - 工具调用闭环、日历、本地记忆与 RAG 未实现（W8 / W9）；
 - CI 未包含容器镜像构建任务，镜像问题目前依赖人工验证；
 - 并发上限经过 16 路并发实测，`CONCURRENCY_LIMIT=50` 为保守设定，尚未进行边界压测；
-- 上游连通性仅在 DeepSeek 上完成端到端验证，Anthropic 与 OpenAI Responses 协议目前以契约测试覆盖。
+- 三种上游协议的真实响应形状已在 DeepSeek 官方接口上核对（同一密钥同时支持 completions / responses / anthropic messages）；其中 completions 已在本机完成客户端端到端验证，另两种受本机网络中间层限制未跑通客户端链路，仅有线上抓包与契约测试佐证。
 
 ---
 

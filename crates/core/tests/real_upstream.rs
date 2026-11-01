@@ -168,3 +168,63 @@ async fn real_upstream_handles_concurrent_streams() {
         failures
     );
 }
+
+/// 三协议真实连通性：DeepSeek 官方同时兼容 completions / responses / anthropic messages，
+/// 但三者的 **base 路径与鉴权头都不同**（messages 走 `x-api-key`，且 base 需要 `/anthropic`）。
+/// 这条测试逐个真打一遍，任何一个失败都会列出失败原因，而不是只验证 completions。
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "需要真实上游 Key（YUNONG_REAL_API_KEY）"]
+async fn real_upstream_all_three_protocols() {
+    let key = api_key();
+    let cases = [
+        (
+            Protocol::OpenaiCompletions,
+            env_or("YUNONG_REAL_BASE_URL", "https://api.deepseek.com"),
+        ),
+        (
+            Protocol::OpenaiResponses,
+            env_or("YUNONG_REAL_RESPONSES_BASE_URL", "https://api.deepseek.com"),
+        ),
+        (
+            Protocol::AnthropicMessages,
+            env_or(
+                "YUNONG_REAL_MESSAGES_BASE_URL",
+                "https://api.deepseek.com/anthropic",
+            ),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (protocol, base) in cases {
+        let provider = DirectProvider::new(
+            protocol,
+            base.clone(),
+            env_or("YUNONG_REAL_MODEL", "deepseek-chat"),
+        )
+        .with_api_key(key.clone());
+        let req = request(protocol, "只回复两个字：成功");
+
+        let mut text = String::new();
+        let mut on_chunk = |chunk: Chunk| {
+            if let Chunk::Delta { text: delta } = &chunk {
+                text.push_str(delta);
+            }
+            Flow::Continue
+        };
+        let started = Instant::now();
+        match provider.chat_stream(&req, &mut on_chunk).await {
+            Ok(outcome) => println!(
+                "✓ {protocol:?}  base={base}\n    text={text:?} finish={:?} usage={:?} 耗时={:?}",
+                outcome.finish,
+                outcome.usage,
+                started.elapsed()
+            ),
+            Err(err) => {
+                println!("✗ {protocol:?}  base={base}\n    {err}");
+                failures.push(format!("{protocol:?} @ {base}: {err}"));
+            }
+        }
+    }
+
+    assert!(failures.is_empty(), "以下协议真实连通失败：{failures:#?}");
+}
