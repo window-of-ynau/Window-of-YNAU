@@ -33,6 +33,18 @@ pub struct Config {
     pub sse_heartbeat_secs: u64,
     /// usage 抽样百分比（0..=100），默认 1 = 1%（ADR-03：抽样成本监控，不是账单）
     pub usage_sample_percent: u8,
+    /// 未鉴权端点的**哈希并发**上限（红队 H1）：Argon2 一次 19 MiB，
+    /// 按次数限流挡不住并发内存峰值，所以这里按"同时在算的哈希数"收口。
+    pub auth_hash_concurrency: usize,
+    /// 登录限流（次/分钟/邮箱）。0 = 不限次数（并发闸仍然生效）
+    pub auth_login_per_min: u32,
+    /// 注册限流（次/分钟，全局）
+    pub auth_register_per_min: u32,
+    /// 刷新限流（次/分钟，全局）
+    pub auth_refresh_per_min: u32,
+    /// 请求体字节上限（红队 H2）：`MAX_INPUT_TOKENS` 之外的第二道闸，
+    /// 防止"正文塞满 + estimated_input_tokens 填 1"绕过准入。
+    pub body_limit_bytes: usize,
     /// 套餐通道的上游供应商（三家协议可各配一套；Key 只存在服务端）
     pub upstream: UpstreamConfig,
 }
@@ -53,6 +65,11 @@ impl Config {
             upstream_idle_timeout_secs: env_parse("UPSTREAM_IDLE_TIMEOUT_SECS", 30),
             sse_heartbeat_secs: env_parse("SSE_HEARTBEAT_SECS", 15),
             usage_sample_percent: env_parse("USAGE_SAMPLE_PERCENT", 1).min(100),
+            auth_hash_concurrency: env_parse("AUTH_HASH_CONCURRENCY", 8),
+            auth_login_per_min: env_parse("AUTH_LOGIN_PER_MIN", 20),
+            auth_register_per_min: env_parse("AUTH_REGISTER_PER_MIN", 10),
+            auth_refresh_per_min: env_parse("AUTH_REFRESH_PER_MIN", 60),
+            body_limit_bytes: env_parse("YUNONG_BODY_LIMIT_BYTES", 1024 * 1024),
             upstream: UpstreamConfig::from_env(),
         }
     }
@@ -73,6 +90,12 @@ impl Config {
             upstream_idle_timeout_secs: 5,
             sse_heartbeat_secs: 0,
             usage_sample_percent: 1,
+            // 测试默认值：限流要"够用但不碍事"——单测自己会显式调小来断言拒绝逻辑
+            auth_hash_concurrency: 8,
+            auth_login_per_min: 1000,
+            auth_register_per_min: 1000,
+            auth_refresh_per_min: 1000,
+            body_limit_bytes: 1024 * 1024,
             upstream: UpstreamConfig::default(),
         }
     }

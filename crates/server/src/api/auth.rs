@@ -15,7 +15,11 @@ use yunong_shared::ErrorCode;
 
 use crate::api::{envelope, error::AppError, request_id::ReqId};
 use crate::auth::Principal;
+use crate::limiter::AuthRoute;
 use crate::state::AppState;
+
+/// 抢哈希名额最多等多久：等不到就 429（宁可让客户端退避，也不要把内存堆起来）。
+const HASH_SLOT_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Debug, Deserialize)]
 struct CredentialsRequest {
@@ -50,6 +54,16 @@ pub async fn register(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let credentials: CredentialsRequest = parse_body(&body, &req_id)?;
+    // 红队 H1：未鉴权端点先过限流（速率闸 + 哈希并发闸），否则匿名并发能把内存打爆
+    state
+        .limiter
+        .check_rate(AuthRoute::Register, "global")
+        .map_err(|error| error.with_request_id(&req_id.0))?;
+    let _hash_slot = state
+        .limiter
+        .acquire_hash_slot(HASH_SLOT_WAIT)
+        .await
+        .map_err(|error| error.with_request_id(&req_id.0))?;
     let session = state
         .auth
         .register(&credentials.email, &credentials.password)
@@ -74,6 +88,16 @@ pub async fn login(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let credentials: CredentialsRequest = parse_body(&body, &req_id)?;
+    // 红队 H1：按**规范化邮箱**限速（同一账号被撞库时能立刻收口），再抢一个哈希名额
+    state
+        .limiter
+        .check_rate(AuthRoute::Login, &credentials.email.trim().to_lowercase())
+        .map_err(|error| error.with_request_id(&req_id.0))?;
+    let _hash_slot = state
+        .limiter
+        .acquire_hash_slot(HASH_SLOT_WAIT)
+        .await
+        .map_err(|error| error.with_request_id(&req_id.0))?;
     let session = state
         .auth
         .login(&credentials.email, &credentials.password)
@@ -98,6 +122,11 @@ pub async fn refresh(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let request: RefreshRequest = parse_body(&body, &req_id)?;
+    // 刷新不哈希（只查库），所以只过速率闸、不占哈希名额
+    state
+        .limiter
+        .check_rate(AuthRoute::Refresh, "global")
+        .map_err(|error| error.with_request_id(&req_id.0))?;
     let session = state
         .auth
         .refresh(&request.refresh_token)

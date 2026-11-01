@@ -88,12 +88,16 @@ pub async fn chat_stream(
         .map_err(|(code, message)| AppError::new(code, message, &req_id.0))?;
 
     // 服务端再守一道：配置可收紧上限，不信任客户端自报。
-    if request.estimated_input_tokens > state.config.max_input_tokens {
+    // 红队 H2：**不信客户端自报**——取"客户端估值"与"服务端估值"的较大者。
+    // 否则把 estimated_input_tokens 填 1，就能把接近 body 上限的正文送进上游。
+    let server_estimate = estimate_input_tokens(&request);
+    let admission_tokens = request.estimated_input_tokens.max(server_estimate);
+    if admission_tokens > state.config.max_input_tokens {
         return Err(AppError::new(
             ErrorCode::MessageTooLarge,
             format!(
                 "输入约 {} tokens，超过服务端上限 {}",
-                request.estimated_input_tokens, state.config.max_input_tokens
+                admission_tokens, state.config.max_input_tokens
             ),
             &req_id.0,
         ));
@@ -253,19 +257,32 @@ fn sanitize_upstream_errors(chunks: Vec<Chunk>, request_id: &str) -> Vec<Chunk> 
         .collect()
 }
 
+/// 服务端自己的输入 token 估算（**准入与记账共用这一份**）。
+///
+/// 口径与端侧一致（`core::context::estimate_tokens`：CJK 1 字 ≈ 1 token，其它 4 字符 ≈ 1）。
+/// 除消息正文外也算上工具声明的名字——工具描述同样进上游 prompt。
+pub fn estimate_input_tokens(request: &ChatRequest) -> u32 {
+    let messages: u32 = request
+        .messages
+        .iter()
+        .map(|message| yunong_core::context::estimate_tokens(&message.content))
+        .sum();
+    let tools: u32 = request
+        .tools
+        .iter()
+        .map(|tool| yunong_core::context::estimate_tokens(&tool.name))
+        .sum();
+    messages.saturating_add(tools)
+}
+
 /// 上游没给 `usage` 时的兜底估算，**与端侧同口径**
 /// （[`yunong_core::context::estimate_tokens`]：CJK 1 字 ≈ 1 token，其它 4 字符 ≈ 1 token）。
 ///
 /// 输入按每条消息分别估算再相加（不拼大字符串）；输出按已下发的增量文本估算。
 /// 这是"区分未知与真 0"的最低成本做法：只标 `estimated=true` 不够，0/0 会让成本统计失真。
 fn estimate_usage(request: &ChatRequest, emitted_text: &str) -> Usage {
-    let tokens_in = request
-        .messages
-        .iter()
-        .map(|message| yunong_core::context::estimate_tokens(&message.content))
-        .sum();
     Usage {
-        tokens_in,
+        tokens_in: estimate_input_tokens(request),
         tokens_out: yunong_core::context::estimate_tokens(emitted_text),
         estimated: true,
     }
