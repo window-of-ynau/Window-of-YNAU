@@ -216,6 +216,24 @@ impl fmt::Display for UpstreamError {
 
 impl std::error::Error for UpstreamError {}
 
+/// 2xx 的响应是不是 SSE（评审 F4）。
+///
+/// 只认 `text/event-stream`（允许带 `; charset=utf-8`）；`Content-Type` 缺失也算不合法——
+/// 宁可 502，也不要把登录页/JSON 当成"空回答"发给客户端。
+fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
+        .unwrap_or(false)
+}
+
 /// 协议对应的上游端点（`docs/02` §7.1）。
 pub fn endpoint(protocol: Protocol) -> &'static str {
     match protocol {
@@ -274,7 +292,12 @@ impl UpstreamClient {
             provider.base_url().trim_end_matches('/'),
             endpoint(protocol)
         );
-        let body = yunong_core::protocols::build_body(protocol, request);
+        // 强制 `stream=true`（评审 F4）：这个端点是纯流式代理，端侧若声明 stream=false
+        // 上游会回一整个 JSON，我们收不到 SSE 事件，只会变成"空回答"。
+        // `build_body` 以入参为准，所以这里传一份改过的副本，而不是依赖端侧声明。
+        let mut streaming = request.clone();
+        streaming.stream = true;
+        let body = yunong_core::protocols::build_body(protocol, &streaming);
         // 自己序列化而不是 reqwest 的 `.json()`：那条路径要开 `json` feature，
         // 这里只需要把 `serde_json::Value` 写进 body，没必要多开一个 feature。
         let body = serde_json::to_vec(&body)
@@ -314,13 +337,29 @@ impl UpstreamClient {
         let status = response.status();
         if !status.is_success() {
             let code = status.as_u16();
-            // 错误体只截 200 字符：够定位，又不会把正文 / 大页面写进日志
+            // 错误体只截 200 字符：够定位，又不会把正文 / 大页面写进日志。
+            // **注意**：这段 message 只进日志，对外由 `api::chat` 换成固定文案（评审 F3）。
             let bytes = response.bytes().await.unwrap_or_default();
             let snippet: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
             return Err(UpstreamError::status(
                 code,
                 format!("上游返回 {code}：{snippet}"),
             ));
+        }
+
+        // 2xx 不等于 SSE（评审 F4）：登录跳转页、网关默认页、非流式 JSON 都是 200。
+        // 不校验的话这些会被当成"上游正常关闭"，产出 Meta + Done{Stop} 的空回答，
+        // 与 docs/03「响应不合法 → 502」冲突。端侧网关早就验了，服务端也要验。
+        if !is_event_stream(&response) {
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("<缺失>")
+                .to_owned();
+            return Err(UpstreamError::protocol(format!(
+                "上游返回的不是 SSE（content-type: {content_type}）"
+            )));
         }
 
         Ok(UpstreamStream {

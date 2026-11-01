@@ -123,10 +123,11 @@ pub async fn chat_stream(
         }
     };
 
-    // 2) 上游开流：连不上/超时/非 2xx 都在这里变成 502/504 信封
+    // 2) 上游开流：连不上/超时/非 2xx/不是 SSE 都在这里变成 502/504 信封
     let upstream = match state.upstream.open(request.protocol, &request).await {
         Ok(upstream) => upstream,
         Err(error) => {
+            // 细节（内网上游地址、缺哪个环境变量、上游响应片段）**只进日志**（评审 F3）
             tracing::warn!(
                 request_id = %req_id.0,
                 error = %error,
@@ -135,7 +136,7 @@ pub async fn chat_stream(
             );
             return Err(AppError::new(
                 error.code(),
-                error.message().to_owned(),
+                public_upstream_message(error.code()),
                 &req_id.0,
             ));
         }
@@ -199,6 +200,38 @@ fn gate_reason(rejection: GateRejection) -> &'static str {
     }
 }
 
+/// 估算输出 token 时最多累计多少字符（只要够算比例，不必留全文）。
+const MAX_ESTIMATE_CHARS: usize = 64 * 1024;
+
+/// 上游故障对外的**固定文案**（评审 F3）。
+///
+/// 内网上游地址、缺哪个环境变量、上游响应片段这些细节只进 `tracing`，**绝不进响应体**——
+/// 客户端只需要"能不能重试"，运维靠日志。
+fn public_upstream_message(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::UpstreamTimeout => "上游响应超时，请稍后重试",
+        _ => "上游暂时不可用，请稍后重试",
+    }
+}
+
+/// 上游没给 `usage` 时的兜底估算，**与端侧同口径**
+/// （[`yunong_core::context::estimate_tokens`]：CJK 1 字 ≈ 1 token，其它 4 字符 ≈ 1 token）。
+///
+/// 输入按每条消息分别估算再相加（不拼大字符串）；输出按已下发的增量文本估算。
+/// 这是"区分未知与真 0"的最低成本做法：只标 `estimated=true` 不够，0/0 会让成本统计失真。
+fn estimate_usage(request: &ChatRequest, emitted_text: &str) -> Usage {
+    let tokens_in = request
+        .messages
+        .iter()
+        .map(|message| yunong_core::context::estimate_tokens(&message.content))
+        .sum();
+    Usage {
+        tokens_in,
+        tokens_out: yunong_core::context::estimate_tokens(emitted_text),
+        estimated: true,
+    }
+}
+
 /// 生产任务：读上游 → 装配 → 写 channel；任务结束（含客户端断开）时取消上游并记账。
 fn sse_stream(
     state: AppState,
@@ -214,6 +247,9 @@ fn sse_stream(
     tokio::spawn(async move {
         let model = request.model.clone();
         let mut assembler = ChunkAssembler::new(Channel::Plan, request_id.clone(), model.clone());
+        // 记账用的两个观察量：上游有没有给过 usage；吐出过多长文本（估算出 token 用）
+        let mut saw_usage = false;
+        let mut emitted_text = String::new();
 
         // 客户端断开时收端被 drop，这个 future 立刻完成：我们立刻停止读上游
         // （随后 drop `UpstreamStream`，上游的写入会被 TCP 背压卡住）。
@@ -238,7 +274,19 @@ fn sse_stream(
                         }
                     }
                     ReadOutcome::Next(Some(Ok(chunks))) => {
-                        if !forward(&sender, assembler.feed(chunks)).await {
+                        let produced = assembler.feed(chunks);
+                        for chunk in &produced {
+                            match chunk {
+                                Chunk::Usage { .. } => saw_usage = true,
+                                Chunk::Delta { text }
+                                    if emitted_text.len() < MAX_ESTIMATE_CHARS =>
+                                {
+                                    emitted_text.push_str(text);
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !forward(&sender, produced).await {
                             break 'stream; // 客户端断开
                         }
                     }
@@ -248,10 +296,11 @@ fn sse_stream(
                             error = %error,
                             "上游流中断，转成 SSE error 事件"
                         );
-                        // Error 是终止事件：装配器不会再补 Done（ADR-16）
+                        // Error 是终止事件：装配器不会再补 Done（ADR-16）。
+                        // 对外只给错误码 + 固定文案，细节留在上面的日志里（评审 F3）。
                         let chunk = Chunk::Error {
                             code: error.code(),
-                            message: error.message().to_owned(),
+                            message: public_upstream_message(error.code()).to_owned(),
                         };
                         forward(&sender, assembler.feed(vec![chunk])).await;
                         break 'stream;
@@ -269,10 +318,23 @@ fn sse_stream(
         // （reqwest 不会主动发 FIN，但 socket 缓冲一旦被灌满，厂商的写就会被卡住。）
         drop(upstream);
 
-        // 抽样记账：**只写一行**，用装配器合并后的终值（按字段 max 合并）
-        let usage: Usage = assembler.usage();
+        // 抽样记账：**每轮一行**（`(turn_id, round)` 幂等），写装配器合并后的终值。
+        // 上游一次 usage 都没给时，用与端侧同口径的估算兜底并置 `estimated=true`（评审 F2）：
+        // 否则库里只有 0/0，分不清"真的是 0"还是"没有数据"。
+        let usage = if saw_usage {
+            assembler.usage()
+        } else {
+            tracing::debug!(
+                request_id = %request_id,
+                turn_id = %request.turn_id,
+                round = request.round,
+                "上游没给 usage，落库用估算值（estimated=true）"
+            );
+            estimate_usage(&request, &emitted_text)
+        };
         if state.accounting.should_sample(&request.turn_id) {
             state.accounting.record_sample_detached(UsageSample {
+                turn_id: request.turn_id.clone(),
                 user_id,
                 req_id: request_id.clone(),
                 model,
