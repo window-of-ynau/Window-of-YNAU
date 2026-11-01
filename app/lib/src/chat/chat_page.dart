@@ -8,6 +8,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../core/chat_service.dart';
+import '../core/secret_service.dart';
 
 /// 会话设置（MVP：密钥只在内存里，进程退出即失效）。
 ///
@@ -31,10 +32,12 @@ class ChatBubble {
 
 /// 会话页。
 class ChatPage extends StatefulWidget {
-  const ChatPage({super.key, this.service, this.settings});
+  const ChatPage({super.key, this.service, this.settings, this.secretService, this.dbPath = ''});
 
   final ChatService? service;
   final ChatSettings? settings;
+  final SecretService? secretService;
+  final String dbPath;
 
   @override
   State<ChatPage> createState() => _ChatPageState();
@@ -43,6 +46,8 @@ class ChatPage extends StatefulWidget {
 class _ChatPageState extends State<ChatPage> {
   late final ChatService _service = widget.service ?? ChatService();
   late final ChatSettings _settings = widget.settings ?? ChatSettings();
+  late final SecretService _secrets = widget.secretService ?? SecretService(dbPath: widget.dbPath);
+  SecretStatus _keyStatus = const SecretStatus(set: false, masked: '' );
   final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
 
@@ -58,6 +63,7 @@ class _ChatPageState extends State<ChatPage> {
   void initState() {
     super.initState();
     _channel = _settings.channel;
+    unawaited(_refreshKeyStatus());
   }
 
   @override
@@ -107,7 +113,9 @@ class _ChatPageState extends State<ChatPage> {
         orElse: () => ChatProtocol.completions,
       ),
       messages: history,
-      apiKey: _settings.byokKey,
+      // BYOK：只传 key 名，明文由 Rust 从安全存储取（Dart 不见明文）
+      secretKey: _channel == 'byok' ? SecretService.byokKeyName : null,
+      dataDir: widget.dbPath,
       cloudToken: _settings.cloudToken,
     );
 
@@ -165,14 +173,58 @@ class _ChatPageState extends State<ChatPage> {
     });
   }
 
+  Future<void> _refreshKeyStatus() async {
+    try {
+      final status = await _secrets.status(SecretService.byokKeyName);
+      if (mounted) {
+        setState(() => _keyStatus = status);
+      }
+    } on SecretException catch (failure) {
+      if (mounted) {
+        setState(() => _error = failure.userHint);
+      }
+    } on Object {
+      // 核心库不可用（例如 widget 测试环境没有 DLL）：保持“未设置”，不打扰用户
+      if (mounted) {
+        setState(() => _keyStatus = const SecretStatus(set: false, masked: ''));
+      }
+    }
+  }
+
+  Future<void> _deleteKey() async {
+    try {
+      await _secrets.delete(SecretService.byokKeyName);
+      await _refreshKeyStatus();
+    } on SecretException catch (failure) {
+      if (mounted) {
+        setState(() => _error = failure.userHint);
+      }
+    }
+  }
+
   Future<void> _openSettings() async {
+    await _refreshKeyStatus();
+    if (!mounted) {
+      return;
+    }
     final result = await showDialog<ChatSettings>(
       context: context,
       builder: (BuildContext context) => _SettingsDialog(settings: _settings),
     );
     if (result != null && mounted) {
+      if (result.byokKey.isNotEmpty) {
+        // 明文只交给 Rust 一次，随后从 Dart 状态里清掉
+        try {
+          await _secrets.save(SecretService.byokKeyName, result.byokKey);
+          result.byokKey = '';
+          await _refreshKeyStatus();
+        } on SecretException catch (failure) {
+          if (mounted) {
+            setState(() => _error = failure.userHint);
+          }
+        }
+      }
       setState(() {
-        _settings.byokKey = result.byokKey;
         _settings.cloudToken = result.cloudToken;
         _settings.model = result.model;
         _settings.protocol = result.protocol;
@@ -212,6 +264,14 @@ class _ChatPageState extends State<ChatPage> {
                   '用量 ${_promptTokens ?? '-'} / ${_completionTokens ?? '-'}',
                   style: theme.textTheme.bodySmall,
                 ),
+              if (_channel == 'byok')
+                Text('Key ${_keyStatus.display}', style: theme.textTheme.bodySmall),
+              if (_channel == 'byok' && _keyStatus.set)
+                IconButton(
+                  tooltip: '删除已保存的 Key',
+                  onPressed: _deleteKey,
+                  icon: const Icon(Icons.key_off_outlined, size: 18),
+                ),
               IconButton(
                 tooltip: '设置',
                 onPressed: _openSettings,
@@ -220,6 +280,14 @@ class _ChatPageState extends State<ChatPage> {
             ],
           ),
         ),
+        if (_keyStatus.degraded)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Text(
+              'Key ${_keyStatus.degradedHint}',
+              style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.tertiary),
+            ),
+          ),
         if (_error != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
