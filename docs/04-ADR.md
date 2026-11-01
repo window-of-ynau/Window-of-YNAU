@@ -477,6 +477,55 @@ ToolCall { id: String, name: String, arguments: serde_json::Value, index: Option
 
 ---
 
+## ADR-18 校务会话存放在 WebView 自身 profile，不进端侧数据库
+
+**状态**：已定（W6）
+
+### 背景
+
+W6 要求"重启免二次登录"，而 ADR-02 / ADR-11 要求凭据不出端、不入库、不进日志。
+两种做法：① 自己抓 `Set-Cookie` 存 keystore 再注入；② 交给平台 WebView 的会话存储。
+
+### 决策
+
+采用 ②。Windows 用 WebView2 user data folder（`%LOCALAPPDATA%\yunong\webview\`），
+Android 用系统 CookieManager（应用私有目录）。端侧代码**从不读取** Cookie 值。
+
+### 边界
+
+- Cookie 不进 SQLite / JSON / 日志 / 上传；
+- 端侧只读页面可见的业务元素（课表表头、学号栏）判定登录态；
+- 上报给端的路径去掉 query 与 fragment（CAS 的 `ticket` 属凭据）。
+
+### 越界防范
+
+端侧从不调用 `document.cookie`；注入脚本白名单只收 `type/html/url/message`；
+会话介质由 OS 账户与应用沙箱隔离，不经过我们的代码。
+
+### 失败模式
+
+| 情况 | 行为 |
+|---|---|
+| 会话失效 | CAS 跳到登录页，探针报 `login_form`，用户登录后自动继续 |
+| 用户清理应用数据 | 会话丢失，需重新登录一次（可接受） |
+| 页面结构改版 | 探针 `no_signal`，抓取 `HTML_CHANGED`，提示反馈且不清库 |
+
+### 否决的备选
+
+| 备选 | 否决理由 |
+|---|---|
+| 自己抓 `Set-Cookie` 存 keystore 再注入 | 需自行处理 Domain/Path/SameSite/HttpOnly 与 CAS 多域跳转，出错面大，且容易把凭据落进我们自己的存储 |
+| 把 Cookie 存进 SQLite 便于"跨平台一致" | 直接违反 ADR-02/ADR-11 的凭据边界 |
+
+### 代价
+
+卸载或清理应用数据会丢会话；Windows 与 Android 的存储位置不同，需在文档写清（见 docs/03 §8.3）。
+
+### 复审条件
+
+若需要跨设备共享会话，或平台 WebView 无法满足 CAS 的跨域要求时，重新评估。
+
+---
 ## 附：决策状态总表
 
 | ADR | 主题 | 状态 |
@@ -498,4 +547,5 @@ ToolCall { id: String, name: String, arguments: serde_json::Value, index: Option
 | 15 | 令牌用不透明串 | ✅ 已定 |
 | 16 | 契约可表达性升级（C1 `tool_calls` / C6 一事件多 Chunk） | ✅ 已定 |
 | 17 | 并行调用归位（C9 `Chunk::ToolCall.index`） | ✅ 已定 |
+| 18 | 校务会话存 WebView profile，不入库 | ✅ 已定 |
 
