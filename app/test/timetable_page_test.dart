@@ -147,21 +147,20 @@ void main() {
       ];
     final service = TimetableService(core: core, dbPath: '/tmp/t.db');
 
-    await tester.pumpWidget(_wrap(TimetablePage(service: service)));
-
-    // 导入要读 asset（rootBundle.loadString），在 fake-async 下这个 Future 不会完成，
-    // 于是页面的 indeterminate 进度条一直转、pumpAndSettle 永远不 settle。
-    // 用 runAsync 放行真实异步，再用定次 pump 让 setState 生效。
+    await tester.pumpWidget(_wrap(TimetablePage(
+      service: service,
+      // 注入固定 HTML：脱离 asset I/O。否则 fake-async 下 `rootBundle.loadString`
+      // 不完成，`_busy` 一直为 true，indeterminate 进度条持续产生帧，
+      // `pumpAndSettle` 永远等不到静止（CI 上就是这么红的）。
+      fixtureLoader: (String asset) async =>
+          '<html><body><table id="timetable"></table></body></html>',
+    )));
     await tester.tap(find.text('导入内置样本'));
-    await tester.pump();
-    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
-    await tester.pump();
+    await tester.pumpAndSettle();
     expect(find.text('高等数学A'), findsOneWidget);
 
     await tester.tap(find.text('模拟页面改版'));
-    await tester.pump();
-    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
-    await tester.pump();
+    await tester.pumpAndSettle();
 
     expect(find.textContaining('请确认本学期是否已排课'), findsOneWidget);
     expect(find.text('高等数学A'), findsOneWidget, reason: '旧列表要保留');

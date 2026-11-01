@@ -16,9 +16,15 @@ class TimetablePage extends StatefulWidget {
     required this.service,
     this.fetcher,
     this.initialTerm = '2026-2027-1',
+    this.fixtureLoader,
   });
 
   final TimetableService service;
+
+  /// 内置样本的读取方式。默认从 asset 读；测试可注入固定字符串，
+  /// 避免 widget test 里的 asset I/O 让 `_busy` 长期挂在 true（进度条一直转，
+  /// `pumpAndSettle` 永远不 settle）。
+  final Future<String> Function(String asset)? fixtureLoader;
 
   /// 校务取数入口。`null` = 当前构建没有 WebView（调试路径仍可用）。
   final SchoolFetcher? fetcher;
@@ -216,7 +222,8 @@ class _TimetablePageState extends State<TimetablePage> {
     final asset =
         revamped ? DebugFixtures.revampedPage : DebugFixtures.samplePage;
     await _run(() async {
-      final html = await DebugFixtures.load(asset);
+      final html = await (widget.fixtureLoader?.call(asset) ??
+          DebugFixtures.load(asset));
       return widget.service.importHtml(html: html, term: _currentTerm);
     }, notice: revamped ? '已导入「页面改版」样本' : '已导入内置课表样本');
   }
