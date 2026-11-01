@@ -234,6 +234,144 @@ void main() {
   });
 
 
+
+
+  group('CaptureProgress：时间权威单测（假时钟，不依赖真实等待）', () {
+    final t0 = DateTime(2026, 11, 1, 12, 0, 0);
+
+    test('刚进入 capture 0ms → 不超时', () {
+      final progress = CaptureProgress(now: t0);
+      progress.enterStage('capture', t0);
+      expect(progress.shouldTimeout(t0), isFalse);
+    });
+
+    test('进入 capture 后 1 秒内绝不超时（含阶段下限 3s）', () {
+      final progress = CaptureProgress(now: t0);
+      progress.enterStage('capture', t0);
+      for (var ms = 0; ms <= 1000; ms += 100) {
+        expect(
+          progress.shouldTimeout(t0.add(Duration(milliseconds: ms))),
+          isFalse,
+          reason: '进入阶段 ${ms}ms 不应超时',
+        );
+      }
+    });
+
+    test('进入阶段 3s 内即使无进展也不超时（下限生效）', () {
+      final progress = CaptureProgress(now: t0);
+      progress.enterStage('capture', t0);
+      expect(progress.shouldTimeout(t0.add(const Duration(seconds: 2))), isFalse);
+    });
+
+    test('重扫/探测回包会刷新进展 → 无进展 15s 才超时', () {
+      final progress = CaptureProgress(now: t0);
+      progress.enterStage('capture', t0);
+      // 每 10s 一次"重扫"进展：永远不超时
+      var now = t0;
+      for (var i = 0; i < 6; i++) {
+        now = now.add(const Duration(seconds: 10));
+        progress.touch('重扫', now);
+        expect(progress.shouldTimeout(now), isFalse);
+      }
+      // 停止进展 15s 后 → 超时
+      final silent = now.add(CaptureProgress.noProgressThreshold);
+      expect(progress.shouldTimeout(silent), isTrue);
+      // 诊断里两个值都要能拿到
+      expect(progress.sinceStageEnter(silent).inSeconds, greaterThanOrEqualTo(15));
+      expect(progress.sinceLastProgress(silent).inSeconds, 15);
+      expect(progress.lastProgress, '重扫');
+    });
+
+    test('非 capture 阶段永不超时', () {
+      for (final stage in <String>['login', 'waiting_card']) {
+        final progress = CaptureProgress(now: t0)..enterStage(stage, t0);
+        expect(
+          progress.shouldTimeout(t0.add(const Duration(minutes: 10))),
+          isFalse,
+          reason: '$stage 不应超时',
+        );
+      }
+    });
+
+    test('进入新阶段重置时间戳（上一次的旧时间戳不会带过来）', () {
+      final progress = CaptureProgress(now: t0);
+      progress.enterStage('waiting_card', t0);
+      // 等 30s 才进 capture（旧时间戳若未重置会立刻判死）
+      final enter = t0.add(const Duration(seconds: 30));
+      progress.enterStage('capture', enter);
+      expect(progress.shouldTimeout(enter), isFalse);
+      expect(progress.sinceStageEnter(enter), Duration.zero);
+    });
+  });
+  group('判死条件（刚进 capture 绝不立刻超时）', () {
+    test('刚进阶段 200ms、距最后进展 200ms → 不判死', () {
+      expect(
+        shouldReportCaptureTimeout(
+          stage: 'capture',
+          sinceStageEnter: const Duration(milliseconds: 200),
+          sinceLastProgress: const Duration(milliseconds: 200),
+        ),
+        isFalse,
+      );
+    });
+
+    test('非 capture 阶段（login / waiting_card）永远不判死', () {
+      for (final stage in <String>['login', 'waiting_card', '']) {
+        expect(
+          shouldReportCaptureTimeout(
+            stage: stage,
+            sinceStageEnter: const Duration(minutes: 5),
+            sinceLastProgress: const Duration(minutes: 5),
+          ),
+          isFalse,
+          reason: '$stage 阶段不应报超时',
+        );
+      }
+    });
+
+    test('满足全部条件（capture + 两个 15s + 无新增无回包）才判死', () {
+      expect(
+        shouldReportCaptureTimeout(
+          stage: 'capture',
+          sinceStageEnter: const Duration(seconds: 16),
+          sinceLastProgress: const Duration(seconds: 16),
+        ),
+        isTrue,
+      );
+    });
+
+    test('本次有新候选 / 有探测回包 → 不判死（页面还在变化）', () {
+      expect(
+        shouldReportCaptureTimeout(
+          stage: 'capture',
+          sinceStageEnter: const Duration(seconds: 40),
+          sinceLastProgress: const Duration(seconds: 40),
+          newCandidates: 3,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldReportCaptureTimeout(
+          stage: 'capture',
+          sinceStageEnter: const Duration(seconds: 40),
+          sinceLastProgress: const Duration(seconds: 40),
+          probeReturned: true,
+        ),
+        isFalse,
+      );
+    });
+
+    test('进入阶段时间够久但刚有进展 → 不判死', () {
+      expect(
+        shouldReportCaptureTimeout(
+          stage: 'capture',
+          sinceStageEnter: const Duration(minutes: 1),
+          sinceLastProgress: const Duration(milliseconds: 300),
+        ),
+        isFalse,
+      );
+    });
+  });
   group('周次筛选（默认当前周 + 切周）', () {
     test('区间展开：1-16 / 1-8,10-16 / 单周 / 空', () {
       expect(expandWeeks('1-16'), containsAll(<int>[1, 8, 16]));

@@ -251,12 +251,20 @@ String _formatDiagnostics(Object? raw) {
   if (candidates is num) {
     parts.add('候选 $candidates 个');
   }
+  // 探测明细：每个候选 `[前缀:状态码:判据]`，判据 rows7=命中 / empty=空数组 / missing=字段缺失 /
+  // html=被踢回登录页 / http=非 2xx / auth / badjson / err
+  final probeParams = raw['probeParams'];
+  if (probeParams is Map) {
+    parts.add('参数 years=${probeParams['years']} results=${probeParams['results']}');
+  }
   final probeResults = raw['probeResults'];
   if (probeResults is List && probeResults.isNotEmpty) {
-    final tried = probeResults.take(12).map((dynamic item) => '$item').join(',');
+    final tried = probeResults.take(12).map((dynamic item) => '[$item]').join(' ');
     parts.add('探测 $tried');
   } else if (raw['probeFailed'] == true) {
     parts.add('探测全失败');
+  } else {
+    parts.add('探测未发出');
   }
   final years = raw['years'];
   if (years is String && years.isNotEmpty) {
