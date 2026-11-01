@@ -7,6 +7,10 @@ use yunong_shared::MAX_INPUT_TOKENS;
 
 use crate::upstream::{Timeouts, UpstreamConfig};
 
+/// 哈希并发闸的允许上限（security 报告加固建议 1）。每次 Argon2 占 19 MiB，
+/// 32 → 峰值约 608 MiB；再大就接近"匿名并发把进程打爆"的原始问题了。
+pub const MAX_AUTH_HASH_CONCURRENCY: usize = 32;
+
 /// 服务端运行期配置。所有字段都可用环境变量覆盖（见 [`Config::from_env`]）。
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -54,6 +58,12 @@ pub struct Config {
     pub stream_total_timeout_secs: u64,
     /// `max_output_tokens` 的服务端上限（红队 M5）：客户端不得自行放大。
     pub max_output_tokens_cap: u32,
+    /// `/api/v1/auth/**` 的请求体上限（R2-F5）。登录/注册/刷新只有几个字段，
+    /// 给 8 KiB 就够；给 1 MiB 只会让匿名请求白白缓冲内存。
+    pub auth_body_limit_bytes: usize,
+    /// 是否信任 `X-Forwarded-For`（R2-F6）。默认 **false**：没有反向代理时，
+    /// XFF 是攻击者随便填的，按它分桶等于没有限流。部署在 Caddy/Nginx 后面再打开。
+    pub trust_proxy: bool,
     /// 套餐通道的上游供应商（三家协议可各配一套；Key 只存在服务端）
     pub upstream: UpstreamConfig,
 }
@@ -74,11 +84,35 @@ impl Config {
             upstream_idle_timeout_secs: env_parse("UPSTREAM_IDLE_TIMEOUT_SECS", 30),
             sse_heartbeat_secs: env_parse("SSE_HEARTBEAT_SECS", 15),
             usage_sample_percent: env_parse("USAGE_SAMPLE_PERCENT", 1).min(100),
-            auth_hash_concurrency: env_parse("AUTH_HASH_CONCURRENCY", 8),
+            // security 报告加固建议 1：并发闸配成 64 等于重开 H1（64×19MiB ≈ 1.2 GiB）。
+            // 这里**硬性夹到 1..=32**，并在越界时打 warn，免得配置错误静默变成漏洞。
+            auth_hash_concurrency: {
+                let configured: usize = env_parse("AUTH_HASH_CONCURRENCY", 8);
+                let clamped = clamp_auth_hash_concurrency(configured);
+                if configured != clamped {
+                    tracing::warn!(
+                        configured,
+                        clamped,
+                        "AUTH_HASH_CONCURRENCY 越界（允许 1..={MAX_AUTH_HASH_CONCURRENCY}），已夹紧；\
+                         配得过大等于重开内存放大（每次哈希 19 MiB）"
+                    );
+                }
+                clamped
+            },
             auth_login_per_min: env_parse("AUTH_LOGIN_PER_MIN", 20),
             auth_register_per_min: env_parse("AUTH_REGISTER_PER_MIN", 10),
             auth_refresh_per_min: env_parse("AUTH_REFRESH_PER_MIN", 60),
             body_limit_bytes: env_parse("YUNONG_BODY_LIMIT_BYTES", 1024 * 1024),
+            auth_body_limit_bytes: env_parse("AUTH_BODY_LIMIT_BYTES", 8 * 1024),
+            trust_proxy: env::var("YUNONG_TRUST_PROXY")
+                .ok()
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes"
+                    )
+                })
+                .unwrap_or(false),
             sample_salt: env::var("YUNONG_SAMPLE_SALT")
                 .ok()
                 .filter(|value| value.len() >= 16)
@@ -118,6 +152,8 @@ impl Config {
             auth_register_per_min: 1000,
             auth_refresh_per_min: 1000,
             body_limit_bytes: 1024 * 1024,
+            auth_body_limit_bytes: 8 * 1024,
+            trust_proxy: false,
             // 测试用固定盐：抽样判定在用例之间必须可复现
             sample_salt: "test-sample-salt-0123456789".into(),
             // 测试默认不限总时长（长流用例要稳定）；M5 的用例会显式设小
@@ -135,6 +171,13 @@ impl Config {
             idle: Duration::from_secs(self.upstream_idle_timeout_secs),
         }
     }
+}
+
+/// 把 `AUTH_HASH_CONCURRENCY` 夹到允许区间（security 报告加固建议 1）。
+///
+/// 单独抽出来是为了可测：配置错误必须能被回归抓住，而不是等上线后被放大。
+pub fn clamp_auth_hash_concurrency(configured: usize) -> usize {
+    configured.clamp(1, MAX_AUTH_HASH_CONCURRENCY)
 }
 
 fn env_or(key: &str, default: &str) -> String {

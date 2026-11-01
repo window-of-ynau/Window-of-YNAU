@@ -54,6 +54,15 @@ impl AppError {
     pub fn code(&self) -> ErrorCode {
         self.inner.code
     }
+
+    /// 429 的 `Retry-After`（秒）。测试用它断言"按额度算"而不是恒 1s（R2-F7）。
+    pub fn retry_after(&self) -> Option<u64> {
+        self.retry_after
+    }
+
+    pub fn message(&self) -> &str {
+        &self.inner.message
+    }
 }
 
 impl IntoResponse for AppError {

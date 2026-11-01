@@ -23,8 +23,20 @@ use yunong_shared::{ApiError, ErrorCode};
 use crate::api::request_id::ReqId;
 use crate::state::AppState;
 
-pub async fn enforce(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let limit = state.config.body_limit_bytes;
+/// 受保护路由的 body 上限（1 MiB 级）。
+///
+/// **必须挂在 `auth_guard` 内层**：放外层会让未鉴权连接也能缓冲整份 body
+/// （R2-F5：security 实测 50 条未鉴权 chunked 连接 → RSS +55 MiB；修前是 401 且一次都没读）。
+pub async fn enforce_api(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    enforce(state.config.body_limit_bytes, request, next).await
+}
+
+/// 未鉴权鉴权端点的 body 上限（8 KiB 级）：登录/注册/刷新只有几个字段。
+pub async fn enforce_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    enforce(state.config.auth_body_limit_bytes, request, next).await
+}
+
+async fn enforce(limit: usize, request: Request, next: Next) -> Response {
     let request_id = request
         .extensions()
         .get::<ReqId>()
