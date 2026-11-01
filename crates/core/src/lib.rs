@@ -22,6 +22,7 @@ pub mod memory_items;
 pub mod parse;
 pub mod protocols;
 pub mod schedule;
+pub mod secret;
 pub mod store;
 pub mod tools;
 
