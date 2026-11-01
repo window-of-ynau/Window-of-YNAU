@@ -148,12 +148,20 @@ void main() {
     final service = TimetableService(core: core, dbPath: '/tmp/t.db');
 
     await tester.pumpWidget(_wrap(TimetablePage(service: service)));
+
+    // 导入要读 asset（rootBundle.loadString），在 fake-async 下这个 Future 不会完成，
+    // 于是页面的 indeterminate 进度条一直转、pumpAndSettle 永远不 settle。
+    // 用 runAsync 放行真实异步，再用定次 pump 让 setState 生效。
     await tester.tap(find.text('导入内置样本'));
-    await tester.pumpAndSettle();
+    await tester.pump();
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
+    await tester.pump();
     expect(find.text('高等数学A'), findsOneWidget);
 
     await tester.tap(find.text('模拟页面改版'));
-    await tester.pumpAndSettle();
+    await tester.pump();
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
+    await tester.pump();
 
     expect(find.textContaining('请确认本学期是否已排课'), findsOneWidget);
     expect(find.text('高等数学A'), findsOneWidget, reason: '旧列表要保留');
