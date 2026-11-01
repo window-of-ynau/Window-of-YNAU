@@ -66,6 +66,8 @@ enum Script {
     StreamError,
     /// 迟迟不给响应头（触发 504）
     SlowHeaders,
+    /// 302 重定向到别处（验证 M2：服务端不跟随重定向）
+    Redirect,
     /// 一直产出，等客户端断开（验证取消；真实厂商也是如此）
     Endless,
     /// 大口大口地灌（每帧 32KB）：客户端不读了以后，Socket 缓冲很快就会被灌满
@@ -229,6 +231,13 @@ async fn mock_handler(
         ),
         // 不 sleep：靠 channel 的背压，客户端一停读就会立刻卡住
         Script::Flood => sse_response(Arc::clone(&ctx.counters), flood_frames(), Duration::ZERO),
+        // 302：`Location` 指向一个**不该被访问**的本地地址（验证"不跟随"）
+        Script::Redirect => (
+            StatusCode::FOUND,
+            [(header::LOCATION, "http://127.0.0.1:1/leak")],
+            "moved",
+        )
+            .into_response(),
     }
 }
 
@@ -1622,4 +1631,195 @@ async fn pg_gate_rejection_is_audited_as_deny() {
 
     drop(held);
     db.finish().await;
+}
+
+// ===================== 红队预演回归（H1 / H2 / M1 / M2） =====================
+
+/// H1：登录按**邮箱**限速，超额返回 429 + `Retry-After`。
+#[tokio::test]
+async fn login_is_rate_limited_after_quota() {
+    let mut config = Config::for_tests();
+    config.auth_login_per_min = 2;
+    let app = TestApp::with_config(config);
+    // 注册不消耗登录额度（注册走自己的桶）
+    let _ = app.register("rate@ynau.edu.cn").await;
+
+    let body = json!({
+        "email": "rate@ynau.edu.cn",
+        "password": "definitely-wrong-password"
+    })
+    .to_string();
+
+    let mut statuses = Vec::new();
+    let mut retry_after = None;
+    for _ in 0..3 {
+        let response = app
+            .call(json_request("POST", "/api/v1/auth/login", &body, None))
+            .await;
+        statuses.push(response.status());
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            retry_after = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+        }
+        let _ = read_json(response).await;
+    }
+
+    assert_eq!(statuses[0], StatusCode::UNAUTHORIZED, "第 1 次是正常失败");
+    assert_eq!(statuses[1], StatusCode::UNAUTHORIZED, "第 2 次仍在额度内");
+    assert_eq!(
+        statuses[2],
+        StatusCode::TOO_MANY_REQUESTS,
+        "第 3 次必须被限流：{statuses:?}"
+    );
+    assert_eq!(retry_after.as_deref(), Some("1"), "429 必须带 Retry-After");
+}
+
+/// H1：并发闸钉死哈希数。这里直接压限流器（集成层无法稳定制造"同时进哈希"）。
+#[tokio::test]
+async fn hash_concurrency_bounds_memory_amplifier() {
+    use std::time::Duration as StdDuration;
+
+    let limiter = yunong_server::limiter::AuthLimiter::new(1, 1000, 1000, 1000);
+    let first = limiter
+        .acquire_hash_slot(StdDuration::from_millis(1))
+        .await
+        .expect("第一个名额");
+    assert!(
+        limiter
+            .acquire_hash_slot(StdDuration::from_millis(1))
+            .await
+            .is_err(),
+        "名额满时必须立刻拒绝，而不是把 N 份 19MiB 排队堆起来"
+    );
+    drop(first);
+    assert!(
+        limiter
+            .acquire_hash_slot(StdDuration::from_millis(50))
+            .await
+            .is_ok(),
+        "归还后应重新可用"
+    );
+}
+
+/// H2-a：请求体超过 body 上限 → 413（在 JSON 解析之前就被挡下）。
+#[tokio::test]
+async fn oversized_body_is_rejected_with_413() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let mut config = TestApp::config(&mock);
+    config.body_limit_bytes = 256 * 1024;
+    config.max_input_tokens = yunong_shared::MAX_INPUT_TOKENS;
+    let app = TestApp::with_config(config);
+    let token = app.register("big-body@ynau.edu.cn").await;
+
+    let payload = json!({
+        "session_id": "s",
+        "turn_id": "t-big",
+        "round": 1,
+        "model": "m",
+        "protocol": "openai_completions",
+        "messages": [{ "role": "user", "content": "A".repeat(400_000) }],
+        "tools": [],
+        "max_output_tokens": 64,
+        "stream": true,
+        "estimated_input_tokens": 1
+    })
+    .to_string();
+    assert!(payload.len() > 256 * 1024, "测试数据必须真的超限");
+
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &payload,
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "超过 body 上限必须是 413"
+    );
+    assert_eq!(mock.requests(), 0, "被 body 闸拦下的请求不该打上游");
+}
+
+/// H2-b：正文没超 body 上限，但客户端**虚报** token（填 1）→ 服务端估算后 413。
+#[tokio::test]
+async fn lying_token_estimate_is_rejected_by_server_side_estimate() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+    let token = app.register("liar@ynau.edu.cn").await;
+
+    // 非 CJK 字符 4 个 ≈ 1 token：150k 字符 ≈ 37.5k tokens > MAX_INPUT_TOKENS(32k)
+    let payload = json!({
+        "session_id": "s",
+        "turn_id": "t-liar",
+        "round": 1,
+        "model": "m",
+        "protocol": "openai_completions",
+        "messages": [{ "role": "user", "content": "A".repeat(150_000) }],
+        "tools": [],
+        "max_output_tokens": 64,
+        "stream": true,
+        "estimated_input_tokens": 1
+    })
+    .to_string();
+
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &payload,
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "服务端必须自己估算，不能信客户端自报"
+    );
+    let body = read_json(response).await;
+    assert_eq!(body["error"]["code"], "MESSAGE_TOO_LARGE");
+    assert_eq!(mock.requests(), 0, "准入拒绝不该打上游");
+}
+
+/// M1：不同用户用**同一个 turn_id** 互不影响（以前会被判 turn_in_flight）。
+#[tokio::test]
+async fn same_turn_id_is_independent_across_users() {
+    let mock = start_mock(Script::Endless).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+    let alice = app.register("alice-turn@ynau.edu.cn").await;
+    let bob = app.register("bob-turn@ynau.edu.cn").await;
+
+    let alice_stream = app.call(chat_request(Some(&alice), "turn-shared")).await;
+    assert_eq!(alice_stream.status(), StatusCode::OK);
+
+    let bob_stream = app.call(chat_request(Some(&bob), "turn-shared")).await;
+    assert_eq!(
+        bob_stream.status(),
+        StatusCode::OK,
+        "别人占着同名 turn 不该挡住我（红队 M1）"
+    );
+
+    drop(alice_stream);
+    drop(bob_stream);
+}
+
+/// M2：上游 302 时服务端**不跟随**（不把请求带去它指定的地址）→ 502。
+#[tokio::test]
+async fn redirect_is_not_followed() {
+    let mock = start_mock(Script::Redirect).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+    let token = app.register("redirect@ynau.edu.cn").await;
+
+    let response = app.call(chat_request(Some(&token), "turn-redirect")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "3xx 不是可用的上游响应，必须 502"
+    );
+    let _ = read_json(response).await;
+    assert_eq!(mock.requests(), 1, "只应打一次上游，不该跟随重定向再打一次");
 }

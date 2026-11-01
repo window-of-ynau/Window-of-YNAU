@@ -2,7 +2,7 @@
 
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
+    Algorithm, Argon2, Params, Version,
 };
 use uuid::Uuid;
 
@@ -14,6 +14,24 @@ pub const MIN_PASSWORD_LEN: usize = 8;
 /// 上限：防止超长输入拖慢哈希（Argon2 的成本与输入长度有关）。
 pub const MAX_PASSWORD_LEN: usize = 128;
 
+/// 哈希内存成本（KiB）——**显式钉死**，不用 `Argon2::default()`。
+///
+/// 红队 H1：`Argon2::default()` 的 m 值跟随 argon2 crate 的默认值，升级依赖时可能被
+/// 静默改大/改小；而内存成本直接决定"匿名并发能打出多少内存峰值"，不能让它漂移。
+/// 这里写死 19 MiB（crate 当前默认值），由 `params_match_pinned_budget` 单测守着。
+pub const ARGON2_M_COST_KIB: u32 = 19 * 1024;
+/// 时间成本（迭代次数）
+pub const ARGON2_T_COST: u32 = 2;
+/// 并行度
+pub const ARGON2_P_COST: u32 = 1;
+
+/// 构造固定参数的 Argon2id（Argon2id + v19 + 上面的成本参数）。
+fn argon2() -> Argon2<'static> {
+    let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+        .expect("Argon2 参数固定在合法范围内");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
 /// 哈希密码，返回 PHC 字符串。
 ///
 /// 盐自己生成：`SaltString::generate` 需要 `rand_core/getrandom` feature，
@@ -22,7 +40,7 @@ pub const MAX_PASSWORD_LEN: usize = 128;
 /// 交给 `SaltString::encode_b64`，效果等价且零新增依赖。
 pub fn hash(password: &str) -> Result<String, AuthError> {
     let salt = random_salt();
-    let hashed = Argon2::default()
+    let hashed = argon2()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| AuthError::internal(format!("密码哈希失败：{e}")))?;
     Ok(hashed.to_string())
@@ -33,7 +51,7 @@ pub fn verify(password: &str, phc: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(phc) else {
         return false;
     };
-    Argon2::default()
+    argon2()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
 }
@@ -82,6 +100,23 @@ mod tests {
         let a = hash("correct-horse-battery").expect("哈希应成功");
         let b = hash("correct-horse-battery").expect("哈希应成功");
         assert_ne!(a, b, "每次都要用新盐");
+    }
+
+    /// 红队 H1：哈希成本必须**钉死在代码里**，不能被 argon2 crate 的默认值变更带走。
+    ///
+    /// 这个断言把"内存放大器"的参数写进测试：将来升级依赖导致默认值变化时这里会红，
+    /// 逼着人显式决策要不要接受新的内存成本。
+    #[test]
+    fn params_match_pinned_budget() {
+        let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+            .expect("固定参数必须合法");
+        assert_eq!(params.m_cost(), ARGON2_M_COST_KIB, "内存成本被改动");
+        assert_eq!(params.t_cost(), ARGON2_T_COST, "迭代次数被改动");
+        assert_eq!(params.p_cost(), ARGON2_P_COST, "并行度被改动");
+        assert_eq!(ARGON2_M_COST_KIB, 19_456, "19 MiB 是当前基线，改动要过评审");
+        // PHC 串里必须能读出同样的成本：证明 hash() 真的用了这套参数
+        let phc = hash("correct-horse-battery").expect("哈希成功");
+        assert!(phc.contains("m=19456,t=2,p=1"), "PHC 参数不符：{phc}");
     }
 
     #[test]
