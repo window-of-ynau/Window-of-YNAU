@@ -254,7 +254,8 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
       return;
     }
     _progressTimer ??= Timer.periodic(const Duration(seconds: 1), (_) async {
-      if (_templateCaptured || _stage == 'login') {
+      // 只有 capture 阶段才可能报超时（等待登录/等待卡片永不报）
+      if (_templateCaptured || _stage != 'capture') {
         return;
       }
       if (DateTime.now().difference(_lastProgressAt) < const Duration(seconds: 15)) {
