@@ -12,7 +12,9 @@
 //! 4. key 名只允许 `[a-z0-9_-]{1,64}`（防路径穿越：key 会进文件名）。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// key 名规则：小写字母/数字/下划线/连字符，1..=64。
@@ -489,6 +491,7 @@ pub fn default_store(base: impl AsRef<Path>) -> Box<dyn KeyStore> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     fn temp_base() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("yunong-secret-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
