@@ -17,14 +17,27 @@ import 'dart:convert';
 /// 接口路径（用于脚本匹配；改版时只改这里）。
 const String kScheduleApiPath = '/api/uppcard/kbsz/queryAWeekSchedule';
 
-/// 默认学期开始日（第 1 周周一）：**2026-09-07**（owner 已验证）。
+/// 人工验证过的学期锚点（**仅作建议值，不是真值**），来源：云南农业大学
+/// 2026—2027 学年校历。
 ///
-/// 验算：按此锚点，第 1 周 = 09-07 ~ 09-13、第 8 周 = 10-26 ~ 11-01（owner 确认
-/// 11-01 是第 8 周最后一天）、第 15 周 = 12-14 ~ 12-20（即抓包样本那一周）。
+/// 只放"校历上写明、且验算是周一"的学期；其它学期必须由用户确认。
+/// **不要**把已知学期的值套用到别的学期：一学年有 **3** 个学期
+/// （`2026-2027-1` 秋季 / `-2` 春季 / `-3` 暑期短学期），学期之间没有可推导的关系。
+const Map<String, String> kSeededTermStarts = <String, String>{
+  // 第一学期：在校生 9 月 7 日（周一）开始上课；16 周教学 + 2 周机动 + 1 周考试。
+  '2026-2027-1': '2026-09-07',
+  // 第二学期：3 月 1 日（周一）开始上课；16 周教学 + 1 周机动 + 1 周考试。
+  '2026-2027-2': '2027-03-01',
+  // 第三学期（暑期短学期）：7 月 5 日（周一）— 7 月 16 日，仅 2 周。
+  '2026-2027-3': '2027-07-05',
+};
+
+/// 某学期的建议开始日。
 ///
-/// **可配置**：界面会显示这个值并允许用户修改，改完持久化到 `terms.starts_on`；
-/// 这里只是"没有用户确认时的默认值"，不是不可变的硬编码。
-const String kDefaultTermStart = '2026-09-07';
+/// 返回 `null` 表示"该学期没有人工验证过的锚点"，调用方必须要求用户确认，
+/// 并且在确认前**不要显示任何具体日期**（只显示第几周）。
+DateTime? suggestedTermStart(String term) =>
+    parseTermStart(kSeededTermStarts[term] ?? '');
 
 /// 取某天所在周的周一（本地时区，忽略时分秒）。
 DateTime mondayOf(DateTime day) {
@@ -91,8 +104,10 @@ DateTime? parseTermStart(String value) {
   return parsed == null ? null : mondayOf(parsed);
 }
 
-/// 默认学期开始日（`DateTime` 形式）。
-DateTime get defaultTermStart => parseTermStart(kDefaultTermStart) ?? DateTime(2026, 9, 7);
+/// 已废弃：**不再存在"全局默认学期开始日"**。
+///
+/// 保留此注释是为了防止有人重新引入全局常量：学期锚点必须按学期存放，
+/// 见 [kSeededTermStarts] 与 [suggestedTermStart]。
 /// 最多拉 20 周（接口 `weekcount` 上限的约定），并发 4，总超时 20s。
 const int kMaxWeeks = 20;
 const int kFetchConcurrency = 4;

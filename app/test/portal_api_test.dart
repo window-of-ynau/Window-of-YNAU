@@ -39,12 +39,27 @@ void main() {
     });
   });
 
-  group('学期开始日 = 2026-09-07（可配置，不按 zs 推算）', () {
-    final start = defaultTermStart;
+  group('学期开始日来自校历锚点（按学期取，不按 zs 推算）', () {
+    final start = suggestedTermStart('2026-2027-1')!;
 
-    test('默认值就是 2026-09-07 且是周一', () {
+    test('第一学期锚点 2026-09-07 且是周一', () {
       expect(formatIsoDate(start), '2026-09-07');
       expect(start.weekday, DateTime.monday);
+    });
+
+    test('校历三个学期的锚点都是周一', () {
+      for (final term in <String>['2026-2027-1', '2026-2027-2', '2026-2027-3']) {
+        final anchor = suggestedTermStart(term);
+        expect(anchor, isNotNull, reason: '$term 应有校历锚点');
+        expect(anchor!.weekday, DateTime.monday, reason: '$term 锚点必须是周一');
+      }
+      expect(formatIsoDate(suggestedTermStart('2026-2027-2')!), '2027-03-01');
+      expect(formatIsoDate(suggestedTermStart('2026-2027-3')!), '2027-07-05');
+    });
+
+    test('未验证过的学期没有建议值（必须让用户确认，不能套用别的学期）', () {
+      expect(suggestedTermStart('2027-2028-1'), isNull);
+      expect(suggestedTermStart(''), isNull);
     });
 
     test('校验用例：第 1 / 8 / 15 周的区间', () {
@@ -100,7 +115,7 @@ void main() {
     test('等等——zs 不参与任何推算（本文件已无该函数，用编译通过来保证）', () {
       // 只要 portal_api.dart 里没有"用 zs 推算当前周/开学日"的函数，这条就恒真。
       // 断言写在这里是为了让"以后有人想把 zs 当当前周用"必须先删掉这个测试。
-      expect(kDefaultTermStart, '2026-09-07');
+      expect(kSeededTermStarts['2026-2027-1'], '2026-09-07');
     });
   });
   group('解析 schedule_api 消息', () {

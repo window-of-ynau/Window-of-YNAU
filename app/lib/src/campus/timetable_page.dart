@@ -51,14 +51,17 @@ class _TimetablePageState extends State<TimetablePage> {
   /// 最近一次动作（失败卡片的重试按钮复用它）。
   Future<void> Function()? _lastAction;
 
-  /// 学期开始日（默认 2026-09-07，可改可确认；确认后持久化到 terms.starts_on）。
-  DateTime? _termStartDraft = defaultTermStart;
+  /// 学期开始日：**按学期**取建议值（没有人工验证过的学期就是 `null`，必须由用户确认）。
+  /// 确认后持久化到 `terms.starts_on`，下次直接读库。
+  DateTime? _termStartDraft;
   bool _termStartSaved = false;
   String? _notice;
 
   @override
   void initState() {
     super.initState();
+    // 只对"人工验证过的学期"给建议值；其它学期留空，等用户确认。
+    _termStartDraft = suggestedTermStart(_currentTerm);
     unawaited(_loadTermStart());
   }
 
@@ -377,19 +380,44 @@ class _TimetablePageState extends State<TimetablePage> {
 
   /// 学期开始日卡片：**显式展示日期与周区间**并要求确认（错一周整张课表日期全错）。
   ///
-  /// 值来自"默认 2026-09-07 / 用户上次确认的结果"，绝不按 `zs` 推算：
+  /// 值来自"该学期人工验证过的锚点 / 用户上次确认的结果"，绝不按 `zs` 推算：
   /// `zs` 只是回显请求的周号，不是系统当前周。
   Widget _buildTermStartCard(ThemeData theme) {
     final draft = _termStartDraft;
     if (draft == null) {
-      return const SizedBox.shrink();
+      // 该学期没有锚点：**不显示任何具体日期**（宁可不显示，也不能显示错的），
+      // 只提示用户确认一次；确认前课表按"第 N 周 · 星期 X"展示。
+      return Container(
+        margin: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.errorContainer,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          children: <Widget>[
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text('本学期（$_currentTerm）还没确认学期开始日',
+                      style: theme.textTheme.bodyMedium),
+                  Text('确认前只显示「第 N 周」，不显示具体日期；确认一次即可长期记住。',
+                      style: theme.textTheme.bodySmall),
+                ],
+              ),
+            ),
+            FilledButton(onPressed: _editTermStart, child: const Text('选择日期')),
+          ],
+        ),
+      );
     }
     final week = _currentWeek;
     final weekOne = weekRangeLabel(termStart: draft, week: 1);
     final subtitle = <String>[
       '第 1 周：$weekOne',
       if (week != null && week > 0) '今天按此算第 $week 周',
-      _termStartSaved ? '已确认，日历换算按这天起算' : '未确认（默认值可改）',
+      _termStartSaved ? '已确认，日历换算按这天起算' : '未确认（可改）',
     ].join(' · ');
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 4, 16, 4),
