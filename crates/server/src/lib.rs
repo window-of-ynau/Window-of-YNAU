@@ -25,35 +25,47 @@ use tower_http::trace::TraceLayer;
 
 /// 组装路由。`main` 与集成测试共用同一个入口，保证测的是同一套东西。
 pub fn app(state: state::AppState) -> Router {
-    // 公开：探针 + 注册/登录/刷新（最后这三个正是"还没有令牌"时要用的接口）。
-    let public = Router::new()
+    // 探针：没有请求体，不需要 body 闸。
+    let probes = Router::new()
         .route("/healthz", get(api::health::healthz))
-        .route("/readyz", get(api::health::readyz))
+        .route("/readyz", get(api::health::readyz));
+
+    // 未鉴权鉴权端点：body 只有几个字段 → 8 KiB 上限（R2-F5）。
+    let auth_endpoints = Router::new()
         .route("/api/v1/auth/register", post(api::auth::register))
         .route("/api/v1/auth/login", post(api::auth::login))
-        .route("/api/v1/auth/refresh", post(api::auth::refresh));
+        .route("/api/v1/auth/refresh", post(api::auth::refresh))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::body_limit::enforce_auth,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::client_ip::inject,
+        ));
 
     // 需要 Bearer：登出 + 其余全部业务接口。
     // 用 `route_layer`（不是 `layer`）：它只包路由、不包 fallback，
     // 未知路径才能继续是 404，而不是被鉴权改写成 401。
+    //
+    // R2-F5：**先鉴权、再读 body**。`route_layer` 后加的在外层，所以下面这一行
+    // （auth_guard）必须写在 body 闸之后，让 401 发生在任何 body 缓冲之前。
     let protected = Router::new()
         .route("/api/v1/auth/logout", post(api::auth::logout))
         .route("/api/v1/me", get(api::me::me))
         .route("/api/v1/chat/stream", post(api::chat::chat_stream))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
+            api::body_limit::enforce_api,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
             api::auth_guard::require_bearer,
         ));
 
-    public
+    probes
+        .merge(auth_endpoints)
         .merge(protected)
-        // 红队 H2 + security 复核 F3：请求体硬上限由**我们自己的中间件**实现。
-        // `DefaultBodyLimit` 的 413 是 axum 的 text/plain，客户端解析不到统一信封，
-        // 所以这里换成 `api::body_limit::enforce`（超限同样 413，但带 `{ok:false,error:{...}}`）。
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            api::body_limit::enforce,
-        ))
         // 最外层：请求 ID（错误信封需要它）；内层：访问日志
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(api::request_id::attach))

@@ -454,6 +454,35 @@ fn json_request(method: &str, uri: &str, body: &str, token: Option<&str>) -> Req
     builder.body(Body::from(body.to_owned())).expect("构造请求")
 }
 
+/// 只用于"body 有没有被读"的计数流：每 yield 一块就 +1。
+struct CountingStream {
+    remaining: usize,
+    polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Stream for CountingStream {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use std::sync::atomic::Ordering;
+        if self.remaining == 0 {
+            return Poll::Ready(None);
+        }
+        self.remaining -= 1;
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(Some(Ok(Bytes::from(vec![b'x'; 64 * 1024]))))
+    }
+}
+
+/// 往已构造好的请求上加一个头（`json_request` 只支持 token，其它头用这个补）。
+fn with_header(mut request: Request<Body>, name: &str, value: &str) -> Request<Body> {
+    request.headers_mut().insert(
+        header::HeaderName::from_bytes(name.as_bytes()).expect("头名"),
+        header::HeaderValue::from_str(value).expect("头值"),
+    );
+    request
+}
+
 fn chat_body(turn_id: &str) -> String {
     json!({
         "session_id": "s_1",
@@ -1705,22 +1734,28 @@ async fn login_is_rate_limited_after_quota() {
         StatusCode::TOO_MANY_REQUESTS,
         "第 3 次必须被限流：{statuses:?}"
     );
-    assert_eq!(retry_after.as_deref(), Some("1"), "429 必须带 Retry-After");
+    // R2-F7：`Retry-After` 按"回满 1 个 token 需要多久"算——窗口 60s、额度 2/分 → 30s。
+    assert_eq!(
+        retry_after.as_deref(),
+        Some("30"),
+        "429 的 Retry-After 必须按额度算（恒 1s 会让客户端立刻又撞 429）"
+    );
 }
 
 /// H1：并发闸钉死哈希数。这里直接压限流器（集成层无法稳定制造"同时进哈希"）。
 #[tokio::test]
 async fn hash_concurrency_bounds_memory_amplifier() {
     use std::time::Duration as StdDuration;
+    use yunong_server::limiter::AuthRoute;
 
     let limiter = yunong_server::limiter::AuthLimiter::new(1, 1000, 1000, 1000);
     let first = limiter
-        .acquire_hash_slot(StdDuration::from_millis(1))
+        .acquire_hash_slot(AuthRoute::Login, StdDuration::from_millis(1))
         .await
         .expect("第一个名额");
     assert!(
         limiter
-            .acquire_hash_slot(StdDuration::from_millis(1))
+            .acquire_hash_slot(AuthRoute::Login, StdDuration::from_millis(1))
             .await
             .is_err(),
         "名额满时必须立刻拒绝，而不是把 N 份 19MiB 排队堆起来"
@@ -1728,7 +1763,7 @@ async fn hash_concurrency_bounds_memory_amplifier() {
     drop(first);
     assert!(
         limiter
-            .acquire_hash_slot(StdDuration::from_millis(50))
+            .acquire_hash_slot(AuthRoute::Login, StdDuration::from_millis(50))
             .await
             .is_ok(),
         "归还后应重新可用"
@@ -1841,6 +1876,184 @@ async fn same_turn_id_is_independent_across_users() {
 
     drop(alice_stream);
     drop(bob_stream);
+}
+
+/// R2-F5（回归）：受保护路由必须**先鉴权、再读 body**。
+///
+/// 之前把 body 上限挂在最外层，未鉴权连接也能缓冲整份 body（security 实测
+/// 50 条未鉴权 chunked 连接 → RSS +55 MiB）。现在超限 body + 无令牌应当得到 **401**
+/// 而不是 413 —— 401 说明鉴权先跑、body 一次都没读。
+#[tokio::test]
+async fn unauthenticated_oversized_body_is_rejected_before_reading() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+
+    // 3 MiB：远超 1 MiB 的受保护路由上限
+    let payload = "x".repeat(3 * 1024 * 1024);
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &payload,
+            None, // 没有令牌
+        ))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "必须先 401：body 不该在鉴权之前被读"
+    );
+    assert_eq!(mock.requests(), 0);
+}
+
+/// R2-F5 的**直接**证据：body 一次都没被读。
+///
+/// 用计数流做 body（每被 poll 一次就 +1），未鉴权请求必须 401 且计数保持 0
+/// ——比"看状态码"更硬：它证明我们确实没有缓冲任何字节。
+#[tokio::test]
+async fn unauthenticated_body_is_never_polled() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    // 8 MiB 的体，分成 64 KiB 的块；每块被取走都会 +1
+    let stream = CountingStream {
+        remaining: 128,
+        polls: Arc::clone(&polls),
+    };
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/chat/stream")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .expect("构造流式请求");
+
+    let response = app.call(request).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "没有令牌必须 401（在读完 body 之前）"
+    );
+    let read = polls.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        read, 0,
+        "body 被读了 {read} 次：鉴权必须发生在 body 缓冲之前（R2-F5）"
+    );
+}
+
+/// R2-F5 的反面：**通过鉴权之后**，body 上限仍然生效（否则就成了"只挡匿名、放过超限"）。
+#[tokio::test]
+async fn authenticated_oversized_body_is_still_413() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+    let token = app.register("authed-big@ynau.edu.cn").await;
+
+    let payload = "x".repeat(2 * 1024 * 1024); // > 1 MiB
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &payload,
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "带着有效令牌时，body 闸必须仍然生效"
+    );
+    let body = read_json(response).await;
+    assert_eq!(body["error"]["code"], "MESSAGE_TOO_LARGE");
+    assert_eq!(mock.requests(), 0);
+}
+
+/// R2-F5：鉴权端点自己的 body 上限是 8 KiB（登录/注册/刷新只有几个字段）。
+#[tokio::test]
+async fn auth_endpoints_have_small_body_limit() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+
+    let payload = json!({
+        "email": "a@x.cn",
+        "password": "x".repeat(32 * 1024) // 32 KiB > 8 KiB
+    })
+    .to_string();
+    let response = app
+        .call(json_request("POST", "/api/v1/auth/login", &payload, None))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "鉴权端点超过 8 KiB 应 413（而不是先做一次 19 MiB 的哈希）"
+    );
+    let body = read_json(response).await;
+    assert_eq!(body["error"]["code"], "MESSAGE_TOO_LARGE");
+}
+
+/// R2-F6：注册按**客户端 IP** 分桶（原来是全局桶：一个班同时注册会大面积 429）。
+#[tokio::test]
+async fn register_is_rate_limited_per_client_ip() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let mut config = TestApp::config(&mock);
+    config.auth_register_per_min = 1; // 每个 IP 1 次/分钟
+    config.trust_proxy = true; // 测试里用 XFF 模拟 IP
+    let app = TestApp::with_config(config);
+
+    let call = |ip: &'static str, email: String| {
+        let app = &app;
+        async move {
+            let request = with_header(
+                json_request(
+                    "POST",
+                    "/api/v1/auth/register",
+                    &json!({ "email": email, "password": "password-123" }).to_string(),
+                    None,
+                ),
+                "x-forwarded-for",
+                ip,
+            );
+            app.call(request).await
+        }
+    };
+
+    assert_eq!(
+        call("203.0.113.1", "a1@ynau.edu.cn".into()).await.status(),
+        StatusCode::CREATED,
+        "IP1 第一次应成功"
+    );
+    assert_eq!(
+        call("203.0.113.2", "a2@ynau.edu.cn".into()).await.status(),
+        StatusCode::CREATED,
+        "另一个 IP 不该被 IP1 的额度影响"
+    );
+    assert_eq!(
+        call("203.0.113.1", "a3@ynau.edu.cn".into()).await.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "同一 IP 超过额度应 429"
+    );
+}
+
+/// R2-F9：归一化口径统一（ASCII），非 ASCII 邮箱直接 422，避免"两个桶一个账号"。
+#[tokio::test]
+async fn non_ascii_email_is_rejected() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+
+    let payload = json!({ "email": "Ä@x.cn", "password": "password-123" }).to_string();
+    let response = app
+        .call(json_request("POST", "/api/v1/auth/login", &payload, None))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "非 ASCII 邮箱应 422（限流键与账号键必须同一套归一化）"
+    );
+    let body = read_json(response).await;
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
 }
 
 /// security 复核 F1（high）：超长邮箱必须在**进限流之前**被拒，且不进桶表。

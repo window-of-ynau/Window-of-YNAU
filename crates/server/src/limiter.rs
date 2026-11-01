@@ -41,6 +41,15 @@ impl AuthRoute {
             Self::Refresh => "refresh",
         }
     }
+
+    /// 给用户看的中文名（R2-F8：之前并发闸的 429 一律说"login 接口"）。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Register => "注册",
+            Self::Login => "登录",
+            Self::Refresh => "刷新",
+        }
+    }
 }
 
 /// 桶表容量上限（security 复核 F1）。1024 条已经能覆盖"同一时刻被撞库的账号数"，
@@ -128,15 +137,20 @@ impl AuthLimiter {
 
         // 桶表上限 + **LRU 淘汰**（security 复核 F1）：
         // 键来自攻击者可控的邮箱，若不清空/不淘汰，匿名请求能把 map 撑到几十 GiB 常驻。
-        // 不能用 `clear()`：那等于给攻击者一个"重置全部限流"的按钮。淘汰最旧的一条，
-        // 命中率下降只影响被淘汰的那个 key（它立刻又能被限流一次，上限是 1 次）。
+        // 不能用 `clear()`：那等于给攻击者一个"重置全部限流"的按钮。
+        //
+        // R2-F4：淘汰时**优先跳过"还没回满"的惩罚桶**。否则攻击者只要在被撞库的账号
+        // 打到 429 之后灌 1024 个新键，就能把这个账号的惩罚桶挤掉、额度立刻重置
+        // （2000 个新邮箱 ≈ 1.5s 一次，成本极低）。只有整张表都是惩罚桶时才动它们。
         if buckets.len() >= MAX_BUCKETS && !buckets.contains_key(&(route, key.clone())) {
-            let oldest = buckets
+            let victim = buckets
                 .iter()
+                .filter(|(_, bucket)| bucket.tokens >= 1.0)
                 .min_by_key(|(_, bucket)| bucket.updated)
+                .or_else(|| buckets.iter().min_by_key(|(_, bucket)| bucket.updated))
                 .map(|(k, _)| k.clone());
-            if let Some(oldest) = oldest {
-                buckets.remove(&oldest);
+            if let Some(victim) = victim {
+                buckets.remove(&victim);
             }
         }
 
@@ -152,7 +166,10 @@ impl AuthLimiter {
         bucket.updated = now;
 
         if bucket.tokens < 1.0 {
-            return Err(rate_limited(route, 1));
+            // R2-F7：`Retry-After` 要按"回满 1 个 token 需要多久"算，不是恒 1s。
+            // 窗口 60s、额度 limit → 每个 token 需要 60/limit 秒（limit=6 时是 10s）。
+            let retry_after = (60.0 / f64::from(limit.max(1))).ceil() as u64;
+            return Err(rate_limited(route, retry_after));
         }
         bucket.tokens -= 1.0;
         Ok(())
@@ -161,11 +178,16 @@ impl AuthLimiter {
     /// 并发闸：拿一个哈希名额；`wait` 内拿不到就 429。
     ///
     /// 这是**内存**的硬保险：哈希并发数被钉死，攻击者再并发也只能占用这么多内存。
-    pub async fn acquire_hash_slot(&self, wait: Duration) -> Result<HashSlot, AppError> {
+    /// `route` 只用于 429 文案（R2-F8：之前注册被拒也说"login 接口"）。
+    pub async fn acquire_hash_slot(
+        &self,
+        route: AuthRoute,
+        wait: Duration,
+    ) -> Result<HashSlot, AppError> {
         let permit = tokio::time::timeout(wait, self.hashing.clone().acquire_owned())
             .await
-            .map_err(|_| rate_limited(AuthRoute::Login, 1))?
-            .map_err(|_| rate_limited(AuthRoute::Login, 1))?;
+            .map_err(|_| rate_limited(route, 1))?
+            .map_err(|_| rate_limited(route, 1))?;
         Ok(HashSlot { _permit: permit })
     }
 
@@ -192,7 +214,8 @@ pub fn rate_limited(route: AuthRoute, retry_after_secs: u64) -> AppError {
     let mut error = AppError::new(
         ErrorCode::RateLimited,
         format!(
-            "请求过于频繁（{} 接口），请 {} 秒后重试",
+            "请求过于频繁（{}接口 {}），请 {} 秒后重试",
+            route.label(),
             route.as_str(),
             retry_after_secs.max(1)
         ),
@@ -256,6 +279,61 @@ mod tests {
         assert_eq!(limiter.bucket_count(), 1, "长键只应占一条桶");
     }
 
+    /// R2-F7：`Retry-After` 按额度算（60s 窗口 / 额度），不是恒 1s。
+    #[test]
+    fn retry_after_is_derived_from_quota() {
+        let limiter = AuthLimiter::new(8, 6, 30, 120);
+        assert!(limiter.check_rate(AuthRoute::Login, "a@x.cn").is_ok());
+        for _ in 0..5 {
+            assert!(limiter.check_rate(AuthRoute::Login, "a@x.cn").is_ok());
+        }
+        let error = limiter
+            .check_rate(AuthRoute::Login, "a@x.cn")
+            .expect_err("额度用完");
+        assert_eq!(error.code(), ErrorCode::RateLimited);
+        // 额度 6/分钟 → 每个 token 需要 10s
+        assert_eq!(error.retry_after(), Some(10), "Retry-After 应按额度算");
+    }
+
+    /// R2-F8：429 文案要按路由（注册的拒绝不该说"登录接口"）。
+    #[test]
+    fn rate_limit_message_names_the_route() {
+        let register = rate_limited(AuthRoute::Register, 5);
+        assert!(
+            register.message().contains("注册"),
+            "{}",
+            register.message()
+        );
+        assert!(
+            !register.message().contains("登录"),
+            "{}",
+            register.message()
+        );
+        let refresh = rate_limited(AuthRoute::Refresh, 5);
+        assert!(refresh.message().contains("刷新"), "{}", refresh.message());
+    }
+
+    /// R2-F4：淘汰时跳过"还没回满"的惩罚桶——否则攻击者灌新键就能重置受害者额度。
+    #[test]
+    fn eviction_skips_penalized_buckets() {
+        let limiter = limiter(2, 8);
+        // 先把受害者的额度打空（2 次/分）
+        assert!(limiter.check_rate(AuthRoute::Login, "victim@x.cn").is_ok());
+        assert!(limiter.check_rate(AuthRoute::Login, "victim@x.cn").is_ok());
+        assert!(limiter.check_rate(AuthRoute::Login, "victim@x.cn").is_err());
+
+        // 灌满桶表（远超过 1024），逼出大量淘汰
+        for index in 0..(MAX_BUCKETS * 2) {
+            let _ = limiter.check_rate(AuthRoute::Login, &format!("flood-{index}@x.cn"));
+        }
+
+        // 受害者的桶仍在（惩罚桶被跳过），额度没有重置
+        assert!(
+            limiter.check_rate(AuthRoute::Login, "victim@x.cn").is_err(),
+            "惩罚桶被淘汰掉了：攻击者可以靠灌新键重置受害者的撞库额度（R2-F4）"
+        );
+    }
+
     #[test]
     fn rate_limit_zero_means_unlimited() {
         let limiter = limiter(2, 8);
@@ -275,15 +353,17 @@ mod tests {
         // 并发上限 1：拿住第一个名额后，第二个必须立刻被拒（内存放大器被钉死）
         let limiter = limiter(60, 1);
         let first = limiter
-            .acquire_hash_slot(Duration::from_millis(1))
+            .acquire_hash_slot(AuthRoute::Login, Duration::from_millis(1))
             .await
             .expect("第一个名额应拿到");
-        let second = limiter.acquire_hash_slot(Duration::from_millis(1)).await;
+        let second = limiter
+            .acquire_hash_slot(AuthRoute::Login, Duration::from_millis(1))
+            .await;
         assert!(second.is_err(), "并发闸满时必须拒绝而不是排队堆积内存");
         drop(first);
         // 归还之后又能拿到
         assert!(limiter
-            .acquire_hash_slot(Duration::from_millis(50))
+            .acquire_hash_slot(AuthRoute::Login, Duration::from_millis(50))
             .await
             .is_ok());
     }
@@ -294,7 +374,7 @@ mod tests {
         let limiter = limiter(60, 0);
         assert_eq!(limiter.hashing_permits_available(), 1);
         assert!(limiter
-            .acquire_hash_slot(Duration::from_millis(50))
+            .acquire_hash_slot(AuthRoute::Login, Duration::from_millis(50))
             .await
             .is_ok());
     }
