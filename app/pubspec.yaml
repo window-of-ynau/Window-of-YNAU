@@ -22,3 +22,6 @@ flutter:
   uses-material-design: true
   assets:
     - assets/fixtures/
+    # 纸纹平铺图（8×8 PNG，126 B）：仅 C「书本质感」主题用，ImageRepeat.repeat 铺满，
+    # 不做模糊/不做动画，成本可忽略。由 t36/t38 主题方案批准新增。
+    - assets/textures/

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 // 云农之窗 · 客户端骨架（W1）
 //
 // 形态已定（ADR-07 / T-02）：**Flutter 原生 UI**，只在打开校务系统时内嵌 WebView。
@@ -12,39 +14,85 @@ import 'src/campus/timetable_page.dart';
 import 'src/chat/chat_page.dart';
 import 'src/campus/webview_fetcher.dart';
 import 'src/core/timetable_service.dart';
+import 'src/settings/settings_page.dart';
+import 'src/theme/theme_controller.dart';
+import 'src/theme/yunong_tokens.dart';
 
-void main() => runApp(const YunongApp());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const YunongApp());
+}
 
-class YunongApp extends StatelessWidget {
-  const YunongApp({super.key});
+/// 应用根：**唯一**持有 [ThemeController] 的地方。
+///
+/// 换主题 = `controller.notifyListeners()` → `MaterialApp` 重建 →
+/// `AnimatedTheme` 做 200ms 过渡。不需要重启，也不需要重建页面状态
+/// （`home` 始终是同一个 `HomeShell`，路由栈不变）。
+class YunongApp extends StatefulWidget {
+  const YunongApp({super.key, this.themeController});
+
+  /// 测试可注入；生产为 null（现造一个，内存兜底存储）。
+  final ThemeController? themeController;
+
+  @override
+  State<YunongApp> createState() => _YunongAppState();
+}
+
+class _YunongAppState extends State<YunongApp> {
+  late final ThemeController _controller = widget.themeController ?? ThemeController();
+
+  @override
+  void initState() {
+    super.initState();
+    // 读回上次选择（默认 A 极简黑白）。存储未接时是内存实现，读不到就用默认值。
+    unawaited(_controller.load());
+  }
+
+  @override
+  void dispose() {
+    if (widget.themeController == null) {
+      _controller.dispose();
+    }
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: '云农之窗',
-      debugShowCheckedModeBanner: false,
-      // WebView 抓取页需要根导航（CampusWebViewPage 全屏 push）
-      navigatorKey: WebViewSchoolFetcher.navigatorKey,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF2563EB)),
-        useMaterial3: true,
-      ),
-      darkTheme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF2563EB),
-          brightness: Brightness.dark,
-        ),
-        useMaterial3: true,
-      ),
-      themeMode: ThemeMode.system,
-      home: const HomeShell(),
+    return ListenableBuilder(
+      listenable: _controller,
+      builder: (BuildContext context, Widget? child) {
+        return MaterialApp(
+          title: '云农之窗',
+          debugShowCheckedModeBanner: false,
+          // WebView 抓取页需要根导航（CampusWebViewPage 全屏 push）
+          navigatorKey: WebViewSchoolFetcher.navigatorKey,
+          theme: _controller.theme(Brightness.light),
+          darkTheme: _controller.theme(Brightness.dark),
+          themeMode: _controller.themeMode,
+          // 有画布渐变的主题（B 深蓝玻璃）：Scaffold 透明，渐变在这里铺，
+          // 所有路由（设置页、课表页）都叠在同一层背景上，切页不会"闪白"。
+          builder: (BuildContext context, Widget? child) {
+            final Gradient? gradient = context.tokens.canvasGradient;
+            if (gradient == null) {
+              return child ?? const SizedBox.shrink();
+            }
+            return DecoratedBox(
+              decoration: BoxDecoration(gradient: gradient),
+              child: child ?? const SizedBox.shrink(),
+            );
+          },
+          home: HomeShell(themeController: _controller),
+        );
+      },
     );
   }
 }
 
 /// 左侧导航 + 右侧主区（PRD §4 信息架构）。
 class HomeShell extends StatefulWidget {
-  const HomeShell({super.key});
+  const HomeShell({super.key, required this.themeController});
+
+  final ThemeController themeController;
 
   @override
   State<HomeShell> createState() => _HomeShellState();
@@ -64,7 +112,7 @@ class _HomeShellState extends State<HomeShell> {
         actions: <Widget>[
           IconButton(
             tooltip: '设置',
-            onPressed: () => _showPlaceholder(context, '设置', 'BYOK / 套餐、记忆与隐私选项将在 W2 接入'),
+            onPressed: _openSettings,
             icon: const Icon(Icons.settings_outlined),
           ),
         ],
@@ -101,22 +149,17 @@ class _HomeShellState extends State<HomeShell> {
     );
   }
 
+  void _openSettings() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (BuildContext context) => SettingsPage(controller: widget.themeController),
+      ),
+    );
+  }
+
   void _select(int index) {
     setState(() => _selected = index);
     Navigator.of(context).maybePop();
-  }
-
-  void _showPlaceholder(BuildContext context, String title, String message) {
-    showDialog<void>(
-      context: context,
-      builder: (BuildContext ctx) => AlertDialog(
-        title: Text(title),
-        content: Text(message),
-        actions: <Widget>[
-          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('知道了')),
-        ],
-      ),
-    );
   }
 }
 

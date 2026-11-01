@@ -7,15 +7,8 @@
 
 import 'package:flutter/material.dart';
 
-/// 琥珀色（浅色主题）：确认类提示。对比度 8.6:1。
-const Color _kAmberBg = Color(0xFFFFF3CD);
-const Color _kAmberFg = Color(0xFF5C4400);
-const Color _kAmberLine = Color(0xFFE8CE85);
+import '../../theme/yunong_tokens.dart';
 
-/// 琥珀色（深色主题）：低明度底 + 高明度字。
-const Color _kAmberBgDark = Color(0xFF3A2F12);
-const Color _kAmberFgDark = Color(0xFFF0DFA8);
-const Color _kAmberLineDark = Color(0xFF6B5623);
 
 /// 「还没确认学期开始日」横幅。
 ///
@@ -44,10 +37,12 @@ class TermStartPrompt extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
-    final bool dark = theme.brightness == Brightness.dark;
-    final Color bg = dark ? _kAmberBgDark : _kAmberBg;
-    final Color fg = dark ? _kAmberFgDark : _kAmberFg;
-    final Color line = dark ? _kAmberLineDark : _kAmberLine;
+    // 琥珀是**语义色**（"等你确认"，不是错误），三套主题共用同一组值，
+    // 由 token 提供（深色主题另有低明度版本）。
+    final YunongTokens tokens = context.tokens;
+    final Color bg = tokens.warnBg;
+    final Color fg = tokens.warnFg;
+    final Color line = tokens.warnLine;
 
     return Container(
       margin: const EdgeInsets.fromLTRB(12, 6, 12, 0),

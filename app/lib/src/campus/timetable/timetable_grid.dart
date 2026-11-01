@@ -12,6 +12,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../../core/timetable_service.dart';
+import '../../theme/yunong_tokens.dart';
 import 'course_detail_sheet.dart';
 import 'course_palette.dart';
 
@@ -116,6 +117,7 @@ class _TimetableGridState extends State<TimetableGrid> {
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
     final bool dark = theme.brightness == Brightness.dark;
+    final YunongTokens tokens = context.tokens;
 
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
@@ -173,12 +175,10 @@ class _TimetableGridState extends State<TimetableGrid> {
                                   dayWidth: dayWidth,
                                   dayCount: days,
                                   todayIndex: widget.todayIndex,
-                                  lineColor: dark
-                                      ? Colors.white.withValues(alpha: 0.10)
-                                      : Colors.black.withValues(alpha: 0.06),
-                                  todayColor:
-                                      theme.colorScheme.primary.withValues(
-                                    alpha: dark ? 0.10 : 0.05,
+                                  // 网格线/今天列底色都来自主题 token（三套主题各自不同）
+                                  lineColor: tokens.hairline,
+                                  todayColor: tokens.accent.withValues(
+                                    alpha: dark ? 0.12 : 0.06,
                                   ),
                                 ),
                               ),
