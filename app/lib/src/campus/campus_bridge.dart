@@ -227,5 +227,26 @@ String _formatDiagnostics(Object? raw) {
   if (source is String && source.isNotEmpty) {
     parts.add('来源 $source');
   }
+  // 诊断三件套：hook 是否装上、试了几个候选、每个候选的状态码（只看前 8 位前缀）
+  if (raw['hookInstalled'] == true) {
+    parts.add('hook 已装');
+  }
+  final candidates = raw['candidates'];
+  if (candidates is num) {
+    parts.add('候选 $candidates 个');
+  }
+  final probeResults = raw['probeResults'];
+  if (probeResults is List && probeResults.isNotEmpty) {
+    final tried = probeResults.take(12).map((dynamic item) => '$item').join(',');
+    parts.add('探测 $tried');
+  } else if (raw['probeFailed'] == true) {
+    parts.add('探测全失败');
+  }
+  final years = raw['years'];
+  if (years is String && years.isNotEmpty) {
+    parts.add('学期 $years');
+  } else {
+    parts.add('学期未取到');
+  }
   return parts.join(' · ');
 }
