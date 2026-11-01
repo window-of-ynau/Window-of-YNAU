@@ -368,7 +368,7 @@ jobs:
           sh -n deploy/migrate.sh
       # type=gha 缓存与 load: true 都需要 docker-container driver（setup-buildx 的默认）
       - name: 启用 buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - name: docker build（deploy/Dockerfile.server）
         uses: docker/build-push-action@v6
         with:

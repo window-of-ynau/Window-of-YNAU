@@ -65,7 +65,7 @@ jobs:
             *) echo "::warning::app/pubspec.yaml 版本是 '$app_ver'，与 tag v$tag 不一致" ;;
           esac
       - name: 启用 buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       # 分支名（干跑时）含 / 不能直接当镜像 tag，这里统一归一化；tag push 时 vX.Y.Z 原样保留
       - name: 计算镜像 tag
         id: tag
