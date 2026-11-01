@@ -4,7 +4,7 @@
 // 既不能显示"这学期没课"，也不能把空结果覆盖掉旧课表。
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show Clipboard;
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 
 import '../core/ffi_bindings.dart';
 import 'portal_api.dart';
@@ -50,6 +50,9 @@ class _TimetablePageState extends State<TimetablePage> {
   List<StoredCourse> _courses = const <StoredCourse>[];
   List<String> _warnings = const <String>[];
   TimetableException? _failure;
+
+  /// 最近一次 ICS 导出结果（成功时显示路径与事件数）。
+  IcsExportResult? _exportResult;
 
   /// 最近一次动作（失败卡片的重试按钮复用它）。
   Future<void> Function()? _lastAction;
@@ -143,6 +146,12 @@ class _TimetablePageState extends State<TimetablePage> {
                     icon: const Icon(Icons.bug_report_outlined, size: 18),
                     label: const Text('模拟页面改版'),
                   ),
+                  OutlinedButton.icon(
+                    onPressed: _busy ? null : _exportIcs,
+                    style: _compactButtonStyle,
+                    icon: const Icon(Icons.event_available, size: 18),
+                    label: const Text('导出到日历'),
+                  ),
                   TextButton.icon(
                     onPressed: _busy ? null : _importFromClipboard,
                     style: _compactButtonStyle,
@@ -213,8 +222,15 @@ class _TimetablePageState extends State<TimetablePage> {
             ),
           ),
         _buildTermStartCard(theme),
+        _buildExportCard(theme),
         if (_failure != null)
-          _FailureCard(failure: _failure!, onRetry: _retryFailedAction),
+          _FailureCard(
+            failure: _failure!,
+            onRetry: _retryFailedAction,
+            onConfirmTermStart: _failure!.code == 'TERM_START_UNKNOWN'
+                ? () => unawaited(_goToTermStart())
+                : null,
+          ),
         Expanded(child: _buildBody(theme)),
       ],
     );
@@ -738,6 +754,99 @@ class _TimetablePageState extends State<TimetablePage> {
 
   static String _shortDate(DateTime date) =>
       '${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+  /// 「导出到日历」：成功显示路径 + 事件数；TERM_START_UNKNOWN 引导到学期开始日卡片。
+  Future<void> _exportIcs() async {
+    _lastAction = _exportIcs;
+    setState(() {
+      _busy = true;
+      _failure = null;
+      _exportResult = null;
+    });
+    try {
+      final result = await widget.service.exportIcs(term: _currentTerm);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _exportResult = result;
+        _notice = '已导出 ${result.events} 个事件';
+      });
+    } on TimetableException catch (failure) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _failure = failure);
+    } on CoreUnavailable catch (err) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _failure = TimetableException(
+          code: 'CORE_UNAVAILABLE',
+          userHint: '端侧核心未就绪',
+          message: '$err',
+        );
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
+  /// TERM_START_UNKNOWN：直接打开学期开始日确认（日期选择器），确认后再导出。
+  Future<void> _goToTermStart() async {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('先确认学期开始日，再点「导出到日历」')),
+    );
+    await _editTermStart();
+  }
+
+  Future<void> _copyExportPath(String path) async {
+    await Clipboard.setData(ClipboardData(text: path));
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已复制导出路径')),
+    );
+  }
+
+  /// 导出成功后的结果卡片：路径可复制 + 事件数。
+  Widget _buildExportCard(ThemeData theme) {
+    final result = _exportResult;
+    if (result == null) {
+      return const SizedBox.shrink();
+    }
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.tertiaryContainer,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: <Widget>[
+          const Icon(Icons.event_available, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text('已导出 ${result.events} 个事件到日历文件', style: theme.textTheme.bodyMedium),
+                SelectableText(result.path, style: theme.textTheme.bodySmall),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: '复制路径',
+            onPressed: () => _copyExportPath(result.path),
+            icon: const Icon(Icons.copy, size: 18),
+          ),
+        ],
+      ),
+    );
+  }
   /// 失败卡片上的"重试"：重放最近一次动作（登录超时 / 网络错误最常见）。
   Future<void> _retryFailedAction() async {
     final action = _lastAction ?? _fetchFromCampus;
@@ -794,11 +903,29 @@ class _TimetablePageState extends State<TimetablePage> {
 }
 
 /// 失败卡片：大字号给用户看的那句 + 小字原始信息 + 明确"这不是空课表"。
+/// 只有"抓取/诊断"类错误才把原始信息显示给用户；导出/存储类只给可读文案
+/// （需求：导出失败不要显示原始错误串）。
+bool _shouldShowRawMessage(String code) => const <String>{
+      'CAPTURE_TIMEOUT',
+      'HTML_CHANGED',
+      'PORTAL_PAGE',
+      'AUTH_REQUIRED',
+      'CARD_NOT_FOUND',
+      'NETWORK',
+      'CERT',
+      'TIMEOUT',
+      'LOGIN_TIMEOUT',
+    }.contains(code);
 class _FailureCard extends StatelessWidget {
-  const _FailureCard({required this.failure, required this.onRetry});
+  const _FailureCard({
+    required this.failure,
+    required this.onRetry,
+    this.onConfirmTermStart,
+  });
 
   final TimetableException failure;
   final Future<void> Function() onRetry;
+  final void Function()? onConfirmTermStart;
 
   @override
   Widget build(BuildContext context) {
@@ -835,6 +962,15 @@ class _FailureCard extends StatelessWidget {
               color: theme.colorScheme.onErrorContainer,
             ),
           ),
+          if (onConfirmTermStart != null)
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton.icon(
+                onPressed: onConfirmTermStart,
+                icon: const Icon(Icons.edit_calendar, size: 18),
+                label: const Text('去确认学期开始日'),
+              ),
+            ),
           if (failure.code != 'CORE_UNAVAILABLE' && failure.code != 'NO_WEBVIEW')
             Align(
               alignment: Alignment.centerRight,
@@ -845,8 +981,12 @@ class _FailureCard extends StatelessWidget {
               ),
             ),
           const SizedBox(height: 4),
+          // 错误码始终显示（便于反馈）；原始错误串只对"抓取/诊断"类错误展示，
+          // 导出/存储类只给可读文案（需求：不要显示原始错误串）。
           SelectableText(
-            '错误码 ${failure.code} · ${failure.message}',
+            _shouldShowRawMessage(failure.code) && failure.message.trim().isNotEmpty
+                ? '错误码 ${failure.code} · ${failure.message}'
+                : '错误码 ${failure.code}',
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.onErrorContainer.withValues(alpha: 0.75),
             ),

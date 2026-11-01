@@ -30,6 +30,14 @@ class ScriptedCore implements CoreApi {
       });
 
   @override
+  CoreEnvelope exportIcs({
+    required String term,
+    required String outPath,
+    required String dbPath,
+  }) =>
+      const CoreEnvelope(ok: false, code: 'INTERNAL', message: 'unused');
+
+  @override
   CoreEnvelope setTermStart({
     required String term,
     required String startsOn,
