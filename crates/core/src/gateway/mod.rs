@@ -26,8 +26,13 @@
 //!
 //! # 取消
 //!
-//! 回调返回 [`Flow::Stop`]，或调用方直接 drop 掉 [`GatewayFuture`]，都会立刻丢弃响应体 →
-//! TCP 关闭 → 上游请求取消（不再计费）。这两条都有集成测试守着。
+//! 回调返回 [`Flow::Stop`]，或调用方直接 drop 掉 [`GatewayFuture`]，都会立刻**停止读取**：
+//! 响应体被丢弃后不再消费上游字节，上游的写会被 TCP 背压挡住 → 不再产生新的 token。
+//!
+//! **不承诺"立刻断连"**：`reqwest`/`hyper` 在响应被 drop 后不会主动发 FIN（Windows 实测
+//! 连接会继续挂着），要等上游自己超时或写完才回收。所以取消换来的是"停止生成"
+//! （成本上等价于不再计费），而不是"立刻释放连接"。集成测试按"取消后服务端继续灌 32MB
+//! 数据写不动 = 客户端确实停止消费"来断言，而不是等 FIN。
 
 use std::future::Future;
 use std::pin::Pin;
@@ -64,7 +69,7 @@ pub(crate) const MAX_ERROR_CHARS: usize = 200;
 pub enum Flow {
     /// 继续读
     Continue,
-    /// 立刻停：丢弃响应体，上游请求被取消
+    /// 立刻停：丢弃响应体、不再读取上游（背压让上游写不进去；**不保证立刻断连**）
     Stop,
 }
 
@@ -77,7 +82,8 @@ pub struct StreamOutcome {
     /// 终止原因；取消或上游没给 `Done` 时是 [`FinishReason::Stop`]，
     /// 上游报错是 [`FinishReason::Error`]。
     pub finish: FinishReason,
-    /// 是否被调用方提前取消（回调返回 `Stop` 或被 drop）
+    /// 是否被调用方提前取消（回调返回 `Stop` 或被 drop）：
+    /// **已停止消费上游**，不代表连接已断开
     pub cancelled: bool,
     /// 套餐通道的 `meta.request_id`（BYOK 通道是 `None`）
     pub request_id: Option<String>,
@@ -91,7 +97,7 @@ pub type GatewayFuture<'a> = Pin<Box<dyn Future<Output = CoreResult<StreamOutcom
 pub trait ModelGateway {
     /// 发起一次流式调用：每产出一个**契约合法**的 `Chunk` 就回调一次。
     ///
-    /// 回调返回 [`Flow::Stop`] 时立刻取消（见模块注释）。
+    /// 回调返回 [`Flow::Stop`] 时立刻停止读取（见模块注释：停止消费 ≠ 立刻断连）。
     fn chat_stream<'a>(
         &'a self,
         request: &'a ChatRequest,
@@ -307,7 +313,7 @@ pub(crate) struct AssemblerPlan {
 pub(crate) struct Pumped {
     /// 累计的可见文本（上游没给 usage 时用来估算输出 token）
     pub output_text: String,
-    /// 被调用方取消
+    /// 被调用方取消（已停止消费上游，见 [`Flow::Stop`]）
     pub cancelled: bool,
     /// 已发出的终止原因
     pub finish: Option<FinishReason>,
@@ -343,7 +349,8 @@ pub(crate) async fn send_with_first_event_timeout(
 /// - `map_frame` 把一帧解释成 0..n 个 `Chunk`（BYOK = `protocols::parse_events`，
 ///   套餐 = [`parse_cloud_event`]）；
 /// - 上游的 `Meta` **不透传**：只用来取 `request_id`，对外 `Meta` 由装配器注入；
-/// - 回调返回 [`Flow::Stop`] → 立刻返回（响应体被 drop → 连接关闭 → 上游取消）；
+/// - 回调返回 [`Flow::Stop`] → 立刻返回：丢弃响应体、**不再读取上游**，上游的写会被 TCP 背压
+///   卡住；连接不保证立刻断开（见模块注释"取消"一节）；
 /// - 上游正常关闭但没给终止事件 → `ChunkAssembler::finish()` 补 `Done{Stop}`。
 pub(crate) async fn pump_sse(
     mut response: reqwest::Response,
