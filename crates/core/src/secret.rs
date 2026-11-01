@@ -568,7 +568,10 @@ mod tests {
         }))
         .unwrap();
         assert!(!json.contains(plain), "返回 JSON 泄漏明文：{json}");
-        assert!(!json.contains("0123456789abcdef"), "返回 JSON 含明文片段：{json}");
+        assert!(
+            !json.contains("0123456789abcdef"),
+            "返回 JSON 含明文片段：{json}"
+        );
         assert!(json.contains("sk-****cdef"));
     }
 

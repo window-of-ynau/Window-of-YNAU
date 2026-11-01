@@ -1637,7 +1637,10 @@ mod tests {
             }
             let raw = response.to_string();
             assert!(!raw.contains(plain), "get 返回里出现明文：{raw}");
-            assert!(!raw.contains("0123456789abcdef"), "get 返回里出现明文片段：{raw}");
+            assert!(
+                !raw.contains("0123456789abcdef"),
+                "get 返回里出现明文片段：{raw}"
+            );
 
             // delete → get(set:false)；非 Windows 本来就没存，deleted 为 false
             let response = call_secret(yunong_delete_secret(key.as_ptr(), db.as_ptr()));

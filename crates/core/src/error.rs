@@ -21,6 +21,16 @@ pub enum CoreError {
     /// 而用户几乎发现不了。调用方应引导用户先确认第 1 周周一。
     #[error("学期开学日期未确认：{0}")]
     TermStartUnknown(String),
+    /// 工具循环达到轮次上限仍未收敛。
+    ///
+    /// **不能静默停**：静默停会让界面显示一个"答完了"的假象，而用户的问题其实没被回答。
+    #[error("工具循环达到轮次上限：{0}")]
+    RoundLimit(String),
+    /// 模型输出被 max_tokens 截断（`finish_reason=length`），且这一轮带着工具调用。
+    ///
+    /// 参数是**半个 JSON**，执行它等于执行一段被截断的指令，所以整批工具一律不执行。
+    #[error("模型输出被截断：{0}")]
+    Truncated(String),
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
     /// 远端（上游厂商或我们的服务端）明确返回了失败。
