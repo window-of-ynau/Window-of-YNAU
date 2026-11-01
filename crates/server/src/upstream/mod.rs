@@ -268,6 +268,9 @@ impl UpstreamClient {
     pub fn new(providers: UpstreamConfig, timeouts: Timeouts) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(timeouts.connect)
+            // 红队 M2：**不跟随重定向**。上游或中间层返回 302 时，跟随会把请求带去
+            // 它指定的任意地址（内网探测 / 把请求头带到别处）。3xx 按"非 2xx"处理 → 502。
+            .redirect(reqwest::redirect::Policy::none())
             // 刻意**不设** `.timeout()`：那是"整条请求"的上限，会把长回答截断。
             // 首事件 / 空闲超时由 `UpstreamStream::next_chunks` 自己管（分段见模块文档）。
             .build()

@@ -9,6 +9,7 @@ use crate::accounting::UsageRecorder;
 use crate::auth::AuthService;
 use crate::config::Config;
 use crate::gate::TurnGate;
+use crate::limiter::AuthLimiter;
 use crate::upstream::UpstreamClient;
 
 #[derive(Clone)]
@@ -24,6 +25,8 @@ pub struct AppState {
     pub accounting: Arc<UsageRecorder>,
     /// 上游客户端：复用一个 `reqwest::Client`（连接池 + TLS 会话复用）。
     pub upstream: Arc<UpstreamClient>,
+    /// 未鉴权端点的限流（红队 H1）：并发闸钉死 Argon2 内存峰值、令牌桶掐撞库。
+    pub limiter: Arc<AuthLimiter>,
     started_at: Instant,
 }
 
@@ -35,6 +38,12 @@ impl AppState {
             Duration::from_millis(config.concurrency_queue_ms),
         ));
         let accounting = Arc::new(UsageRecorder::new(db.clone(), config.usage_sample_percent));
+        let limiter = Arc::new(AuthLimiter::new(
+            config.auth_hash_concurrency,
+            config.auth_login_per_min,
+            config.auth_register_per_min,
+            config.auth_refresh_per_min,
+        ));
         let upstream = Arc::new(UpstreamClient::new(
             config.upstream.clone(),
             config.upstream_timeouts(),
@@ -46,6 +55,7 @@ impl AppState {
             gate,
             accounting,
             upstream,
+            limiter,
             started_at: Instant::now(),
         }
     }
