@@ -1609,7 +1609,7 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let db = CString::new(base.join("t.db").to_string_lossy().to_string()).unwrap();
         let key = CString::new("byok_api_key").unwrap();
-        let plain = "sk-c12f4e6cba8e4caea103f3a4cea73eee";
+        let plain = "sk-test-0123456789abcdef0123456789abcdef";
         let value = CString::new(plain).unwrap();
 
         unsafe {
@@ -1618,7 +1618,7 @@ mod tests {
                 call_secret(yunong_set_secret(key.as_ptr(), value.as_ptr(), db.as_ptr()));
             assert_eq!(response["ok"], true);
             let masked = response["data"]["masked"].as_str().unwrap().to_owned();
-            assert_eq!(masked, "sk-****3eee");
+            assert_eq!(masked, "sk-****cdef");
             let raw = response.to_string();
             assert!(!raw.contains(plain), "set 返回里出现明文：{raw}");
 
@@ -1630,14 +1630,14 @@ mod tests {
             assert_eq!(response["ok"], true);
             if cfg!(windows) {
                 assert_eq!(response["data"]["set"], true);
-                assert_eq!(response["data"]["masked"], "sk-****3eee");
+                assert_eq!(response["data"]["masked"], "sk-****cdef");
             } else {
                 assert_eq!(response["data"]["set"], false);
                 assert_eq!(response["data"]["degraded"], true);
             }
             let raw = response.to_string();
             assert!(!raw.contains(plain), "get 返回里出现明文：{raw}");
-            assert!(!raw.contains("c12f4e6c"), "get 返回里出现明文片段：{raw}");
+            assert!(!raw.contains("0123456789abcdef"), "get 返回里出现明文片段：{raw}");
 
             // delete → get(set:false)；非 Windows 本来就没存，deleted 为 false
             let response = call_secret(yunong_delete_secret(key.as_ptr(), db.as_ptr()));

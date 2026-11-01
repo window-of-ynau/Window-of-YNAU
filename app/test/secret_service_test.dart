@@ -82,7 +82,7 @@ class FakeSecretBackend implements SecretBackend {
   }
 }
 
-const String _plain = 'sk-c12f4e6cba8e4caea103f3a4cea73eee';
+const String _plain = 'sk-test-0123456789abcdef0123456789abcdef';
 
 void main() {
   group('SecretService（fake backend）', () {
@@ -92,12 +92,12 @@ void main() {
 
       final saved = await service.save(SecretService.byokKeyName, _plain);
       expect(saved.set, isTrue);
-      expect(saved.masked, 'sk-****3eee');
-      expect(saved.masked.contains('c12f4e6c'), isFalse);
+      expect(saved.masked, 'sk-****cdef');
+      expect(saved.masked.contains('0123456789abcdef'), isFalse);
 
       final status = await service.status(SecretService.byokKeyName);
       expect(status.set, isTrue);
-      expect(status.masked, 'sk-****3eee');
+      expect(status.masked, 'sk-****cdef');
 
       expect(await service.delete(SecretService.byokKeyName), isTrue);
       final after = await service.status(SecretService.byokKeyName);
@@ -139,7 +139,7 @@ void main() {
   });
 
   group('UI：设置页只显示掩码', () {
-    testWidgets('顶栏显示 sk-****3eee，降级时提示仅内存生效', (WidgetTester tester) async {
+    testWidgets('顶栏显示 sk-****cdef，降级时提示仅内存生效', (WidgetTester tester) async {
       final backend = FakeSecretBackend(degraded: true);
       backend.entries[SecretService.byokKeyName] = _plain;
       final secrets = SecretService(backend: backend, dbPath: '/tmp/x.db');
@@ -150,7 +150,7 @@ void main() {
       ));
       await tester.pumpAndSettle();
 
-      expect(find.textContaining('sk-****3eee'), findsOneWidget);
+      expect(find.textContaining('sk-****cdef'), findsOneWidget);
       expect(find.text(_plain), findsNothing, reason: 'UI 不得出现明文');
       expect(find.textContaining('仅内存生效'), findsOneWidget);
     });

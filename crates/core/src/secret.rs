@@ -26,7 +26,7 @@ pub fn valid_key(key: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
-/// 掩码：`sk-****3eee`（保留前 3 + 后 4；太短只显示 `****`）。
+/// 掩码：`sk-****cdef`（保留前 3 + 后 4；太短只显示 `****`）。
 pub fn mask_secret(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
     if chars.len() <= 8 {
@@ -511,11 +511,11 @@ mod tests {
     #[test]
     fn mask_keeps_head_and_tail_only() {
         assert_eq!(
-            mask_secret("sk-c12f4e6cba8e4caea103f3a4cea73eee"),
-            "sk-****3eee"
+            mask_secret("sk-test-0123456789abcdef0123456789abcdef"),
+            "sk-****cdef"
         );
         assert_eq!(mask_secret("short"), "****");
-        assert!(!mask_secret("sk-c12f4e6cba8e4caea103f3a4cea73eee").contains("c12f"));
+        assert!(!mask_secret("sk-test-0123456789abcdef0123456789abcdef").contains("c12f"));
     }
 
     #[test]
@@ -559,7 +559,7 @@ mod tests {
     #[test]
     fn status_json_never_contains_plaintext() {
         let store = MemoryKeyStore::new("x");
-        let plain = "sk-c12f4e6cba8e4caea103f3a4cea73eee";
+        let plain = "sk-test-0123456789abcdef0123456789abcdef";
         let status = store.set("byok", plain).unwrap();
         let json = serde_json::to_string(&serde_json::json!({
             "set": status.set,
@@ -568,8 +568,8 @@ mod tests {
         }))
         .unwrap();
         assert!(!json.contains(plain), "返回 JSON 泄漏明文：{json}");
-        assert!(!json.contains("c12f4e6c"), "返回 JSON 含明文片段：{json}");
-        assert!(json.contains("sk-****3eee"));
+        assert!(!json.contains("0123456789abcdef"), "返回 JSON 含明文片段：{json}");
+        assert!(json.contains("sk-****cdef"));
     }
 
     #[cfg(windows)]
@@ -577,14 +577,14 @@ mod tests {
     fn dpapi_roundtrip_on_windows() {
         let base = temp_base();
         let store = DpapiKeyStore::open(&base);
-        let plain = "sk-c12f4e6cba8e4caea103f3a4cea73eee";
+        let plain = "sk-test-0123456789abcdef0123456789abcdef";
         let status = store.set("byok_api_key", plain).unwrap();
         assert!(
             !status.degraded,
             "DPAPI 应可用（当前用户会话）：{:?}",
             status.reason
         );
-        assert_eq!(status.masked, "sk-****3eee");
+        assert_eq!(status.masked, "sk-****cdef");
 
         // 密文文件存在且不是明文
         let bin = base.join("secrets").join("byok_api_key.bin");
@@ -598,7 +598,7 @@ mod tests {
 
         // 元数据只有掩码
         let meta = std::fs::read_to_string(base.join("secrets").join("byok_api_key.json")).unwrap();
-        assert!(meta.contains("sk-****3eee"));
+        assert!(meta.contains("sk-****cdef"));
         assert!(!meta.contains(plain), "元数据不得出现明文");
 
         // 内部可解密（仅 Rust 使用）
@@ -610,7 +610,7 @@ mod tests {
         // 对外 status 不带明文
         let status = store.status("byok_api_key").unwrap();
         assert!(status.set);
-        assert_eq!(status.masked, "sk-****3eee");
+        assert_eq!(status.masked, "sk-****cdef");
 
         // 删除后为未设置
         assert!(store.delete("byok_api_key").unwrap());

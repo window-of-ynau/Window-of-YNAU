@@ -30,7 +30,7 @@ class SecretStatus {
 
   final bool set;
 
-  /// 形如 `sk-****3eee`
+  /// 形如 `sk-****cdef`
   final String masked;
 
   /// true = 只存在内存里（重启失效）
