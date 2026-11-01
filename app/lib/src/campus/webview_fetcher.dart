@@ -356,8 +356,9 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       ),
                       OutlinedButton(
                         onPressed: () async {
+                          // 门户模式先走接口（__yunongGrab）；旧正方页面才走 DOM（__yunongGrabDom）
                           await _controller?.evaluateJavascript(
-                            source: 'window.__yunongGrab && window.__yunongGrab();',
+                            source: '(window.__yunongGrab || window.__yunongGrabDom || function(){})();',
                           );
                         },
                         child: const Text('抓取当前页'),

@@ -151,10 +151,20 @@ const String kCampusProbeScript = r'''
     bridge({ type: 'login_state', state: d.state, reason: d.reason, path: path });
   }
 
-  // 抓取：拿到表格就回传 outerHTML；拿不到明确报 HTML_CHANGED（不冒充"这学期没课"）
-  window.__yunongGrab = function () {
+  /// 旧正方课表页的 DOM 抓取：只有**确认是旧页面**时才用（门户页不适用）。
+  ///
+  /// 名字带 Dom 是刻意的：门户脚本会定义自己的 `__yunongGrab`（走接口），
+  /// 两者不能互相覆盖——之前正是这个覆盖导致门户页点"抓取当前页"报 table#timetable 的 HTML_CHANGED。
+  window.__yunongGrabDom = function () {
     var table = findTable();
     if (!table) {
+      // 门户页（React 单页）没有 table#timetable：给出正确的指引，而不是"页面改版"
+      var host = location.hostname || '';
+      if (host.indexOf('one.ynau.edu.cn') >= 0 || has('.ant-layout') || has('.ant-menu')) {
+        bridge({ type: 'portal_hint',
+                 message: '当前是门户页，需要先打开「课表」卡片' });
+        return;
+      }
       bridge({ type: 'error', code: 'HTML_CHANGED',
                message: '当前页面找不到课表表格（table#timetable）' });
       return;
