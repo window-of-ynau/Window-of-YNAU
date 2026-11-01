@@ -308,7 +308,12 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                           : Icons.info_outline, size: 18),
                       const SizedBox(width: 8),
                       Expanded(
-                        child: Text(_probe.hint, style: theme.textTheme.bodySmall),
+                        child: Text(
+          widget.mode == CampusFetchMode.portalApi && !_probe.isLoggedIn && _probe.state == CampusLoginState.needLogin
+              ? '请先登录；登录后打开一次门户里的课表卡片，会自动抓取'
+              : _probe.hint,
+          style: theme.textTheme.bodySmall,
+        ),
                       ),
                       OutlinedButton(
                         onPressed: () async {

@@ -116,6 +116,16 @@ const String kCampusProbeScript = r'''
         }
       } catch (e) { /* 跨域 iframe 读不到，忽略 */ }
     }
+    // ③ 统一身份认证 / 门户（W6：课表走门户接口）
+    var host = location.hostname || '';
+    var hash = location.hash || '';
+    if (host.indexOf('one.ynau.edu.cn') >= 0
+        && (hash.indexOf('index5') >= 0 || has('.ant-layout') || has('.ant-menu'))) {
+      return { state: 'logged_in', reason: 'portal' };
+    }
+    if ((location.pathname || '').indexOf('/lyuapServer/login') >= 0) {
+      return { state: 'need_login', reason: 'sso_login' };
+    }
     var text = bodyText();
     if (/学号[：:]\s*\d{6,}/.test(text) || /姓名[：:]\s*\S{2,4}/.test(text)) {
       return { state: 'logged_in', reason: 'student_bar' };

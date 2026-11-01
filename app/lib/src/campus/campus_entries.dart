@@ -6,7 +6,8 @@
 enum CampusEntry {
   portal('教务门户', 'https://jwxt.ynau.edu.cn/DefaultStu'),
   scores('成绩查询', 'https://jwgl.ynau.edu.cn/STU/cj_default.aspx'),
-  timetable('我的课表', 'https://qzjwxt.ynau.edu.cn/jsxsd/framework/xsMainV.htmlx'),
+  // W6：课表走门户接口，入口是统一身份认证；登录后门户即 one.ynau.edu.cn/#/index5。
+  timetable('我的课表', 'https://ssoo.ynau.edu.cn/lyuapServer/login'),
   library('图书馆', 'http://10.8.225.101:8013/#/Home'),
   software('正版软件', 'http://software.ynau.edu.cn/');
 
