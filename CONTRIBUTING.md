@@ -4,7 +4,6 @@
 > 动手之前先读 `docs/04-ADR.md` 的前三条——三条信任域是所有设计的边界。
 
 ---
-
 ## 1. 分支策略
 
 | 分支 | 用途 | 规则 |
@@ -16,7 +15,6 @@
 | `refactor/v1` | 1.0 大重构长分支 | 按 WBS 里程碑定期合入 `dev`，**禁止长期脱钩** |
 
 流程：`feature/*` → PR → `dev` → 发布时 PR → `main` → 打 `v*` 标签触发发布工作流。
-
 ## 2. Commit 约定（Conventional Commits）
 
 格式：`<type>(<scope>): <subject>`
@@ -36,7 +34,6 @@ feat(shared)!: ChatRequest 增加 tool_call_id 字段
 
 BREAKING CHANGE: 端与服务端需同时升级，旧字段不再兼容
 ```
-
 ## 3. 本地检查（提 PR 前请全部跑一遍）
 
 ```bash
@@ -60,7 +57,6 @@ python bench/run.py --cases bench/cases/smoke.jsonl \
 ```
 
 CI（`.github/workflows/ci.yml`）跑的就是上面这些，本地能过 CI 基本就能过。
-
 ## 3.1 构建 Windows 客户端与 Docker 部署
 
 ### 打包 Windows 客户端（一键）
@@ -97,31 +93,6 @@ curl http://127.0.0.1:8080/healthz
 - 容器内监听地址由 compose 固定为 `YUNONG_BIND=0.0.0.0:8080`（默认 `127.0.0.1` 会让端口映射进来的流量失效）；
 - **升级必须先跑迁移再起新二进制**：启动时会校验 `usage_samples` 是否具备 `turn_id`/`estimated`，缺失直接拒绝启动并提示执行 `migrations/0003_usage_turn_estimated.sql`；
 - 数据库不映射端口，只在 compose 内网可达。
-### 本地跑 Dart 测试的代理坑
-
-若**当前 shell** 里存在 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，`flutter test` 会把与测试进程之间的 **localhost** 连接也送进代理，表现为：
-
-```
-Connection closed before test suite loaded
-```
-
-先确认有没有：
-
-```powershell
-$env:HTTP_PROXY; $env:HTTPS_PROXY; $env:ALL_PROXY
-```
-
-注意这些变量**不一定来自系统代理设置**，常见来源是：包管理器、容器工具、开发 shell、CI/沙箱环境注入的变量；Windows 的"系统代理"（`netsh winhttp show proxy` / IE 设置）与它们无关。两种修法任选：
-
-```powershell
-# 1) 只让回环地址绕过代理
-$env:NO_PROXY="localhost,127.0.0.1,::1"; $env:no_proxy="localhost,127.0.0.1,::1"
-
-# 2) 或直接清掉代理变量（仅本会话）
-Remove-Item Env:\HTTP_PROXY,Env:\HTTPS_PROXY,Env:\ALL_PROXY,Env:\http_proxy,Env:\https_proxy -ErrorAction SilentlyContinue
-
-cd app; flutter test
-```
 ## 4. PR 要求
 
 - PR 描述请用仓库模板：变更说明 / 关联 ADR 或 issue / 验证方式 / 是否影响 `shared` / 自检清单。
@@ -130,7 +101,6 @@ cd app; flutter test
 - 改动数据库需新增迁移文件 `crates/server/migrations/NNNN_描述.sql`，**只增不改**已合入的迁移。
 - 不允许提交：密钥、keystore、`key.properties`、`.env`、真实校务数据、会话正文。
 - 合并方式：压缩合并（squash），标题即 commit message，遵守第 2 节约定。
-
 ## 5. ADR 先行原则
 
 **先定边界，再写代码。** 以下情形必须先提 ADR（或修订现有 ADR），在 `docs/04-ADR.md` 定稿后再动实现：
@@ -141,7 +111,6 @@ cd app; flutter test
 - 存储选型、并发与容量口径、许可证与数据权利。
 
 ADR 变更与代码变更**同 PR 或先后紧邻的 PR**；只改代码不改 ADR 会被要求返工。
-
 ## 6. 代码风格
 
 - 由 `.editorconfig` 统一：UTF-8、LF、缩进 4 空格，`*.{yml,yaml,json,md}` 用 2 空格。
@@ -165,21 +134,6 @@ ADR 变更与代码变更**同 PR 或先后紧邻的 PR**；只改代码不改 A
 派任务时按此边界点名分配；**跨边界任务必须先说明理由并获得确认**，不要"谁空谁上"。
 
 因边界不清已产生过一次返工：课表可视化被派给 lead-server，其实现与 owner 拍板项冲突后被废弃。
-## 多代理协作（AI Agent 并行开发）
-
-多人 / 多 Agent 同时改一个仓库时，**一个 Agent 一个 Git worktree**，否则会出现写入竞态（文件被互相覆盖，且很难发现）。
-
-```powershell
-pwsh scripts/new-agent-worktree.ps1 -Name rust-parser    # 创建 .worktrees/rust-parser，分支 agent/rust-parser
-git diff main..agent/rust-parser                          # 审阅
-git merge --no-ff agent/rust-parser                       # 合入
-git worktree remove .worktrees/rust-parser                # 收尾
-```
-
-规则与"单写者文件"清单见 [docs/integrations/agent-worktrees.md](docs/integrations/agent-worktrees.md)。
-
----
-
 ## Python / 实验分支（EXP）
 
 > 写给**只写 Python** 的贡献者（包括 v0 Demo 的原作者）：

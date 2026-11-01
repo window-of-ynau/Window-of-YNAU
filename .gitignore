@@ -42,3 +42,6 @@ docs/v0-审计/**/*.tmp
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 内部工程规范（不公开）
+.internal/
