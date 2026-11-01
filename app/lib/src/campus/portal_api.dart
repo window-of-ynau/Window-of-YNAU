@@ -348,8 +348,15 @@ const String kPortalScheduleScript = r'''
     xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0,
     hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: []
   };
-  var TIMEOUT_MS = 20000;
+  // **没有任何"从页面打开算起"的绝对超时**：只有"无进展兜底"（见 watchdog）
+  var LAST_PROGRESS = { at: Date.now(), what: 'start' };
+  var NO_PROGRESS_MS = 15000;
   var timeoutPosted = false;
+
+  function progress(what) {
+    LAST_PROGRESS = { at: Date.now(), what: what };
+    timeoutPosted = false;
+  }
 
   function post(payload) {
     try {
@@ -374,6 +381,7 @@ const String kPortalScheduleScript = r'''
     TEMPLATE = { cardId: cardId, years: years, weekcount: 20, weekcountFromApi: false };
     DIAG.cardIdPrefix = cardId.slice(0, 8);
     DIAG.cardIdSource = 'xhr';
+    progress('hook 捕获到课表请求');
     post({ type: 'schedule_template', card_id: cardId, years: years, weekcount: TEMPLATE.weekcount });
     // 捕获到模板就自动批量拉，用户不需要再点任何按钮
     setTimeout(function () { window.__yunongFetchSchedule(); }, 300);
@@ -435,6 +443,8 @@ const String kPortalScheduleScript = r'''
     try { title = document.title || ''; } catch (e) {}
     return JSON.stringify({
       stage: STAGE,
+      cardDom: !!timetableCardNode(),
+      lastProgress: LAST_PROGRESS.what + '（距今 ' + Math.round((Date.now() - LAST_PROGRESS.at) / 1000) + 's）',
       path: safePath(),
       host: (location.hostname || ''),
       title: title,
@@ -461,10 +471,7 @@ const String kPortalScheduleScript = r'''
     });
   }
 
-  // 20s 还没捕获到任何课表请求 → 明确告诉用户该做什么，绝不静默挂起
-  setTimeout(function () {
-    if (!TEMPLATE) { postCaptureTimeout('no_template_20s'); }
-  }, TIMEOUT_MS);
+  // 无进展兜底：只在"已离开登录页"且 15s 没有任何进展时才报，登录页永远不报
   // ---- cardId 兜底：捕获不到真实请求时，从页面里读 ----
   //
   // 已知样例：卡片 DOM id 形如 `timeTableWeekCard_d907dd70`（hash 可能就是 cardId），
@@ -599,14 +606,59 @@ const String kPortalScheduleScript = r'''
   }
 
   // 每 1.5s 看一次：还在登录页就只保持 login 阶段；离开后切到 capture 并开始自动发现
+  // 课表卡片的选择器（门户 React 页面；多个都试，命中任一即可）
+  var CARD_SELECTORS = ['.timeTableWeekCard', '#courseWrapper', '.Courses-content', '[id*="timeTable"]'];
+
+  function timetableCardNode() {
+    for (var i = 0; i < CARD_SELECTORS.length; i++) {
+      try {
+        if (document.querySelector(CARD_SELECTORS[i])) { return CARD_SELECTORS[i]; }
+      } catch (e) {}
+    }
+    return '';
+  }
+
+  // 阶段机（**事件驱动**，不是计时驱动）：
+  //   login（登录页，什么都不做）→ waiting_card（等卡片 DOM 或 XHR）→ capture（扫候选→探测→拉周）
   function watchStage() {
     if (isLoginPage()) {
       setStage('login');
       return;
     }
-    setStage('capture');
-    if (!TEMPLATE) { autoStart(); }
+    var card = timetableCardNode();
+    if (card) {
+      progress('检测到课表卡片 ' + card);
+      setStage('capture');
+      if (!TEMPLATE) { autoStart(); }
+      return;
+    }
+    if (TEMPLATE) {
+      setStage('capture');
+      return;
+    }
+    // 已离开登录页但卡片还没渲染：等 MutationObserver / XHR，不算失败
+    setStage('waiting_card');
   }
+
+  function installCardObserver() {
+    try {
+      if (!window.MutationObserver || !document.body) { return; }
+      var observer = new MutationObserver(function () { watchStage(); });
+      observer.observe(document.body, { childList: true, subtree: true });
+    } catch (e) {}
+  }
+
+  // 无进展兜底：登录页阶段永不报；其它阶段 15s 没进展才报（诊断里写最后进展）
+  setInterval(function () {
+    if (STAGE === 'login') { return; }
+    if (Date.now() - LAST_PROGRESS.at > NO_PROGRESS_MS) {
+      postCaptureTimeout('no_progress');
+    }
+  }, 1000);
+
+  installCardObserver();
+  setTimeout(watchStage, 600);
+  setInterval(watchStage, 1500);
   // ---- 自动优先（owner 实测：hook 根本没挂上，不能等它）----
   //
   // 顺序：① 从页面读 cardId（DOM 属性 / 初始状态 / 内联 script）→ ② 32 位 hex 候选逐个点接口自验证
@@ -662,6 +714,7 @@ const String kPortalScheduleScript = r'''
     }).then(function (res) {
       var prefix = cardId ? cardId.slice(0, 8) : '(none)';
       DIAG.probeResults.push(prefix + ':' + res.status);
+      progress('探测 ' + prefix + ' → ' + res.status);
       if (res.status === 401 || res.status === 403) {
         var authErr = new Error('AUTH');
         authErr.code = 'AUTH_REQUIRED';
@@ -718,6 +771,7 @@ const String kPortalScheduleScript = r'''
       if (!dup) { candidates.push({ cardId: hex[i], source: 'hex-scan' }); }
     }
     DIAG.candidates = candidates.length;
+    progress('扫描到 ' + candidates.length + ' 个候选');
 
     if (!years) {
       // 没有学期就什么都试不了：交给超时提示（诊断里会写 years 为空）
@@ -748,8 +802,6 @@ const String kPortalScheduleScript = r'''
   window.__yunongAutoStart = function () { AUTO_STARTED = false; autoStart(); };
 
   // 阶段 watcher：登录页期间只报 login；离开登录页才切 capture 并开始自动发现
-  setTimeout(watchStage, 800);
-  STAGE_WATCHER = setInterval(watchStage, 1500);
   // ---- 最后手段：滚动/点击含"课表"的卡片，切换周选择器 ----
   function autoTrigger() {
     DIAG.autoTried += 1;
@@ -836,6 +888,7 @@ const String kPortalScheduleScript = r'''
             var data = body && body.data ? body.data : null;
             if (data && data.resultsJsonArr) {
               weeks.push({ week: week, data: data });
+              progress('第 ' + week + ' 周数据返回');
               var wc = parseInt(data.weekcount, 10);
               if (wc && !isNaN(wc)) { TEMPLATE.weekcount = wc; TEMPLATE.weekcountFromApi = true; }
             } else {
