@@ -16,10 +16,10 @@
 //!
 //! | code | 含义 | 用户看到 |
 //! |---|---|---|
-//! | `BAD_INPUT` | 空参数 / 非 UTF-8 / 空 HTML | "内容为空，请重新抓取" |
+//! | `BAD_INPUT` | 空参数 / 非 UTF-8 / 空 HTML / 参数非法（记忆类型写错、正文超 64 KiB…） | "内容为空，请重新抓取" |
 //! | `PARSE_FAILED` | 结构性解析失败（找不到表/表头/列数错位） | "学校页面可能已更新，请反馈" |
 //! | `PARSE_EMPTY` | 解析成功但一门课都没有（**不落库**） | "未解析到课程，请确认是否已排课" |
-//! | `STORAGE` | SQLite 读写失败 | "本地课表保存失败" |
+//! | `STORAGE` | SQLite 读写失败（课表 / 本地记忆） | "本地数据保存失败" |
 //! | `TERM_START_UNKNOWN` | 学期开学日未确认/无法识别（**绝不猜默认日期**） | "请先确认本学期开学日期" |
 //! | `INTERNAL` | 兜底 | "内部错误" |
 
@@ -29,6 +29,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use serde_json::{json, Value};
 
 use crate::error::CoreError;
+use crate::memory_items::{MemoryDraft, MemoryItemStore, MemoryKind};
 use crate::parse::{ParseError, ParseReport};
 use crate::schedule::{merge, SchedulePayload};
 use crate::store::CourseStore;
@@ -432,6 +433,201 @@ pub unsafe extern "C" fn yunong_export_ics(
                 let (code, message) = map_core_error(err);
                 err_json(&code, message)
             }
+        }
+    })
+}
+
+// -------------------------------------------------------------------------
+// 本地记忆（W7-3）：`memory_items` 的增删查。正文只在本机，不上云（ADR-02）。
+// -------------------------------------------------------------------------
+
+/// 记忆相关的错误映射：**校验类**问题统一 `BAD_INPUT`。
+///
+/// 共享的 [`map_core_error`] 把 `Invalid` 归到 `STORAGE`（课表那几个函数的历史行为，
+/// 改动它等于改既有契约）。但"记忆类型写错"不是存储故障：界面若显示
+/// "本地记忆保存失败"，用户会去查磁盘而不是改输入。所以这里只给记忆这三个函数
+/// 单独把 `Invalid` 映射成 `BAD_INPUT`。
+fn memory_error(err: CoreError) -> Value {
+    match err {
+        CoreError::Invalid(message) => err_json("BAD_INPUT", message),
+        other => {
+            let (code, message) = map_core_error(other);
+            err_json(&code, message)
+        }
+    }
+}
+
+/// 解析可选的 id（空串 = 新增一条）。
+fn parse_optional_id(text: &str) -> Result<Option<i64>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    match text.parse::<i64>() {
+        Ok(id) if id > 0 => Ok(Some(id)),
+        _ => Err(format!("id 必须是正整数：{text}")),
+    }
+}
+
+/// 解析 `list` 的条数（空串 = 默认 [`crate::memory_items::DEFAULT_LIST_LIMIT`]）。
+fn parse_list_limit(text: &str) -> Result<usize, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(crate::memory_items::DEFAULT_LIST_LIMIT);
+    }
+    match text.parse::<usize>() {
+        Ok(limit) if (1..=crate::memory_items::DEFAULT_MAX_ITEMS).contains(&limit) => Ok(limit),
+        _ => Err(format!(
+            "limit 必须是 1..={} 的整数：{text}",
+            crate::memory_items::DEFAULT_MAX_ITEMS
+        )),
+    }
+}
+
+/// 写一条本地记忆（新增或更新）。
+///
+/// - `kind`：`note` / `summary` / `fact`（其它值 → `BAD_INPUT`）；
+/// - `id_or_empty`：空串 = 新增，非空 = 更新该 id（不存在 → `BAD_INPUT`，不会静默新增）；
+/// - 返回 `{"ok":true,"data":{"id":12,"evicted":0}}`，`evicted` = 为守容量删掉的行数。
+///
+/// 单条正文超过 64 KiB → `BAD_INPUT`（不静默截断：截断等于丢用户内容）。
+///
+/// # Safety
+///
+/// 六个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_memory_upsert(
+    kind: *const c_char,
+    title: *const c_char,
+    content: *const c_char,
+    source: *const c_char,
+    id_or_empty: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (kind, title, content, source, id_or_empty, db_path) = match (
+            read_arg(kind, "kind"),
+            read_arg(title, "title"),
+            read_arg(content, "content"),
+            read_arg(source, "source"),
+            read_arg(id_or_empty, "id"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(kind), Ok(title), Ok(content), Ok(source), Ok(id), Ok(db)) => {
+                (kind, title, content, source, id, db)
+            }
+            (Err(err), ..)
+            | (_, Err(err), ..)
+            | (_, _, Err(err), ..)
+            | (_, _, _, Err(err), ..)
+            | (_, _, _, _, Err(err), _)
+            | (_, _, _, _, _, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        let kind = match MemoryKind::parse(kind) {
+            Ok(kind) => kind,
+            Err(err) => return memory_error(err),
+        };
+        let id = match parse_optional_id(id_or_empty) {
+            Ok(id) => id,
+            Err(err) => return err_json("BAD_INPUT", err),
+        };
+        let mut store = match MemoryItemStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return memory_error(err),
+        };
+        let draft = MemoryDraft {
+            kind,
+            title: Some(title),
+            content,
+            source: Some(source),
+            expires_at: None,
+        };
+        match store.upsert(&draft, id) {
+            Ok(write) => ok_json(json!({ "id": write.id, "evicted": write.evicted })),
+            Err(err) => memory_error(err),
+        }
+    })
+}
+
+/// 列出本地记忆（按 `updated_at` 倒序）。
+///
+/// - `kind_or_empty`：空串 = 全部，否则必须是 `note` / `summary` / `fact`；
+/// - `limit`：空串 = 默认 100，显式值必须落在 `1..=5000`；
+/// - 返回 `{"ok":true,"data":[{...}, ...]}`（到期的条目不会出现）。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_memory_list(
+    kind_or_empty: *const c_char,
+    limit: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (kind_or_empty, limit, db_path) = match (
+            read_arg(kind_or_empty, "kind"),
+            read_arg(limit, "limit"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(kind), Ok(limit), Ok(db_path)) => (kind, limit, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
+        };
+        let kind = match kind_or_empty.trim() {
+            "" => None,
+            text => match MemoryKind::parse(text) {
+                Ok(kind) => Some(kind),
+                Err(err) => return memory_error(err),
+            },
+        };
+        let limit = match parse_list_limit(limit) {
+            Ok(limit) => limit,
+            Err(err) => return err_json("BAD_INPUT", err),
+        };
+        let store = match MemoryItemStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return memory_error(err),
+        };
+        match store.list(kind, limit) {
+            Ok(items) => ok_json(json!(items)),
+            Err(err) => memory_error(err),
+        }
+    })
+}
+
+/// 删除一条本地记忆。
+///
+/// 返回 `{"ok":true,"data":{"deleted":1}}`；删除是幂等的，删不存在的 id 返回 0
+/// 而不是报错（界面重复点击不该弹错）。
+///
+/// # Safety
+///
+/// 两个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_memory_delete(
+    id: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (id, db_path) = match (read_arg(id, "id"), read_arg(db_path, "db_path")) {
+            (Ok(id), Ok(db_path)) => (id, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        // 空 id 当 0 处理会"静默什么也没删"，比报错更难排查
+        let id = match parse_optional_id(id) {
+            Ok(Some(id)) => id,
+            Ok(None) => return err_json("BAD_INPUT", "id 不能为空"),
+            Err(err) => return err_json("BAD_INPUT", err),
+        };
+        let mut store = match MemoryItemStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return memory_error(err),
+        };
+        match store.delete(id) {
+            Ok(deleted) => ok_json(json!({ "deleted": deleted })),
+            Err(err) => memory_error(err),
         }
     })
 }
@@ -901,6 +1097,268 @@ mod tests {
         unsafe { yunong_free_string(raw) };
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["code"], "BAD_INPUT", "{value}");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    // ---------------------------------------------------------------------
+    // 本地记忆（W7-3）
+    // ---------------------------------------------------------------------
+
+    fn call_memory_upsert(
+        kind: &str,
+        title: &str,
+        content: &str,
+        source: &str,
+        id: &str,
+        db: &str,
+    ) -> Value {
+        let kind = CString::new(kind).unwrap();
+        let title = CString::new(title).unwrap();
+        let content = CString::new(content).unwrap();
+        let source = CString::new(source).unwrap();
+        let id = CString::new(id).unwrap();
+        let db_c = CString::new(db).unwrap();
+        let raw = unsafe {
+            yunong_memory_upsert(
+                kind.as_ptr(),
+                title.as_ptr(),
+                content.as_ptr(),
+                source.as_ptr(),
+                id.as_ptr(),
+                db_c.as_ptr(),
+            )
+        };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn call_memory_list(kind: &str, limit: &str, db: &str) -> Value {
+        let kind = CString::new(kind).unwrap();
+        let limit = CString::new(limit).unwrap();
+        let db_c = CString::new(db).unwrap();
+        let raw = unsafe { yunong_memory_list(kind.as_ptr(), limit.as_ptr(), db_c.as_ptr()) };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn call_memory_delete(id: &str, db: &str) -> Value {
+        let id = CString::new(id).unwrap();
+        let db_c = CString::new(db).unwrap();
+        let raw = unsafe { yunong_memory_delete(id.as_ptr(), db_c.as_ptr()) };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn memory_roundtrip_via_ffi() {
+        let db = temp_db();
+        let created = call_memory_upsert("note", "第一节课", "周三记得带雨伞", "user", "", &db);
+        assert_eq!(created["ok"], true, "{created}");
+        let id = created["data"]["id"].as_i64().expect("必须返回 id");
+        assert!(id > 0, "{created}");
+        assert_eq!(created["data"]["evicted"], 0, "{created}");
+
+        let all = call_memory_list("", "", &db);
+        assert_eq!(all["ok"], true, "{all}");
+        let items = all["data"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{all}");
+        assert_eq!(items[0]["id"], id);
+        assert_eq!(items[0]["kind"], "note");
+        assert_eq!(items[0]["title"], "第一节课");
+        assert_eq!(items[0]["content"], "周三记得带雨伞");
+        assert_eq!(items[0]["source"], "user");
+        assert!(items[0]["created_at"].as_i64().unwrap() > 0);
+        assert!(items[0]["updated_at"].as_i64().unwrap() > 0);
+        assert!(items[0]["expires_at"].is_null());
+
+        // 按种类过滤
+        assert_eq!(
+            call_memory_list("note", "10", &db)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            call_memory_list("summary", "10", &db)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // 带 id 再写 = 更新同一条（不新增）
+        let id_text = id.to_string();
+        let updated =
+            call_memory_upsert("note", "第一节课（改）", "改带外套", "user", &id_text, &db);
+        assert_eq!(updated["ok"], true, "{updated}");
+        assert_eq!(updated["data"]["id"], id, "{updated}");
+        let items = call_memory_list("", "", &db)["data"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(items.len(), 1, "更新不能多出一条");
+        assert_eq!(items[0]["content"], "改带外套");
+        assert_eq!(items[0]["title"], "第一节课（改）");
+
+        // 删除幂等
+        assert_eq!(call_memory_delete(&id_text, &db)["data"]["deleted"], 1);
+        assert_eq!(call_memory_delete(&id_text, &db)["data"]["deleted"], 0);
+        assert_eq!(
+            call_memory_list("", "", &db)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn memory_rejects_bad_input_with_bad_input_code() {
+        let db = temp_db();
+        // 类型不在白名单
+        let result = call_memory_upsert("diary", "标题", "正文", "", "", &db);
+        assert_eq!(result["code"], "BAD_INPUT", "{result}");
+        // 空正文
+        let result = call_memory_upsert("note", "标题", "   ", "", "", &db);
+        assert_eq!(result["code"], "BAD_INPUT", "{result}");
+        // 正文超 64 KiB：报错但不截断、不落库
+        let huge = "x".repeat(64 * 1024 + 1);
+        let result = call_memory_upsert("note", "标题", &huge, "", "", &db);
+        assert_eq!(result["code"], "BAD_INPUT", "{result}");
+        assert_eq!(
+            call_memory_list("", "", &db)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0,
+            "超限的那条不能落库"
+        );
+        // id 非法 / 更新不存在的 id
+        let result = call_memory_upsert("note", "标题", "正文", "", "abc", &db);
+        assert_eq!(result["code"], "BAD_INPUT", "{result}");
+        let result = call_memory_upsert("note", "标题", "正文", "", "999", &db);
+        assert_eq!(result["code"], "BAD_INPUT", "{result}");
+        assert!(
+            result["message"].as_str().unwrap().contains("不存在"),
+            "{result}"
+        );
+        // 删除缺 id / id 非正数
+        assert_eq!(call_memory_delete("", &db)["code"], "BAD_INPUT");
+        assert_eq!(call_memory_delete("0", &db)["code"], "BAD_INPUT");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn memory_list_limit_boundaries_via_ffi() {
+        let db = temp_db();
+        for index in 0..3 {
+            let result = call_memory_upsert(
+                "fact",
+                &format!("事实 {index}"),
+                &format!("第 {index} 条"),
+                "user",
+                "",
+                &db,
+            );
+            assert_eq!(result["ok"], true, "{result}");
+        }
+        assert_eq!(
+            call_memory_list("", "1", &db)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            call_memory_list("", "3", &db)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        // 空 limit = 默认条数
+        assert_eq!(
+            call_memory_list("", "", &db)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        for bad in ["0", "abc", "-1", "5001"] {
+            let result = call_memory_list("", bad, &db);
+            assert_eq!(result["code"], "BAD_INPUT", "limit={bad} => {result}");
+        }
+        // 种类过滤也要校验
+        let result = call_memory_list("diary", "10", &db);
+        assert_eq!(result["code"], "BAD_INPUT", "{result}");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn memory_null_arguments_do_not_crash() {
+        let raw = unsafe {
+            yunong_memory_upsert(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!raw.is_null(), "绝不返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+
+        let raw =
+            unsafe { yunong_memory_list(std::ptr::null(), std::ptr::null(), std::ptr::null()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+
+        let raw = unsafe { yunong_memory_delete(std::ptr::null(), std::ptr::null()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+    }
+
+    #[test]
+    fn memory_and_timetable_share_the_same_database_file() {
+        let db = temp_db();
+        // 同一个库文件里既放课表也放记忆，互不干扰
+        assert_eq!(
+            call_schedule(&weekly_json(1), "2026-2027-1", &db)["ok"],
+            true
+        );
+        let created = call_memory_upsert("fact", "班级", "我在 3 班", "user", "", &db);
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(
+            call_list("2026-2027-1", &db)["data"]["courses"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "写记忆不能动课表"
+        );
+        assert_eq!(
+            call_memory_list("", "", &db)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
     }
 }
