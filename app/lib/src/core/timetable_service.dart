@@ -13,6 +13,7 @@ import 'dart:io';
 
 import 'package:flutter/services.dart' show rootBundle;
 
+import '../campus/portal_api.dart';
 import 'ffi_bindings.dart';
 
 /// 一门已入库的课。
@@ -74,6 +75,39 @@ class ImportOutcome {
   final List<String> warnings;
 }
 
+/// 门户周数据入库的结果（W6）。
+class ScheduleImportOutcome {
+  const ScheduleImportOutcome({
+    required this.term,
+    required this.imported,
+    required this.warnings,
+    required this.weeksSeen,
+    required this.missingWeeks,
+    required this.partial,
+    this.weekcount,
+  });
+
+  final String term;
+  final int imported;
+  final List<String> warnings;
+  final List<int> weeksSeen;
+  final List<int> missingWeeks;
+
+  /// 部分周没拉到但仍入库（不整体失败）
+  final bool partial;
+  final int? weekcount;
+}
+
+/// 学期一条记录（`starts_on` 是用户确认过的开学日，空串=未确认）。
+class TermSummary {
+  const TermSummary({required this.term, required this.startsOn});
+
+  final String term;
+  final String startsOn;
+
+  bool get hasStart => startsOn.isNotEmpty;
+}
+
 /// 课表相关的用户可见失败。
 ///
 /// `userHint` 是**大字号给用户看的那句**；`message` 是原始细节（小字/日志）。
@@ -102,6 +136,18 @@ TimetableException describeFailure(String? code, String? message) {
       return TimetableException(
         code: code!,
         userHint: '学校页面可能已更新，请反馈',
+        message: detail,
+      );
+    case 'CARD_NOT_FOUND':
+      return TimetableException(
+        code: code!,
+        userHint: '没抓到课表接口：请先在门户里打开一次课表卡片',
+        message: detail,
+      );
+    case 'AUTH_REQUIRED':
+      return TimetableException(
+        code: code!,
+        userHint: '登录态已失效，请重新登录',
         message: detail,
       );
     case 'PARSE_EMPTY':
@@ -135,6 +181,12 @@ TimetableException describeFailure(String? code, String? message) {
 abstract class SchoolFetcher {
   /// 打开校务入口、等用户登录、抓取课表页 **HTML 原文**。
   Future<FetchedPage> fetchTimetablePage({required String entryUrl});
+
+  /// W6 新形态：直接取门户周数据（默认不支持 → 调用方退回 HTML 路径）。
+  Future<ScheduleApiResult> fetchSchedule({required String entryUrl}) =>
+      Future<ScheduleApiResult>.error(
+        UnsupportedError('该取数实现不支持门户接口，请退回 HTML 路径'),
+      );
 
   /// 这个实现当前能不能用（Windows 上 WebView 未初始化时 UI 要给出解释）。
   bool get isAvailable;
@@ -218,6 +270,72 @@ class TimetableService {
           .map((item) => item.toString())
           .toList(growable: false),
     );
+  }
+
+  /// 门户周数据 JSON 入库（W6 新形态）。
+  ///
+  /// 合并规则（相邻节次、周集合压缩）在 Rust 侧；这里只负责把 JSON 送下去并把
+  /// `partial/missing_weeks` 如实带回 UI。
+  Future<ScheduleImportOutcome> importScheduleJson({
+    required String scheduleJson,
+    required String term,
+  }) async {
+    final CoreEnvelope envelope;
+    try {
+      envelope = _library.importScheduleJson(
+        json: scheduleJson,
+        term: term,
+        dbPath: dbPath,
+      );
+    } on CoreUnavailable {
+      rethrow;
+    } on Object catch (err) {
+      throw describeFailure('INTERNAL', '调用端侧核心失败：$err');
+    }
+    if (!envelope.ok) {
+      throw describeFailure(envelope.code, envelope.message);
+    }
+    final data = envelope.data ?? const <String, dynamic>{};
+    return ScheduleImportOutcome(
+      term: data['term'] as String? ?? term,
+      imported: data['imported'] as int? ?? 0,
+      warnings: (data['warnings'] as List<dynamic>? ?? const <dynamic>[])
+          .map((dynamic item) => item.toString())
+          .toList(growable: false),
+      weeksSeen: (data['weeks_seen'] as List<dynamic>? ?? const <dynamic>[])
+          .map((dynamic item) => item is int ? item : int.tryParse('$item') ?? 0)
+          .where((int week) => week > 0)
+          .toList(growable: false),
+      missingWeeks: (data['missing_weeks'] as List<dynamic>? ?? const <dynamic>[])
+          .map((dynamic item) => item is int ? item : int.tryParse('$item') ?? 0)
+          .where((int week) => week > 0)
+          .toList(growable: false),
+      partial: data['partial'] == true,
+      weekcount: data['weekcount'] as int?,
+    );
+  }
+
+  /// 设置/修正学期开始日（`YYYY-MM-DD`，空串=清空）。
+  Future<void> setTermStart({required String term, required String startsOn}) async {
+    final envelope = _library.setTermStart(term: term, startsOn: startsOn, dbPath: dbPath);
+    if (!envelope.ok) {
+      throw describeFailure(envelope.code, envelope.message);
+    }
+  }
+
+  /// 学期记录（含用户确认过的开学日）。
+  Future<List<TermSummary>> listTermRecords() async {
+    final envelope = _library.listTerms(dbPath: dbPath);
+    if (!envelope.ok) {
+      throw describeFailure(envelope.code, envelope.message);
+    }
+    final terms = (envelope.data?['terms'] as List<dynamic>? ?? const <dynamic>[]);
+    return terms.whereType<Map<String, dynamic>>().map((Map<String, dynamic> item) {
+      return TermSummary(
+        term: item['term'] as String? ?? '',
+        startsOn: item['starts_on'] as String? ?? '',
+      );
+    }).where((TermSummary item) => item.term.isNotEmpty).toList(growable: false);
   }
 
   /// 查某学期的课程。

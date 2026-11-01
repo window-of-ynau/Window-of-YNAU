@@ -21,7 +21,17 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../core/timetable_service.dart';
 import 'campus_bridge.dart';
+import 'portal_api.dart';
 import 'webview_session.dart';
+
+/// 取数模式：旧的 DOM 抓取 / W6 的门户接口。
+enum CampusFetchMode {
+  /// 抓 `table#timetable` 的 outerHTML（兜底路径）
+  timerHtml,
+
+  /// 捕获 `queryAWeekSchedule` 模板后批量拉周（W6 主路径）
+  portalApi,
+}
 
 /// WebView 版取数实现（真实登录 + 会话复用）。
 class WebViewSchoolFetcher implements SchoolFetcher {
@@ -40,8 +50,25 @@ class WebViewSchoolFetcher implements SchoolFetcher {
   String? get unavailableReason =>
       isAvailable ? null : '当前平台没有内置浏览器';
 
+  /// W6 新形态：打开门户 → 捕获 queryAWeekSchedule 模板 → 批量拉周 → 原样回传。
+  ///
+  /// 与 HTML 路径共用同一个 WebView 页面（`CampusWebViewPage` 的 `mode` 区分）。
   @override
-  Future<FetchedPage> fetchTimetablePage({required String entryUrl}) {
+  Future<ScheduleApiResult> fetchSchedule({required String entryUrl}) =>
+      _open<ScheduleApiResult>(
+        entryUrl: entryUrl,
+        mode: CampusFetchMode.portalApi,
+      );
+
+  Future<FetchedPage> fetchTimetablePage({required String entryUrl}) =>
+      _open<FetchedPage>(
+        entryUrl: entryUrl,
+        mode: CampusFetchMode.timerHtml,
+      );  /// 打开取数页面并等待结果（两种模式共用）。
+  Future<T> _open<T>({
+    required String entryUrl,
+    required CampusFetchMode mode,
+  }) {
     final navigator = navigatorKey.currentState;
     if (!isAvailable || navigator == null) {
       throw FetchException(
@@ -50,7 +77,7 @@ class WebViewSchoolFetcher implements SchoolFetcher {
         message: unavailableReason ?? '导航未就绪',
       );
     }
-    final completer = Completer<FetchedPage>();
+    final completer = Completer<T>();
     var closed = false;
     void close() {
       if (closed) {
@@ -63,9 +90,16 @@ class WebViewSchoolFetcher implements SchoolFetcher {
     unawaited(navigator.push<void>(MaterialPageRoute<void>(
       builder: (BuildContext context) => CampusWebViewPage(
         entryUrl: entryUrl,
+        mode: mode,
+        onFetchedSchedule: (ScheduleApiResult result) {
+          if (!completer.isCompleted && T == ScheduleApiResult) {
+            completer.complete(result as T);
+          }
+          close();
+        },
         onFetched: (FetchedPage page) {
-          if (!completer.isCompleted) {
-            completer.complete(page);
+          if (!completer.isCompleted && T == FetchedPage) {
+            completer.complete(page as T);
           }
           close();
         },
@@ -88,19 +122,22 @@ class WebViewSchoolFetcher implements SchoolFetcher {
     });
   }
 }
-
 /// 抓取用的全屏页面（由 `WebViewSchoolFetcher` push 出来）。
 class CampusWebViewPage extends StatefulWidget {
   const CampusWebViewPage({
     super.key,
     required this.entryUrl,
+    required this.mode,
     required this.onFetched,
+    required this.onFetchedSchedule,
     required this.onError,
     this.onStage,
   });
 
   final String entryUrl;
+  final CampusFetchMode mode;
   final void Function(FetchedPage page) onFetched;
+  final void Function(ScheduleApiResult result) onFetchedSchedule;
   final void Function(FetchException error) onError;
   final void Function(FetchStage stage)? onStage;
 
@@ -126,6 +163,8 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     onFetched: widget.onFetched,
     onError: _onBridgeError,
     onLoginState: _onLoginState,
+    onScheduleTemplate: _onScheduleTemplate,
+    onScheduleApi: widget.onFetchedSchedule,
     onStage: (FetchStage stage) {
       widget.onStage?.call(stage);
       if (stage == FetchStage.grabbed) {
@@ -171,7 +210,28 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     }
   }
 
+  /// 捕获到门户课表接口模板 → 自动批量拉周（用户不需要再点按钮）。
+  void _onScheduleTemplate(ScheduleTemplate template) {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _busy = false;
+      _probe = const LoginProbe(
+        state: CampusLoginState.loggedIn,
+        reason: 'schedule_api',
+      );
+    });
+    unawaited(_controller?.evaluateJavascript(
+      source: 'window.__yunongFetchSchedule && window.__yunongFetchSchedule();',
+    ));
+  }
+
   void _startGrabLoop() {
+    // 门户接口模式下不抓 DOM：等接口模板捕获（脚本自己 hook fetch/XHR）
+    if (widget.mode == CampusFetchMode.portalApi) {
+      return;
+    }
     if (_grabTimer != null) {
       return;
     }
@@ -282,6 +342,11 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                         source: kCampusProbeScript,
                         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
                       ),
+                      if (widget.mode == CampusFetchMode.portalApi)
+                        UserScript(
+                          source: kPortalScheduleScript,
+                          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+                        ),
                     ]),
                     onWebViewCreated: (InAppWebViewController controller) {
                       _controller = controller;

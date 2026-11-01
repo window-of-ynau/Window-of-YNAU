@@ -16,6 +16,27 @@ class ScriptedCore implements CoreApi {
   List<StoredCourse> courses = const <StoredCourse>[];
 
   @override
+  CoreEnvelope importScheduleJson({
+    required String json,
+    required String term,
+    required String dbPath,
+  }) =>
+      const CoreEnvelope(ok: true, data: <String, dynamic>{
+        'term': '',
+        'imported': 0,
+        'weeks_seen': <dynamic>[],
+        'missing_weeks': <dynamic>[],
+        'partial': false,
+      });
+
+  @override
+  CoreEnvelope setTermStart({
+    required String term,
+    required String startsOn,
+    required String dbPath,
+  }) =>
+      const CoreEnvelope(ok: true, data: <String, dynamic>{'term': '', 'starts_on': ''});
+  @override
   String get version => 'test';
 
   @override

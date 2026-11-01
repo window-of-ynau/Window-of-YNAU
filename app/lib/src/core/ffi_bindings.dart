@@ -48,6 +48,8 @@ typedef _FreeNative = Void Function(Pointer<Utf8>);
 typedef _FreeDart = void Function(Pointer<Utf8>);
 typedef _VersionNative = Pointer<Utf8> Function();
 typedef _VersionDart = Pointer<Utf8> Function();
+typedef _ThreeArgsNative = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _ThreeArgsDart = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
 
 /// 核心能力接口：生产实现是 [CoreLibrary]，测试用 fake（不需要真 DLL）。
 abstract class CoreApi {
@@ -62,6 +64,20 @@ abstract class CoreApi {
   CoreEnvelope listCourses({required String term, required String dbPath});
 
   CoreEnvelope listTerms({required String dbPath});
+
+  /// 门户周数据 JSON 入库（W6 新形态；HTML 路径保留作兜底）。
+  CoreEnvelope importScheduleJson({
+    required String json,
+    required String term,
+    required String dbPath,
+  });
+
+  /// 设置/修正学期开始日（`YYYY-MM-DD`，空串=清空）。
+  CoreEnvelope setTermStart({
+    required String term,
+    required String startsOn,
+    required String dbPath,
+  });
 }
 
 /// 已加载的核心库。
@@ -76,13 +92,19 @@ class CoreLibrary implements CoreApi {
         _free = library.lookupFunction<_FreeNative, _FreeDart>(
             'yunong_free_string'),
         _version =
-            library.lookupFunction<_VersionNative, _VersionDart>('yunong_core_version');
+            library.lookupFunction<_VersionNative, _VersionDart>('yunong_core_version'),
+        _importSchedule = library
+            .lookupFunction<_ThreeArgsNative, _ThreeArgsDart>('yunong_import_schedule_json'),
+        _setTermStart = library
+            .lookupFunction<_ThreeArgsNative, _ThreeArgsDart>('yunong_set_term_start');
 
   final _ImportDart _import;
   final _TwoArgsDart _listCourses;
   final _OneArgDart _listTerms;
   final _FreeDart _free;
   final _VersionDart _version;
+  final _ThreeArgsDart _importSchedule;
+  final _ThreeArgsDart _setTermStart;
 
   static CoreLibrary? _instance;
 
@@ -149,6 +171,23 @@ class CoreLibrary implements CoreApi {
   CoreEnvelope listTerms({required String dbPath}) =>
       _call(<String>[dbPath], (List<Pointer<Utf8>> p) => _listTerms(p[0]));
 
+  @override
+  CoreEnvelope importScheduleJson({
+    required String json,
+    required String term,
+    required String dbPath,
+  }) =>
+      _call(<String>[json, term, dbPath],
+          (List<Pointer<Utf8>> p) => _importSchedule(p[0], p[1], p[2]));
+
+  @override
+  CoreEnvelope setTermStart({
+    required String term,
+    required String startsOn,
+    required String dbPath,
+  }) =>
+      _call(<String>[term, startsOn, dbPath],
+          (List<Pointer<Utf8>> p) => _setTermStart(p[0], p[1], p[2]));
   CoreEnvelope _call(
     List<String> args,
     Pointer<Utf8> Function(List<Pointer<Utf8>>) invoke,

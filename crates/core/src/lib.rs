@@ -18,6 +18,7 @@ pub mod keystore;
 pub mod memory;
 pub mod parse;
 pub mod protocols;
+pub mod schedule;
 pub mod store;
 pub mod tools;
 
@@ -48,6 +49,9 @@ pub mod prelude {
     pub use crate::memory::{Blob, BlobKind, MemoryStore, Message};
     pub use crate::parse::{parse_timetable, parse_timetable_with_report, ParseError, ParseReport};
     pub use crate::protocols::{build_body, build_body_with, parse_events, BuildOptions};
+    pub use crate::schedule::{
+        compress_weeks, merge, MergedSchedule, SchedulePayload, WeekPayload,
+    };
     pub use crate::store::{CourseStore, ImportOutcome, StoredCourse, TermRecord};
     pub use crate::tools::{ToolCall, ToolOutcome, ToolRegistry};
 }
