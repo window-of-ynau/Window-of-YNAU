@@ -234,6 +234,10 @@ const String kPortalScheduleScript = r'''
   var API = '/api/uppcard/kbsz/queryAWeekSchedule';
   var TEMPLATE = null;
   var running = false;
+  // 诊断用：owner/我们据此判断卡在哪一步（不含任何凭据）
+  var DIAG = { xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0 };
+  var TIMEOUT_MS = 20000;
+  var timeoutPosted = false;
 
   function post(payload) {
     try {
@@ -248,6 +252,7 @@ const String kPortalScheduleScript = r'''
   }
 
   function capture(rawUrl) {
+    DIAG.xhrSeen += 1;
     var url = parseUrl(rawUrl);
     if (!url || url.pathname.indexOf(API) < 0) { return; }
     var cardId = url.searchParams.get('cardId') || '';
@@ -255,6 +260,8 @@ const String kPortalScheduleScript = r'''
     if (!cardId || !years) { return; }
     if (TEMPLATE && TEMPLATE.cardId === cardId && TEMPLATE.years === years) { return; }
     TEMPLATE = { cardId: cardId, years: years, weekcount: 20, weekcountFromApi: false };
+    DIAG.cardIdPrefix = cardId.slice(0, 8);
+    DIAG.cardIdSource = 'xhr';
     post({ type: 'schedule_template', card_id: cardId, years: years, weekcount: TEMPLATE.weekcount });
     // 捕获到模板就自动批量拉，用户不需要再点任何按钮
     setTimeout(function () { window.__yunongFetchSchedule(); }, 300);
@@ -307,9 +314,46 @@ const String kPortalScheduleScript = r'''
       + '&_t=' + Date.now();
   }
 
+  function safePath() {
+    try { return location.pathname || ''; } catch (e) { return ''; }
+  }
+
+  window.__yunongDiagnostics = function () {
+    var title = '';
+    try { title = document.title || ''; } catch (e) {}
+    return JSON.stringify({
+      path: safePath(),
+      host: (location.hostname || ''),
+      title: title,
+      captured: !!TEMPLATE,
+      xhrSeen: DIAG.xhrSeen,
+      cardIdPrefix: DIAG.cardIdPrefix,
+      cardIdSource: DIAG.cardIdSource,
+      autoTried: DIAG.autoTried
+    });
+  };
+
+  function postCaptureTimeout(reason) {
+    if (timeoutPosted) { return; }
+    timeoutPosted = true;
+    post({
+      type: 'capture_timeout',
+      reason: reason || 'no_template',
+      diagnostics: JSON.parse(window.__yunongDiagnostics())
+    });
+  }
+
+  // 20s 还没捕获到任何课表请求 → 明确告诉用户该做什么，绝不静默挂起
+  setTimeout(function () {
+    if (!TEMPLATE) { postCaptureTimeout('no_template_20s'); }
+  }, TIMEOUT_MS);
   window.__yunongFetchSchedule = function () {
     if (!TEMPLATE) {
-      post({ type: 'error', code: 'CARD_NOT_FOUND', message: '没捕获到课表接口请求：请先在门户里打开一次课表卡片' });
+      post({
+        type: 'capture_timeout',
+        reason: 'manual_grab_without_template',
+        diagnostics: JSON.parse(window.__yunongDiagnostics())
+      });
       return;
     }
     if (running) { return; }

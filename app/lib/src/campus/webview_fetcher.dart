@@ -149,6 +149,10 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
   InAppWebViewController? _controller;
   WebViewEnvironment? _environment;
 
+  /// 门户接口模式下：20s 内没捕获到课表请求就明确报错（绝不静默挂起）。
+  Timer? _captureTimer;
+  bool _templateCaptured = false;
+
   /// 已登录但还没拿到课表时的重试抓取（最多 20 次 × 1.5s ≈ 30s）。
   Timer? _grabTimer;
   int _grabAttempts = 0;
@@ -186,6 +190,7 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
 
   @override
   void dispose() {
+    _stopCaptureTimer();
     _stopGrabLoop();
     super.dispose();
   }
@@ -210,8 +215,35 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     }
   }
 
+  /// 门户接口模式：等模板也有时限（脚本自己也有一段 20s 兜底，这里防注入失败/页面白屏）。
+  void _startCaptureTimer() {
+    if (widget.mode != CampusFetchMode.portalApi || _templateCaptured) {
+      return;
+    }
+    _captureTimer?.cancel();
+    _captureTimer = Timer(const Duration(seconds: 20), () async {
+      if (_templateCaptured || !mounted) {
+        return;
+      }
+      final Object? diagnostics = await _controller?.evaluateJavascript(
+        source: 'window.__yunongDiagnostics ? window.__yunongDiagnostics() : ""',
+      );
+      widget.onError(FetchException(
+        code: 'CAPTURE_TIMEOUT',
+        userHint: describeFetchFailure('CAPTURE_TIMEOUT'),
+        message: diagnostics is String ? diagnostics : '',
+      ));
+    });
+  }
+
+  void _stopCaptureTimer() {
+    _captureTimer?.cancel();
+    _captureTimer = null;
+  }
   /// 捕获到门户课表接口模板 → 自动批量拉周（用户不需要再点按钮）。
   void _onScheduleTemplate(ScheduleTemplate template) {
+    _templateCaptured = true;
+    _stopCaptureTimer();
     if (!mounted) {
       return;
     }
@@ -367,6 +399,7 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       if (mounted) {
                         setState(() => _busy = false);
                       }
+                      _startCaptureTimer();
                       // 每次导航结束立刻探一次（登录成功后自动进入取数靠这条）
                       await _controller?.evaluateJavascript(
                         source: 'window.__yunongProbeNow && window.__yunongProbeNow();',

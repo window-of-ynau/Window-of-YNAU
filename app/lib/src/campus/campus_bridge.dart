@@ -72,6 +72,21 @@ class CampusBridge {
         ));
         return true;
 
+      case 'capture_timeout':
+        _fail(FetchException(
+          code: 'CAPTURE_TIMEOUT',
+          userHint: '请在页面里打开「课表」卡片，或切换一次周次后重试',
+          message: _formatDiagnostics(message['diagnostics']),
+        ));
+        return true;
+
+      case 'portal_hint':
+        _fail(FetchException(
+          code: 'PORTAL_PAGE',
+          userHint: '当前是门户页，需要先打开「课表」卡片',
+          message: _formatDiagnostics(message['diagnostics']),
+        ));
+        return true;
       case 'schedule_template':
         final template = ScheduleTemplate.fromMessage(message);
         if (template.isValid) {
@@ -138,7 +153,10 @@ class CampusBridge {
     }
     // `HTML_CHANGED` 是"这次没找到表"：自动重试窗口内页面可能还在渲染，
     // 所以不锁定 delivered——只要后面某一轮真抓到了表，仍然算成功。
-    if (error.code != 'HTML_CHANGED' && error.code != 'CARD_NOT_FOUND') {
+    if (error.code != 'HTML_CHANGED' &&
+        error.code != 'CARD_NOT_FOUND' &&
+        error.code != 'CAPTURE_TIMEOUT' &&
+        error.code != 'PORTAL_PAGE') {
       _delivered = true;
     }
     onError(error);
@@ -149,6 +167,8 @@ class CampusBridge {
 String describeFetchFailure(String code) => switch (code) {
       'HTML_CHANGED' => '学校页面可能已更新，请反馈',
       'CARD_NOT_FOUND' => '没抓到课表接口：请先在门户里打开一次课表卡片',
+      'CAPTURE_TIMEOUT' => '请在页面里打开「课表」卡片，或切换一次周次后重试',
+      'PORTAL_PAGE' => '当前是门户页，需要先打开「课表」卡片',
       'AUTH_REQUIRED' => '登录态已失效，请重新登录',
       'LOGIN_TIMEOUT' => '登录超时，请重试',
       'NO_WEBVIEW' => '当前平台不支持内置浏览器',
@@ -176,4 +196,36 @@ String classifyWebViewError(String? description, {String? type}) {
     return 'NETWORK';
   }
   return 'NETWORK';
+}
+
+/// 把脚本带回的诊断信息压成一行（给人看，**不含任何凭据**）。
+String _formatDiagnostics(Object? raw) {
+  if (raw is! Map) {
+    return '';
+  }
+  final parts = <String>[];
+  final path = raw['path'];
+  if (path is String && path.isNotEmpty) {
+    parts.add('页面 $path');
+  }
+  final title = raw['title'];
+  if (title is String && title.trim().isNotEmpty) {
+    parts.add('标题 ${title.trim()}');
+  }
+  parts.add(raw['captured'] == true ? '已捕获接口' : '未捕获接口');
+  final xhrSeen = raw['xhrSeen'];
+  if (xhrSeen is num) {
+    parts.add('XHR $xhrSeen 次');
+  }
+  final cardIdPrefix = raw['cardIdPrefix'];
+  if (cardIdPrefix is String && cardIdPrefix.isNotEmpty) {
+    parts.add('cardId ${cardIdPrefix}…');
+  } else {
+    parts.add('cardId 无');
+  }
+  final source = raw['cardIdSource'];
+  if (source is String && source.isNotEmpty) {
+    parts.add('来源 $source');
+  }
+  return parts.join(' · ');
 }
