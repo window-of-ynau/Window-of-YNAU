@@ -9,6 +9,7 @@
 import 'dart:convert';
 
 import '../core/timetable_service.dart';
+import 'portal_api.dart';
 import 'webview_session.dart';
 
 /// 抓取阶段（UI 用来显示进度）。
@@ -21,12 +22,20 @@ class CampusBridge {
     required this.onError,
     this.onLoginState,
     this.onStage,
+    this.onScheduleTemplate,
+    this.onScheduleApi,
   });
 
   final void Function(FetchedPage page) onFetched;
   final void Function(FetchException error) onError;
   final void Function(LoginProbe probe)? onLoginState;
   final void Function(FetchStage stage)? onStage;
+
+  /// 捕获到课表接口模板（cardId/years/weekcount 都是运行时拿的）
+  final void Function(ScheduleTemplate template)? onScheduleTemplate;
+
+  /// 批量拉周完成（原样交给 Rust 合并）
+  final void Function(ScheduleApiResult result)? onScheduleApi;
 
   /// 已经拿到过课表就不再重复触发（抓取脚本可能多轮上报）。
   bool _delivered = false;
@@ -63,6 +72,30 @@ class CampusBridge {
         ));
         return true;
 
+      case 'schedule_template':
+        final template = ScheduleTemplate.fromMessage(message);
+        if (template.isValid) {
+          onScheduleTemplate?.call(template);
+        }
+        return true;
+
+      case 'schedule_api':
+        final result = ScheduleApiResult.fromMessage(message);
+        if (_delivered) {
+          return true;
+        }
+        _delivered = true;
+        onStage?.call(FetchStage.grabbed);
+        onScheduleApi?.call(result);
+        return true;
+
+      case 'auth_required':
+        _fail(FetchException(
+          code: 'AUTH_REQUIRED',
+          userHint: describeFetchFailure('AUTH_REQUIRED'),
+          message: message['message'] as String?,
+        ));
+        return true;
       case 'timetable':
         final html = message['html'];
         if (html is! String || html.trim().isEmpty) {
@@ -105,7 +138,7 @@ class CampusBridge {
     }
     // `HTML_CHANGED` 是"这次没找到表"：自动重试窗口内页面可能还在渲染，
     // 所以不锁定 delivered——只要后面某一轮真抓到了表，仍然算成功。
-    if (error.code != 'HTML_CHANGED') {
+    if (error.code != 'HTML_CHANGED' && error.code != 'CARD_NOT_FOUND') {
       _delivered = true;
     }
     onError(error);
@@ -115,6 +148,8 @@ class CampusBridge {
 /// 抓取失败码 → 用户看得懂的一句话（不要弹异常栈）。
 String describeFetchFailure(String code) => switch (code) {
       'HTML_CHANGED' => '学校页面可能已更新，请反馈',
+      'CARD_NOT_FOUND' => '没抓到课表接口：请先在门户里打开一次课表卡片',
+      'AUTH_REQUIRED' => '登录态已失效，请重新登录',
       'LOGIN_TIMEOUT' => '登录超时，请重试',
       'NO_WEBVIEW' => '当前平台不支持内置浏览器',
       'NETWORK' => '校务系统打不开，请检查校园网',

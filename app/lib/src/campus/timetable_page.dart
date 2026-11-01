@@ -7,6 +7,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard;
 
 import '../core/ffi_bindings.dart';
+import 'portal_api.dart';
+import 'dart:async';
+
 import 'campus_entries.dart';
 import '../core/timetable_service.dart';
 
@@ -47,7 +50,17 @@ class _TimetablePageState extends State<TimetablePage> {
 
   /// 最近一次动作（失败卡片的重试按钮复用它）。
   Future<void> Function()? _lastAction;
+
+  /// 学期开始日（默认 2026-09-07，可改可确认；确认后持久化到 terms.starts_on）。
+  DateTime? _termStartDraft = defaultTermStart;
+  bool _termStartSaved = false;
   String? _notice;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadTermStart());
+  }
 
   @override
   void dispose() {
@@ -141,6 +154,7 @@ class _TimetablePageState extends State<TimetablePage> {
               ],
             ),
           ),
+        _buildTermStartCard(theme),
         if (_failure != null)
           _FailureCard(failure: _failure!, onRetry: _retryFailedAction),
         Expanded(child: _buildBody(theme)),
@@ -217,16 +231,67 @@ class _TimetablePageState extends State<TimetablePage> {
       });
       return;
     }
+    _lastAction = _fetchFromCampus;
+    // 主路径：门户接口（queryAWeekSchedule）；接口变了/抓不到模板再退回 DOM 抓取
+    try {
+      await _run(() async {
+        final result = await fetcher.fetchSchedule(entryUrl: CampusEntry.timetable.url);
+        final outcome = await widget.service.importScheduleJson(
+          scheduleJson: result.toImportJson(term: _currentTerm),
+          term: _currentTerm,
+        );
+        // 学期开始日不做任何推算：默认值 + 用户确认，见卡片
+        _notice = _apiNotice(outcome);
+        return ImportOutcome(
+          term: outcome.term,
+          imported: outcome.imported,
+          warnings: outcome.warnings,
+        );
+      }, notice: '已从门户接口抓取');
+    } on UnsupportedError {
+      await _fetchFromCampusHtml(fetcher);
+    } on TimetableException catch (failure) {
+      // 接口没抓到模板（大多是因为用户还没在门户里打开课表卡片）：提示 + 退回 DOM 路径
+      if (failure.code == 'CARD_NOT_FOUND') {
+        await _fetchFromCampusHtml(fetcher, hint: '接口没抓到模板，已退回页面解析：${failure.userHint}');
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+      setState(() => _failure = failure);
+    } on FetchException catch (failure) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _failure = TimetableException(
+          code: failure.code,
+          userHint: failure.userHint,
+          message: failure.message ?? '',
+        );
+      });
+    }
+  }
+
+  String _apiNotice(ScheduleImportOutcome outcome) {
+    final parts = <String>[
+      '已抓取 ${outcome.weeksSeen.length} 周',
+      if (outcome.partial) '缺 ${outcome.missingWeeks.length} 周（已入库其余周）',
+      if (outcome.weekcount != null) '共 ${outcome.weekcount} 周',
+    ];
+    return parts.join('，');
+  }
+
+  /// 兜底路径：抓 `table#timetable` 的 HTML（接口改版/抓不到模板时用）。
+  Future<void> _fetchFromCampusHtml(SchoolFetcher fetcher, {String? hint}) async {
     await _run(() async {
-      _lastAction = _fetchFromCampus;
-      // 直接开课表页：会话有效时它自己就是课表，会话无效时 CAS 会把它带到登录页
       final page = await fetcher.fetchTimetablePage(
         entryUrl: CampusEntry.timetable.url,
       );
       return widget.service.importHtml(html: page.html, term: _currentTerm);
-    }, notice: '已从校务系统抓取');
+    }, notice: hint ?? '已从校务系统页面抓取');
   }
-
   Future<void> _importFixture({required bool revamped}) async {
     _lastAction = () => _importFixture(revamped: revamped);
     final asset =
@@ -247,6 +312,111 @@ class _TimetablePageState extends State<TimetablePage> {
     }, notice: '已从剪贴板导入');
   }
 
+  /// 读取用户上次确认过的开学日（没有就用"按当前周推算"的候选值）。
+  Future<void> _loadTermStart() async {
+    try {
+      final records = await widget.service.listTermRecords();
+      final match = records.where((TermSummary item) => item.term == _currentTerm);
+      if (match.isNotEmpty && match.first.hasStart) {
+        final parsed = parseTermStart(match.first.startsOn);
+        if (parsed != null && mounted) {
+          setState(() {
+            _termStartDraft = parsed;
+            _termStartSaved = true;
+          });
+        }
+      }
+    } on Object {
+      // 读取失败不影响主流程：界面会显示"按当前周推算"的候选值让用户确认
+    }
+  }
+
+  /// 今天是第几周（按"今天 + 学期开始日"自己算；**不用** `zs`：那只是回显请求的周号）。
+  int? get _currentWeek {
+    final draft = _termStartDraft;
+    if (draft == null) {
+      return null;
+    }
+    return currentWeek(termStart: draft, today: DateTime.now());
+  }
+  Future<void> _editTermStart() async {
+    final initial = _termStartDraft ?? DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(initial.year - 1),
+      lastDate: DateTime(initial.year + 2),
+      helpText: '学期开始日（第 1 周周一）',
+    );
+    if (picked != null && mounted) {
+      setState(() => _termStartDraft = mondayOf(picked));
+    }
+  }
+
+  Future<void> _saveTermStart() async {
+    final draft = _termStartDraft;
+    if (draft == null) {
+      return;
+    }
+    try {
+      await widget.service.setTermStart(term: _currentTerm, startsOn: formatIsoDate(draft));
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _termStartSaved = true;
+        _notice = '已保存学期开始日：${formatIsoDate(draft)}';
+      });
+    } on TimetableException catch (failure) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _failure = failure);
+    }
+  }
+
+  /// 学期开始日卡片：**显式展示日期与周区间**并要求确认（错一周整张课表日期全错）。
+  ///
+  /// 值来自"默认 2026-09-07 / 用户上次确认的结果"，绝不按 `zs` 推算：
+  /// `zs` 只是回显请求的周号，不是系统当前周。
+  Widget _buildTermStartCard(ThemeData theme) {
+    final draft = _termStartDraft;
+    if (draft == null) {
+      return const SizedBox.shrink();
+    }
+    final week = _currentWeek;
+    final weekOne = weekRangeLabel(termStart: draft, week: 1);
+    final subtitle = <String>[
+      '第 1 周：$weekOne',
+      if (week != null && week > 0) '今天按此算第 $week 周',
+      _termStartSaved ? '已确认，日历换算按这天起算' : '未确认（默认值可改）',
+    ].join(' · ');
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.secondaryContainer,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text('学期开始日（第 1 周周一）：${formatIsoDate(draft)}',
+                    style: theme.textTheme.bodyMedium),
+                Text(subtitle, style: theme.textTheme.bodySmall),
+              ],
+            ),
+          ),
+          TextButton(onPressed: _editTermStart, child: const Text('修改')),
+          if (!_termStartSaved)
+            FilledButton(onPressed: _saveTermStart, child: const Text('确认')),
+        ],
+      ),
+    );
+  }
   /// 失败卡片上的"重试"：重放最近一次动作（登录超时 / 网络错误最常见）。
   Future<void> _retryFailedAction() async {
     final action = _lastAction ?? _fetchFromCampus;

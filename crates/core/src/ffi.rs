@@ -28,7 +28,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use serde_json::{json, Value};
 
 use crate::error::CoreError;
-use crate::parse::ParseError;
+use crate::parse::{ParseError, ParseReport};
+use crate::schedule::{merge, SchedulePayload};
 use crate::store::CourseStore;
 
 /// 成功信封。
@@ -228,6 +229,161 @@ pub unsafe extern "C" fn yunong_list_terms(db_path: *const c_char) -> *mut c_cha
     })
 }
 
+/// 门户课表接口的 JSON 入库（W6 新形态，保留 HTML 路径作兜底）。
+///
+/// 入参 `json` 形如：
+/// ```json
+/// {"weeks":[{"week":1,"data":{...portal data...}}],
+///  "missing_weeks":[3,4],"weekcount":20}
+/// ```
+/// 合并规则（相邻节次、周集合压缩）在 [`crate::schedule::merge`] 里，这里只负责
+/// 解析 → 落库 → 回报。部分周失败**不整体失败**：已成功的周照常入库，
+/// 结果里给 `partial:true` 与 `missing_weeks`。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_import_schedule_json(
+    json: *const c_char,
+    term: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (json, term, db_path) = match (
+            read_arg(json, "json"),
+            read_arg(term, "term"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(json), Ok(term), Ok(db_path)) => (json, term, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
+        };
+        if json.trim().is_empty() {
+            return err_json("BAD_INPUT", "内容为空，请重新抓取");
+        }
+        if term.trim().is_empty() {
+            return err_json("BAD_INPUT", "学期不能为空");
+        }
+
+        let payload: SchedulePayload = match serde_json::from_str(json) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return err_json("BAD_INPUT", format!("课表 JSON 解析失败：{err}"));
+            }
+        };
+        let merged = merge(&payload);
+        // 合并出 0 门课：不落库（否则等于把旧课表清空）
+        if merged.courses.is_empty() {
+            return err_json(
+                "PARSE_EMPTY",
+                "未解析到课程：请确认本学期是否已排课，或接口返回是否为空",
+            );
+        }
+
+        let mut store = match CourseStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => {
+                let (code, message) = map_core_error(err);
+                return err_json(&code, message);
+            }
+        };
+        let report = ParseReport {
+            courses: merged.courses.clone(),
+            warnings: merged.warnings.clone(),
+        };
+        match store.import_report(term, &report) {
+            Ok(outcome) => ok_json(json!({
+                "term": outcome.term,
+                "imported": outcome.imported,
+                "warnings": outcome.warnings,
+                "weeks_seen": merged.weeks_seen,
+                "missing_weeks": merged.missing_weeks,
+                "partial": merged.is_partial(),
+                "weekcount": merged.weekcount,
+            })),
+            Err(err) => {
+                let (code, message) = map_core_error(err);
+                err_json(&code, message)
+            }
+        }
+    })
+}
+/// 设置/修正学期开始日（第 1 周周一），持久化到 `terms.starts_on`。
+///
+/// 为什么要单独一个入口：学期的真实开学日**无法从接口可靠推断**（`years` 是不透明标识，
+/// `zs` 只说明"这次响应是第几周"）。端侧只能"按当前周推算一个候选值 → 让用户确认/修正 →
+/// 持久化"，之后日历换算都用它。推算错一周，整张课表的日期就全错一周，所以宁可让用户多点一下。
+///
+/// 入参 `starts_on` 必须是 `YYYY-MM-DD`；空串表示清空（回到"未知"）。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_set_term_start(
+    term: *const c_char,
+    starts_on: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (term, starts_on, db_path) = match (
+            read_arg(term, "term"),
+            read_arg(starts_on, "starts_on"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(term), Ok(starts_on), Ok(db_path)) => (term, starts_on, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
+        };
+        if term.trim().is_empty() {
+            return err_json("BAD_INPUT", "学期不能为空");
+        }
+        let starts_on = starts_on.trim();
+        if !starts_on.is_empty() && !is_iso_date(starts_on) {
+            return err_json("BAD_INPUT", "开学日期格式必须是 YYYY-MM-DD");
+        }
+        let mut store = match CourseStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => {
+                let (code, message) = map_core_error(err);
+                return err_json(&code, message);
+            }
+        };
+        // 空串 = 清空（`upsert_term` 对空串的处理是"保留旧值"，所以清空要直接写库）
+        let result = if starts_on.is_empty() {
+            store.upsert_term(term, Some(""), None)
+        } else {
+            store.upsert_term(term, Some(starts_on), None)
+        };
+        match result {
+            Ok(()) => ok_json(json!({ "term": term, "starts_on": starts_on })),
+            Err(err) => {
+                let (code, message) = map_core_error(err);
+                err_json(&code, message)
+            }
+        }
+    })
+}
+
+/// 粗略校验 `YYYY-MM-DD`（只做形状 + 月日范围，不做日历校验）。
+fn is_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let year = value[0..4].parse::<i32>();
+    let month = value[5..7].parse::<u32>();
+    let day = value[8..10].parse::<u32>();
+    match (year, month, day) {
+        (Ok(year), Ok(month), Ok(day)) => {
+            (1900..=2999).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day)
+        }
+        _ => false,
+    }
+}
 /// 释放本模块返回的字符串。传 null 是安全的空操作。
 ///
 /// # Safety
@@ -423,5 +579,174 @@ mod tests {
     #[test]
     fn free_string_on_null_is_a_noop() {
         unsafe { yunong_free_string(std::ptr::null_mut()) };
+    }
+    // ---------------------------------------------------------------------
+    // 门户课表 JSON 入库（W6）
+    // ---------------------------------------------------------------------
+
+    /// 造一份一周的门户 data：周一第 1-2 节一门课。
+    fn weekly_json(week_no: u32) -> String {
+        let mut days: Vec<Vec<String>> = vec![vec![String::new(); 10]; 7];
+        days[0][0] = "高等数学I,东校区1教305,班级;,张老师".to_owned();
+        days[0][1] = "高等数学I,东校区1教305,班级;,张老师".to_owned();
+        serde_json::json!({
+            "weeks": [{ "week": week_no, "data": { "resultsJsonArr": days, "weekcount": "20" } }],
+            "weekcount": 20
+        })
+        .to_string()
+    }
+
+    fn call_schedule(json: &str, term: &str, db: &str) -> Value {
+        let json = CString::new(json).unwrap();
+        let term = CString::new(term).unwrap();
+        let db = CString::new(db).unwrap();
+        let raw = unsafe { yunong_import_schedule_json(json.as_ptr(), term.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn import_schedule_json_then_query() {
+        let db = temp_db();
+        let result = call_schedule(&weekly_json(1), "2026-2027-1", &db);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["imported"], 1);
+        assert_eq!(result["data"]["partial"], false);
+        assert_eq!(result["data"]["weeks_seen"][0], 1);
+
+        let listed = call_list("2026-2027-1", &db);
+        let courses = listed["data"]["courses"].as_array().unwrap();
+        assert_eq!(courses.len(), 1);
+        assert_eq!(courses[0]["name"], "高等数学I");
+        assert_eq!(courses[0]["weekday"], 1);
+        assert_eq!(courses[0]["start_period"], 1);
+        assert_eq!(courses[0]["end_period"], 2);
+        assert_eq!(courses[0]["weeks"], "1");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn partial_weeks_import_with_flag() {
+        let db = temp_db();
+        let payload: Value = serde_json::from_str(&weekly_json(1)).unwrap();
+        let mut payload = payload;
+        payload["missing_weeks"] = serde_json::json!([2, 3]);
+        let result = call_schedule(&payload.to_string(), "2026-2027-1", &db);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["partial"], true, "{result}");
+        assert_eq!(result["data"]["missing_weeks"], serde_json::json!([2, 3]));
+        assert_eq!(result["data"]["imported"], 1);
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn empty_schedule_json_never_wipes_existing_courses() {
+        let db = temp_db();
+        assert_eq!(
+            call_schedule(&weekly_json(1), "2026-2027-1", &db)["ok"],
+            true
+        );
+
+        let empty = serde_json::json!({
+            "weeks": [{ "week": 1, "data": { "resultsJsonArr": vec![vec![String::new(); 10]; 7] } }]
+        })
+        .to_string();
+        let result = call_schedule(&empty, "2026-2027-1", &db);
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "PARSE_EMPTY");
+
+        let listed = call_list("2026-2027-1", &db);
+        assert_eq!(listed["data"]["courses"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn reimport_schedule_replaces_instead_of_duplicating() {
+        let db = temp_db();
+        call_schedule(&weekly_json(1), "2026-2027-1", &db);
+        call_schedule(&weekly_json(1), "2026-2027-1", &db);
+        let listed = call_list("2026-2027-1", &db);
+        assert_eq!(
+            listed["data"]["courses"].as_array().unwrap().len(),
+            1,
+            "重抓必须替换，不能翻倍"
+        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn malformed_schedule_json_is_bad_input_not_a_crash() {
+        let db = temp_db();
+        let result = call_schedule("这不是 JSON", "2026-2027-1", &db);
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "BAD_INPUT");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+    // ---------------------------------------------------------------------
+    // 学期开始日（W6：不硬编码，用户确认后持久化）
+    // ---------------------------------------------------------------------
+
+    fn call_set_term_start(term: &str, starts_on: &str, db: &str) -> Value {
+        let term = CString::new(term).unwrap();
+        let starts_on = CString::new(starts_on).unwrap();
+        let db = CString::new(db).unwrap();
+        let raw = unsafe { yunong_set_term_start(term.as_ptr(), starts_on.as_ptr(), db.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn set_term_start_persists_and_is_readable_via_list_terms() {
+        let db = temp_db();
+        // 先有学期（导入或随便建一条），再设置开学日
+        assert_eq!(
+            call_schedule(&weekly_json(1), "2026-2027-1", &db)["ok"],
+            true
+        );
+        let result = call_set_term_start("2026-2027-1", "2026-08-31", &db);
+        assert_eq!(result["ok"], true, "{result}");
+
+        let db_c = CString::new(db.clone()).unwrap();
+        let raw = unsafe { yunong_list_terms(db_c.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let terms = value["data"]["terms"].as_array().unwrap();
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0]["starts_on"], "2026-08-31", "{value}");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn set_term_start_rejects_bad_date_without_touching_the_store() {
+        let db = temp_db();
+        assert_eq!(
+            call_schedule(&weekly_json(1), "2026-2027-1", &db)["ok"],
+            true
+        );
+        for bad in [
+            "2026-8-31",
+            "2026/08/31",
+            "20260831",
+            "2026-13-01",
+            "2026-08-32",
+        ] {
+            let result = call_set_term_start("2026-2027-1", bad, &db);
+            assert_eq!(result["ok"], false, "{bad} => {result}");
+            assert_eq!(result["code"], "BAD_INPUT", "{bad} => {result}");
+        }
+        let db_c = CString::new(db.clone()).unwrap();
+        let raw = unsafe { yunong_list_terms(db_c.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["data"]["terms"][0]["starts_on"], "",
+            "坏日期不能写库：{value}"
+        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
     }
 }
