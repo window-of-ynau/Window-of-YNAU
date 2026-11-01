@@ -240,7 +240,10 @@ const String kPortalScheduleScript = r'''
   var TEMPLATE = null;
   var running = false;
   // 诊断用：owner/我们据此判断卡在哪一步（不含任何凭据）
-  var DIAG = { xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0 };
+  var DIAG = {
+    xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0,
+    hookInstalled: true, candidates: 0, years: '', probeFailed: false
+  };
   var TIMEOUT_MS = 20000;
   var timeoutPosted = false;
 
@@ -334,7 +337,11 @@ const String kPortalScheduleScript = r'''
       xhrSeen: DIAG.xhrSeen,
       cardIdPrefix: DIAG.cardIdPrefix,
       cardIdSource: DIAG.cardIdSource,
-      autoTried: DIAG.autoTried
+      autoTried: DIAG.autoTried,
+      hookInstalled: DIAG.hookInstalled,
+      candidates: DIAG.candidates,
+      years: DIAG.years || '',
+      probeFailed: DIAG.probeFailed
     });
   };
 
@@ -456,7 +463,107 @@ const String kPortalScheduleScript = r'''
     return true;
   }
 
-  // ---- 自动触发：滚动/点击含"课表"的卡片，切换周选择器 ----
+  // ---- 自动优先（owner 实测：hook 根本没挂上，不能等它）----
+  //
+  // 顺序：① 从页面读 cardId（DOM 属性 / 初始状态 / 内联 script）→ ② 32 位 hex 候选逐个点接口自验证
+  // → ③ 不带 cardId 的自探测（服务端若忽略该参数直接返回本人课表，这条路最省事）。
+  // 全自动，不需要用户点任何东西；都失败才交给 20s 超时给具体诊断。
+  var AUTO_STARTED = false;
+
+  function hexCandidates() {
+    var out = [];
+    try {
+      var html = document.documentElement.outerHTML || '';
+      var re = /[0-9a-f]{32}/g;
+      var match = re.exec(html);
+      while (match && out.length < 12) {
+        if (out.indexOf(match[0]) < 0) { out.push(match[0]); }
+        match = re.exec(html);
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  function termGuess() {
+    if (window.__yunongTerm) { return String(window.__yunongTerm); }
+    return termFromDom();
+  }
+
+  function probeCandidate(cardId, years) {
+    var url = API + '?years=' + encodeURIComponent(years) + '&results=1'
+      + (cardId ? '&cardId=' + encodeURIComponent(cardId) : '')
+      + '&_t=' + Date.now();
+    return getJson(url).then(function (body) {
+      var data = body && body.data ? body.data : null;
+      return !!(data && data.resultsJsonArr);
+    }).catch(function () {
+      return false;
+    });
+  }
+
+  function adoptTemplate(cardId, source, years) {
+    if (TEMPLATE) { return; }
+    TEMPLATE = { cardId: cardId, years: years, weekcount: 20, weekcountFromApi: false };
+    DIAG.cardIdPrefix = cardId ? cardId.slice(0, 8) : '';
+    DIAG.cardIdSource = source;
+    post({
+      type: 'schedule_template',
+      card_id: cardId,
+      years: years,
+      weekcount: 20,
+      card_id_source: source
+    });
+    setTimeout(function () { window.__yunongFetchSchedule(); }, 200);
+  }
+
+  function autoStart() {
+    if (AUTO_STARTED || TEMPLATE) { return; }
+    AUTO_STARTED = true;
+    var years = termGuess();
+    DIAG.years = years;
+
+    var direct = cardIdFromPage();
+    var candidates = [];
+    if (direct) { candidates.push({ cardId: direct.cardId, source: direct.source }); }
+    var hex = hexCandidates();
+    for (var i = 0; i < hex.length; i++) {
+      var dup = false;
+      for (var j = 0; j < candidates.length; j++) {
+        if (candidates[j].cardId === hex[i]) { dup = true; }
+      }
+      if (!dup) { candidates.push({ cardId: hex[i], source: 'hex-scan' }); }
+    }
+    DIAG.candidates = candidates.length;
+
+    if (!years) {
+      // 没有学期就什么都试不了：交给超时提示（诊断里会写 years 为空）
+      DIAG.probeFailed = true;
+      return;
+    }
+
+    (function tryAt(index) {
+      if (TEMPLATE) { return; }
+      if (index >= candidates.length) {
+        // ③ 不带 cardId 的自探测
+        probeCandidate('', years).then(function (ok) {
+          if (ok) { adoptTemplate('', 'no-cardid', years); }
+          else { DIAG.probeFailed = true; }
+        });
+        return;
+      }
+      probeCandidate(candidates[index].cardId, years).then(function (ok) {
+        if (ok) { adoptTemplate(candidates[index].cardId, candidates[index].source, years); }
+        else { tryAt(index + 1); }
+      });
+    })(0);
+  }
+
+  window.__yunongAutoStart = function () { AUTO_STARTED = false; autoStart(); };
+
+  // 页面可能晚挂载：1.5s 先试一次，6s 再试一次（仍未拿到模板才继续等 hook）
+  setTimeout(autoStart, 1500);
+  setTimeout(function () { if (!TEMPLATE) { autoStart(); } }, 6000);
+  // ---- 最后手段：滚动/点击含"课表"的卡片，切换周选择器 ----
   function autoTrigger() {
     DIAG.autoTried += 1;
     try {

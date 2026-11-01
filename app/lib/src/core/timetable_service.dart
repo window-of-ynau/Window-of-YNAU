@@ -183,7 +183,7 @@ abstract class SchoolFetcher {
   Future<FetchedPage> fetchTimetablePage({required String entryUrl});
 
   /// W6 新形态：直接取门户周数据（默认不支持 → 调用方退回 HTML 路径）。
-  Future<ScheduleApiResult> fetchSchedule({required String entryUrl}) =>
+  Future<ScheduleApiResult> fetchSchedule({required String entryUrl, String? term}) =>
       Future<ScheduleApiResult>.error(
         UnsupportedError('该取数实现不支持门户接口，请退回 HTML 路径'),
       );

@@ -54,10 +54,11 @@ class WebViewSchoolFetcher implements SchoolFetcher {
   ///
   /// 与 HTML 路径共用同一个 WebView 页面（`CampusWebViewPage` 的 `mode` 区分）。
   @override
-  Future<ScheduleApiResult> fetchSchedule({required String entryUrl}) =>
+  Future<ScheduleApiResult> fetchSchedule({required String entryUrl, String? term}) =>
       _open<ScheduleApiResult>(
         entryUrl: entryUrl,
         mode: CampusFetchMode.portalApi,
+        term: term,
       );
 
   Future<FetchedPage> fetchTimetablePage({required String entryUrl}) =>
@@ -68,6 +69,7 @@ class WebViewSchoolFetcher implements SchoolFetcher {
   Future<T> _open<T>({
     required String entryUrl,
     required CampusFetchMode mode,
+    String? term,
   }) {
     final navigator = navigatorKey.currentState;
     if (!isAvailable || navigator == null) {
@@ -91,6 +93,7 @@ class WebViewSchoolFetcher implements SchoolFetcher {
       builder: (BuildContext context) => CampusWebViewPage(
         entryUrl: entryUrl,
         mode: mode,
+        term: term,
         onFetchedSchedule: (ScheduleApiResult result) {
           if (!completer.isCompleted && T == ScheduleApiResult) {
             completer.complete(result as T);
@@ -128,6 +131,7 @@ class CampusWebViewPage extends StatefulWidget {
     super.key,
     required this.entryUrl,
     required this.mode,
+    this.term,
     required this.onFetched,
     required this.onFetchedSchedule,
     required this.onError,
@@ -136,6 +140,9 @@ class CampusWebViewPage extends StatefulWidget {
 
   final String entryUrl;
   final CampusFetchMode mode;
+
+  /// 当前学期（`years` 兜底来源：页面里读不到时用它）
+  final String? term;
   final void Function(FetchedPage page) onFetched;
   final void Function(ScheduleApiResult result) onFetchedSchedule;
   final void Function(FetchException error) onError;
@@ -378,11 +385,14 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       UserScript(
                         source: kCampusProbeScript,
                         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+                        forMainFrameOnly: false,
                       ),
                       if (widget.mode == CampusFetchMode.portalApi)
                         UserScript(
                           source: kPortalScheduleScript,
+                          // 提前到文档开始 + 所有 frame：owner 实测"切了周次也没捕获"，说明钩子没挂上
                           injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+                          forMainFrameOnly: false,
                         ),
                     ]),
                     onWebViewCreated: (InAppWebViewController controller) {
@@ -400,6 +410,18 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                         setState(() => _busy = false);
                       }
                       _startCaptureTimer();
+                      final term = widget.term;
+                      if (term != null && term.isNotEmpty) {
+                        await _controller?.evaluateJavascript(
+                          source: "window.__yunongTerm = '$term';",
+                        );
+                      }
+                      // 门户模式：立刻跑一次"自动优先"发现流程（不等用户点任何东西）
+                      if (widget.mode == CampusFetchMode.portalApi) {
+                        await _controller?.evaluateJavascript(
+                          source: 'window.__yunongAutoStart && window.__yunongAutoStart();',
+                        );
+                      }
                       // 每次导航结束立刻探一次（登录成功后自动进入取数靠这条）
                       await _controller?.evaluateJavascript(
                         source: 'window.__yunongProbeNow && window.__yunongProbeNow();',
