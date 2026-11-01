@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard;
 
 import '../core/ffi_bindings.dart';
+import 'campus_entries.dart';
 import '../core/timetable_service.dart';
 
 /// 课表页。
@@ -43,6 +44,9 @@ class _TimetablePageState extends State<TimetablePage> {
   List<StoredCourse> _courses = const <StoredCourse>[];
   List<String> _warnings = const <String>[];
   TimetableException? _failure;
+
+  /// 最近一次动作（失败卡片的重试按钮复用它）。
+  Future<void> Function()? _lastAction;
   String? _notice;
 
   @override
@@ -137,7 +141,8 @@ class _TimetablePageState extends State<TimetablePage> {
               ],
             ),
           ),
-        if (_failure != null) _FailureCard(failure: _failure!),
+        if (_failure != null)
+          _FailureCard(failure: _failure!, onRetry: _retryFailedAction),
         Expanded(child: _buildBody(theme)),
       ],
     );
@@ -213,14 +218,17 @@ class _TimetablePageState extends State<TimetablePage> {
       return;
     }
     await _run(() async {
+      _lastAction = _fetchFromCampus;
+      // 直接开课表页：会话有效时它自己就是课表，会话无效时 CAS 会把它带到登录页
       final page = await fetcher.fetchTimetablePage(
-        entryUrl: 'https://jwxt.ynau.edu.cn/DefaultStu',
+        entryUrl: CampusEntry.timetable.url,
       );
       return widget.service.importHtml(html: page.html, term: _currentTerm);
     }, notice: '已从校务系统抓取');
   }
 
   Future<void> _importFixture({required bool revamped}) async {
+    _lastAction = () => _importFixture(revamped: revamped);
     final asset =
         revamped ? DebugFixtures.revampedPage : DebugFixtures.samplePage;
     await _run(() async {
@@ -231,11 +239,18 @@ class _TimetablePageState extends State<TimetablePage> {
   }
 
   Future<void> _importFromClipboard() async {
+    _lastAction = _importFromClipboard;
     await _run(() async {
       final data = await Clipboard.getData('text/plain');
       final html = data?.text ?? '';
       return widget.service.importHtml(html: html, term: _currentTerm);
     }, notice: '已从剪贴板导入');
+  }
+
+  /// 失败卡片上的"重试"：重放最近一次动作（登录超时 / 网络错误最常见）。
+  Future<void> _retryFailedAction() async {
+    final action = _lastAction ?? _fetchFromCampus;
+    await action();
   }
 
   /// 统一执行一次导入：成功刷新列表，失败保留旧列表并显示可读提示。
@@ -289,9 +304,10 @@ class _TimetablePageState extends State<TimetablePage> {
 
 /// 失败卡片：大字号给用户看的那句 + 小字原始信息 + 明确"这不是空课表"。
 class _FailureCard extends StatelessWidget {
-  const _FailureCard({required this.failure});
+  const _FailureCard({required this.failure, required this.onRetry});
 
   final TimetableException failure;
+  final Future<void> Function() onRetry;
 
   @override
   Widget build(BuildContext context) {
@@ -328,6 +344,15 @@ class _FailureCard extends StatelessWidget {
               color: theme.colorScheme.onErrorContainer,
             ),
           ),
+          if (failure.code != 'CORE_UNAVAILABLE' && failure.code != 'NO_WEBVIEW')
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: () => onRetry(),
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('重试'),
+              ),
+            ),
           const SizedBox(height: 4),
           SelectableText(
             '错误码 ${failure.code} · ${failure.message}',
