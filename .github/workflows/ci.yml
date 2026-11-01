@@ -208,6 +208,54 @@ jobs:
           for f in crates/server/migrations/*.sql; do mig "$f"; done
           echo "升级路径 OK"
 
+      # 0003 的注释承诺"已经把旧索引建出来的库也能重放"（半成品库），另外"空表升级"
+      # 也是干净库天然会走到的形态。这两条单独验，避免只有"有脏数据的老库"被测到：
+      #   ① 半成品：turn_id 已加、旧索引 ux_usage_turn_round 已建 → 新 0003 必须 DROP 旧索引并建新索引
+      #   ② 空表：usage_samples 0 行 → 0003 的回填 UPDATE 空跑也必须安全
+      - name: 升级路径②（半成品旧索引 / 空表）
+        run: |
+          set -euo pipefail
+          P="psql -v ON_ERROR_STOP=1 -q"
+
+          echo "== ① 半成品库：旧版 0003 已经建过 ux_usage_turn_round"
+          $P -c "CREATE DATABASE yunong_half"
+          $P -d yunong_half -f crates/server/migrations/0001_init.sql
+          $P -d yunong_half -f crates/server/migrations/0002_auth.sql
+          $P -d yunong_half <<'SQL'
+          INSERT INTO users (email) VALUES ('half@example.com');
+          INSERT INTO usage_samples (user_id, req_id, model, protocol, channel, round, tokens_in, tokens_out)
+          SELECT id, 'req_a', 'm', 'openai_completions', 'plan', 1, 1, 1
+            FROM users WHERE email = 'half@example.com';
+          -- 旧版 0003 的形态：列已加、值已回填、旧唯一索引已建（无重复行时才建得出来）
+          ALTER TABLE usage_samples ADD COLUMN turn_id text;
+          UPDATE usage_samples SET turn_id = req_id;
+          CREATE UNIQUE INDEX ux_usage_turn_round ON usage_samples (turn_id, round);
+          SQL
+          $P -d yunong_half -f crates/server/migrations/0003_usage_turn_estimated.sql
+          $P -d yunong_half <<'SQL'
+          DO $$
+          BEGIN
+            IF (SELECT count(*) FROM pg_indexes
+                 WHERE tablename = 'usage_samples' AND indexname = 'ux_usage_turn_round') <> 0
+              THEN RAISE EXCEPTION '半成品库：旧索引 ux_usage_turn_round 没被 DROP';
+            END IF;
+            IF (SELECT count(*) FROM pg_indexes
+                 WHERE tablename = 'usage_samples' AND indexname = 'ux_usage_user_turn_round') <> 1
+              THEN RAISE EXCEPTION '半成品库：新索引 ux_usage_user_turn_round 没建出来';
+            END IF;
+            RAISE NOTICE '半成品库升级断言通过';
+          END $$;
+          SQL
+
+          echo "== ② 空表库：usage_samples 一行数据都没有"
+          $P -c "CREATE DATABASE yunong_empty"
+          $P -d yunong_empty -f crates/server/migrations/0001_init.sql
+          $P -d yunong_empty -f crates/server/migrations/0002_auth.sql
+          $P -d yunong_empty -f crates/server/migrations/0003_usage_turn_estimated.sql
+          $P -d yunong_empty -f crates/server/migrations/0004_audit_decisions.sql
+
+          echo "半成品 / 空表升级 OK"
+
   # 真实的 PostgreSQL 上跑 auth 的 SQL：migrations job 只证明"迁移能落"，
   # 这个 job 证明"注册/登录/刷新/登出/校验这几条 SQL 在真库里真的对"。
   pg:
