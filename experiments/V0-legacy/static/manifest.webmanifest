@@ -1,0 +1,26 @@
+{
+  "name": "云农之窗 · 校园智能助理",
+  "short_name": "云农之窗",
+  "description": "云南农业大学校园智能助理：教务、成绩、课表、图书馆，一句话就能问",
+  "lang": "zh-CN",
+  "start_url": "/static/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#f8fafc",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "/static/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
