@@ -108,6 +108,16 @@ DateTime? parseTermStart(String value) {
 ///
 /// 保留此注释是为了防止有人重新引入全局常量：学期锚点必须按学期存放，
 /// 见 [kSeededTermStarts] 与 [suggestedTermStart]。
+/// 当前是不是 SSO 登录页（**登录等待阶段**：不扫描、不探测、不计抓取超时）。
+///
+/// 判据与脚本一致：path 含 `/lyuapServer/login`，或 host 是 `ssoo.ynau.edu.cn` 且 path 含 login。
+bool isSsoLoginPage(String host, String path) {
+  final lowerPath = path.toLowerCase();
+  if (lowerPath.contains('/lyuapserver/login')) {
+    return true;
+  }
+  return host.contains('ssoo.ynau.edu.cn') && lowerPath.contains('login');
+}
 /// 一个候选 cardId（32 位 hex）+ 它在 HTML 里的上下文（用于排序与诊断，不含凭据）。
 class CardIdCandidate {
   const CardIdCandidate({required this.value, required this.context, required this.order});
@@ -424,6 +434,7 @@ const String kPortalScheduleScript = r'''
     var title = '';
     try { title = document.title || ''; } catch (e) {}
     return JSON.stringify({
+      stage: STAGE,
       path: safePath(),
       host: (location.hostname || ''),
       title: title,
@@ -558,6 +569,44 @@ const String kPortalScheduleScript = r'''
     return true;
   }
 
+  // ---- 阶段状态机：登录前**绝不做**候选扫描/探测/抓取 ----
+  //
+  // owner 实测的 bug：还在 SSO 登录页输入账号时，20s 抓取超时就到了。
+  // 现在登录页阶段只上报 stage=login，抓取计时/扫描/探测全部等到离开登录页才开始。
+  var STAGE = 'login';
+  var STAGE_WATCHER = null;
+
+  function isLoginPage() {
+    try {
+      var host = location.hostname || '';
+      var path = location.pathname || '';
+      if (path.indexOf('/lyuapServer/login') >= 0) { return true; }
+      if (host.indexOf('ssoo.ynau.edu.cn') >= 0 && path.indexOf('login') >= 0) { return true; }
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function diagnosticsJson() {
+    try { return JSON.parse(window.__yunongDiagnostics()); } catch (e) { return {}; }
+  }
+
+  function setStage(next) {
+    if (STAGE === next) { return; }
+    STAGE = next;
+    post({ type: 'stage', stage: next, diagnostics: diagnosticsJson() });
+  }
+
+  // 每 1.5s 看一次：还在登录页就只保持 login 阶段；离开后切到 capture 并开始自动发现
+  function watchStage() {
+    if (isLoginPage()) {
+      setStage('login');
+      return;
+    }
+    setStage('capture');
+    if (!TEMPLATE) { autoStart(); }
+  }
   // ---- 自动优先（owner 实测：hook 根本没挂上，不能等它）----
   //
   // 顺序：① 从页面读 cardId（DOM 属性 / 初始状态 / 内联 script）→ ② 32 位 hex 候选逐个点接口自验证
@@ -602,6 +651,7 @@ const String kPortalScheduleScript = r'''
   }
 
   function probeCandidate(cardId, years) {
+    if (!cardId) { return Promise.resolve(false); }
     var week = window.__yunongCurrentWeek || 1;
     var url = API + '?years=' + encodeURIComponent(years) + '&results=' + week
       + (cardId ? '&cardId=' + encodeURIComponent(cardId) : '')
@@ -649,6 +699,8 @@ const String kPortalScheduleScript = r'''
   }
 
   function autoStart() {
+    // 登录页阶段绝不扫描/探测（owner 实测的 CAPTURE_TIMEOUT 误报根因）
+    if (isLoginPage()) { setStage('login'); return; }
     if (AUTO_STARTED || TEMPLATE) { return; }
     AUTO_STARTED = true;
     var years = termGuess();
@@ -672,15 +724,18 @@ const String kPortalScheduleScript = r'''
       DIAG.probeFailed = true;
       return;
     }
+    if (!candidates.length) {
+      // **候选为空绝不发请求**：登录页/门户首页会返回 200 HTML，
+      // 之前的 "探测 (none):200" 就是这么来的
+      DIAG.probeFailed = true;
+      return;
+    }
 
     (function tryAt(index) {
       if (TEMPLATE) { return; }
       if (index >= candidates.length) {
-        // ③ 不带 cardId 的自探测
-        probeCandidate('', years).then(function (ok) {
-          if (ok) { adoptTemplate('', 'no-cardid', years); }
-          else { DIAG.probeFailed = true; }
-        });
+        // 候选试完仍未命中：不再发"无 cardId"的请求，直接记失败
+        DIAG.probeFailed = true;
         return;
       }
       probeCandidate(candidates[index].cardId, years).then(function (ok) {
@@ -692,9 +747,9 @@ const String kPortalScheduleScript = r'''
 
   window.__yunongAutoStart = function () { AUTO_STARTED = false; autoStart(); };
 
-  // 页面可能晚挂载：1.5s 先试一次，6s 再试一次（仍未拿到模板才继续等 hook）
-  setTimeout(autoStart, 1500);
-  setTimeout(function () { if (!TEMPLATE) { autoStart(); } }, 6000);
+  // 阶段 watcher：登录页期间只报 login；离开登录页才切 capture 并开始自动发现
+  setTimeout(watchStage, 800);
+  STAGE_WATCHER = setInterval(watchStage, 1500);
   // ---- 最后手段：滚动/点击含"课表"的卡片，切换周选择器 ----
   function autoTrigger() {
     DIAG.autoTried += 1;
@@ -717,9 +772,13 @@ const String kPortalScheduleScript = r'''
     try { window.__yunongFetchSchedule(); } catch (e) {}
   }
 
-  setTimeout(function () { if (!TEMPLATE) { autoTrigger(); } }, 3000);
-  setTimeout(function () { if (!TEMPLATE) { autoTrigger(); } }, 8000);
+  setTimeout(function () { if (!TEMPLATE && STAGE === 'capture') { autoTrigger(); } }, 3000);
+  setTimeout(function () { if (!TEMPLATE && STAGE === 'capture') { autoTrigger(); } }, 8000);
   window.__yunongFetchSchedule = function () {
+    if (isLoginPage()) {
+      post({ type: 'portal_hint', code: 'LOGIN_PENDING', message: '请先在页面里完成登录', diagnostics: diagnosticsJson() });
+      return;
+    }
     if (!TEMPLATE) {
       post({
         type: 'capture_timeout',

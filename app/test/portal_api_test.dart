@@ -225,6 +225,23 @@ void main() {
       expect(isScheduleProbeHit('html'), isFalse);
     });
   });
+
+  group('SSO 登录页判定（登录等待阶段不抓取）', () {
+    test('登录页：host+path 都命中', () {
+      expect(isSsoLoginPage('ssoo.ynau.edu.cn', '/lyuapServer/login'), isTrue);
+      expect(isSsoLoginPage('ssoo.ynau.edu.cn', '/lyuapServer/login?x=1'), isTrue);
+    });
+
+    test('门户页 / 空值：不是登录页', () {
+      expect(isSsoLoginPage('one.ynau.edu.cn', '/#/index5'), isFalse);
+      expect(isSsoLoginPage('', ''), isFalse);
+      expect(isSsoLoginPage('one.ynau.edu.cn', '/api/uppcard/kbsz/queryAWeekSchedule'), isFalse);
+    });
+
+    test('大小写不敏感', () {
+      expect(isSsoLoginPage('SSOO.YNAU.EDU.CN', '/LYUAPSERVER/LOGIN'), isTrue);
+    });
+  });
   group('解析 schedule_api 消息', () {
     test('正常载荷 + 部分周缺失', () {
       final result = ScheduleApiResult.fromMessage(<String, dynamic>{
