@@ -47,7 +47,9 @@ impl GateRejection {
 #[derive(Debug, Default)]
 struct GateState {
     /// turn_id → 用户（判断"同一 turn 重复提交"）
-    turns: HashMap<String, Uuid>,
+    /// `(用户, turn)` → 占位标记。**不能只用 turn_id**：turn_id 是客户端给的，
+    /// 全局唯一会让任何人用一个 turn_id 挡住别人的 turn（红队 M1）。
+    turns: HashMap<(Uuid, String), ()>,
     /// 用户 → 在途 turn_id（判断"单用户 1 个"）
     per_user: HashMap<Uuid, String>,
 }
@@ -99,13 +101,15 @@ impl TurnGate {
         // 检查与占位必须在同一把锁里完成，否则同一 turn 的并发请求会双双通过
         {
             let mut state = self.lock();
-            if state.turns.contains_key(turn_id) {
+            let key = (user_id, turn_id.to_owned());
+            // 同一用户重复提交同一 turn 才叫"在途"；不同用户互不影响
+            if state.turns.contains_key(&key) {
                 return Err(GateRejection::TurnInFlight);
             }
             if state.per_user.contains_key(&user_id) {
                 return Err(GateRejection::UserInFlight);
             }
-            state.turns.insert(turn_id.to_owned(), user_id);
+            state.turns.insert(key, ());
             state.per_user.insert(user_id, turn_id.to_owned());
         }
 
@@ -150,7 +154,7 @@ impl Drop for TurnPermit {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.turns.remove(&self.turn_id);
+        state.turns.remove(&(self.user_id, self.turn_id.clone()));
         state.per_user.remove(&self.user_id);
         // OwnedSemaphorePermit 在这里随之释放
     }

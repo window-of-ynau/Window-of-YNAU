@@ -12,6 +12,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod gate;
+pub mod limiter;
 pub mod state;
 pub mod upstream;
 
@@ -46,6 +47,11 @@ pub fn app(state: state::AppState) -> Router {
 
     public
         .merge(protected)
+        // 红队 H2：请求体硬上限。`MAX_INPUT_TOKENS` 之外的物理闸——
+        // 正文塞得比 token 预算大时先在这里被拒，不让它走完解析再进转发。
+        .layer(axum::extract::DefaultBodyLimit::max(
+            state.config.body_limit_bytes,
+        ))
         // 最外层：请求 ID（错误信封需要它）；内层：访问日志
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(api::request_id::attach))
