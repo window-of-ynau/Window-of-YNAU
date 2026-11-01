@@ -178,10 +178,25 @@ jobs:
       # 迁移由上面那步按文件名 glob 全量应用（0001→0004），不需要额外前置。
       - name: cargo test（对话链路的 PostgreSQL 集成测试，含 #[ignore] 用例）
         run: |
-          set -euo pipefail
-          out=$(cargo test -p yunong-server --test chat_stream -- --include-ignored 2>&1)
+          # 不用 `set -e`：cargo 挂了也要先把输出打出来，否则 CI 上只剩 exit code 1，
+          # 看不到是哪条 SQL 挂了——最需要诊断力的时候恰恰是失败时。
+          set -uo pipefail
+          if ! out=$(cargo test -p yunong-server --test chat_stream -- --include-ignored 2>&1); then
+            printf '%s\n' "$out" | tail -n 60
+            echo "::error::chat_stream 集成测试失败（完整输出见上）"
+            exit 1
+          fi
           printf '%s\n' "$out" | tail -n 25
-          # 防假绿：忽略数必须为 0。有人删掉 --include-ignored 时会立刻红，
-          # 而不是静静变成"跑过但全跳过"。
-          printf '%s\n' "$out" | grep -q "0 ignored" \
-            || { echo "::error::chat_stream 的 #[ignore] 用例没有真跑（检查 --include-ignored）"; exit 1; }
+          # 防假绿（锚定整行）：只认 `0 failed; 0 ignored` 的汇总行。
+          # 不能用子串 `"0 ignored"`——`"10 ignored"` / `"20 ignored"` 里也含它。
+          summary=$(printf '%s\n' "$out" | grep -E '^test result: ok\. [0-9]+ passed; 0 failed; 0 ignored' | tail -n 1)
+          if [ -z "$summary" ]; then
+            echo "::error::chat_stream 的 #[ignore] 用例没有真跑（检查 --include-ignored）"
+            exit 1
+          fi
+          # 再卡一道下限：真跑了才是绿的（防"0 passed"这种形态也算绿）
+          passed=$(printf '%s\n' "$summary" | sed -E 's/^test result: ok\. ([0-9]+) passed.*/\1/')
+          if [ "$passed" -lt 20 ]; then
+            echo "::error::只跑了 $passed 条用例（预期 ≥20）"
+            exit 1
+          fi
