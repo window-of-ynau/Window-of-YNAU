@@ -92,7 +92,10 @@ async fn real_upstream_streams_end_to_end() {
         saw_usage || outcome.usage.tokens_in > 0 || outcome.usage.tokens_out > 0,
         "拿不到 usage，记账会退化成纯估算"
     );
-    assert!(elapsed < Duration::from_secs(90), "首事件+整段超过 90s，超时配置或网络有问题");
+    assert!(
+        elapsed < Duration::from_secs(90),
+        "首事件+整段超过 90s，超时配置或网络有问题"
+    );
 }
 
 /// 并发冒烟：用来给「50 并发」这个上限找现实依据，而不是拍脑袋。
@@ -112,8 +115,8 @@ async fn real_upstream_handles_concurrent_streams() {
         let base = base.clone();
         let model = model.clone();
         handles.push(tokio::spawn(async move {
-            let provider = DirectProvider::new(Protocol::OpenaiCompletions, base, model)
-                .with_api_key(key);
+            let provider =
+                DirectProvider::new(Protocol::OpenaiCompletions, base, model).with_api_key(key);
             let req = request(Protocol::OpenaiCompletions, &format!("只回答一个字：{i}"));
             let started = Instant::now();
             let mut first_byte: Option<Duration> = None;
@@ -156,5 +159,12 @@ async fn real_upstream_handles_concurrent_streams() {
     if let Some(p50) = ttfts.get(ttfts.len() / 2) {
         println!("TTFT 中位数: {p50:?}");
     }
-    assert_eq!(failures.len(), 0, "有 {}/{} 路失败：{:?}", failures.len(), concurrency, failures);
+    assert_eq!(
+        failures.len(),
+        0,
+        "有 {}/{} 路失败：{:?}",
+        failures.len(),
+        concurrency,
+        failures
+    );
 }
