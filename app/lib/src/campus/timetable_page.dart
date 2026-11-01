@@ -58,7 +58,12 @@ class _TimetablePageState extends State<TimetablePage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
-              Row(
+              // 用 Wrap 而不是 Row：按钮文案较长，窄窗口（含 800×600 的 widget test 视口）
+              // 下 Row 会直接溢出；Wrap 会自动折行。
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
                 children: <Widget>[
                   SizedBox(
                     width: 180,
@@ -71,25 +76,21 @@ class _TimetablePageState extends State<TimetablePage> {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 12),
                   FilledButton.icon(
                     onPressed: _busy ? null : _fetchFromCampus,
                     icon: const Icon(Icons.login),
                     label: const Text('登录并抓取课表'),
                   ),
-                  const SizedBox(width: 8),
                   OutlinedButton.icon(
                     onPressed: _busy ? null : () => _importFixture(revamped: false),
                     icon: const Icon(Icons.description_outlined),
                     label: const Text('导入内置样本'),
                   ),
-                  const SizedBox(width: 8),
                   OutlinedButton.icon(
                     onPressed: _busy ? null : () => _importFixture(revamped: true),
                     icon: const Icon(Icons.bug_report_outlined),
                     label: const Text('模拟页面改版'),
                   ),
-                  const SizedBox(width: 8),
                   TextButton.icon(
                     onPressed: _busy ? null : _importFromClipboard,
                     icon: const Icon(Icons.content_paste),
