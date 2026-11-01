@@ -8,8 +8,7 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::auth::{
-    error::AuthError, password, token, AuthSession, Principal, ACCESS_TOKEN_TTL_SECS,
-    REFRESH_TOKEN_TTL_SECS,
+    error::AuthError, token, AuthSession, Principal, ACCESS_TOKEN_TTL_SECS, REFRESH_TOKEN_TTL_SECS,
 };
 
 /// 刚签发的一对令牌（明文只留在内存里，落库的是摘要）。
@@ -42,15 +41,18 @@ pub(crate) async fn register(
     issue_session(pool, user_id, None).await
 }
 
-/// 登录：查用户 → Argon2id 校验 → 发令牌。
+/// 登录第一步：只查"这个邮箱的哈希串"，**不做** Argon2 校验。
 ///
-/// 邮箱不存在时也做一次哈希，让"存在"与"不存在"的耗时接近；
-/// 两种情况返回**完全相同**的 401 文案，不泄露账号是否存在。
-pub(crate) async fn login(
+/// 为什么拆开：Argon2 是同步的 CPU/内存密集计算，直接在 async fn 里做会占住 runtime
+/// worker（实测并发登录时 `/healthz` 被拖到 632ms）。现在由 `AuthService::login`
+/// 把校验交给 `spawn_blocking`，这里只负责一次查询。
+///
+/// 返回 `None` 表示"邮箱不存在或已禁用"；"存在但没有密码"（如第三方账号）返回 `Some(.., None)`。
+/// 两种情况由调用方统一回 401 且文案一致，不泄露账号是否存在。
+pub(crate) async fn password_hash(
     pool: &PgPool,
     email: &str,
-    password: &str,
-) -> Result<AuthSession, AuthError> {
+) -> Result<Option<(Uuid, Option<String>)>, AuthError> {
     let found = sqlx::query(
         "SELECT id, password_hash FROM users WHERE lower(email) = lower($1) AND disabled_at IS NULL",
     )
@@ -60,20 +62,12 @@ pub(crate) async fn login(
     .map_err(db_error)?;
 
     let Some(row) = found else {
-        let _ = password::hash(password);
-        return Err(AuthError::unauthorized_with("邮箱或密码不正确"));
+        return Ok(None);
     };
 
     let user_id: Uuid = row.try_get("id").map_err(row_error)?;
     let stored: Option<String> = row.try_get("password_hash").map_err(row_error)?;
-    let matched = stored
-        .as_deref()
-        .is_some_and(|phc| password::verify(password, phc));
-    if !matched {
-        return Err(AuthError::unauthorized_with("邮箱或密码不正确"));
-    }
-
-    issue_session(pool, user_id, None).await
+    Ok(Some((user_id, stored)))
 }
 
 /// 校验访问令牌。
@@ -182,7 +176,7 @@ pub(crate) async fn logout(pool: &PgPool, principal: &Principal) -> Result<(), A
 }
 
 /// 发一对新令牌。
-async fn issue_session(
+pub(crate) async fn issue_session(
     pool: &PgPool,
     user_id: Uuid,
     device_id: Option<Uuid>,

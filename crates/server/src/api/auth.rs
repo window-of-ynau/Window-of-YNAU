@@ -21,6 +21,15 @@ use crate::state::AppState;
 /// 抢哈希名额最多等多久：等不到就 429（宁可让客户端退避，也不要把内存堆起来）。
 const HASH_SLOT_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// 邮箱最大字节数（RFC 5321 的路径上限 254）。
+///
+/// security 复核 F1：这个校验**必须早于限流**——限流桶的键就是这个邮箱，
+/// 不先卡长度的话，1 MiB 的假邮箱会被原样放进桶表常驻（匿名即可撑爆内存）。
+const MAX_EMAIL_BYTES: usize = 254;
+
+/// 刷新令牌的最大字节数：`token::is_well_formed` 之前先挡明显伪造的超长串。
+const MAX_REFRESH_TOKEN_BYTES: usize = 512;
+
 #[derive(Debug, Deserialize)]
 struct CredentialsRequest {
     email: String,
@@ -54,6 +63,14 @@ pub async fn register(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let credentials: CredentialsRequest = parse_body(&body, &req_id)?;
+    // security 复核 F1：**先卡长度再进限流**（顺序不能反，否则长邮箱已经进了桶表）
+    if credentials.email.len() > MAX_EMAIL_BYTES {
+        return Err(AppError::new(
+            ErrorCode::ValidationError,
+            format!("邮箱长度不能超过 {MAX_EMAIL_BYTES} 字节"),
+            &req_id.0,
+        ));
+    }
     // 红队 H1：未鉴权端点先过限流（速率闸 + 哈希并发闸），否则匿名并发能把内存打爆
     state
         .limiter
@@ -88,6 +105,14 @@ pub async fn login(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let credentials: CredentialsRequest = parse_body(&body, &req_id)?;
+    // security 复核 F1：同上——先卡长度，再进限流（这是内存放大器的入口）
+    if credentials.email.len() > MAX_EMAIL_BYTES {
+        return Err(AppError::new(
+            ErrorCode::ValidationError,
+            format!("邮箱长度不能超过 {MAX_EMAIL_BYTES} 字节"),
+            &req_id.0,
+        ));
+    }
     // 红队 H1：按**规范化邮箱**限速（同一账号被撞库时能立刻收口），再抢一个哈希名额
     state
         .limiter
@@ -122,6 +147,15 @@ pub async fn refresh(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let request: RefreshRequest = parse_body(&body, &req_id)?;
+    // security 复核 F1：刷新键是固定串（不会撑桶表），但超长令牌没有意义，
+    // 先挡掉避免把 1 MiB 的假令牌送进哈希与数据库绑定。
+    if request.refresh_token.len() > MAX_REFRESH_TOKEN_BYTES {
+        return Err(AppError::new(
+            ErrorCode::Unauthorized,
+            "刷新令牌格式不正确",
+            &req_id.0,
+        ));
+    }
     // 刷新不哈希（只查库），所以只过速率闸、不占哈希名额
     state
         .limiter

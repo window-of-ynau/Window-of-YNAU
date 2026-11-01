@@ -295,17 +295,32 @@ fn sanitize_upstream_errors(chunks: Vec<Chunk>, request_id: &str) -> Vec<Chunk> 
 /// 口径与端侧一致（`core::context::estimate_tokens`：CJK 1 字 ≈ 1 token，其它 4 字符 ≈ 1）。
 /// 除消息正文外也算上工具声明的名字——工具描述同样进上游 prompt。
 pub fn estimate_input_tokens(request: &ChatRequest) -> u32 {
-    let messages: u32 = request
-        .messages
-        .iter()
-        .map(|message| yunong_core::context::estimate_tokens(&message.content))
-        .sum();
-    let tools: u32 = request
-        .tools
-        .iter()
-        .map(|tool| yunong_core::context::estimate_tokens(&tool.name))
-        .sum();
-    messages.saturating_add(tools)
+    // 口径：**凡是会转发给上游的内容都要算**（security 复核 F2）。
+    // 之前漏了工具描述/参数与历史 tool_calls 的参数——实测 700 KiB 的工具描述
+    // 能整体绕过 32k 预算，上游实收 717 KB。
+    let mut total: u32 = 0;
+    for message in &request.messages {
+        total = total.saturating_add(yunong_core::context::estimate_tokens(&message.content));
+        for call in &message.tool_calls {
+            total = total.saturating_add(yunong_core::context::estimate_tokens(&call.name));
+            total = total.saturating_add(estimate_json_tokens(&call.arguments));
+        }
+    }
+    for tool in &request.tools {
+        total = total.saturating_add(yunong_core::context::estimate_tokens(&tool.name));
+        total = total.saturating_add(yunong_core::context::estimate_tokens(&tool.description));
+        total = total.saturating_add(estimate_json_tokens(&tool.parameters));
+    }
+    total
+}
+
+/// 估算一个 JSON 值序列化后的 token 数（工具参数 / JSON Schema 都会原样转发）。
+fn estimate_json_tokens(value: &serde_json::Value) -> u32 {
+    match serde_json::to_string(value) {
+        Ok(text) => yunong_core::context::estimate_tokens(&text),
+        // 极少数情况（NaN 等）序列化失败：宁可高估也不能漏算
+        Err(_) => u32::MAX,
+    }
 }
 
 /// 上游没给 `usage` 时的兜底估算，**与端侧同口径**

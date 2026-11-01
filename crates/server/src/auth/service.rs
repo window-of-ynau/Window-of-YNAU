@@ -40,7 +40,9 @@ impl AuthService {
         let email =
             normalize_email(email).ok_or_else(|| AuthError::validation("邮箱格式不正确"))?;
         password::validate_new(raw_password)?;
-        let password_hash = password::hash(raw_password)?;
+        // Argon2 是 CPU/内存密集的**同步**计算：直接在 async worker 上跑会把 runtime 线程
+        // 占住（实测并发登录时 `/healthz` 能被拖到 632ms，探针可能超时）。
+        let password_hash = hash_blocking(raw_password.to_owned()).await?;
 
         match &self.backend {
             AuthBackend::Memory(state) => lock(state).register(email, password_hash),
@@ -55,18 +57,34 @@ impl AuthService {
 
         match &self.backend {
             AuthBackend::Memory(state) => {
+                // 注意：**不要**把锁跨过 await 持有（MutexGuard 不是 Send），
+                // 所以先取出哈希串、释放锁，再把 Argon2 交给阻塞线程池。
                 let found = lock(state).password_hash(&email);
                 let Some((user_id, password_hash)) = found else {
                     // 账号不存在也付一次哈希成本，让两条路径耗时接近。
-                    let _ = password::hash(raw_password);
+                    let _ = hash_blocking(raw_password.to_owned()).await;
                     return Err(credentials_error());
                 };
-                if !password::verify(raw_password, &password_hash) {
+                if !verify_blocking(raw_password.to_owned(), password_hash).await {
                     return Err(credentials_error());
                 }
                 Ok(lock(state).issue_session(user_id, None))
             }
-            AuthBackend::Pg(pool) => pg::login(pool, &email, raw_password).await,
+            AuthBackend::Pg(pool) => {
+                let found = pg::password_hash(pool, &email).await?;
+                let Some((user_id, stored)) = found else {
+                    let _ = hash_blocking(raw_password.to_owned()).await;
+                    return Err(credentials_error());
+                };
+                let matched = match stored {
+                    Some(phc) => verify_blocking(raw_password.to_owned(), phc).await,
+                    None => false, // 存在但没有密码（第三方账号）：按凭据错误处理
+                };
+                if !matched {
+                    return Err(credentials_error());
+                }
+                pg::issue_session(pool, user_id, None).await
+            }
         }
     }
 
@@ -102,6 +120,20 @@ impl AuthService {
             AuthBackend::Pg(pool) => pg::logout(pool, principal).await,
         }
     }
+}
+
+/// 把 Argon2 哈希放到阻塞线程池（不占 async worker，探针不再被拖慢）。
+async fn hash_blocking(password: String) -> Result<String, AuthError> {
+    tokio::task::spawn_blocking(move || password::hash(&password))
+        .await
+        .map_err(|error| AuthError::internal(format!("密码哈希任务失败：{error}")))?
+}
+
+/// 把 Argon2 校验放到阻塞线程池；任务本身 panic 时按"不匹配"处理（失败即拒绝）。
+async fn verify_blocking(password: String, phc: String) -> bool {
+    tokio::task::spawn_blocking(move || password::verify(&password, &phc))
+        .await
+        .unwrap_or(false)
 }
 
 /// 登录失败的唯一文案。

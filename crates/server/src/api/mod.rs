@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod auth_guard;
+pub mod body_limit;
 pub mod chat;
 pub mod envelope;
 pub mod error;
