@@ -4,7 +4,8 @@
 //! 1. 成功（含鉴权头、端点、请求体、`Meta` 注入、`Usage` 合并、`Done` 唯一）；
 //! 2. 超时（首事件超时、事件间空闲超时）；
 //! 3. 上游错误（非 2xx 状态码 → 稳定错误码；流内 `error` 事件）；
-//! 4. 取消（回调 `Flow::Stop`、以及直接 drop future）—— 两种情况都必须让**服务端观察到断连**。
+//! 4. 取消（回调 `Flow::Stop`、以及直接 drop future）—— 两种情况都必须**真的停止消费上游**：
+//!    服务端随后继续灌数据应当写不动（TCP 背压），而不是"读完再丢"；注意停止消费 ≠ 立刻断连。
 
 #![allow(clippy::unwrap_used)]
 
@@ -585,7 +586,7 @@ async fn dropping_the_future_stops_consuming_upstream() {
         })
     };
 
-    // 等到确实收到过 chunk，再模拟"客户端断开"（drop future）
+    // 等到确实收到过 chunk，再模拟"客户端不再消费"（drop future）
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while *seen.lock().unwrap() == 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
