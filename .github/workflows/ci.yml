@@ -172,3 +172,16 @@ jobs:
       # 不加 --include-ignored 就会"绿但一条 SQL 都没跑"，那正是这个 job 要防的事
       - name: cargo test（auth 的 PostgreSQL 集成测试，含 #[ignore] 用例）
         run: cargo test -p yunong-server --test pg_auth -- --include-ignored
+      # 记账 upsert（usage_samples 的 ON CONFLICT）与审计写入（audit_logs 三类事件）
+      # 这些**真实 SQL** 只活在 chat_stream 的 #[ignore] 用例里：不接进来的话，
+      # CI 一直是绿的，但审计/记账的 SQL 从未在 CI 上被验证过。
+      # 迁移由上面那步按文件名 glob 全量应用（0001→0004），不需要额外前置。
+      - name: cargo test（对话链路的 PostgreSQL 集成测试，含 #[ignore] 用例）
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p yunong-server --test chat_stream -- --include-ignored 2>&1)
+          printf '%s\n' "$out" | tail -n 25
+          # 防假绿：忽略数必须为 0。有人删掉 --include-ignored 时会立刻红，
+          # 而不是静静变成"跑过但全跳过"。
+          printf '%s\n' "$out" | grep -q "0 ignored" \
+            || { echo "::error::chat_stream 的 #[ignore] 用例没有真跑（检查 --include-ignored）"; exit 1; }
