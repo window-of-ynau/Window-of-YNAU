@@ -11,7 +11,9 @@ description = "云农之窗端侧核心：本地记忆、上下文、检索、�
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-yunong-shared = { path = "../shared" }
+# 内部 path 依赖也写死版本：cargo-deny 的 wildcard 检查不允许"只有 path 没有版本"
+# （版本必须与 workspace.package.version 一致，升 workspace 版本时这里要同步）
+yunong-shared = { path = "../shared", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
