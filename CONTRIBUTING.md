@@ -97,6 +97,20 @@ curl http://127.0.0.1:8080/healthz
 - 容器内监听地址由 compose 固定为 `YUNONG_BIND=0.0.0.0:8080`（默认 `127.0.0.1` 会让端口映射进来的流量失效）；
 - **升级必须先跑迁移再起新二进制**：启动时会校验 `usage_samples` 是否具备 `turn_id`/`estimated`，缺失直接拒绝启动并提示执行 `migrations/0003_usage_turn_estimated.sql`；
 - 数据库不映射端口，只在 compose 内网可达。
+### 本地跑 Dart 测试的代理坑
+
+若机器设置了 `HTTP_PROXY` / `HTTPS_PROXY`（公司代理、Clash 等），`flutter test` 会把与测试进程之间的 **localhost** 连接也走代理，表现为：
+
+```
+Connection closed before test suite loaded
+```
+
+跑之前排除回环地址即可：
+
+```powershell
+$env:NO_PROXY="localhost,127.0.0.1,::1"; $env:no_proxy="localhost,127.0.0.1,::1"
+cd app; flutter test
+```
 ## 4. PR 要求
 
 - PR 描述请用仓库模板：变更说明 / 关联 ADR 或 issue / 验证方式 / 是否影响 `shared` / 自检清单。
