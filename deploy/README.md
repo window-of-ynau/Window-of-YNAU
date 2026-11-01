@@ -187,7 +187,7 @@ gh run watch
 | `persist-credentials: false` 保持 | 不把 token 写进 `.git/config`；需要凭据的步骤（GHCR 登录）单独用 `GITHUB_TOKEN` |
 | `release.yml` 是唯一提权 workflow（`packages: write`） | 不要在 `ci.yml` 里加 `packages: write` / `contents: write` |
 | 镜像冒烟只有一份实现：`scripts/docker-smoke.sh` | CI 的 docker job 与 release 的发布前检查共用，改断言只改一处 |
-| `docker` job 暂不在必需检查里 | 先观察耗时与稳定性；稳定后再用 `gh api` 加入 required checks（加之前它只报警、不阻塞合入） |
+| `docker` / `security` job 暂不在必需检查里 | 先观察耗时与稳定性；稳定后再用 `gh api` 一次性加入 required checks（加之前它们只报警、不阻塞合入） |
 | PG 用例不并行加锁（不要 `--test-threads=1`） | 每条用例用独立 schema（`yunong_pg_<uuid>`）隔离，并行是安全的；单线程只会白白变慢 |
 
 ## 依赖安全与许可证（cargo-deny）
@@ -196,20 +196,18 @@ CI 的 `security` job（`依赖安全与许可证（cargo-deny）`）在每次 P
 
 | 检查 | 内容 | 当前姿态 |
 |---|---|---|
-| `advisories` | RustSec 漏洞库（含 yanked、unmaintained） | 漏洞类一律 error，但 **job 处于阶段 1：`continue-on-error: true`，只记录基线、不阻断合入** |
-| `licenses` | 许可证白名单（AGPL-3.0 + 商业双许可 → 只允许宽松/弱著佐权项） | 白名单外一律 error（含在基线期内，只是不阻断） |
-| `bans` | 禁用依赖：直接依赖 `openssl-sys` / `native-tls`（服务端统一 rustls）；重复版本与通配版本只告警 | 命中即 error |
-| `sources` | 依赖来源：只允许 crates.io 官方索引，禁 git 依赖与未知 registry | 命中即 error |
+| `advisories` | RustSec 漏洞库（含 yanked、unmaintained） | 漏洞一律 error，**阶段 2 起阻断合入**（2026-11 依赖升级后基线已清零） |
+| `licenses` | 许可证白名单（AGPL-3.0 + 商业双许可 → 只允许宽松/弱著佐权项） | 白名单外一律 error（阻断） |
+| `bans` | 禁用依赖：直接依赖 `openssl-sys` / `native-tls`（服务端统一 rustls）；重复版本与通配版本只告警 | 命中即 error（阻断） |
+| `sources` | 依赖来源：只允许 crates.io 官方索引，禁 git 依赖与未知 registry | 命中即 error（阻断） |
 
 **为什么选 cargo-deny 而不是 cargo-audit**：cargo-audit 只查 RustSec 漏洞；cargo-deny 一次把漏洞、许可证、禁用依赖、来源都查了——本项目是双许可，许可证闸门与"服务端只用 rustls"这类依赖政策和漏洞同等重要。
 
-### 两阶段（当前卡在阶段 1，别跳步）
+### 当前状态：已阻断（阶段 2）
 
-- **阶段 1（现在）**：`security` job 带 `continue-on-error: true`，命中问题只提示不卡 PR，目的是先记录基线。**该 job 也不在分支保护必需检查里**（先用几个 PR 观察稳定性与耗时）。
-- **阶段 2（基线连续稳定后）**：
-  1. 删掉 `.github/workflows/ci.yml` 里 `security` job 的 `continue-on-error: true`；
-  2. 视基线收紧 `deny.toml`：`yanked = "deny"`、`unmaintained = "all"`；
-  3. `gh api` 把 `依赖安全与许可证（cargo-deny）` 加进分支保护必需检查。
+- **阶段 1（已完成，留作记录）**：门禁刚接入时先以 `continue-on-error: true` 跑了一轮，只记录基线。那次基线是 **7 条漏洞**：`rustls 0.23.45` ×4（RUSTSEC-2026-0346/0347/0348/0349）、`rustls-webpki 0.103.15`（-0382）、`tokio 1.54.0`（-0384，且已被 yank）、`webpki-roots 1.0.9`（-0381），全部有修复版本。
+- **阶段 2（当前）**：升级 `rustls 0.23.46` / `tokio 1.54.1` / `rustls-webpki 0.103.16` / `webpki-roots 1.0.11` 后 `cargo deny check` 变成 `advisories ok, bans ok, licenses ok, sources ok`；`ci.yml` 已去掉 `continue-on-error`，**命中即红**。
+- **还剩一步**：先观察 3~5 个 PR 的稳定性与耗时，再用 `gh api` 把 `依赖安全与许可证（cargo-deny）` 加进分支保护必需检查（与 `docker` job 同一节奏）。在此之前它变红会「看得见但不阻塞合入」。
 
 > 注意：cargo-deny ≥ 0.18 **移除了 advisories 的 `vulnerability` 级别开关**（漏洞一律按 error 报），所以"先 warn 后 deny"只能在 CI 层用 `continue-on-error` 表达；在 `deny.toml` 里写 `vulnerability = "warn"` 会让配置解析直接报错。
 
@@ -228,7 +226,7 @@ Solution:  Upgrade to >=0.2.23     # 没有修复版本时这里会写明无可�
 
 处理路径：
 1. **能升级** → 单独提依赖升级 PR（不要顺手改 `Cargo.lock` 混进功能 PR，它会牵动所有 CI job）；
-2. **确认不可利用 / 不影响** → 写进 `deny.toml` 的 `[advisories].ignore`，**必须写原因**，阶段 2 前复审；
+2. **确认不可利用 / 不影响** → 写进 `deny.toml` 的 `[advisories].ignore`，**必须写原因**，并定期复审（升级依赖后要回来删掉已失效的 ignore）；
 3. **许可证拿不准** → 先报 captain，**不要自行往 `[licenses].allow` 里加**（AGPL + 商业双许可的兼容性判断不能由 CI 维护者单方面放宽）。
 
 ### 本地复现（需要网络，离线环境跑不了）
