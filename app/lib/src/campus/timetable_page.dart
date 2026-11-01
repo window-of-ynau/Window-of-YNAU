@@ -12,6 +12,9 @@ import 'dart:async';
 
 import 'campus_entries.dart';
 import '../core/timetable_service.dart';
+import 'timetable/course_palette.dart';
+import 'timetable/timetable_grid.dart';
+import 'timetable/timetable_notices.dart';
 
 /// 课表页。
 class TimetablePage extends StatefulWidget {
@@ -62,6 +65,9 @@ class _TimetablePageState extends State<TimetablePage> {
   /// 当前查看的周（默认定位到"今天所在周"，算不出来才回第 1 周）
   int? _selectedWeek;
   String? _notice;
+
+  /// 窄窗口下是否手动展开周末列（< 560 且本周周末无课时默认折叠）。
+  bool _showWeekend = false;
 
   @override
   void initState() {
@@ -128,6 +134,39 @@ class _TimetablePageState extends State<TimetablePage> {
                     icon: const Icon(Icons.content_paste),
                     label: const Text('从剪贴板导入'),
                   ),
+                  // 「本学期 N 门课 / 最近一次抓取结果」合成一个 chip。
+                  // 原来它单独占一行（"已从门户接口抓取，本学期 9 门课"），
+                  // 1280×720 下白吃 22px 竖向空间，导致 10 节看不全。
+                  if (_courses.isNotEmpty || _notice != null)
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 420),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.55),
+                          borderRadius: BorderRadius.circular(99),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            Icon(
+                              Icons.info_outline,
+                              size: 15,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                            const SizedBox(width: 6),
+                            Flexible(
+                              child: Text(
+                                _notice ?? '本学期 ${_courses.length} 门课',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.bodySmall,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                 ],
               ),
               const SizedBox(height: 8),
@@ -140,11 +179,6 @@ class _TimetablePageState extends State<TimetablePage> {
           ),
         ),
         if (_busy) const LinearProgressIndicator(),
-        if (_notice != null)
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-            child: Text(_notice!, style: theme.textTheme.bodySmall),
-          ),
         if (_warnings.isNotEmpty)
           Container(
             margin: const EdgeInsets.fromLTRB(16, 4, 16, 4),
@@ -221,14 +255,64 @@ class _TimetablePageState extends State<TimetablePage> {
 
   bool get _isThisWeek => _todayWeek != null && _week == _todayWeek;
 
-  /// `第 N 周 · 本周（MM-DD ~ MM-DD）`：当前周才带"本周"。
+  /// `第 N 周（MM-DD ~ MM-DD）`。是不是本周由标题旁的 pill 表达，不重复写在文案里。
   String get _weekTitle {
     final week = _week;
     final draft = _termStartDraft;
     final range = draft == null ? '' : weekRangeLabel(termStart: draft, week: week);
-    final suffix = _isThisWeek ? ' · 本周' : '';
-    return range.isEmpty ? '第 $week 周$suffix' : '第 $week 周$suffix（$range）';
+    return range.isEmpty ? '第 $week 周' : '第 $week 周（$range）';
   }
+
+  /// 整学期的「课程名 → 色板槽位」（切周不换色，见 `course_palette.dart`）。
+  Map<String, int> get _courseTints =>
+      assignCourseTints(_courses.map((StoredCourse course) => course.name));
+
+  /// 本周 7 天的日期；学期开始日未确认时返回 `null`——**不猜日期**。
+  List<DateTime>? get _weekDates {
+    final draft = _termStartDraft;
+    if (draft == null) {
+      return null;
+    }
+    final start = draft.add(Duration(days: 7 * (_week - 1)));
+    return List<DateTime>.generate(7, (int index) => start.add(Duration(days: index)));
+  }
+
+  /// 今天所在列（1=周一 … 7=周日）：只有"查看的是本周 + 已确认学期开始日"才给。
+  int? get _todayColumn => _isThisWeek ? DateTime.now().weekday : null;
+
+  /// 今天第一节的节次：进入/切到本周时滚到那里。今天没课就不滚（返回 null）。
+  int? get _todayFirstPeriod {
+    final column = _todayColumn;
+    if (column == null) {
+      return null;
+    }
+    final List<int> starts = _visibleCourses
+        .where((StoredCourse course) => course.weekday == column)
+        .map((StoredCourse course) => course.startPeriod)
+        .toList(growable: false);
+    if (starts.isEmpty) {
+      return null;
+    }
+    return starts.reduce((int a, int b) => a < b ? a : b);
+  }
+
+  /// 相邻"确实有课"的周号（各取最近一个），给「本周无课」当跳板。
+  List<int> get _nearestCourseWeeks {
+    final int current = _week;
+    final Set<int> weeksWithCourses = <int>{};
+    for (final StoredCourse course in _courses) {
+      weeksWithCourses.addAll(expandWeeks(course.weeks));
+    }
+    final List<int> before =
+        weeksWithCourses.where((int week) => week < current).toList()..sort();
+    final List<int> after =
+        weeksWithCourses.where((int week) => week > current).toList()..sort();
+    return <int>[
+      if (before.isNotEmpty) before.last,
+      if (after.isNotEmpty) after.first,
+    ];
+  }
+
   Widget _buildBody(ThemeData theme) {
     if (_busy && _courses.isEmpty && _failure == null) {
       return const Center(child: Text('正在解析…'));
@@ -240,82 +324,167 @@ class _TimetablePageState extends State<TimetablePage> {
       return const SizedBox.shrink();
     }
     if (_courses.isEmpty) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: <Widget>[
-              const Icon(Icons.event_note_outlined, size: 48),
-              const SizedBox(height: 12),
-              Text('还没有导入课表', style: theme.textTheme.titleMedium),
-              const SizedBox(height: 8),
-              Text(
-                '在校务系统登录一次，或在调试环境导入一份课表 HTML。\n'
-                '学期：$_currentTerm',
-                textAlign: TextAlign.center,
-                style: theme.textTheme.bodySmall,
-              ),
-            ],
-          ),
-        ),
-      );
+      return _buildNoData(theme);
     }
     final visible = _visibleCourses;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: <Widget>[
-        // 周次标题 + 前后切周（"本周"标识让用户不用自己数）
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-          child: Row(
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final bool narrow = constraints.maxWidth < kNarrowWidth;
+        final bool weekendHasCourses =
+            visible.any((StoredCourse course) => course.weekday >= 6);
+        final bool folded = narrow && !_showWeekend && !weekendHasCourses;
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            _buildWeekBar(
+              theme,
+              canToggleWeekend: narrow && !weekendHasCourses,
+              folded: folded,
+            ),
+            Expanded(
+              child: visible.isEmpty
+                  ? WeekEmptyCard(
+                      week: _week,
+                      totalCourses: _courses.length,
+                      weekCount: _weekcount,
+                      nearestWeeks: _nearestCourseWeeks,
+                      onSelectWeek: (int week) => setState(() => _selectedWeek = week),
+                      canPrevious: _week > 1,
+                      canNext: _week < (_weekcount ?? 1 << 30),
+                      onPreviousWeek: () => _changeWeek(-1),
+                      onNextWeek: () => _changeWeek(1),
+                    )
+                  : Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+                      child: TimetableGrid(
+                        courses: visible,
+                        week: _week,
+                        dayCount: folded ? 5 : 7,
+                        assignment: _courseTints,
+                        dates: _weekDates,
+                        todayIndex: _todayColumn,
+                        scrollToPeriod: _todayFirstPeriod,
+                      ),
+                    ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// 「从未导入」的空态（中性；契约要求解析失败时**不能**显示这一屏）。
+  Widget _buildNoData(ThemeData theme) {
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(
+              Icons.event_note_outlined,
+              size: 44,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(height: 12),
+            Text('还没有导入课表', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Text(
+              '在校务系统登录一次，或在调试环境导入一份课表 HTML。\n'
+              '学期：$_currentTerm',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 周次栏：`‹ 标题 ›` + 「本周」pill；附加动作（显示周末 / 回到本周）单独一行，
+  /// **不和标题抢宽度**——窄窗口下这是最容易溢出的地方。
+  Widget _buildWeekBar(
+    ThemeData theme, {
+    required bool canToggleWeekend,
+    required bool folded,
+  }) {
+    final bool canBack = _todayWeek != null && !_isThisWeek;
+    final List<Widget> extras = <Widget>[
+      if (canToggleWeekend)
+        TextButton(
+          onPressed: () => setState(() => _showWeekend = !_showWeekend),
+          child: Text(folded ? '显示周末' : '收起周末'),
+        ),
+      if (canBack)
+        TextButton(
+          onPressed: () => setState(() => _selectedWeek = _todayWeek),
+          child: const Text('回到本周'),
+        ),
+    ];
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Row(
             children: <Widget>[
               IconButton(
                 tooltip: '上一周',
+                visualDensity: VisualDensity.compact,
                 onPressed: _week > 1 ? () => _changeWeek(-1) : null,
                 icon: const Icon(Icons.chevron_left),
               ),
               Expanded(
-                child: Text(
-                  _weekTitle,
-                  textAlign: TextAlign.center,
-                  style: theme.textTheme.titleMedium,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: <Widget>[
+                    Flexible(
+                      child: Text(
+                        _weekTitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.titleMedium
+                            ?.copyWith(fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                    if (_isThisWeek) ...<Widget>[
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.primaryContainer,
+                          borderRadius: BorderRadius.circular(99),
+                        ),
+                        child: Text(
+                          '本周',
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: theme.colorScheme.onPrimaryContainer,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
               ),
               IconButton(
                 tooltip: '下一周',
+                visualDensity: VisualDensity.compact,
                 onPressed: _week < (_weekcount ?? 1 << 30) ? () => _changeWeek(1) : null,
                 icon: const Icon(Icons.chevron_right),
               ),
             ],
           ),
-        ),
-        if (visible.isEmpty)
-          const Expanded(
-            child: Center(child: Text('本周无课')),
-          )
-        else
-          Expanded(
-            child: ListView.separated(
-              padding: const EdgeInsets.all(16),
-              itemCount: visible.length,
-              separatorBuilder: (_, __) => const Divider(height: 1),
-              itemBuilder: (BuildContext context, int index) {
-                final course = visible[index];
-                return ListTile(
-                  leading: CircleAvatar(child: Text(course.weekdayLabel)),
-                  title: Text(course.name),
-                  subtitle: Text(<String>[
-                    course.periodLabel,
-                    course.weeks,
-                    if (course.room != null) course.room!,
-                    if (course.teacher != null) course.teacher!,
-                  ].join(' · ')),
-                );
-              },
+          if (extras.isNotEmpty)
+            Wrap(
+              alignment: WrapAlignment.end,
+              spacing: 8,
+              children: extras,
             ),
-          ),
-      ],
+        ],
+      ),
     );
   }
   // ---------------------------------------------------------------------------
@@ -492,29 +661,22 @@ class _TimetablePageState extends State<TimetablePage> {
     if (draft == null) {
       // 该学期没有锚点：**不显示任何具体日期**（宁可不显示，也不能显示错的），
       // 只提示用户确认一次；确认前课表按"第 N 周 · 星期 X"展示。
-      return Container(
-        margin: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-        padding: const EdgeInsets.all(10),
-        decoration: BoxDecoration(
-          color: theme.colorScheme.errorContainer,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Row(
-          children: <Widget>[
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Text('本学期（$_currentTerm）还没确认学期开始日',
-                      style: theme.textTheme.bodyMedium),
-                  Text('确认前只显示「第 N 周」，不显示具体日期；确认一次即可长期记住。',
-                      style: theme.textTheme.bodySmall),
-                ],
-              ),
-            ),
-            FilledButton(onPressed: _editTermStart, child: const Text('选择日期')),
-          ],
-        ),
+      // 用琥珀色而不是红色：这是"等你确认"，不是"出错了"——
+      // 红色只留给解析失败（见 `_FailureCard`），两者不能长得一样。
+      return TermStartPrompt(
+        title: '还没确认这学期的开始日',
+        subtitle: '确认后才能标出「今天」和当前周；课表内容仍可查看。（$_currentTerm）',
+        onPickDate: _editTermStart,
+      );
+    }
+    if (!_termStartSaved) {
+      // 有校历建议值、但用户还没点过确认：同一处琥珀横幅，多给一个一键确认。
+      return TermStartPrompt(
+        title: '学期开始日还没确认（校历建议 ${_shortDate(draft)}）',
+        subtitle: '确认后按这天换算每一周的日期；课表内容与周次不受影响。',
+        suggestedLabel: '确认 ${_shortDate(draft)}',
+        onUseSuggested: () => unawaited(_saveTermStart()),
+        onPickDate: _editTermStart,
       );
     }
     final week = _currentWeek;
@@ -522,17 +684,18 @@ class _TimetablePageState extends State<TimetablePage> {
     final subtitle = <String>[
       '第 1 周：$weekOne',
       if (week != null && week > 0) '今天按此算第 $week 周',
-      _termStartSaved ? '已确认，日历换算按这天起算' : '未确认（可改）',
     ].join(' · ');
     return Container(
-      margin: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-      padding: const EdgeInsets.all(10),
+      margin: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+      padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
       decoration: BoxDecoration(
-        color: theme.colorScheme.secondaryContainer,
-        borderRadius: BorderRadius.circular(8),
+        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(10),
       ),
       child: Row(
         children: <Widget>[
+          Icon(Icons.event_available_outlined, size: 18, color: theme.colorScheme.onSurfaceVariant),
+          const SizedBox(width: 8),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -544,12 +707,13 @@ class _TimetablePageState extends State<TimetablePage> {
             ),
           ),
           TextButton(onPressed: _editTermStart, child: const Text('修改')),
-          if (!_termStartSaved)
-            FilledButton(onPressed: _saveTermStart, child: const Text('确认')),
         ],
       ),
     );
   }
+
+  static String _shortDate(DateTime date) =>
+      '${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
   /// 失败卡片上的"重试"：重放最近一次动作（登录超时 / 网络错误最常见）。
   Future<void> _retryFailedAction() async {
     final action = _lastAction ?? _fetchFromCampus;
