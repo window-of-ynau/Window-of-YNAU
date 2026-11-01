@@ -21,7 +21,7 @@ mod password;
 mod pg;
 mod service;
 mod store;
-mod token;
+pub(crate) mod token;
 
 pub use error::AuthError;
 pub use service::AuthService;

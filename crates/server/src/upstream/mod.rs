@@ -146,6 +146,41 @@ pub enum UpstreamErrorKind {
     Protocol,
 }
 
+/// 读上游非 2xx 的响应体，**最多 64 KiB、最多 5 秒**，只取前 200 字符做日志。
+///
+/// 为什么要限制：`Response::bytes()` 会把整个 body 读进内存且没有超时，
+/// 一个异常/恶意上游（或中间层返回的错误页）就能拖住连接、放大内存。
+async fn read_error_snippet(mut response: reqwest::Response) -> String {
+    /// 读取上限：日志只需要前 200 字符，64 KiB 已经足够覆盖常见错误页。
+    const LIMIT: usize = 64 * 1024;
+    /// 总读取时间上限：超时就用手上已有的内容。
+    const BUDGET: Duration = Duration::from_secs(5);
+
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let mut collected: Vec<u8> = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                let take = LIMIT.saturating_sub(collected.len()).min(chunk.len());
+                collected.extend_from_slice(&chunk[..take]);
+                if collected.len() >= LIMIT {
+                    break;
+                }
+            }
+            // 读完了 / 出错 / 超时：都用已有内容
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&collected)
+        .chars()
+        .take(200)
+        .collect()
+}
+
 /// 上游错误：给客户端一个笼统的错误码，给日志一份具体原因。
 #[derive(Debug, Clone)]
 pub struct UpstreamError {
@@ -355,8 +390,10 @@ impl UpstreamClient {
             let code = status.as_u16();
             // 错误体只截 200 字符：够定位，又不会把正文 / 大页面写进日志。
             // **注意**：这段 message 只进日志，对外由 `api::chat` 换成固定文案（评审 F3）。
-            let bytes = response.bytes().await.unwrap_or_default();
-            let snippet: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
+            //
+            // security 报告加固建议 2：以前是 `response.bytes()`——**无上限、无超时**，
+            // 异常/恶意上游返回一个巨大 body 就能把内存或连接拖住。现在按 64 KiB + 5s 收口。
+            let snippet = read_error_snippet(response).await;
             return Err(UpstreamError::status(
                 code,
                 format!("上游返回 {code}：{snippet}"),
