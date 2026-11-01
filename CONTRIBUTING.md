@@ -61,6 +61,42 @@ python bench/run.py --cases bench/cases/smoke.jsonl \
 
 CI（`.github/workflows/ci.yml`）跑的就是上面这些，本地能过 CI 基本就能过。
 
+## 3.1 构建 Windows 客户端与 Docker 部署
+
+### 打包 Windows 客户端（一键）
+
+```powershell
+pwsh scripts/build-windows-app.ps1          # release
+pwsh scripts/build-windows-app.ps1 -Debug   # 更快
+```
+
+它会做三件事，**不要只跑 `flutter build windows`**：
+
+1. `cargo build -p yunong-core` 产出 `yunong_core.dll`；
+2. `flutter build windows`；
+3. 把 DLL 复制到 `yunong.exe` 同目录。
+
+漏掉第 3 步的现象是：App 能启动，但界面显示「端侧核心未就绪」——看着像功能缺失，其实是打包漏了。
+
+### Windows 构建的三个前置条件（都会以很隐晦的方式失败）
+
+| 条件 | 缺失时的表现 | 解决 |
+|---|---|---|
+| **Windows 开发者模式** | Flutter 建插件符号链接失败 | 设置 → 隐私和安全性 → 开发者选项 → 开发人员模式 |
+| **`nuget.exe` 在 PATH** | `MSB3073 … NUGET-NOTFOUND install nlohmann.json` | `winget install Microsoft.NuGet`（`flutter_inappwebview` 的 Windows 实现要用它） |
+| **VS2022 C++ 桌面工具链 + Rust MSVC** | 链接器报缺 `kernel32.lib` 之类 | VS Installer 勾"使用 C++ 的桌面开发" |
+
+### 用 Docker 跑服务端
+
+```bash
+cp deploy/.env.example deploy/.env      # 填 POSTGRES_PASSWORD / DATABASE_URL / UPSTREAM_*
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build
+curl http://127.0.0.1:8080/healthz
+```
+
+- 容器内监听地址由 compose 固定为 `YUNONG_BIND=0.0.0.0:8080`（默认 `127.0.0.1` 会让端口映射进来的流量失效）；
+- **升级必须先跑迁移再起新二进制**：启动时会校验 `usage_samples` 是否具备 `turn_id`/`estimated`，缺失直接拒绝启动并提示执行 `migrations/0003_usage_turn_estimated.sql`；
+- 数据库不映射端口，只在 compose 内网可达。
 ## 4. PR 要求
 
 - PR 描述请用仓库模板：变更说明 / 关联 ADR 或 issue / 验证方式 / 是否影响 `shared` / 自检清单。
