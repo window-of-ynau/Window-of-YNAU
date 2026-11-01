@@ -5,7 +5,9 @@ import 'package:yunong/main.dart';
 void main() {
   testWidgets('启动后能看到对话主区', (WidgetTester tester) async {
     await tester.pumpWidget(const YunongApp());
-    expect(find.text('你好，我是云农之窗'), findsOneWidget);
+    // W7 起对话区是真实会话页（流式 UI），不再是 W1 占位文案。
+    expect(find.textContaining('问点什么吧'), findsOneWidget);
+    expect(find.text('发送'), findsOneWidget);
   });
 
   testWidgets('侧栏能进入课表页', (WidgetTester tester) async {
