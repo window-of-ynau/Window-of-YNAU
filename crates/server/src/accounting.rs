@@ -275,6 +275,12 @@ impl UsageRecorder {
     }
 
     /// 审计落库：同样 fire-and-forget。
+    /// 写一条审计（fire-and-forget）。
+    ///
+    /// **统计口径提醒**（security 复核 M5 后提出的运维注意点）：
+    /// 同一次请求可能留下**两条**审计——开流时的 `allow`，以及流中/流末失败的 `error`
+    /// （例如 `stream_total_timeout`）。所以"成功数"不能直接按 `decision = 'allow'` 统计，
+    /// 否则会高估；正确口径是 `allow` 减去后续同 `req_id` 的 `error`，失败率单独按 `error` 统计。
     pub fn record_audit_detached(self: &Arc<Self>, entry: AuditEntry) {
         let Some(_) = &self.db else {
             return;
