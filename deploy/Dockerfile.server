@@ -40,7 +40,20 @@ RUN mkdir -p crates/core/src crates/server/src crates/shared/src \
 # ---------------------------------------------------------------------------
 COPY crates ./crates
 
-RUN cargo build --release -p yunong-server
+# 关键：`COPY` 会保留宿主机文件的 mtime，而上一层里空壳源码刚被创建，mtime 更新。
+# 若直接 build，cargo 按 mtime 判定"没变"，会**跳过**重编并继续沿用空壳 `fn main(){}`，
+# 镜像里就会打包一个立刻退出的假二进制（本轮实测踩到：314KB、exit 0、无任何日志）。
+# 因此先统一 touch 刷新 mtime，再编译。
+RUN find crates -name '*.rs' -exec touch {} + \
+    && cargo build --release -p yunong-server \
+    && size=$(stat -c%s target/release/yunong-server) \
+    && echo "yunong-server 二进制大小：${size} bytes" \
+    && test "$size" -gt 2000000
+
+# 构建期冒烟：真实二进制启动后会打印"启动中"，空壳不会。
+# 无数据库模式下它会 warn 后继续监听，这里只取前几行就退出，不占端口。
+RUN (timeout 5 target/release/yunong-server 2>&1 || true) | tee /tmp/boot.log \
+    && grep -q "启动中" /tmp/boot.log
 
 # ---------------------------------------------------------------------------
 # 运行阶段：只要二进制和 CA 证书，不带工具链、不带源码、不带 .env。

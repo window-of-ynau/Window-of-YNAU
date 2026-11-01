@@ -29,6 +29,25 @@ services:
       - internal
     # 刻意不映射端口：数据库只给 server 用，宿主机和公网都碰不到。
 
+  # 一次性迁移任务：按 schema_migrations 幂等应用 crates/server/migrations/*.sql。
+  # 没有它，全新环境里数据库是空的，服务端启动自检会拒绝启动（有意设计）。
+  migrate:
+    image: pgvector/pgvector:pg16
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?请先在 deploy/.env 里设置 POSTGRES_PASSWORD}
+      PGHOST: db
+      PGUSER: yunong
+      PGDATABASE: yunong
+    volumes:
+      - ../crates/server/migrations:/migrations:ro
+      - ./migrate.sh:/migrate.sh:ro
+    entrypoint: ["/bin/sh", "/migrate.sh"]
+    networks:
+      - internal
   server:
     build:
       context: ..
@@ -37,6 +56,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       # db 是 compose 内部服务名，所以 .env 里用 postgres://...@db:5432/...
       DATABASE_URL: ${DATABASE_URL:?请先在 deploy/.env 里设置 DATABASE_URL}
