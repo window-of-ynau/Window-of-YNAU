@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "云农之窗端侧核心：本地记忆、上下文、检索、日历、直连网关（供 Flutter FFI 调用）"
 
+# 端侧核心同时产出 rlib（内部使用）与 cdylib（Flutter 的 dart:ffi 加载）
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 yunong-shared = { path = "../shared" }
 serde = { workspace = true }
@@ -13,6 +17,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+# 端侧 SQLite（课表 terms/courses）；bundled 自带 SQLite 源码，不依赖系统库
+rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 # 课表 HTML 解析（教务页面是机器生成的固定结构，用正则足够且无重依赖）
 regex = "1"

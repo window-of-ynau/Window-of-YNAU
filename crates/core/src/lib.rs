@@ -7,7 +7,7 @@
 //! 敏感数据边界：本 crate 的 `keystore` 是**唯一**接触 Cookie / API Key 的地方；
 //! `gateway` 只在发请求前取一次 Key，用完即弃（`ApiKeySource::Provider`）。
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod calendar;
 pub mod context;
@@ -18,9 +18,16 @@ pub mod keystore;
 pub mod memory;
 pub mod parse;
 pub mod protocols;
+pub mod store;
 pub mod tools;
 
 pub use error::{CoreError, CoreResult};
+
+/// C ABI 出口（Flutter `dart:ffi` 调这里）。
+///
+/// 本 crate 其余部分仍然 `deny(unsafe_code)`；`unsafe` 只在这个模块里解包裸指针。
+#[allow(unsafe_code)]
+pub mod ffi;
 
 /// 核心版本（随 crate 版本走）。
 pub fn version() -> &'static str {
@@ -39,7 +46,8 @@ pub mod prelude {
     pub use crate::index::{Bm25Index, LocalIndex, SearchHit};
     pub use crate::keystore::{SecretKind, SecretStore};
     pub use crate::memory::{Blob, BlobKind, MemoryStore, Message};
-    pub use crate::parse::{parse_timetable, ParseError};
+    pub use crate::parse::{parse_timetable, parse_timetable_with_report, ParseError, ParseReport};
     pub use crate::protocols::{build_body, build_body_with, parse_events, BuildOptions};
+    pub use crate::store::{CourseStore, ImportOutcome, StoredCourse, TermRecord};
     pub use crate::tools::{ToolCall, ToolOutcome, ToolRegistry};
 }
