@@ -190,3 +190,56 @@ gh run watch
 | `docker` job 暂不在必需检查里 | 先观察耗时与稳定性；稳定后再用 `gh api` 加入 required checks（加之前它只报警、不阻塞合入） |
 | PG 用例不并行加锁（不要 `--test-threads=1`） | 每条用例用独立 schema（`yunong_pg_<uuid>`）隔离，并行是安全的；单线程只会白白变慢 |
 
+## 依赖安全与许可证（cargo-deny）
+
+CI 的 `security` job（`依赖安全与许可证（cargo-deny）`）在每次 PR / push main 时跑 [cargo-deny](https://embarkstudios.github.io/cargo-deny/)，配置在仓库根 `deny.toml`，检查四类东西：
+
+| 检查 | 内容 | 当前姿态 |
+|---|---|---|
+| `advisories` | RustSec 漏洞库（含 yanked、unmaintained） | 漏洞类一律 error，但 **job 处于阶段 1：`continue-on-error: true`，只记录基线、不阻断合入** |
+| `licenses` | 许可证白名单（AGPL-3.0 + 商业双许可 → 只允许宽松/弱著佐权项） | 白名单外一律 error（含在基线期内，只是不阻断） |
+| `bans` | 禁用依赖：直接依赖 `openssl-sys` / `native-tls`（服务端统一 rustls）；重复版本与通配版本只告警 | 命中即 error |
+| `sources` | 依赖来源：只允许 crates.io 官方索引，禁 git 依赖与未知 registry | 命中即 error |
+
+**为什么选 cargo-deny 而不是 cargo-audit**：cargo-audit 只查 RustSec 漏洞；cargo-deny 一次把漏洞、许可证、禁用依赖、来源都查了——本项目是双许可，许可证闸门与"服务端只用 rustls"这类依赖政策和漏洞同等重要。
+
+### 两阶段（当前卡在阶段 1，别跳步）
+
+- **阶段 1（现在）**：`security` job 带 `continue-on-error: true`，命中问题只提示不卡 PR，目的是先记录基线。**该 job 也不在分支保护必需检查里**（先用几个 PR 观察稳定性与耗时）。
+- **阶段 2（基线连续稳定后）**：
+  1. 删掉 `.github/workflows/ci.yml` 里 `security` job 的 `continue-on-error: true`；
+  2. 视基线收紧 `deny.toml`：`yanked = "deny"`、`unmaintained = "all"`；
+  3. `gh api` 把 `依赖安全与许可证（cargo-deny）` 加进分支保护必需检查。
+
+> 注意：cargo-deny ≥ 0.18 **移除了 advisories 的 `vulnerability` 级别开关**（漏洞一律按 error 报），所以"先 warn 后 deny"只能在 CI 层用 `continue-on-error` 表达；在 `deny.toml` 里写 `vulnerability = "warn"` 会让配置解析直接报错。
+
+### 命中时怎么看、怎么处理
+
+cargo-deny 的人类可读输出直接给足四要素，例如：
+
+```text
+error[vulnerability]: Potential segfault in the time crate
+  ┌─ ...
+Crate:     time
+Version:   0.1.45
+ID:        RUSTSEC-2020-0071
+Solution:  Upgrade to >=0.2.23     # 没有修复版本时这里会写明无可用修复
+```
+
+处理路径：
+1. **能升级** → 单独提依赖升级 PR（不要顺手改 `Cargo.lock` 混进功能 PR，它会牵动所有 CI job）；
+2. **确认不可利用 / 不影响** → 写进 `deny.toml` 的 `[advisories].ignore`，**必须写原因**，阶段 2 前复审；
+3. **许可证拿不准** → 先报 captain，**不要自行往 `[licenses].allow` 里加**（AGPL + 商业双许可的兼容性判断不能由 CI 维护者单方面放宽）。
+
+### 本地复现（需要网络，离线环境跑不了）
+
+```bash
+cargo install cargo-deny --locked        # 一次性安装
+cargo deny --all-features check          # 四类全查（默认读仓库根 deny.toml）
+cargo deny --all-features check advisories   # 只查漏洞
+cargo deny --all-features check --format json  # 机器可读
+```
+
+**为什么离线跑不了**：cargo-deny 要 `git clone` RustSec advisory-db（默认拉到本地缓存目录），并通过 `cargo metadata` 拉取 crates.io 元数据/sources；内网、沙箱或断网环境会直接失败。这种情况下**以 CI 的 `security` job 结果为准**——这也是把它放 CI 而不是只放本地的原因。
+
+

@@ -1,0 +1,91 @@
+# 依赖安全与许可证门禁（cargo-deny）
+# ---------------------------------------------------------------------------
+# 为什么选 cargo-deny 而不是 cargo-audit：
+#   - cargo-audit 只查 RustSec 漏洞；
+#   - cargo-deny 一次跑完四类检查：[advisories] 漏洞、[licenses] 许可证、
+#     [bans] 禁用依赖与重复版本、[sources] 依赖来源。
+#   本项目是 AGPL-3.0 + 商业双许可，许可证闸门与"服务端只用 rustls"这类依赖
+#   政策同样重要，所以选 cargo-deny。
+#
+# 两阶段落地（当前 = 阶段 1，勿跳步）：
+#   阶段 1（本文件当前状态）：CI 的 security job 带 continue-on-error: true，
+#     只记录基线、不阻断合入。注意 cargo-deny >= 0.18 已移除 advisories 的
+#     `vulnerability` 级别开关（漏洞一律按 error 报），所以"非阻断"只能在 CI 层做，
+#     写 `vulnerability = "warn"` 反而会让配置解析直接报错。
+#   阶段 2（基线连续稳定后）：
+#     1) 去掉 .github/workflows/ci.yml 里 security job 的 continue-on-error；
+#     2) 视基线把 unmaintained 收紧到 "all"、yanked 改成 "deny"；
+#     3) 用 gh api 把该 job 加进分支保护必需检查（与 docker job 同样先观察几个 PR）。
+#
+# 本地复现（需要网络）：
+#   cargo install cargo-deny --locked          # 一次性
+#   cargo deny --all-features check            # 四项全跑
+#   cargo deny --all-features check advisories # 只查漏洞
+#   cargo deny --all-features check --format json   # 机器可读
+# 离线环境跑不了：cargo-deny 要 clone RustSec advisory-db、并通过 cargo metadata
+# 拉取 crates.io 元数据；内网/沙箱环境会失败，以 CI 结果为准。
+
+[advisories]
+# RustSec 漏洞：全部 error（cargo-deny 已不支持降级），基线期靠 CI 的
+# continue-on-error 兜住、不阻断合入。
+# yanked：默认就是 warn；阶段 2 收紧为 deny。
+yanked = "warn"
+# unmaintained：默认 "all"（连传递依赖一起判，噪音大）。阶段 1 只看直接依赖，
+# 阶段 2 再评估是否收紧到 "all"。
+unmaintained = "workspace"
+# 明确接受的告警：必须写 ID + 原因；基线稳定前保持为空。
+ignore = []
+
+[licenses]
+# 本项目自身是 AGPL-3.0-or-later（+ 商业授权），分发时第三方依赖必须与 AGPL 兼容。
+# 白名单只放宽松 / 弱著佐权许可证；GPL-2.0-only、SSPL、Commons-Clause、任何专有
+# 许可证都不放。新增依赖触发未列入的许可证时：先报 captain 决策，不要自行放宽。
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",  # webpki-roots：只含根证书数据，Mozilla 的宽松数据许可
+    "ISC",
+    "MIT",
+    "Unicode-3.0",          # ICU4X 系列 / unicode-ident 等
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+# 白名单里列了但依赖树没用到的许可证要能看到，方便清理（默认即 warn）
+unused-allowed-license = "warn"
+
+# 只有我们自己的 workspace crate 允许 AGPL（它们由我们授权）。
+# 用 exceptions 而不是把 AGPL 全局加进 allow：第三方依赖里出现 AGPL 仍要报错。
+[[licenses.exceptions]]
+crate = "yunong-core"
+allow = ["AGPL-3.0-or-later"]
+
+[[licenses.exceptions]]
+crate = "yunong-server"
+allow = ["AGPL-3.0-or-later"]
+
+[[licenses.exceptions]]
+crate = "yunong-shared"
+allow = ["AGPL-3.0-or-later"]
+
+[bans]
+# 服务端统一 rustls（见 crates/server/Cargo.toml 的 reqwest features）：
+# 直接依赖 openssl-sys / native-tls 会引入系统 OpenSSL 依赖与额外 CVE 面。
+deny = [
+    { name = "openssl-sys", use-instead = "rustls" },
+    { name = "native-tls", use-instead = "rustls" },
+]
+# 重复版本 / 通配版本阶段 1 只告警（默认就是 warn，写出来是为了显式表达意图）
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+
+[sources]
+# 依赖只能来自 crates.io 官方索引：git 依赖与未知 registry 一律拒绝。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
