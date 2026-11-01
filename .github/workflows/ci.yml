@@ -1,5 +1,6 @@
-# 主 CI：PR 与 push main 触发；四类检查独立，便于快速定位失败原因
-# 名称保持小写：分支保护的状态检查名是「ci / rust」「ci / flutter」「ci / docs」「ci / migrations」「ci / pg」
+# 主 CI：PR 与 push main 触发；各 job 独立，便于快速定位失败原因
+# 分支保护的必需检查名 = 下面各 job 的 name:（「ci / rust」「ci / flutter」「ci / docs」
+# 「ci / migrations」「ci / pg」）。改 name: 前必须用 gh api 同步分支保护，否则保护会静默失效。
 name: ci
 
 on:
@@ -118,6 +119,143 @@ jobs:
             psql -v ON_ERROR_STOP=1 -q -f "$f"
           done < <(printf '%s\n' "${files[@]}" | sort)
 
+      # 上面那步只证明"全新库能把迁移落下去"。线上不会每次重建库：0003 改过唯一键、
+      # 0004 改过 CHECK 约束，升级路径（老库 → 逐个新迁移）必须单独验，否则
+      # "全新建库能过、老库升级炸掉"这类事故只有上线时才发现。
+      # 用独立数据库，不污染上面刚建好的新库。
+      - name: 升级路径（老库 0001+0002 → 0003 → 0004 → 全量重入）
+        run: |
+          set -euo pipefail
+          db=yunong_upgrade
+          psql -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE $db"
+          mig() { psql -v ON_ERROR_STOP=1 -q -d "$db" -f "$1"; }
+
+          echo "== 老库：只跑 0001 + 0002"
+          mig crates/server/migrations/0001_init.sql
+          mig crates/server/migrations/0002_auth.sql
+
+          echo "== 历史脏数据（老实现没有唯一键，同一轮重复行真实存在）"
+          psql -v ON_ERROR_STOP=1 -q -d "$db" <<'SQL'
+          INSERT INTO users (email) VALUES ('upgrade@example.com');
+          INSERT INTO usage_samples (user_id, req_id, model, protocol, channel, round, tokens_in, tokens_out)
+          SELECT id, 'req_upgrade', 'm', 'openai_completions', 'plan', 1, 10, 20
+            FROM users WHERE email = 'upgrade@example.com';
+          INSERT INTO usage_samples (user_id, req_id, model, protocol, channel, round, tokens_in, tokens_out)
+          SELECT id, 'req_upgrade', 'm', 'openai_completions', 'plan', 1, 99, 99
+            FROM users WHERE email = 'upgrade@example.com';
+          INSERT INTO audit_logs (action, decision, reason)
+          VALUES ('chat.stream', 'allow', NULL), ('chat.stream', 'deny', 'user_in_flight');
+          SQL
+
+          echo "== 升级：只跑 0003、0004（模拟线上老库升版本）"
+          mig crates/server/migrations/0003_usage_turn_estimated.sql
+          mig crates/server/migrations/0004_audit_decisions.sql
+
+          echo "== 断言升级结果（任一不满足即红）"
+          psql -v ON_ERROR_STOP=1 -q -d "$db" <<'SQL'
+          DO $$
+          DECLARE n int;
+          BEGIN
+            SELECT count(*) INTO n FROM usage_samples WHERE turn_id IS NULL;
+            IF n <> 0 THEN RAISE EXCEPTION '0003 回填失败：% 行 turn_id 为空', n; END IF;
+
+            SELECT count(*) INTO n FROM usage_samples WHERE req_id = 'req_upgrade' AND round = 1;
+            IF n <> 1 THEN RAISE EXCEPTION '0003 去重失败：残留 % 行', n; END IF;
+
+            -- 去重保留 id 最大的那行，所以终值应是后插入的 99/99
+            SELECT count(*) INTO n FROM usage_samples WHERE req_id = 'req_upgrade' AND tokens_in = 99;
+            IF n <> 1 THEN RAISE EXCEPTION '0003 去重保留的不是最新一行'; END IF;
+
+            SELECT count(*) INTO n FROM pg_indexes
+             WHERE tablename = 'usage_samples' AND indexname = 'ux_usage_user_turn_round';
+            IF n <> 1 THEN RAISE EXCEPTION '缺唯一索引 ux_usage_user_turn_round'; END IF;
+
+            -- 幂等键必须带 user_id（F11）：两个用户撞同一 turn_id 不能互相覆盖
+            SELECT count(*) INTO n FROM pg_indexes
+             WHERE tablename = 'usage_samples' AND indexdef LIKE '%UNIQUE%'
+               AND indexdef LIKE '%user_id%' AND indexdef LIKE '%turn_id%' AND indexdef LIKE '%round%';
+            IF n < 1 THEN RAISE EXCEPTION '唯一键没带全 (user_id, turn_id, round)'; END IF;
+
+            SELECT count(*) INTO n FROM information_schema.columns
+             WHERE table_name = 'usage_samples' AND column_name = 'estimated'
+               AND is_nullable = 'NO' AND column_default LIKE 'false%';
+            IF n <> 1 THEN RAISE EXCEPTION 'estimated 列缺失或默认值不对'; END IF;
+
+            -- 0004：decision=error 必须被接受
+            BEGIN
+              INSERT INTO audit_logs (action, decision) VALUES ('chat.stream', 'error');
+            EXCEPTION WHEN check_violation THEN
+              RAISE EXCEPTION '0004 未生效：decision=error 被 CHECK 拒绝';
+            END;
+
+            -- 0004：非法 decision 必须被拒
+            BEGIN
+              INSERT INTO audit_logs (action, decision) VALUES ('chat.stream', 'bogus');
+              RAISE EXCEPTION '0004 未生效：非法 decision 竟被接受';
+            EXCEPTION WHEN check_violation THEN NULL;
+            END;
+
+            SELECT count(*) INTO n FROM pg_indexes
+             WHERE tablename = 'audit_logs'
+               AND indexname IN ('ix_audit_action_time', 'ix_audit_not_allow_time');
+            IF n <> 2 THEN RAISE EXCEPTION '0004 索引缺失：% / 2', n; END IF;
+
+            RAISE NOTICE '升级路径断言全部通过';
+          END $$;
+          SQL
+
+          echo "== 可重入：全部迁移再跑一遍也必须成功"
+          for f in crates/server/migrations/*.sql; do mig "$f"; done
+          echo "升级路径 OK"
+
+      # 0003 的注释承诺"已经把旧索引建出来的库也能重放"（半成品库），另外"空表升级"
+      # 也是干净库天然会走到的形态。这两条单独验，避免只有"有脏数据的老库"被测到：
+      #   ① 半成品：turn_id 已加、旧索引 ux_usage_turn_round 已建 → 新 0003 必须 DROP 旧索引并建新索引
+      #   ② 空表：usage_samples 0 行 → 0003 的回填 UPDATE 空跑也必须安全
+      - name: 升级路径②（半成品旧索引 / 空表）
+        run: |
+          set -euo pipefail
+          P="psql -v ON_ERROR_STOP=1 -q"
+
+          echo "== ① 半成品库：旧版 0003 已经建过 ux_usage_turn_round"
+          $P -c "CREATE DATABASE yunong_half"
+          $P -d yunong_half -f crates/server/migrations/0001_init.sql
+          $P -d yunong_half -f crates/server/migrations/0002_auth.sql
+          $P -d yunong_half <<'SQL'
+          INSERT INTO users (email) VALUES ('half@example.com');
+          INSERT INTO usage_samples (user_id, req_id, model, protocol, channel, round, tokens_in, tokens_out)
+          SELECT id, 'req_a', 'm', 'openai_completions', 'plan', 1, 1, 1
+            FROM users WHERE email = 'half@example.com';
+          -- 旧版 0003 的形态：列已加、值已回填、旧唯一索引已建（无重复行时才建得出来）
+          ALTER TABLE usage_samples ADD COLUMN turn_id text;
+          UPDATE usage_samples SET turn_id = req_id;
+          CREATE UNIQUE INDEX ux_usage_turn_round ON usage_samples (turn_id, round);
+          SQL
+          $P -d yunong_half -f crates/server/migrations/0003_usage_turn_estimated.sql
+          $P -d yunong_half <<'SQL'
+          DO $$
+          BEGIN
+            IF (SELECT count(*) FROM pg_indexes
+                 WHERE tablename = 'usage_samples' AND indexname = 'ux_usage_turn_round') <> 0
+              THEN RAISE EXCEPTION '半成品库：旧索引 ux_usage_turn_round 没被 DROP';
+            END IF;
+            IF (SELECT count(*) FROM pg_indexes
+                 WHERE tablename = 'usage_samples' AND indexname = 'ux_usage_user_turn_round') <> 1
+              THEN RAISE EXCEPTION '半成品库：新索引 ux_usage_user_turn_round 没建出来';
+            END IF;
+            RAISE NOTICE '半成品库升级断言通过';
+          END $$;
+          SQL
+
+          echo "== ② 空表库：usage_samples 一行数据都没有"
+          $P -c "CREATE DATABASE yunong_empty"
+          $P -d yunong_empty -f crates/server/migrations/0001_init.sql
+          $P -d yunong_empty -f crates/server/migrations/0002_auth.sql
+          $P -d yunong_empty -f crates/server/migrations/0003_usage_turn_estimated.sql
+          $P -d yunong_empty -f crates/server/migrations/0004_audit_decisions.sql
+
+          echo "半成品 / 空表升级 OK"
+
   # 真实的 PostgreSQL 上跑 auth 的 SQL：migrations job 只证明"迁移能落"，
   # 这个 job 证明"注册/登录/刷新/登出/校验这几条 SQL 在真库里真的对"。
   pg:
@@ -200,3 +338,50 @@ jobs:
             echo "::error::只跑了 $passed 条用例（预期 ≥20）"
             exit 1
           fi
+
+  # 镜像构建 + 冒烟：本轮踩过"镜像里打包的是空壳二进制"——Dockerfile 的依赖缓存层带着
+  # 空壳源码的 mtime，`COPY crates` 后 cargo 认为没变化、跳过重编，镜像里就装了个
+  # 立刻退出的 `fn main(){}`（314KB、exit 0、无日志）。当时只能人工 `docker run` 才发现，
+  # 所以这里在每次 PR / push main 都真 build、真起容器、真探 /healthz：
+  # 空壳二进制会马上退出 → 健康检查拿不到响应 → job 红。
+  #
+  # 耗时：buildx 的 gha 缓存与 release.yml 共用（默认 scope=buildkit）。命中约 1~2 分钟，
+  # 冷启（缓存被淘汰/首次）约 8~12 分钟，故 timeout 给到 25 分钟。
+  # 本 job 目前**不在**分支保护的必需检查里：先只提供信号，等它稳定跑绿若干次后，
+  # 再由维护者用 gh api 把「ci / 服务端镜像（build + /healthz 冒烟）」加进 required checks。
+  docker:
+    name: 服务端镜像（build + /healthz 冒烟）
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # 便宜的护栏：compose 插值、迁移脚本语法错了直接红，不用等镜像构建
+      - name: 校验 compose 与迁移脚本可解析
+        env:
+          POSTGRES_PASSWORD: ci-dummy
+          DATABASE_URL: postgres://yunong:ci-dummy@db:5432/yunong
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/docker-compose.yml config --quiet
+          sh -n deploy/migrate.sh
+      # type=gha 缓存与 load: true 都需要 docker-container driver（setup-buildx 的默认）
+      - name: 启用 buildx
+        uses: docker/setup-buildx-action@v3
+      - name: docker build（deploy/Dockerfile.server）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.server
+          push: false
+          load: true
+          tags: yunong-server:ci
+          # 与 release.yml 同一个 gha 缓存：CI 暖的缓存，打标签发布时直接复用
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # 冒烟逻辑在 scripts/docker-smoke.sh：release.yml 打标签发布时调同一个脚本，
+      # 避免"CI 验的"和"发布验的"两处漂移；本机也能直接跑：
+      #   bash scripts/docker-smoke.sh yunong-server:ci
+      - name: 起容器并探 /healthz（scripts/docker-smoke.sh）
+        run: bash scripts/docker-smoke.sh yunong-server:ci yunong-ci 18080
