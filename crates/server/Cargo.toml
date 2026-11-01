@@ -7,10 +7,12 @@ license.workspace = true
 description = "云农之窗服务端：鉴权、代理转发、配额、知识检索、审计"
 
 [dependencies]
-yunong-shared = { path = "../shared" }
+# 内部 path 依赖也写死版本：cargo-deny 的 wildcard 检查不允许"只有 path 没有版本"
+# （版本必须与 workspace.package.version 一致，升 workspace 版本时这里要同步）
+yunong-shared = { path = "../shared", version = "0.1.0" }
 # 三协议适配（build_body / parse_events）：服务端**只做转发 + 记账**，
 # 协议解析一律复用 core，避免端与服务端各写一份（ADR-13 / ADR-16）。
-yunong-core = { path = "../core" }
+yunong-core = { path = "../core", version = "0.1.0" }
 axum = "0.8"
 tokio = { version = "1", features = [
     "rt-multi-thread",

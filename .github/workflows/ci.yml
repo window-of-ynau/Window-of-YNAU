@@ -385,3 +385,41 @@ jobs:
       #   bash scripts/docker-smoke.sh yunong-server:ci
       - name: 起容器并探 /healthz（scripts/docker-smoke.sh）
         run: bash scripts/docker-smoke.sh yunong-server:ci yunong-ci 18080
+
+  # 依赖安全与许可证（cargo-deny）：RustSec 漏洞 / 许可证 / 禁用依赖 / 依赖来源。
+  # 红队 L4 指出的缺口：之前 CI 完全不看依赖的已知漏洞，也没有许可证闸门。
+  # 选 cargo-deny 而不是 cargo-audit：一次跑完漏洞 + 许可证 + 禁用依赖 + 来源，
+  # 双许可项目更需要许可证闸门（理由与白名单见仓库根 deny.toml）。
+  #
+  # 阶段 2（当前）：基线已清零——升级 rustls 0.23.46 / tokio 1.54.1 /
+  # rustls-webpki 0.103.16 / webpki-roots 1.0.11 后 advisories 变 ok，所以去掉
+  # continue-on-error：命中即红。
+  # 仍**不把该 job 加进分支保护必需检查**：先观察 3~5 个 PR 的稳定性与耗时，
+  # 再一次性 gh api 加入（与 docker job 同一节奏，步骤见 deny.toml 顶部与 deploy/README）。
+  security:
+    name: 依赖安全与许可证（cargo-deny）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # 阶段 2：阻断。任何 error 级命中（漏洞 / 许可证 / 被禁依赖 / 来源）都会让 job 变红。
+      # 将来若出现"暂时无法升级"的条目，写法有两种（都要求可复审）：
+      #   a) deny.toml 的 [advisories].ignore 写 ID + 原因；
+      #   b) 临时给本 step 加 continue-on-error，同时在这里与 deploy/README 记一笔，别变成永久。
+      - name: cargo-deny（RustSec 漏洞 / 许可证 / 禁用依赖 / 来源）
+        id: deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+          manifest-path: ./Cargo.toml
+      # 命中时的定位提示：明细在上一 step 的输出里（crate / version / RUSTSEC-ID /
+      # Solution 是否给出修复版本），这里只补充"接下来怎么处理"。
+      - name: 命中时的处理指引
+        if: steps.deny.outcome == 'failure'
+        run: |
+          echo "::error::cargo-deny 命中 error 级问题（阶段 2：会阻断合入）"
+          echo "上一步输出每条形如：Crate / Version / ID（RUSTSEC-…）/ Solution（有修复版本时会写 Upgrade to …）"
+          echo "处理路径：a) 升级依赖（会动 Cargo.lock，单独提 PR 并评估）；b) 确认不可利用则写进 deny.toml 的 ignore 并注明原因；c) 许可证拿不准先报 captain。"
