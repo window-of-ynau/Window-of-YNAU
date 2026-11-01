@@ -187,8 +187,40 @@ gh run watch
 | `persist-credentials: false` 保持 | 不把 token 写进 `.git/config`；需要凭据的步骤（GHCR 登录）单独用 `GITHUB_TOKEN` |
 | `release.yml` 是唯一提权 workflow（`packages: write`） | 不要在 `ci.yml` 里加 `packages: write` / `contents: write` |
 | 镜像冒烟只有一份实现：`scripts/docker-smoke.sh` | CI 的 docker job 与 release 的发布前检查共用，改断言只改一处 |
-| `docker` / `security` job 暂不在必需检查里 | 先观察耗时与稳定性；稳定后再用 `gh api` 一次性加入 required checks（加之前它们只报警、不阻塞合入） |
+| `docker` / `security` / `e2e` job 暂不在必需检查里 | 先观察耗时与稳定性；稳定后再用 `gh api` 一次性加入 required checks（加之前它们只报警、不阻塞合入） |
 | PG 用例不并行加锁（不要 `--test-threads=1`） | 每条用例用独立 schema（`yunong_pg_<uuid>`）隔离，并行是安全的；单线程只会白白变慢 |
+
+## 端到端闭环（无凭据）
+
+CI 的 `e2e` job（`端到端对话闭环（mock 上游）`）验证的是"**用户能完成一次对话**"，而不是"各组件单测过了"：
+
+```
+mock 上游(假 SSE) ← 服务端容器 ← 脚本客户端（注册 → 登录 → /api/v1/chat/stream）
+```
+
+**不需要任何真实账号或 Key**：mock 上游不校验 Key；用户在测试里现注册现登录。
+
+- 编排脚本：`scripts/e2e-chat.py`（docker + python3 stdlib，无需 psql——迁移和断言都走 pgvector 镜像里的 psql）；
+- mock 上游：`scripts/mock-upstream/mock_upstream.py`，按请求体里的 `model` 选形态：
+  `mock-ok`（正常流）、`mock-500`、`mock-html`（非 SSE）、`mock-hang`（挂起）、`mock-stream-error`（流内错误帧）；
+- 覆盖的断言：正常流契约（`meta` 首 / `usage` / `done` 末且唯一）、上游 500 → 502 **不泄露原文**、
+  非 SSE → 502、流内错误帧 → `event: error`（终止事件）且洗掉厂商原文、首事件超时 → 504、
+  100% 抽样时 `usage_samples` 落 1 行且 token 数与 mock 一致、上游失败写 `audit_logs(decision='error')`。
+
+本地复现（需要 Docker，Windows/macOS/Linux 都行；容器通过 `host.docker.internal` 访问本机 mock）：
+
+```bash
+docker build -f deploy/Dockerfile.server -t yunong-server:ci .
+python3 scripts/e2e-chat.py --image yunong-server:ci
+# 失败时保留容器排查：python3 scripts/e2e-chat.py --image yunong-server:ci --keep
+```
+
+**当前节奏**：该 job 带 `continue-on-error: true`，先观察 3~5 个 PR，稳定后删掉这行转阻断，
+最后再与其他非必需 job 一起用 `gh api` 加进分支保护。
+
+> 仓库里还有 `crates/core/examples/fake_sse.rs`（端侧人工联调用的假上游）。它只提供
+> ok/429/html 三种形态，没有"流内错误帧"和"挂起"，覆盖不了 `event: error` 与超时路径，
+> 所以 CI 闭环用 `scripts/mock-upstream/` 这份；两者互不替代，也别把断言逻辑写两遍。
 
 ## 依赖安全与许可证（cargo-deny）
 

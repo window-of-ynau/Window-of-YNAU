@@ -423,3 +423,38 @@ jobs:
           echo "::error::cargo-deny 命中 error 级问题（阶段 2：会阻断合入）"
           echo "上一步输出每条形如：Crate / Version / ID（RUSTSEC-…）/ Solution（有修复版本时会写 Upgrade to …）"
           echo "处理路径：a) 升级依赖（会动 Cargo.lock，单独提 PR 并评估）；b) 确认不可利用则写进 deny.toml 的 ignore 并注明原因；c) 许可证拿不准先报 captain。"
+
+  # 无凭据端到端闭环：mock 上游 ← 服务端容器 ← 脚本客户端（注册 → 登录 → /chat/stream）。
+  # 之前 CI 只验证到"各组件单测 + 探针"，没有验证"用户能完成一次对话"。这里不需要
+  # 任何真实账号/Key：mock 上游（scripts/mock-upstream/mock_upstream.py）接受任意 Key。
+  # 覆盖：正常流契约（meta 首 / usage / done 末且唯一）、上游 500 → 502 不泄露原文、
+  # 非 SSE → 502、流内错误帧 → event: error 且洗掉厂商原文、首事件超时 → 504、
+  # 100% 抽样落库（psql 断言 usage_samples）、上游失败写审计（audit_logs decision=error）。
+  #
+  # 阶段 1（当前）：整 job continue-on-error —— 只观察，不阻断合入。
+  # 稳定 3~5 个 PR 后删掉 continue-on-error 转阻断，与 docker / security job 同一节奏
+  # （见 deploy/README 的"端到端闭环"与"CI 工作流的关键约束"）。
+  e2e:
+    name: 端到端对话闭环（mock 上游）
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: 启用 buildx
+        uses: docker/setup-buildx-action@v3
+      # 与 docker / release 共用同一个 gha 缓存：命中时约 20~30 秒
+      - name: docker build（deploy/Dockerfile.server）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.server
+          push: false
+          load: true
+          tags: yunong-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: 端到端闭环（mock 上游 + PG + 服务端容器 + 脚本客户端）
+        run: python3 scripts/e2e-chat.py --image yunong-server:ci
