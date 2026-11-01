@@ -243,62 +243,8 @@ jobs:
           # 与 release.yml 同一个 gha 缓存：CI 暖的缓存，打标签发布时直接复用
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: 起容器并探 /healthz
-        run: |
-          set -uo pipefail
-          # 1) 二进制不是空壳：真实产物 10MB 量级，空壳只有几百 KB
-          size=$(docker run --rm --entrypoint /bin/sh yunong-server:ci -c 'stat -c%s /usr/local/bin/yunong-server') || size=""
-          case "$size" in
-            '' | *[!0-9]*)
-              echo "::error::取不到镜像里的二进制大小（stat 失败，size='$size'）"
-              exit 1
-              ;;
-          esac
-          echo "二进制大小：${size} bytes"
-          if [ "$size" -lt 2000000 ]; then
-            echo "::error::镜像里的 yunong-server 只有 ${size} bytes，疑似空壳二进制"
-            exit 1
-          fi
-          # 2) 起容器：compose 里同样设 0.0.0.0:8080——默认 127.0.0.1 在容器外探不到
-          docker run -d --name yunong-ci \
-            -e YUNONG_BIND=0.0.0.0:8080 \
-            -p 127.0.0.1:18080:8080 \
-            yunong-server:ci
-          # 3) 等 /healthz：最多 30s。容器先死就直接判失败（空壳二进制就是这个表现）
-          body=""
-          for i in $(seq 1 30); do
-            if body=$(curl -fsS --max-time 2 http://127.0.0.1:18080/healthz 2>/dev/null); then
-              echo "第 ${i}s 探到 /healthz：$body"
-              break
-            fi
-            if [ "$(docker inspect -f '{{.State.Running}}' yunong-ci 2>/dev/null || echo false)" != "true" ]; then
-              echo "::error::容器启动即退出（二进制跑不起来，容器日志见下一步）"
-              docker logs yunong-ci 2>&1 || true
-              exit 1
-            fi
-            sleep 1
-          done
-          if [ -z "$body" ]; then
-            echo "::error::30s 内 /healthz 未就绪"
-            docker logs yunong-ci 2>&1 || true
-            exit 1
-          fi
-          # 4) 探针契约：ok=true / status=alive / version 非空
-          printf '%s' "$body" | jq -e '.ok == true and .data.status == "alive" and (.data.version | length > 0)' > /dev/null \
-            || { echo "::error::/healthz 返回不符合约定"; exit 1; }
-          echo "version=$(printf '%s' "$body" | jq -r '.data.version')"
-          # 5) 无库模式：/readyz 必须 200 且 db=not_configured（没有 DATABASE_URL 时的约定）
-          ready=$(curl -fsS --max-time 2 http://127.0.0.1:18080/readyz)
-          echo "/readyz：$ready"
-          printf '%s' "$ready" | jq -e '.ok == true and .data.db == "not_configured"' > /dev/null \
-            || { echo "::error::/readyz 在无库模式下不符合预期"; exit 1; }
-          # 6) 非 root 运行（Dockerfile 约定 uid/gid=10001）
-          uid=$(docker run --rm --entrypoint /bin/sh yunong-server:ci -c 'id -u')
-          echo "容器 uid=$uid"
-          [ "$uid" = "10001" ] || { echo "::error::容器以 uid=$uid 运行，预期 10001"; exit 1; }
-      - name: 失败时打印容器日志
-        if: failure()
-        run: docker logs yunong-ci 2>&1 || true
-      - name: 清理容器
-        if: always()
-        run: docker rm -f yunong-ci 2>&1 || true
+      # 冒烟逻辑在 scripts/docker-smoke.sh：release.yml 打标签发布时调同一个脚本，
+      # 避免"CI 验的"和"发布验的"两处漂移；本机也能直接跑：
+      #   bash scripts/docker-smoke.sh yunong-server:ci
+      - name: 起容器并探 /healthz（scripts/docker-smoke.sh）
+        run: bash scripts/docker-smoke.sh yunong-server:ci yunong-ci 18080
