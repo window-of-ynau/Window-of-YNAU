@@ -222,7 +222,7 @@ impl<F: FnMut(String) -> bool> SendableClosure<F> {
 /// 流内错误一律以 `Chunk::Error` 交给回调。
 pub fn run_stream(
     config: ChatRunConfig,
-    mut on_chunk: impl FnMut(String) -> bool,
+    on_chunk: impl FnMut(String) -> bool,
 ) -> Result<(), (ErrorCode, String)> {
     let request = config.to_request();
     let runtime = tokio::runtime::Builder::new_current_thread()
