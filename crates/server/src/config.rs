@@ -113,17 +113,7 @@ impl Config {
                     )
                 })
                 .unwrap_or(false),
-            sample_salt: env::var("YUNONG_SAMPLE_SALT")
-                .ok()
-                .filter(|value| value.len() >= 16)
-                .unwrap_or_else(|| {
-                    let generated = uuid::Uuid::new_v4().simple().to_string();
-                    tracing::warn!(
-                        "YUNONG_SAMPLE_SALT 未设置（或短于 16 字符）：本次启动用随机盐；\
-                         重启后抽样判定会变（历史行不受影响，也不回填）。生产请固定一个随机串。"
-                    );
-                    generated
-                }),
+            sample_salt: sample_salt_from_env(),
             stream_total_timeout_secs: env_parse("STREAM_TOTAL_TIMEOUT_SECS", 600),
             max_output_tokens_cap: env_parse("MAX_OUTPUT_TOKENS_CAP", 8_192),
             upstream: UpstreamConfig::from_env(),
@@ -154,8 +144,10 @@ impl Config {
             body_limit_bytes: 1024 * 1024,
             auth_body_limit_bytes: 8 * 1024,
             trust_proxy: false,
-            // 测试用固定盐：抽样判定在用例之间必须可复现
-            sample_salt: "test-sample-salt-0123456789".into(),
+            // 测试用固定盐：抽样判定在用例之间必须可复现。
+            // 这里刻意用"64 字符小写十六进制"——它必须能通过 `validate_sample_salt`，
+            // 否则将来有人把校验接到 for_tests 上会整片测试挂掉。
+            sample_salt: "9f2c7b1e4d6a8035c1e9f7b2d4a6c8e05b3d1f7a9c2e4b6d8f0a1c3e5b7d9f2c".into(),
             // 测试默认不限总时长（长流用例要稳定）；M5 的用例会显式设小
             stream_total_timeout_secs: 0,
             max_output_tokens_cap: 8_192,
@@ -171,6 +163,81 @@ impl Config {
             idle: Duration::from_secs(self.upstream_idle_timeout_secs),
         }
     }
+}
+
+/// 抽样盐的最小长度（R3-F2：16 太松，提到 32 字节）。
+pub const MIN_SAMPLE_SALT_BYTES: usize = 32;
+
+/// `.env.example` 里出现过的示例值前缀：一旦被原样使用，等于**没加盐**（R3-F1）。
+const SAMPLE_SALT_PLACEHOLDER: &str = "CHANGE_ME";
+
+/// 读抽样盐（R3-F1 / R3-F2）。
+///
+/// - **留空**：启动时随机生成并 `warn`（重启后抽样判定会变；历史行不受影响、不回填）；
+/// - **配置了但不合规**（示例值 / 太短 / 低熵）：**启动失败**。
+///   理由：盐是成本监控的信任根，配错是**静默**失效——`warn` 会被忽略，
+///   security 已实测用它可以把"不被抽中"做成 100% 规避。宁可起不来。
+fn sample_salt_from_env() -> String {
+    let raw = env::var("YUNONG_SAMPLE_SALT").unwrap_or_default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        let generated = uuid::Uuid::new_v4().simple().to_string();
+        tracing::warn!(
+            "YUNONG_SAMPLE_SALT 未设置：本次启动用随机盐；重启后抽样判定会变\
+             （历史行不受影响，也不回填）。生产请固定 ≥{MIN_SAMPLE_SALT_BYTES} 字节的随机值\
+             （例如 `openssl rand -hex 32`）。"
+        );
+        return generated;
+    }
+    match validate_sample_salt(trimmed) {
+        Ok(()) => trimmed.to_owned(),
+        Err(reason) => panic!(
+            "YUNONG_SAMPLE_SALT 不合规（{reason}）：抽样判定必须不可预测，否则成本监控可被规避。\
+             请填 ≥{MIN_SAMPLE_SALT_BYTES} 字节的随机值（`openssl rand -hex 32`），或留空使用随机盐。"
+        ),
+    }
+}
+
+/// 盐的强度校验（R3-F2）。`Ok(())` 表示可用，`Err(原因)` 用于启动失败与测试。
+///
+/// 只做"明显低熵"的启发式，不过度设计：
+/// 示例值 / 太短 / 纯数字 / 字符种类过少 / 明显的递增序列 / 短的小写十六进制串。
+pub fn validate_sample_salt(salt: &str) -> Result<(), String> {
+    if salt.trim().is_empty() {
+        return Err("盐是全空白".to_owned());
+    }
+    if salt.contains(SAMPLE_SALT_PLACEHOLDER) {
+        return Err("这是 .env.example 里的示例值，等于没加盐".to_owned());
+    }
+    if salt.len() < MIN_SAMPLE_SALT_BYTES {
+        return Err(format!(
+            "长度 {} 字节，少于 {MIN_SAMPLE_SALT_BYTES}",
+            salt.len()
+        ));
+    }
+    if salt.chars().all(|c| c.is_ascii_digit()) {
+        return Err("纯数字（可预测）".to_owned());
+    }
+    let mut distinct: Vec<char> = salt.chars().collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() <= 4 {
+        return Err(format!("字符种类只有 {} 种（可预测）", distinct.len()));
+    }
+    // 明显的递增序列：0123456789 / abcdefghijklmnopqrstuvwxyz 之类出现在盐里
+    const OBVIOUS_RUNS: [&str; 4] = ["0123456789", "abcdefghij", "ABCDEFGHIJ", "qwertyuiop"];
+    if OBVIOUS_RUNS.iter().any(|run| salt.contains(run)) {
+        return Err("包含明显的递增/键盘序列".to_owned());
+    }
+    // 短的小写十六进制串（例如 32 位的 0123456789abcdef...）：熵不够。
+    // 注意 `openssl rand -hex 32` 是 **64** 字符，能通过。
+    let is_lower_hex = salt
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+    if is_lower_hex && salt.len() < 64 {
+        return Err("小写十六进制串不足 64 字符（建议 `openssl rand -hex 32`）".to_owned());
+    }
+    Ok(())
 }
 
 /// 把 `AUTH_HASH_CONCURRENCY` 夹到允许区间（security 报告加固建议 1）。
@@ -222,6 +289,82 @@ mod tests {
             timeouts.first_event > timeouts.idle,
             "首事件预算必须比空闲预算宽"
         );
+    }
+
+    /// R3-F1：`.env.example` 里的示例值一旦被原样使用，等于**没加盐**
+    /// （security 实测：可 100% 规避抽样）。这种配置错误必须**启动失败**，不能只 warn。
+    #[test]
+    fn sample_salt_rejects_example_placeholder() {
+        assert!(validate_sample_salt("CHANGE_ME_random_hex_32").is_err());
+        assert!(validate_sample_salt("CHANGE_ME").is_err());
+        assert!(
+            validate_sample_salt("prefix-CHANGE_ME-suffix-0123456789abcdef").is_err(),
+            "嵌在中间的示例值也要挡住"
+        );
+    }
+
+    /// R3-F2：强度校验——太短、全空白、纯数字、字符种类太少、明显序列都要拒。
+    #[test]
+    fn sample_salt_rejects_weak_values() {
+        for weak in [
+            "",
+            "    ",
+            "short",
+            "0123456789abcdef",
+            "0123456789abcdef0123456789abcdef",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1234567890123456789012345678901234567890",
+            "qwertyuiopasdfghjklzxcvbnm123456",
+        ] {
+            assert!(
+                validate_sample_salt(weak).is_err(),
+                "弱盐应被拒绝：{weak:?}"
+            );
+        }
+    }
+
+    /// 合法的随机盐必须能通过（含 `openssl rand -hex 32` 的形态）。
+    #[test]
+    fn sample_salt_accepts_strong_values() {
+        for strong in [
+            "9f2c7b1e4d6a8035c1e9f7b2d4a6c8e05b3d1f7a9c2e4b6d8f0a1c3e5b7d9f2c",
+            "kR7#pQ2$vN9@wT4&zX6!bM1^cL8*hJ3%fD5(sG0)aE2-uY4+tI6=oP8]rW1[",
+        ] {
+            assert!(
+                validate_sample_salt(strong).is_ok(),
+                "强盐应通过：{strong:?}"
+            );
+        }
+    }
+
+    /// 测试默认配置里的盐必须能过校验（否则将来把校验接到 `for_tests` 会整片挂）。
+    #[test]
+    fn test_config_salt_is_valid() {
+        let config = Config::for_tests();
+        assert!(validate_sample_salt(&config.sample_salt).is_ok());
+        assert!(config.sample_salt.len() >= MIN_SAMPLE_SALT_BYTES);
+    }
+
+    /// 加固建议 1（t28）：并发闸配成 64 等于重开内存放大（64×19MiB ≈ 1.2 GiB）。
+    #[test]
+    fn auth_hash_concurrency_is_clamped() {
+        assert_eq!(clamp_auth_hash_concurrency(8), 8);
+        assert_eq!(clamp_auth_hash_concurrency(0), 1, "0 会让登录永久不可用");
+        assert_eq!(
+            clamp_auth_hash_concurrency(64),
+            MAX_AUTH_HASH_CONCURRENCY,
+            "超上限必须夹紧，否则一个配置错误就重开 H1"
+        );
+        assert_eq!(MAX_AUTH_HASH_CONCURRENCY, 32);
+    }
+
+    /// R2-F5：鉴权端点的 body 上限必须**远小于**业务接口（8 KiB vs 1 MiB）。
+    #[test]
+    fn auth_body_limit_is_smaller_than_api_limit() {
+        let config = Config::for_tests();
+        assert!(config.auth_body_limit_bytes < config.body_limit_bytes);
+        assert_eq!(config.auth_body_limit_bytes, 8 * 1024);
+        assert!(!config.trust_proxy, "默认不信任 XFF");
     }
 
     #[test]
