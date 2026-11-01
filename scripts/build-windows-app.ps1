@@ -7,18 +7,18 @@
 #
 # 用法：
 #   pwsh scripts/build-windows-app.ps1              # release
-#   pwsh scripts/build-windows-app.ps1 -Debug       # debug（快一些）
+#   pwsh scripts/build-windows-app.ps1 -DebugBuild  # debug（快一些）
 #   pwsh scripts/build-windows-app.ps1 -SkipFlutter # 只重编 DLL 并复制到已有产物目录
 
 [CmdletBinding()]
 param(
-    [switch]$Debug,
+    [switch]$DebugBuild,
     [switch]$SkipFlutter
 )
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
-$profile = if ($Debug) { "debug" } else { "release" }
+$profile = if ($DebugBuild) { "debug" } else { "release" }
 
 function Step([string]$text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
 
@@ -40,7 +40,7 @@ if (-not (Get-Command nuget -ErrorAction SilentlyContinue)) {
 Step "构建 Rust 端侧核心（$profile）"
 Push-Location $repo
 try {
-    cargo build -p yunong-core --$(if ($Debug) { 'debug' } else { 'release' })
+    cargo build -p yunong-core --$(if ($DebugBuild) { 'debug' } else { 'release' })
     if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
 } finally { Pop-Location }
 
@@ -51,7 +51,7 @@ $corePath = Join-Path $repo "target/$profile/$coreName"
 if (-not (Test-Path $corePath)) { throw "没找到端侧核心：$corePath" }
 
 # 3) Flutter 产物
-$releaseDir = Join-Path $repo "app/build/windows/x64/runner/$(if ($Debug) { 'Debug' } else { 'Release' })"
+$releaseDir = Join-Path $repo "app/build/windows/x64/runner/$(if ($DebugBuild) { 'Debug' } else { 'Release' })"
 if (-not $SkipFlutter) {
     Step "构建 Flutter Windows（$profile）"
     Push-Location (Join-Path $repo "app")
