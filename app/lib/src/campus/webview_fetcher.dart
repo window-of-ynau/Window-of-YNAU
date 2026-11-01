@@ -157,7 +157,8 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
   WebViewEnvironment? _environment;
 
   /// 门户接口模式下：20s 内没捕获到课表请求就明确报错（绝不静默挂起）。
-  Timer? _captureTimer;
+  Timer? _progressTimer;
+  DateTime _lastProgressAt = DateTime.now();
   bool _templateCaptured = false;
 
   /// 阶段：`login`（等用户登录，**不抓取**）/ `capture`（登录完成，开始抓）
@@ -201,7 +202,7 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
 
   @override
   void dispose() {
-    _stopCaptureTimer();
+    _stopProgressWatchdog();
     _stopGrabLoop();
     super.dispose();
   }
@@ -235,29 +236,31 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     if (_stage != stage) {
       setState(() => _stage = stage);
     }
+    _markProgress();
     if (isCapture) {
-      _startCaptureTimer();
+      _startProgressWatchdog();
       unawaited(_controller?.evaluateJavascript(
         source: 'window.__yunongAutoStart && window.__yunongAutoStart();',
       ));
     } else {
-      // 还在登录页：不扫描、不探测、不计抓取超时
-      _stopCaptureTimer();
+      // 还在登录页：不扫描、不探测、不计时（watchdog 自身也会跳过 login 阶段）
     }
   }
 
-  /// 门户接口模式：等模板也有时限（脚本自己也有一段 20s 兜底，这里防注入失败/页面白屏）。
-  void _startCaptureTimer() {
-    if (widget.mode != CampusFetchMode.portalApi ||
-        _templateCaptured ||
-        _stage != 'capture') {
+  /// **无进展兜底**（不是绝对超时）：登录页阶段永远不报；
+  /// 其它阶段只有 15s 没有任何进展（候选/探测/卡片/周数据）才报 CAPTURE_TIMEOUT。
+  void _startProgressWatchdog() {
+    if (widget.mode != CampusFetchMode.portalApi) {
       return;
     }
-    _captureTimer?.cancel();
-    _captureTimer = Timer(const Duration(seconds: 20), () async {
-      if (_templateCaptured || !mounted) {
+    _progressTimer ??= Timer.periodic(const Duration(seconds: 1), (_) async {
+      if (_templateCaptured || _stage == 'login') {
         return;
       }
+      if (DateTime.now().difference(_lastProgressAt) < const Duration(seconds: 15)) {
+        return;
+      }
+      _stopProgressWatchdog();
       final Object? diagnostics = await _controller?.evaluateJavascript(
         source: 'window.__yunongDiagnostics ? window.__yunongDiagnostics() : ""',
       );
@@ -269,14 +272,20 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     });
   }
 
-  void _stopCaptureTimer() {
-    _captureTimer?.cancel();
-    _captureTimer = null;
+  void _stopProgressWatchdog() {
+    _progressTimer?.cancel();
+    _progressTimer = null;
   }
+
+  void _markProgress() {
+    _lastProgressAt = DateTime.now();
+  }
+
   /// 捕获到门户课表接口模板 → 自动批量拉周（用户不需要再点按钮）。
   void _onScheduleTemplate(ScheduleTemplate template) {
     _templateCaptured = true;
-    _stopCaptureTimer();
+    _markProgress();
+    _stopProgressWatchdog();
     if (!mounted) {
       return;
     }
@@ -442,10 +451,11 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       final onLoginPage = isSsoLoginPage(host, path);
                       if (onLoginPage) {
                         _stage = 'login';
-                        _stopCaptureTimer();
                       } else {
-                        _stage = 'capture';
-                        _startCaptureTimer();
+                        // 已离开登录页：进入"等待卡片"，计时改为无进展兜底（不是绝对 20s）
+                        _stage = 'waiting_card';
+                        _markProgress();
+                        _startProgressWatchdog();
                       }
                       final term = widget.term;
                       if (term != null && term.isNotEmpty) {
