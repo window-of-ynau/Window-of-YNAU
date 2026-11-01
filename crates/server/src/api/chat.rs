@@ -203,15 +203,45 @@ fn gate_reason(rejection: GateRejection) -> &'static str {
 /// 估算输出 token 时最多累计多少字符（只要够算比例，不必留全文）。
 const MAX_ESTIMATE_CHARS: usize = 64 * 1024;
 
-/// 上游故障对外的**固定文案**（评审 F3）。
+/// 上游故障对外的**固定文案**（评审 F3 / F9）。
 ///
-/// 内网上游地址、缺哪个环境变量、上游响应片段这些细节只进 `tracing`，**绝不进响应体**——
-/// 客户端只需要"能不能重试"，运维靠日志。
+/// 内网上游地址、缺哪个环境变量、上游响应片段、厂商错误原文这些细节只进 `tracing`，
+/// **绝不进响应体**——客户端只需要"能不能重试"，运维靠日志。
 fn public_upstream_message(code: ErrorCode) -> &'static str {
     match code {
         ErrorCode::UpstreamTimeout => "上游响应超时，请稍后重试",
         _ => "上游暂时不可用，请稍后重试",
     }
+}
+
+/// 把**来自上游帧**的 `Chunk::Error` 文案换成固定文案（评审 F9）。
+///
+/// 上游会在流里直接发错误对象（`{"error":{"message":"<厂商原文>"}}`），适配器把它原样
+/// 塞进 `Chunk::Error.message`；如果照发，厂商的 org id、配额提示、内网地址就漏到客户端了。
+///
+/// 在**转发层统一清洗**（而不是试图在类型上区分来源）：
+/// - `code` 保留（客户端要靠它决定重试策略）；
+/// - 原文 `warn!`（运维在日志里看得见）；
+/// - 我们自己在别处产生的 `Error`（装配器/闸门/校验）不经过这里，文案不受影响。
+fn sanitize_upstream_errors(chunks: Vec<Chunk>, request_id: &str) -> Vec<Chunk> {
+    chunks
+        .into_iter()
+        .map(|chunk| match chunk {
+            Chunk::Error { code, message } => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    code = code.as_str(),
+                    upstream_message = %message,
+                    "上游在流中报了错：原文只进日志，对外换成固定文案"
+                );
+                Chunk::Error {
+                    code,
+                    message: public_upstream_message(code).to_owned(),
+                }
+            }
+            other => other,
+        })
+        .collect()
 }
 
 /// 上游没给 `usage` 时的兜底估算，**与端侧同口径**
@@ -274,7 +304,8 @@ fn sse_stream(
                         }
                     }
                     ReadOutcome::Next(Some(Ok(chunks))) => {
-                        let produced = assembler.feed(chunks);
+                        let produced =
+                            assembler.feed(sanitize_upstream_errors(chunks, &request_id));
                         for chunk in &produced {
                             match chunk {
                                 Chunk::Usage { .. } => saw_usage = true,
