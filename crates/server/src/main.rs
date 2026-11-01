@@ -53,6 +53,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // 启动自检（评审 F12）：漏跑迁移的话，抽样记账会静默失败、成本统计永远是 0，
+    // 没人会发现。这里宁可**启动即失败**，把该执行哪个迁移文件说清楚。
+    if let Some(pool) = &db {
+        if let Err(message) = yunong_server::accounting::verify_schema(pool).await {
+            tracing::error!("数据库结构检查失败：{message}");
+            anyhow::bail!("{message}");
+        }
+        tracing::info!("数据库结构检查通过（usage_samples 已含 turn_id / estimated）");
+    }
+
     let state = AppState::new(config.clone(), db);
     // 内存后端意味着重启即丢失账号与令牌：启动时必须让人看见。
     tracing::info!(auth_backend = state.auth.backend_kind(), "鉴权后端已就绪");

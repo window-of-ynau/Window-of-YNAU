@@ -130,8 +130,12 @@ impl UsageRecorder {
 
     /// 写一条抽样样本。返回 `Ok(false)` 表示"没有数据库，跳过"。
     ///
-    /// 写入是 **upsert**：`(turn_id, round)` 唯一，同一轮重放只会覆盖那一行
+    /// 写入是 **upsert**：`(user_id, turn_id, round)` 唯一，同一用户同一轮重放只覆盖那一行
     /// （否则客户端重试一次就多算一次成本）。
+    ///
+    /// 唯一键**必须带 `user_id`**（评审 F11）：`turn_id` 是端侧生成的，两个用户撞同一个
+    /// `turn_id` 并不罕见；只按 `(turn_id, round)` 唯一会让后一个用户改掉前一个用户的行
+    /// （`user_id` 还留在前一个人身上，跨用户串账）。
     pub async fn write_sample(&self, sample: &UsageSample) -> Result<bool, sqlx::Error> {
         let Some(pool) = &self.db else {
             return Ok(false);
@@ -141,7 +145,7 @@ impl UsageRecorder {
             "INSERT INTO usage_samples \
              (turn_id, user_id, req_id, model, protocol, channel, round, tokens_in, tokens_out, estimated) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-             ON CONFLICT (turn_id, round) DO UPDATE SET \
+             ON CONFLICT (user_id, turn_id, round) DO UPDATE SET \
                req_id = EXCLUDED.req_id, \
                model = EXCLUDED.model, \
                protocol = EXCLUDED.protocol, \
@@ -223,6 +227,47 @@ pub fn protocol_str(protocol: Protocol) -> &'static str {
         Protocol::OpenaiResponses => "openai_responses",
         Protocol::AnthropicMessages => "anthropic_messages",
     }
+}
+
+/// 启动自检：库里有没有 `0003` 迁移加的那两列（评审 F12）。
+///
+/// 没有守卫时，漏跑迁移的表现是"抽样 INSERT 失败 → 只有 `warn` → 账目静默为零"，
+/// 谁都不会发现。这里选择**启动即失败**：宁可起不来，也不要悄悄不记账。
+///
+/// 无数据库模式不调用它（本来就不记账）。
+pub async fn verify_schema(pool: &PgPool) -> Result<(), String> {
+    const REQUIRED: [&str; 2] = ["turn_id", "estimated"];
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = ANY (current_schemas(false)) \
+           AND table_name = 'usage_samples'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("检查 usage_samples 表结构失败：{error}"))?;
+
+    if columns.is_empty() {
+        return Err(
+            "数据库里没有 usage_samples 表：请先执行 crates/server/migrations/ 下的全部迁移\
+             （psql \"$DATABASE_URL\" -f 每个 .sql，或 `sqlx migrate run`）"
+                .into(),
+        );
+    }
+
+    let missing: Vec<&str> = REQUIRED
+        .iter()
+        .copied()
+        .filter(|column| !columns.iter().any(|name| name == column))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "usage_samples 缺少列 {missing:?}：迁移没跑全（多半是漏了 0003_usage_turn_estimated.sql）。\n\
+         请先执行：psql \"$DATABASE_URL\" -f crates/server/migrations/0003_usage_turn_estimated.sql\n\
+         不修就启动的话，抽样记账会一直静默失败、成本统计永远是 0。"
+    ))
 }
 
 #[cfg(test)]

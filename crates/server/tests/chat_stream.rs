@@ -62,6 +62,8 @@ enum Script {
     ServerError,
     /// 200 但不是 SSE：模拟网关默认页/登录跳转页（验证 F4 的 content-type 校验）
     HtmlLoginPage,
+    /// 正常开流，但**流中**发一个厂商错误对象（验证 F9：厂商原文不能漏给客户端）
+    StreamError,
     /// 迟迟不给响应头（触发 504）
     SlowHeaders,
     /// 一直产出，等客户端断开（验证取消；真实厂商也是如此）
@@ -210,6 +212,11 @@ async fn mock_handler(
             completions_frames_without_usage(),
             Duration::from_millis(10),
         ),
+        Script::StreamError => sse_response(
+            Arc::clone(&ctx.counters),
+            stream_error_frames(),
+            Duration::from_millis(10),
+        ),
         Script::MessagesOk => sse_response(
             Arc::clone(&ctx.counters),
             messages_frames(),
@@ -304,6 +311,21 @@ fn completions_frames_without_usage() -> Vec<String> {
         sse(
             r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
         ),
+        sse("[DONE]"),
+    ]
+}
+
+/// 正常开流，但流中直接发一个厂商错误对象（评审 F9 的路径）：
+/// 适配器会把它变成 `Chunk::Error{ message = 厂商原文 }`，服务端转发前必须洗掉。
+fn stream_error_frames() -> Vec<String> {
+    vec![
+        sse(
+            r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"先吐一点"}}]}"#,
+        ),
+        sse(
+            r#"{"error":{"message":"vendor-secret-marker daily-quota-exceeded org-abc123 http://10.9.9.9/internal","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+        ),
+        // 错误之后上游还会发结束标记：装配器不能再补 Done（Error 是终止事件）
         sse("[DONE]"),
     ]
 }
@@ -841,6 +863,53 @@ async fn upstream_error_does_not_leak_internal_details() {
     assert!(body.contains("上游暂时不可用"), "{body}");
 }
 
+/// 评审 F9：**流中**的厂商错误原文也不能漏给客户端（这是 F3 没覆盖到的路径）。
+///
+/// 上游在 SSE 里直接发 `{"error":{...}}`，厂商原文（org id / 配额提示 / 内网地址）
+/// 会随 `Chunk::Error.message` 一路走到客户端；服务端转发前必须换成固定文案。
+#[tokio::test]
+async fn upstream_stream_error_does_not_leak_vendor_message() {
+    let mock = start_mock(Script::StreamError).await;
+    let app = TestApp::new(&mock);
+    let token = app.register("student@ynau.edu.cn").await;
+
+    let response = app.call(chat_request(Some(&token), "turn-1")).await;
+    assert_eq!(response.status(), StatusCode::OK, "流已经开了，错误在流里");
+    let events = read_events(response).await;
+    let body: String = events
+        .iter()
+        .map(|(event, data)| format!("event: {event}\ndata: {data}\n"))
+        .collect();
+
+    // 终止事件是 error，且只有它一个（装配器不会在错误后再补 Done）
+    let names: Vec<&str> = events.iter().map(|(event, _)| event.as_str()).collect();
+    assert_eq!(names.last().copied(), Some("error"), "{names:?}");
+    assert_eq!(
+        names.iter().filter(|name| **name == "error").count(),
+        1,
+        "{names:?}"
+    );
+    assert!(!names.contains(&"done"), "错误之后不能再补 done：{names:?}");
+
+    // 厂商原文一个字都不能出现
+    for marker in [
+        "vendor-secret-marker",
+        "daily-quota-exceeded",
+        "org-abc123",
+        "http://",
+        "10.9.9.9",
+    ] {
+        assert!(!body.contains(marker), "泄露了 {marker}：{body}");
+    }
+    // 但错误码与固定文案要在，且码要是 UPSTREAM_ERROR
+    let last = events
+        .last()
+        .map(|(_, data)| data.as_str())
+        .unwrap_or_default();
+    assert!(last.contains("UPSTREAM_ERROR"), "{last}");
+    assert!(last.contains("上游暂时不可用"), "{last}");
+}
+
 /// 评审 F4：2xx 但不是 SSE（登录页/网关默认页）→ 502，而不是 Meta + Done 的"空回答"。
 #[tokio::test]
 async fn non_sse_2xx_maps_to_502_and_never_produces_done() {
@@ -1124,6 +1193,139 @@ async fn pg_sample_is_idempotent_per_round() {
         2,
         "两轮 = 两行"
     );
+
+    db.finish().await;
+}
+
+/// 评审 F11：唯一键必须带 `user_id`——两个用户撞同一个 `turn_id` 时不能互相改对方的行
+/// （`turn_id` 是端侧生成的，同一设备模板 / 重装复用 id 都会撞）。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_sample_is_isolated_per_user() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mock = start_mock(Script::CompletionsOk).await;
+    let mut config = TestApp::config(&mock);
+    config.usage_sample_percent = 100;
+    let app = TestApp::with_db(config, Some(db.pool.clone()));
+
+    let alice = app.register("alice-shared@ynau.edu.cn").await;
+    let bob = app.register("bob-shared@ynau.edu.cn").await;
+
+    for token in [&alice, &bob] {
+        let response = app.call(chat_request(Some(token), "turn-shared")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = read_events(response).await;
+    }
+
+    assert!(
+        wait_for_rows(
+            &db,
+            "SELECT count(*) FROM usage_samples WHERE turn_id = 'turn-shared'",
+            2
+        )
+        .await,
+        "两个用户各一行（唯一键含 user_id）"
+    );
+    assert_eq!(
+        count(
+            &db.pool,
+            "SELECT count(DISTINCT user_id) FROM usage_samples WHERE turn_id = 'turn-shared'"
+        )
+        .await,
+        2,
+        "user_id 不能被后一个用户的 upsert 改掉"
+    );
+    assert_eq!(
+        count(
+            &db.pool,
+            "SELECT count(*) FROM usage_samples WHERE turn_id = 'turn-shared' AND user_id IS NULL"
+        )
+        .await,
+        0,
+        "两行都必须绑定到各自的用户"
+    );
+
+    db.finish().await;
+}
+
+/// 评审 F12：漏跑 `0003` 时启动自检必须**报错并说清该执行哪个文件**，
+/// 而不是让抽样记账静默失败、账目悄悄变成 0。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_schema_guard_rejects_missing_migration() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    // 迁移跑全了：自检通过
+    yunong_server::accounting::verify_schema(&db.pool)
+        .await
+        .expect("0003 已应用，自检应通过");
+
+    // 模拟"只跑到 0002"：把 0003 加的列删掉
+    db.execute("ALTER TABLE usage_samples DROP COLUMN turn_id")
+        .await;
+    let error = yunong_server::accounting::verify_schema(&db.pool)
+        .await
+        .expect_err("少了 turn_id 必须报错");
+    assert!(
+        error.contains("0003"),
+        "指引里要写清该执行哪个迁移文件：{error}"
+    );
+    assert!(error.contains("turn_id"), "{error}");
+
+    db.finish().await;
+}
+
+/// 评审 F11/F12：`0003` 可重入——已经建过旧索引的库、重复执行都必须安全。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_migration_0003_is_reentrant() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let sql = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations/0003_usage_turn_estimated.sql"
+    ))
+    .expect("读 0003 迁移");
+
+    // 重入两次：第二次必须也是 ok（IF NOT EXISTS / DROP IF EXISTS / 幂等 UPDATE）
+    for round in 1..=2 {
+        sqlx::raw_sql(&sql)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(|error| panic!("第 {round} 次执行 0003 失败（不可重入）：{error}"));
+    }
+
+    // 唯一索引存在且**带 user_id**
+    let index_def: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes \
+         WHERE schemaname = ANY (current_schemas(false)) \
+           AND indexname = 'ux_usage_user_turn_round'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("ux_usage_user_turn_round 应存在");
+    for column in ["user_id", "turn_id", "round"] {
+        assert!(index_def.contains(column), "唯一键缺 {column}：{index_def}");
+    }
+    // 旧索引不能还留在库里（否则 ON CONFLICT 推断会有歧义）
+    let old: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes \
+         WHERE schemaname = ANY (current_schemas(false)) \
+           AND indexname = 'ux_usage_turn_round'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("查旧索引");
+    assert_eq!(old, 0, "旧索引 ux_usage_turn_round 应被 DROP");
+
+    // 列也都还在，自检继续通过
+    yunong_server::accounting::verify_schema(&db.pool)
+        .await
+        .expect("重入后自检仍应通过");
 
     db.finish().await;
 }
