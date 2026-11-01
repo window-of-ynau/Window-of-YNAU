@@ -1623,18 +1623,26 @@ mod tests {
             assert!(!raw.contains(plain), "set 返回里出现明文：{raw}");
 
             // get：只有 set + 掩码
+            // 注意平台差异：非 Windows 没有系统安全存储，set 走降级（不落盘），
+            // 因此 get 必然是 set:false + degraded:true。断言必须按平台分支，
+            // 否则 Linux CI 上会红（此前就是这样挂的）。
             let response = call_secret(yunong_get_secret(key.as_ptr(), db.as_ptr()));
             assert_eq!(response["ok"], true);
-            assert_eq!(response["data"]["set"], true);
-            assert_eq!(response["data"]["masked"], "sk-****3eee");
+            if cfg!(windows) {
+                assert_eq!(response["data"]["set"], true);
+                assert_eq!(response["data"]["masked"], "sk-****3eee");
+            } else {
+                assert_eq!(response["data"]["set"], false);
+                assert_eq!(response["data"]["degraded"], true);
+            }
             let raw = response.to_string();
             assert!(!raw.contains(plain), "get 返回里出现明文：{raw}");
             assert!(!raw.contains("c12f4e6c"), "get 返回里出现明文片段：{raw}");
 
-            // delete → get(set:false)
+            // delete → get(set:false)；非 Windows 本来就没存，deleted 为 false
             let response = call_secret(yunong_delete_secret(key.as_ptr(), db.as_ptr()));
             assert_eq!(response["ok"], true);
-            assert_eq!(response["data"]["deleted"], true);
+            assert_eq!(response["data"]["deleted"], cfg!(windows));
             let response = call_secret(yunong_get_secret(key.as_ptr(), db.as_ptr()));
             assert_eq!(response["data"]["set"], false);
             // 再删一次是幂等
