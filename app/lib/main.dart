@@ -7,25 +7,12 @@
 
 import 'package:flutter/material.dart';
 
+import 'src/campus/campus_entries.dart';
 import 'src/campus/timetable_page.dart';
 import 'src/campus/webview_fetcher.dart';
 import 'src/core/timetable_service.dart';
 
 void main() => runApp(const YunongApp());
-
-/// 校务入口（阶段一只做导航；登录与取数在 WebView 里完成，见 ADR-11）。
-enum CampusEntry {
-  portal('教务门户', 'https://jwxt.ynau.edu.cn/DefaultStu'),
-  scores('成绩查询', 'https://jwgl.ynau.edu.cn/STU/cj_default.aspx'),
-  timetable('我的课表', 'https://qzjwxt.ynau.edu.cn/jsxsd/framework/xsMainV.htmlx'),
-  library('图书馆', 'http://10.8.225.101:8013/#/Home'),
-  software('正版软件', 'http://software.ynau.edu.cn/');
-
-  const CampusEntry(this.label, this.url);
-
-  final String label;
-  final String url;
-}
 
 class YunongApp extends StatelessWidget {
   const YunongApp({super.key});
