@@ -99,16 +99,27 @@ curl http://127.0.0.1:8080/healthz
 - 数据库不映射端口，只在 compose 内网可达。
 ### 本地跑 Dart 测试的代理坑
 
-若机器设置了 `HTTP_PROXY` / `HTTPS_PROXY`（公司代理、Clash 等），`flutter test` 会把与测试进程之间的 **localhost** 连接也走代理，表现为：
+若**当前 shell** 里存在 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，`flutter test` 会把与测试进程之间的 **localhost** 连接也送进代理，表现为：
 
 ```
 Connection closed before test suite loaded
 ```
 
-跑之前排除回环地址即可：
+先确认有没有：
 
 ```powershell
+$env:HTTP_PROXY; $env:HTTPS_PROXY; $env:ALL_PROXY
+```
+
+注意这些变量**不一定来自系统代理设置**，常见来源是：包管理器、容器工具、开发 shell、CI/沙箱环境注入的变量；Windows 的"系统代理"（`netsh winhttp show proxy` / IE 设置）与它们无关。两种修法任选：
+
+```powershell
+# 1) 只让回环地址绕过代理
 $env:NO_PROXY="localhost,127.0.0.1,::1"; $env:no_proxy="localhost,127.0.0.1,::1"
+
+# 2) 或直接清掉代理变量（仅本会话）
+Remove-Item Env:\HTTP_PROXY,Env:\HTTPS_PROXY,Env:\ALL_PROXY,Env:\http_proxy,Env:\https_proxy -ErrorAction SilentlyContinue
+
 cd app; flutter test
 ```
 ## 4. PR 要求
