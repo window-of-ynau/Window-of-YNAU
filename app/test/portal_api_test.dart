@@ -303,6 +303,107 @@ void main() {
       expect(progress.sinceStageEnter(enter), Duration.zero);
     });
   });
+
+  group('探测调度器（离线 + fake client 计数）', () {
+    List<CardIdCandidate> candidatesOf(int count) => List<CardIdCandidate>.generate(
+          count,
+          (int index) => CardIdCandidate(
+            value: index.toString().padLeft(32, '0'),
+            context: '',
+            order: index,
+          ),
+        );
+
+    test('候选非空 + 卡片DOM未置位 + 学期有值 → 仍然发起探测', () async {
+      final steps = <String>[];
+      final attempts = <ProbeAttempt>[];
+      final probed = <String>{};
+      var calls = 0;
+      final runner = ScheduleProbeRunner(steps: steps, attempts: attempts, probed: probed);
+      final hit = await runner.run(
+        candidates: candidatesOf(3),
+        stage: 'capture',
+        years: '2026-2027-1',
+        cardDomDetected: false, // 关键：卡片 DOM 标志没置位也不影响探测
+        probe: (CardIdCandidate candidate, String years) async {
+          calls += 1;
+          return ProbeAttempt(cardId: candidate.value, status: 404, verdict: 'http');
+        },
+      );
+      expect(calls, 3, reason: '必须真的发出 3 次探测，不许被短路');
+      expect(hit, isNull);
+      expect(steps.first, contains('进入探测'));
+      expect(steps.where((String s) => s.startsWith('→ ')).length, 3);
+      expect(attempts, hasLength(3));
+      expect(attempts.first.display, endsWith(':404:http'));
+    });
+
+    test('命中即停（真实 cardId 在第 2 个）', () async {
+      final runner = ScheduleProbeRunner(
+        steps: <String>[],
+        attempts: <ProbeAttempt>[],
+        probed: <String>{},
+      );
+      var calls = 0;
+      final hit = await runner.run(
+        candidates: candidatesOf(4),
+        stage: 'capture',
+        years: 't',
+        probe: (CardIdCandidate candidate, String years) async {
+          calls += 1;
+          if (calls == 2) {
+            return ProbeAttempt(cardId: candidate.value, status: 200, verdict: 'rows7');
+          }
+          return ProbeAttempt(cardId: candidate.value, status: 200, verdict: 'empty');
+        },
+      );
+      expect(calls, 2);
+      expect(hit!.value, candidatesOf(4)[1].value);
+    });
+
+    test('探测抛异常 → 写进诊断（不静默吞），并继续下一个', () async {
+      final attempts = <ProbeAttempt>[];
+      final steps = <String>[];
+      final runner = ScheduleProbeRunner(
+        steps: steps,
+        attempts: attempts,
+        probed: <String>{},
+      );
+      var calls = 0;
+      await runner.run(
+        candidates: candidatesOf(2),
+        stage: 'capture',
+        years: 't',
+        probe: (CardIdCandidate candidate, String years) async {
+          calls += 1;
+          throw StateError('boom $calls');
+        },
+      );
+      expect(calls, 2, reason: '一个抛错不能中断后续');
+      expect(attempts, hasLength(2));
+      expect(attempts.first.verdict, startsWith('err:'));
+      expect(steps.any((String s) => s.contains('err ')), isTrue);
+    });
+
+    test('非 capture 阶段 / 候选为空 / 学期为空 → 不探测，并留下跳过原因', () async {
+      final steps = <String>[];
+      var calls = 0;
+      Future<ProbeAttempt> probe(CardIdCandidate c, String y) async {
+        calls += 1;
+        return ProbeAttempt(cardId: c.value, status: 200, verdict: 'empty');
+      }
+
+      await ScheduleProbeRunner(steps: steps, attempts: <ProbeAttempt>[], probed: <String>{})
+          .run(candidates: candidatesOf(2), stage: 'waiting_card', years: 't', probe: probe);
+      await ScheduleProbeRunner(steps: steps, attempts: <ProbeAttempt>[], probed: <String>{})
+          .run(candidates: <CardIdCandidate>[], stage: 'capture', years: 't', probe: probe);
+      await ScheduleProbeRunner(steps: steps, attempts: <ProbeAttempt>[], probed: <String>{})
+          .run(candidates: candidatesOf(2), stage: 'capture', years: '', probe: probe);
+
+      expect(calls, 0);
+      expect(steps.where((String s) => s.startsWith('跳过探测')).length, 3);
+    });
+  });
   group('判死条件（刚进 capture 绝不立刻超时）', () {
     test('刚进阶段 200ms、距最后进展 200ms → 不判死', () {
       expect(

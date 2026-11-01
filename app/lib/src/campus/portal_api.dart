@@ -212,6 +212,95 @@ class CaptureProgress {
     return sinceLastProgress(now) >= noProgressThreshold;
   }
 }
+/// 探测尝试的结果（诊断用）。
+class ProbeAttempt {
+  const ProbeAttempt({required this.cardId, this.status, required this.verdict});
+
+  final String cardId;
+  final int? status;
+
+  /// `rows7`（命中）/ `empty` / `missing` / `html` / `http` / `auth` / `badjson` / `err:xxx`
+  final String verdict;
+
+  String get display => '${cardId.substring(0, 8)}:${status ?? '-'}:$verdict';
+
+  bool get hit => verdict.startsWith('rows');
+}
+
+/// 探测调度器（**纯 Dart、可离线单测**；注入脚本里的 `probeUnprobed()` 与此语义一致）。
+///
+/// 不变量（owner 实测 bug 的教训）：
+/// - 只要 `candidates` 非空且阶段是 `capture`，**必须**进入探测循环，
+///   不得被 `cardDomDetected` 之类标志位短路；
+/// - 每个候选在发请求**之前**先记一条 `→ prefix` 步骤；
+/// - 任何异常都写进 `attempts`（`err:类型:消息`），**不允许静默吞掉**；
+/// - `probed` 只在请求**发出之后**才标记，避免"标记了但没发"。
+class ScheduleProbeRunner {
+  ScheduleProbeRunner({
+    required this.steps,
+    required this.attempts,
+    required this.probed,
+  });
+
+  /// 人可读的步骤日志（进诊断字符串）
+  final List<String> steps;
+
+  /// 每个候选的结果
+  final List<ProbeAttempt> attempts;
+
+  /// 已发出过请求的候选（去重，避免每 500ms 重复打）
+  final Set<String> probed;
+
+  /// 执行探测；返回命中的候选（未命中返回 null）。
+  Future<CardIdCandidate?> run({
+    required List<CardIdCandidate> candidates,
+    required String stage,
+    required String years,
+    required Future<ProbeAttempt> Function(CardIdCandidate candidate, String years) probe,
+    bool cardDomDetected = false,
+  }) async {
+    if (stage != 'capture') {
+      steps.add('跳过探测：阶段=$stage');
+      return null;
+    }
+    if (candidates.isEmpty) {
+      steps.add('跳过探测：候选为空');
+      return null;
+    }
+    if (years.isEmpty) {
+      steps.add('跳过探测：学期为空');
+      return null;
+    }
+    // 注意：`cardDomDetected` 只用于诊断，**不参与是否探测的判定**
+    steps.add('进入探测（候选 ${candidates.length}，卡片DOM=${cardDomDetected ? '已出' : '未出'}）');
+    for (final candidate in candidates) {
+      if (probed.contains(candidate.value)) {
+        continue;
+      }
+      steps.add('→ ${candidate.value.substring(0, 8)}');
+      try {
+        final attempt = await probe(candidate, years);
+        probed.add(candidate.value);
+        attempts.add(attempt);
+        if (attempt.hit) {
+          steps.add('命中 ${attempt.display}');
+          return candidate;
+        }
+        steps.add(attempt.display);
+      } on Object catch (err) {
+        // **不许静默吞**：把类型与消息写进诊断
+        final message = err.toString().replaceAll('\n', ' ');
+        attempts.add(ProbeAttempt(
+          cardId: candidate.value,
+          verdict: 'err:${err.runtimeType}:${message.length > 60 ? message.substring(0, 60) : message}',
+        ));
+        probed.add(candidate.value);
+        steps.add('err ${candidate.value.substring(0, 8)}：$message');
+      }
+    }
+    return null;
+  }
+}
 /// 是否该报 `CAPTURE_TIMEOUT`（保留的纯函数入口，语义等同 [CaptureProgress.shouldTimeout]）。
 ///
 /// 只有**同时**满足才判死：
@@ -468,7 +557,7 @@ const String kPortalScheduleScript = r'''
   // 诊断用：owner/我们据此判断卡在哪一步（不含任何凭据）
   var DIAG = {
     xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0,
-    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: [], probeParams: null
+    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: [], probeParams: null, steps: []
   };
   // **没有任何"从页面打开算起"的绝对超时**：只有"无进展兜底"（见 watchdog）
   var LAST_PROGRESS = { at: Date.now(), what: 'start' };
@@ -583,7 +672,8 @@ const String kPortalScheduleScript = r'''
       years: DIAG.years || '',
       probeFailed: DIAG.probeFailed,
       probeResults: DIAG.probeResults,
-      probeParams: DIAG.probeParams
+      probeParams: DIAG.probeParams,
+      steps: DIAG.steps
     });
   };
 
@@ -939,24 +1029,56 @@ const String kPortalScheduleScript = r'''
     probeUnprobed();
   }
 
+  // 探测调度（与 Dart `ScheduleProbeRunner.run` 同一语义）：
+  // - 只要阶段是 capture 且候选非空，**必须**进入循环（不被 cardDom 等标志短路）；
+  // - 每个候选发请求前记一条 `→ prefix`；结果记 `prefix:status:verdict`；
+  // - 任何异常记 `err:类型:消息`，不静默吞；`PROBED` 只在请求发出后标记。
   function probeUnprobed() {
     if (TEMPLATE) { return; }
+    if (STAGE !== 'capture') { DIAG.steps.push('跳过探测：阶段=' + STAGE); return; }
+    if (!CANDIDATE_ORDER.length) { DIAG.steps.push('跳过探测：候选为空'); return; }
     var years = termGuess();
-    if (!years || !CANDIDATE_ORDER.length) {
-      DIAG.probeFailed = !years;
-      return;
-    }
+    if (!years) { DIAG.steps.push('跳过探测：学期为空'); DIAG.probeFailed = true; return; }
     DIAG.years = years;
     var queue = sortedCandidates().filter(function (c) { return !PROBED[c.value]; });
+    DIAG.steps.push('进入探测（候选 ' + CANDIDATE_ORDER.length + '，待探 ' + queue.length +
+      '，卡片DOM=' + (timetableCardNode() ? '已出' : '未出') + '）');
     if (!queue.length) { return; }
     (function next(index) {
       if (TEMPLATE || index >= queue.length) { return; }
       var cand = queue[index];
-      PROBED[cand.value] = true;
-      probeCandidate(cand.value, years).then(function (ok) {
+      DIAG.steps.push('→ ' + cand.value.slice(0, 8));
+      var pending;
+      try {
+        pending = probeCandidate(cand.value, years);
+      } catch (e) {
+        var name = (e && e.name) ? e.name : 'Error';
+        var msg = (e && e.message) ? String(e.message).slice(0, 60) : '';
+        DIAG.probeResults.push(cand.value.slice(0, 8) + ':0:err:' + name + ':' + msg);
+        DIAG.steps.push('err ' + cand.value.slice(0, 8) + '：' + name + ' ' + msg);
+        PROBED[cand.value] = true;
+        next(index + 1);
+        return;
+      }
+      if (!pending || typeof pending.then !== 'function') {
+        DIAG.probeResults.push(cand.value.slice(0, 8) + ':0:err:no-promise');
+        DIAG.steps.push('err ' + cand.value.slice(0, 8) + '：返回值不是 Promise');
+        PROBED[cand.value] = true;
+        next(index + 1);
+        return;
+      }
+      pending.then(function (ok) {
+        PROBED[cand.value] = true;
         progress('探测 ' + cand.value.slice(0, 8) + (ok ? ' 命中' : ' 未命中'));
         if (ok) { adoptTemplate(cand.value, cand.source || 'scan', years); }
         else { next(index + 1); }
+      }).catch(function (e) {
+        PROBED[cand.value] = true;
+        var name = (e && e.name) ? e.name : 'Error';
+        var msg = (e && e.message) ? String(e.message).slice(0, 60) : '';
+        DIAG.probeResults.push(cand.value.slice(0, 8) + ':0:err:' + name + ':' + msg);
+        DIAG.steps.push('err ' + cand.value.slice(0, 8) + '：' + name + ' ' + msg);
+        next(index + 1);
       });
     })(0);
   }
