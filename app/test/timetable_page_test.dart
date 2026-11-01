@@ -147,6 +147,13 @@ void main() {
       ];
     final service = TimetableService(core: core, dbPath: '/tmp/t.db');
 
+    // 默认测试视口 800×600 太窄：头部 + 失败卡片会把列表的 Expanded 挤到 0 高度，
+    // ListView 于是不构建任何条目，`find.text` 自然找不到（数据其实还在）。
+    // 给一个足够大的视口，让「失败卡片 + 旧列表」能同时出现在树里。
+    tester.view.physicalSize = const Size(1200, 1600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
     await tester.pumpWidget(_wrap(TimetablePage(
       service: service,
       // 注入固定 HTML：脱离 asset I/O。否则 fake-async 下 `rootBundle.loadString`
@@ -157,12 +164,6 @@ void main() {
     )));
     await tester.tap(find.text('导入内置样本'));
     await tester.pumpAndSettle();
-    // 诊断：CI 是唯一能跑 widget test 的环境，先把现场打出来再断言。
-    // ignore: avoid_print
-    print('DIAG after-import texts: '
-        '${tester.widgetList<Text>(find.byType(Text)).map((Text t) => t.data).toList()}');
-    // ignore: avoid_print
-    print('DIAG busy indicator: ${find.byType(LinearProgressIndicator).evaluate().length}');
     expect(find.text('高等数学A'), findsOneWidget);
 
     await tester.tap(find.text('模拟页面改版'));
