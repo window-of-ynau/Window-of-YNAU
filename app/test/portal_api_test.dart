@@ -118,6 +118,113 @@ void main() {
       expect(kSeededTermStarts['2026-2027-1'], '2026-09-07');
     });
   });
+  group('cardId 从 HTML 里探测（owner 实测 18 个命中、真实值排第 14）', () {
+    // owner 给出的真实页面候选（已脱敏为静态度量：顺序与重复都保留）
+    const candidates = <String>[
+      'a1b2c3d4e5f60718293a4b5c6d7e8f90',
+      '6f5bd67d6fa147afb820d47f26bf78ed',
+      '22208d630bda4d9a9f1c2d3e4f506172',
+      '4d72f8a7b5c34e2f8a9b0c1d2e3f4051',
+      'f762ddbe2d3c4b5a6978e0f1d2c3b4a5',
+      '6f5bd67d6fa147afb820d47f26bf78ed',
+      'b5c5556e5a714fccb490aa4832762cbb',
+      'f95c8b218c6946bea509c540c50eac18', // 真实 cardId
+      '6f5bd67d6fa147afb820d47f26bf78ed',
+      '22208d630bda4d9a9f1c2d3e4f506172',
+      '4d72f8a7b5c34e2f8a9b0c1d2e3f4051',
+      'f762ddbe2d3c4b5a6978e0f1d2c3b4a5',
+      '0f1e2d3c4b5a69788796a5b4c3d2e1f0',
+      '9a8b7c6d5e4f30211203f4e5d6c7b8a9',
+      '1234567890abcdef1234567890abcdef',
+      'abcdef0123456789abcdef0123456789',
+    ];
+
+    String pageHtml({String? timetableHint}) {
+      final buffer = StringBuffer('<html><head>');
+      for (final value in candidates) {
+        final hint = timetableHint ?? '';
+        buffer.write('<script>window.__D.push({"id":"$value"$hint})</script>');
+      }
+      buffer.write('</head><body>门户</body></html>');
+      return buffer.toString();
+    }
+
+    test('去重后按出现顺序保留，最多 12 个候选', () {
+      final extracted = extractCardIdCandidates(pageHtml());
+      final values = extracted.map((CardIdCandidate item) => item.value).toList();
+      expect(values.toSet().length, values.length, reason: '不能重复');
+      // 16 个里 4 个重复 → 12 个唯一
+      expect(values, hasLength(12));
+      expect(values, contains('f95c8b218c6946bea509c540c50eac18'));
+    });
+
+    test('课表相关上下文排前面（其余保持出现顺序）', () {
+      const html = '<html><body>'
+          '<script>var a="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";</script>'
+          '<script>var b="f95c8b218c6946bea509c540c50eac18"; var t="课表 kbsz";</script>'
+          '<script>var c="cccccccccccccccccccccccccccccccc";</script>'
+          '</body></html>';
+      final extracted = extractCardIdCandidates(html);
+      expect(extracted.first.value, 'f95c8b218c6946bea509c540c50eac18');
+    });
+
+    test('逐个探测：前 11 个返回 4xx/空都不崩，第 12 个命中即停', () async {
+      final extracted = extractCardIdCandidates(pageHtml());
+      final probed = <String>[];
+      final hit = await selectCardIdByProbing(
+        extracted,
+        (CardIdCandidate candidate) async {
+          probed.add(candidate.value);
+          // 模拟真实服务端：只有真实 cardId 返回带 resultsJsonArr 的数据
+          if (candidate.value == 'f95c8b218c6946bea509c540c50eac18') {
+            return isScheduleProbeHit(<String, dynamic>{
+              'data': <String, dynamic>{
+                'resultsJsonArr': List<dynamic>.generate(7, (int i) => <dynamic>[]),
+              },
+            });
+          }
+          if (candidate.value.startsWith('6f5b')) {
+            throw StateError('404');
+          }
+          return false;
+        },
+        maxAttempts: 12,
+      );
+      expect(hit, isNotNull);
+      expect(hit!.value, 'f95c8b218c6946bea509c540c50eac18');
+      expect(probed, hasLength(12), reason: '必须靠探测而不是位置');
+    });
+
+    test('全部不命中时返回 null（交给超时提示，而不是猜一个）', () async {
+      final extracted = extractCardIdCandidates(pageHtml());
+      final hit = await selectCardIdByProbing(
+        extracted,
+        (CardIdCandidate candidate) async => false,
+        maxAttempts: 12,
+      );
+      expect(hit, isNull);
+    });
+
+    test('命中判据要求 resultsJsonArr 是非空行数组', () {
+      expect(isScheduleProbeHit(<String, dynamic>{'data': <String, dynamic>{}}), isFalse);
+      expect(
+        isScheduleProbeHit(<String, dynamic>{
+          'data': <String, dynamic>{'resultsJsonArr': <dynamic>[]},
+        }),
+        isFalse,
+      );
+      expect(
+        isScheduleProbeHit(<String, dynamic>{
+          'data': <String, dynamic>{
+            'resultsJsonArr': List<dynamic>.generate(7, (int i) => <dynamic>[]),
+          },
+        }),
+        isTrue,
+      );
+      expect(isScheduleProbeHit(<String, dynamic>{'code': 500}), isFalse);
+      expect(isScheduleProbeHit('html'), isFalse);
+    });
+  });
   group('解析 schedule_api 消息', () {
     test('正常载荷 + 部分周缺失', () {
       final result = ScheduleApiResult.fromMessage(<String, dynamic>{

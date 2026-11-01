@@ -238,7 +238,10 @@ class _TimetablePageState extends State<TimetablePage> {
     // 主路径：门户接口（queryAWeekSchedule）；接口变了/抓不到模板再退回 DOM 抓取
     try {
       await _run(() async {
-        final result = await fetcher.fetchSchedule(entryUrl: CampusEntry.timetable.url);
+        final result = await fetcher.fetchSchedule(
+          entryUrl: CampusEntry.timetable.url,
+          term: _currentTerm,
+        );
         final outcome = await widget.service.importScheduleJson(
           scheduleJson: result.toImportJson(term: _currentTerm),
           term: _currentTerm,
