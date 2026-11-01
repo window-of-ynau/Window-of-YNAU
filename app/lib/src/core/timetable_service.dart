@@ -98,6 +98,45 @@ class ScheduleImportOutcome {
   final int? weekcount;
 }
 
+/// 一次 ICS 导出的结果。
+class IcsExportResult {
+  const IcsExportResult({required this.path, required this.events});
+
+  final String path;
+
+  /// 展开后的独立事件数（= 课程 × 周次；0 表示这学期还没排课）
+  final int events;
+}
+
+/// 导出文件名（纯函数，便于单测）：`云农之窗-课表-<term>.ics`。
+String icsFileName(String term) => '云农之窗-课表-$term.ics';
+
+/// 不静默覆盖：目标已存在时依次尝试 `… (2).ics`、`… (3).ics`（最多到 99）。
+///
+/// `exists` 由调用方注入（生产用 `File(...).existsSync()`），单测可以完全离线。
+String uniqueIcsPath({
+  required String directory,
+  required String fileName,
+  required bool Function(String path) exists,
+  int maxAttempts = 99,
+}) {
+  final separator = directory.endsWith('/') || directory.endsWith(r'\') ? '' : Platform.pathSeparator;
+  final base = fileName.endsWith('.ics') ? fileName.substring(0, fileName.length - 4) : fileName;
+  var candidate = '$directory$separator$fileName';
+  var attempt = 2;
+  while (exists(candidate)) {
+    if (attempt > maxAttempts) {
+      throw const TimetableException(
+        code: 'EXPORT_PATH_BUSY',
+        userHint: '导出目录里同名文件太多了，请清理后重试',
+        message: 'too many existing ics files',
+      );
+    }
+    candidate = '$directory$separator$base ($attempt).ics';
+    attempt += 1;
+  }
+  return candidate;
+}
 /// 学期一条记录（`starts_on` 是用户确认过的开学日，空串=未确认）。
 class TermSummary {
   const TermSummary({required this.term, required this.startsOn});
@@ -148,6 +187,12 @@ TimetableException describeFailure(String? code, String? message) {
       return TimetableException(
         code: code!,
         userHint: '登录态已失效，请重新登录',
+        message: detail,
+      );
+    case 'TERM_START_UNKNOWN':
+      return TimetableException(
+        code: code!,
+        userHint: '本学期的第 1 周日期还没确认，无法换算具体日期',
         message: detail,
       );
     case 'PARSE_EMPTY':
@@ -217,12 +262,20 @@ class FetchException implements Exception {
 
 /// 课表服务：HTML → Rust 核心（解析 + SQLite）→ 列表。
 class TimetableService {
-  TimetableService({CoreApi? core, String? dbPath})
-      : _core = core,
-        _dbPath = dbPath;
+  TimetableService({
+    CoreApi? core,
+    String? dbPath,
+    String? exportDir,
+    bool Function(String path)? pathExists,
+  })  : _core = core,
+        _dbPath = dbPath,
+        _exportDir = exportDir,
+        _pathExists = pathExists;
 
   final CoreApi? _core;
   final String? _dbPath;
+  final String? _exportDir;
+  final bool Function(String path)? _pathExists;
 
   /// 数据库路径（Windows: %LOCALAPPDATA%\yunong\timetable.db）。
   ///
@@ -338,6 +391,55 @@ class TimetableService {
     }).where((TermSummary item) => item.term.isNotEmpty).toList(growable: false);
   }
 
+  /// ICS 导出目录。
+  ///
+  /// Windows 优先 `%USERPROFILE%\Downloads`：用户能在资源管理器里直接找到、双击导入日历；
+  /// 没有该目录时退回应用数据目录 `<base>\yunong\exports`（不往用户目录乱写）。
+  /// 其它平台用应用数据目录（沙箱内，避免申请存储权限）。
+  String get exportDirectory {
+    final override = _exportDir;
+    if (override != null) {
+      return override;
+    }
+    final env = Platform.environment;
+    if (Platform.isWindows) {
+      final profile = env['USERPROFILE'] ?? '';
+      final downloads = <String>[profile, 'Downloads'].join(Platform.pathSeparator);
+      if (profile.isNotEmpty && Directory(downloads).existsSync()) {
+        return downloads;
+      }
+    }
+    final base = env['LOCALAPPDATA'] ?? env['APPDATA'] ?? env['HOME'] ?? Directory.current.path;
+    return <String>[base, 'yunong', 'exports'].join(Platform.pathSeparator);
+  }
+
+  /// 导出某学期课表为 `.ics`（W7）。
+  ///
+  /// 学期开始日未确认时后端返回 `TERM_START_UNKNOWN`，这里原样抛给 UI（有专门文案）。
+  Future<IcsExportResult> exportIcs({required String term}) async {
+    final directory = exportDirectory;
+    final path = uniqueIcsPath(
+      directory: directory,
+      fileName: icsFileName(term),
+      exists: _pathExists ?? (String candidate) => File(candidate).existsSync(),
+    );
+    final CoreEnvelope envelope;
+    try {
+      envelope = _library.exportIcs(term: term, outPath: path, dbPath: dbPath);
+    } on CoreUnavailable {
+      rethrow;
+    } on Object catch (err) {
+      throw describeFailure('INTERNAL', '调用端侧核心失败：$err');
+    }
+    if (!envelope.ok) {
+      throw describeFailure(envelope.code, envelope.message);
+    }
+    final data = envelope.data ?? const <String, dynamic>{};
+    return IcsExportResult(
+      path: data['path'] as String? ?? path,
+      events: data['events'] as int? ?? 0,
+    );
+  }
   /// 查某学期的课程。
   Future<List<StoredCourse>> listCourses({required String term}) async {
     final envelope = _library.listCourses(term: term, dbPath: dbPath);

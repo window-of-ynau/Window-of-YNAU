@@ -73,6 +73,13 @@ abstract class CoreApi {
   });
 
   /// 设置/修正学期开始日（`YYYY-MM-DD`，空串=清空）。
+  /// 导出某学期课表为 .ics（W7）；成功返回 {path, events}，不返回 NULL。
+  CoreEnvelope exportIcs({
+    required String term,
+    required String outPath,
+    required String dbPath,
+  });
+
   CoreEnvelope setTermStart({
     required String term,
     required String startsOn,
@@ -96,7 +103,9 @@ class CoreLibrary implements CoreApi {
         _importSchedule = library
             .lookupFunction<_ThreeArgsNative, _ThreeArgsDart>('yunong_import_schedule_json'),
         _setTermStart = library
-            .lookupFunction<_ThreeArgsNative, _ThreeArgsDart>('yunong_set_term_start');
+            .lookupFunction<_ThreeArgsNative, _ThreeArgsDart>('yunong_set_term_start'),
+        _exportIcs = library
+            .lookupFunction<_ThreeArgsNative, _ThreeArgsDart>('yunong_export_ics');
 
   final _ImportDart _import;
   final _TwoArgsDart _listCourses;
@@ -105,6 +114,7 @@ class CoreLibrary implements CoreApi {
   final _VersionDart _version;
   final _ThreeArgsDart _importSchedule;
   final _ThreeArgsDart _setTermStart;
+  final _ThreeArgsDart _exportIcs;
 
   static CoreLibrary? _instance;
 
@@ -179,6 +189,15 @@ class CoreLibrary implements CoreApi {
   }) =>
       _call(<String>[json, term, dbPath],
           (List<Pointer<Utf8>> p) => _importSchedule(p[0], p[1], p[2]));
+
+  @override
+  CoreEnvelope exportIcs({
+    required String term,
+    required String outPath,
+    required String dbPath,
+  }) =>
+      _call(<String>[term, outPath, dbPath],
+          (List<Pointer<Utf8>> p) => _exportIcs(p[0], p[1], p[2]));
 
   @override
   CoreEnvelope setTermStart({
