@@ -350,7 +350,8 @@ C1 / C6）。这两条不是"实现写错了"，而是**内部契约表达不了
   而改（所以 `ToolCallRef` 不替代 `Chunk::ToolCall`）；`parse_events` 是**内部 API**，
   不是对外 HTTP 契约，端/云各自调用，wire 不受影响。
 - 发起与见证：端侧 `protocols` 产出 `Vec<Chunk>`，`gateway` 消费并注入 `Meta`；
-  云侧只做 SSE 转发，不解析、不落库。
+  云侧（套餐代理）**复用同一套** `parse_events` 与 `ChunkAssembler` 把上游事件装成 SSE，
+  只在内存里过一遍——不落库、不改语义、不另写一份去重逻辑。
 
 ### 越界防范
 
@@ -361,8 +362,8 @@ C1 / C6）。这两条不是"实现写错了"，而是**内部契约表达不了
 - **发请求前失败**：`ChatRequest::validate` 拦住"非 assistant 带 `tool_calls`"、"空 `id`/`name`"、
   "`role=tool` 缺 `tool_call_id`"，不把这些错误留给上游 400。
 - **`[DONE]` 去重**：`[DONE]` 是幂等收尾标记，Completions 在 `finish_reason` 帧之后还会再来一次；
-  "`Done` 唯一"由 gateway 保证（首个 `Done` 为准），不能靠丢掉带真实原因的 `finish_reason`。
-  契约测试 `stream_done_invariant_and_dedup_contract` 把这条写死。
+  "`Done` 唯一"由 `shared::stream::ChunkAssembler` 统一保证（首个 `Done` 为准），不能靠丢掉带真实原因的
+  `finish_reason`。契约测试 `stream_done_invariant_and_dedup_contract` 把这条写死。
 
 ### 失败模式
 
@@ -397,6 +398,85 @@ C1 / C6）。这两条不是"实现写错了"，而是**内部契约表达不了
 
 ---
 
+## ADR-17 并行工具调用需要序号：`Chunk::ToolCall.index`
+
+**状态**：已定
+**日期**：2026-11-01
+**决策者**：队长（yunong-w2b）拍板；提案：端侧负责人（lead-client）；实现：端侧适配器 + 契约层
+
+### 背景
+
+ADR-16 让 assistant 能在一条消息里发起**多个**工具调用（并行调用），但 wire 上的
+`Chunk::ToolCall { id, name, arguments }` **没有序号**。问题出在流式分片：
+
+- 三个上游都把工具参数**按事件分片**下发（`choices[].delta.tool_calls[]`、
+  `content_block_delta` 的 `input_json_delta`、`response.function_call_arguments.delta`）；
+- 分片里只有"片段"，`id`/`name` 往往只在**首片**出现，后续片是纯 JSON 字符串；
+- 端侧要拼参数，就必须知道"这一片属于哪个调用"。没有序号时只能按到达顺序猜——
+  两个调用交错时会把 A 的参数拼到 B 上，**静默产出错误参数**（最坏的失败模式：
+  不是报错，而是拿错参数去执行）。
+
+### 决策
+
+`Chunk::ToolCall` 增加 `index: Option<u32>`：
+
+```rust
+ToolCall { id: String, name: String, arguments: serde_json::Value, index: Option<u32> }
+```
+
+- `None` 时 **不序列化**（`skip_serializing_if`），旧客户端读到的 wire 与之前**逐字节一致**；
+- 三适配器各取自己的序号字段：Completions `choices[].index` 上下文里的
+  `tool_calls[].index`、Anthropic `content_block_start.index`（`content_block_delta.index`）、
+  Responses `output_index`；
+- 只加在 **`Chunk`（wire）** 一侧；请求侧的 `ToolCallRef` 不动（它不需要序号）。
+
+### 边界
+
+- 这条决策**划定**了：并行调用的"归位信息"是**契约的责任**，不是聚合层的私事；
+  聚合层可以自由决定怎么缓存分片，但不能要求上游按顺序给。
+- **绝不能**越过的线：`index` 只在 `Chunk::ToolCall` 上，不能拿它当"调用顺序"的语义
+  （上游的 `index` 是槽位号，可能复用，也可能不连续）；工具结果的相关性仍然只认 `id`。
+- 端/云都不因为这条改动多存东西：服务端只是把 `Chunk` 原样转成 SSE。
+
+### 越界防范
+
+- **兼容性测试**：`index` 缺失时反序列化 / 序列化的 wire 与旧版一致（`shared` 单测守着）。
+- **三协议 fixture**：每个适配器都有一条"并行双调用"用例，断言两个调用的分片各自归位。
+- **文档**：`docs/03` §9 的类型块与 `docs/design/contract-gaps.md` C9 落地位置；
+  `Chunk::ToolCall` 的注释写明"`index` 是槽位号，不是顺序"。
+
+### 失败模式
+
+| 这一侧塌了 | 系统会怎样 | 用户看到什么 |
+|---|---|---|
+| 适配器漏取 `index` | 该调用 `index=None`，聚合层退回"按到达顺序"——交错时参数错位 | 工具报参数非法，模型改口重试（有日志可追） |
+| 聚合层把 `index` 当顺序用 | 多调用场景下结果顺序错乱（内容对、顺序错） | 工具执行顺序奇怪，结果仍可用 |
+| 上游不给 `index`（自建兼容端点） | 全部 `None`，退化为"一次只跑一个工具"的安全路径 | 并行调用变串行，功能不丢 |
+
+### 否决的备选
+
+| 备选 | 否决理由（事实，不是"更复杂"） |
+|---|---|
+| 让端侧按 `id` 自己归位 | 参数分片里**没有 `id`**（只有首片有），拿不到就无法归位 |
+| 用 `Chunk::ToolCall` 的到达顺序隐式编号 | 并行调用会交错到达，顺序≠槽位；错位是**静默**的错误参数 |
+| 在内部另开一条"分片通道"类型 | 等于对外 SSE 出现第二套工具调用形状，客户端要维护两条解析路径 |
+| 强制上游"一次只返回一个工具调用" | 厂商没有这个开关；而且并行调用本身是省延迟的主要收益 |
+
+### 代价（必须诚实地写出来）
+
+- `Chunk::ToolCall` 多一个可选字段，三适配器都要多取一次序号；`shared` 多一条兼容性测试。
+- `index: Option<u32>` 的"`None` 不序列化"约定，要求以后**任何**对 `Chunk` 的扩展都遵守
+  "可选字段缺省不序列化"，否则会悄悄破坏 wire 兼容。
+- 它只解决"归位"，不解决"跨事件聚合"（缺口 C7 仍挂着）：聚合状态依然在 gateway。
+
+### 复审条件
+
+- 上游开始在同一次调用里跨多个 `index` 复用槽位（当前 Anthropic 会复用，需观察是否跨调用）；
+- 引入第四家协议且其分片不带任何槽位信息时（那时要在适配器里做"单调用假设"并降级）；
+- 端侧开始需要"调用顺序"语义时——那是另一个字段（`order`），不能复用 `index`。
+
+---
+
 ## 附：决策状态总表
 
 | ADR | 主题 | 状态 |
@@ -417,3 +497,5 @@ C1 / C6）。这两条不是"实现写错了"，而是**内部契约表达不了
 | 14 | 双许可 + 数据权利 | ✅ 已定 |
 | 15 | 令牌用不透明串 | ✅ 已定 |
 | 16 | 契约可表达性升级（C1 `tool_calls` / C6 一事件多 Chunk） | ✅ 已定 |
+| 17 | 并行调用归位（C9 `Chunk::ToolCall.index`） | ✅ 已定 |
+
