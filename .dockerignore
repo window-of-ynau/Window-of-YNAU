@@ -1,0 +1,42 @@
+# 构建上下文白名单化：deploy/Dockerfile.server 只 COPY Cargo.toml / Cargo.lock /
+# crates/*/Cargo.toml / crates 源码，所以其余一切都不该进上下文。
+#
+# 为什么值得单独一个文件：
+# - 本机 `target/` 已到 9GB 量级、`app/` 1GB 量级，每次 `docker build` 都要打包传输；
+# - `.git/`、`.worktrees/`、`deploy/.env` 进上下文纯属把不该外传的东西送到构建守护进程，
+#   虽然 Dockerfile 不 COPY 它们，但"看不见就不该送"。
+#
+# 注意：这里的条目变化要同步看 Dockerfile 的 COPY 列表——新增 COPY 的目录被 ignore 掉会直接构建失败。
+
+# ---- 构建产物 ----
+target/
+**/target/
+app/build/
+app/.dart_tool/
+.dart_tool/
+
+# ---- 版本控制与本地工作区 ----
+.git/
+.gitignore
+.worktrees/
+.agent-teams/
+.internal/
+
+# ---- 与运行时镜像无关的目录 ----
+app/
+bench/
+docs/
+experiments/
+.github/
+design/
+
+# ---- 本机环境变量：绝不进构建上下文 ----
+deploy/.env
+.env
+.env.*
+!deploy/.env.example
+
+# ---- 杂项 ----
+*.log
+**/*.log
+*.md
