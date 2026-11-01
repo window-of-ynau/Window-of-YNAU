@@ -122,6 +122,19 @@ class CoreLibrary implements CoreApi {
   ///
   /// 查找顺序：`--dart-define=YUNONG_CORE_DLL` → 环境变量 `YUNONG_CORE_DLL`
   /// → 可执行文件同目录 → 系统库搜索路径。
+  /// 打开端侧核心库（chat 流式绑定复用同一份 DLL；找不到时抛 [CoreUnavailable]）。
+  static DynamicLibrary openCoreLibrary() {
+    final errors = <String>[];
+    for (final candidate in _candidates()) {
+      try {
+        return DynamicLibrary.open(candidate);
+      } on ArgumentError catch (err) {
+        errors.add('$candidate: ${err.message}');
+      }
+    }
+    throw CoreUnavailable(errors.join('；'));
+  }
+
   static CoreLibrary instance() {
     final cached = _instance;
     if (cached != null) {

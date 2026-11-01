@@ -26,7 +26,8 @@ regex = "1"
 # rustls 在移动端零系统依赖；也不开 http2（SSE 走 HTTP/1.1）。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # 只为了三段超时里的 `tokio::time::timeout`（运行时由调用方提供）
-tokio = { version = "1", features = ["time"] }
+# rt/net：流式 FFI（yunong_chat_stream）在后台线程里自建 runtime 跑 gateway
+tokio = { version = "1", features = ["time", "rt", "net"] }
 
 [dev-dependencies]
 # 假 SSE 服务（tokio::net::TcpListener 手写，不引 wiremock）+ #[tokio::test]
