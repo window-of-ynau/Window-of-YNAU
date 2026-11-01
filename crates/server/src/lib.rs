@@ -47,10 +47,12 @@ pub fn app(state: state::AppState) -> Router {
 
     public
         .merge(protected)
-        // 红队 H2：请求体硬上限。`MAX_INPUT_TOKENS` 之外的物理闸——
-        // 正文塞得比 token 预算大时先在这里被拒，不让它走完解析再进转发。
-        .layer(axum::extract::DefaultBodyLimit::max(
-            state.config.body_limit_bytes,
+        // 红队 H2 + security 复核 F3：请求体硬上限由**我们自己的中间件**实现。
+        // `DefaultBodyLimit` 的 413 是 axum 的 text/plain，客户端解析不到统一信封，
+        // 所以这里换成 `api::body_limit::enforce`（超限同样 413，但带 `{ok:false,error:{...}}`）。
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::body_limit::enforce,
         ))
         // 最外层：请求 ID（错误信封需要它）；内层：访问日志
         .layer(TraceLayer::new_for_http())

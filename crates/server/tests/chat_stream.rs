@@ -1773,6 +1773,11 @@ async fn oversized_body_is_rejected_with_413() {
         StatusCode::PAYLOAD_TOO_LARGE,
         "超过 body 上限必须是 413"
     );
+    // security 复核 F3：413 必须是**我们的信封**（不是 axum 的 text/plain），
+    // 否则客户端按契约解析时走不到统一错误分支。
+    let body = read_json(response).await;
+    assert_eq!(body["ok"], false, "信封必须是 ok:false：{body}");
+    assert_eq!(body["error"]["code"], "MESSAGE_TOO_LARGE", "{body}");
     assert_eq!(mock.requests(), 0, "被 body 闸拦下的请求不该打上游");
 }
 
@@ -1836,6 +1841,103 @@ async fn same_turn_id_is_independent_across_users() {
 
     drop(alice_stream);
     drop(bob_stream);
+}
+
+/// security 复核 F1（high）：超长邮箱必须在**进限流之前**被拒，且不进桶表。
+///
+/// 原来限流桶的键是这段攻击者可控的 email：600 个 × 256 KiB 就能让进程常驻
+/// 154.8 MiB 且永不释放（与并发无关，并发闸挡不住）。修法是"先卡长度再进限流"。
+#[tokio::test]
+async fn oversized_email_is_rejected_without_growing_rate_limiter() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+    assert_eq!(app.state.limiter.bucket_count(), 0, "起始应为空桶表");
+
+    // 300 字节邮箱（>254）+ 1 MiB 量级的假邮箱各打一次登录
+    for email in ["a".repeat(300), format!("{}@x.cn", "b".repeat(1024))] {
+        let payload = json!({ "email": email, "password": "whatever-password" }).to_string();
+        let response = app
+            .call(json_request("POST", "/api/v1/auth/login", &payload, None))
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "超长邮箱应 422（登录）"
+        );
+        let body = read_json(response).await;
+        assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+
+        let payload = json!({ "email": email, "password": "whatever-password" }).to_string();
+        let response = app
+            .call(json_request(
+                "POST",
+                "/api/v1/auth/register",
+                &payload,
+                None,
+            ))
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "超长邮箱应 422（注册）"
+        );
+    }
+
+    // 关键断言：**桶表一个都没长**（长 email 连限流都没进）
+    assert_eq!(
+        app.state.limiter.bucket_count(),
+        0,
+        "超长邮箱不得进限流桶表（F1 的内存放大器正是它）"
+    );
+    assert_eq!(mock.requests(), 0);
+}
+
+/// security 复核 F2（medium）：工具描述/参数同样会转发给上游，必须计入准入估算。
+#[tokio::test]
+async fn tool_definition_is_counted_in_admission_estimate() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+    let token = app.register("tools-estimate@ynau.edu.cn").await;
+
+    // 700 KiB 工具描述：body 仍在上限内（1 MiB），但远超 32k token 预算
+    let payload = json!({
+        "session_id": "s",
+        "turn_id": "turn-tools",
+        "round": 1,
+        "model": "m",
+        "protocol": "openai_completions",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "tools": [{
+            "name": "demo",
+            "description": "A".repeat(700 * 1024),
+            "parameters": { "type": "object", "properties": {} }
+        }],
+        "max_output_tokens": 64,
+        "stream": true,
+        "estimated_input_tokens": 1
+    })
+    .to_string();
+    assert!(
+        payload.len() < 1024 * 1024,
+        "要测的是估算漏算，不是 body 闸"
+    );
+
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &payload,
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "工具描述必须计入准入估算（之前漏算 → 上游实收 700 KiB）"
+    );
+    let body = read_json(response).await;
+    assert_eq!(body["error"]["code"], "MESSAGE_TOO_LARGE");
+    assert_eq!(mock.requests(), 0, "准入拒绝不该打上游");
 }
 
 /// M4：标识字段超长 → 422（**不截断**：截断会让审计/抽样的 turn_id 与后续轮次对不上）。
