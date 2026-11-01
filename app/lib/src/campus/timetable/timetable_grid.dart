@@ -22,7 +22,7 @@ const int kPeriodCount = 10;
 const double kGridHeaderHeight = 44;
 
 /// 行高自适应区间：下限保证单节块还能放"课名 + 教室"，上限避免高窗口里块太空。
-const double kMinRowHeight = 48;
+const double kMinRowHeight = 44;
 const double kMaxRowHeight = 60;
 
 /// 窄窗口展开周末时的最小列宽（再窄就横向滚动，而不是把字挤碎）。
@@ -67,6 +67,7 @@ class TimetableGrid extends StatefulWidget {
 
 class _TimetableGridState extends State<TimetableGrid> {
   final ScrollController _vertical = ScrollController();
+  final ScrollController _horizontal = ScrollController();
 
   /// 最近一次布局算出的行高（自动滚动要用）。
   double _rowHeight = kMinRowHeight;
@@ -91,6 +92,7 @@ class _TimetableGridState extends State<TimetableGrid> {
   @override
   void dispose() {
     _vertical.dispose();
+    _horizontal.dispose();
     super.dispose();
   }
 
@@ -125,8 +127,8 @@ class _TimetableGridState extends State<TimetableGrid> {
 
         // 行高自适应：让 1280×720 的默认窗口正好放下 10 节（见方案 §2.3.1）。
         final double usable = height.isFinite ? height : 600;
-        final double rowHeight =
-            ((usable - kGridHeaderHeight) / kPeriodCount).clamp(kMinRowHeight, kMaxRowHeight);
+        final double rowHeight = ((usable - kGridHeaderHeight) / kPeriodCount)
+            .clamp(kMinRowHeight, kMaxRowHeight);
 
         // 列宽：宽窗口按可用宽度均分（不滚动）；窄窗口且展开周末时给固定最小宽 + 横向滚动。
         final double fitWidth = math.max(0.0, (width - axisWidth) / days);
@@ -138,67 +140,74 @@ class _TimetableGridState extends State<TimetableGrid> {
         _rowHeight = rowHeight;
         final List<DateTime>? dates = widget.dates;
 
-        return SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: SizedBox(
-            width: innerWidth,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                _HeaderRow(
-                  days: days,
-                  axisWidth: axisWidth,
-                  dayWidth: dayWidth,
-                  dates: dates,
-                  todayIndex: widget.todayIndex,
-                ),
-                Expanded(
-                  child: SingleChildScrollView(
-                    controller: _vertical,
-                    child: SizedBox(
-                      height: rowHeight * kPeriodCount,
-                      child: Stack(
-                        children: <Widget>[
-                          Positioned.fill(
-                            child: CustomPaint(
-                              painter: _GridPainter(
-                                rowHeight: rowHeight,
-                                axisWidth: axisWidth,
-                                dayWidth: dayWidth,
-                                dayCount: days,
-                                todayIndex: widget.todayIndex,
-                                lineColor: dark
-                                    ? Colors.white.withValues(alpha: 0.10)
-                                    : Colors.black.withValues(alpha: 0.06),
-                                todayColor: theme.colorScheme.primary.withValues(
-                                  alpha: dark ? 0.10 : 0.05,
+        return Scrollbar(
+          controller: _horizontal,
+          thumbVisibility: false,
+          child: SingleChildScrollView(
+            controller: _horizontal,
+            scrollDirection: Axis.horizontal,
+            child: SizedBox(
+              width: innerWidth,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  _HeaderRow(
+                    days: days,
+                    axisWidth: axisWidth,
+                    dayWidth: dayWidth,
+                    dates: dates,
+                    todayIndex: widget.todayIndex,
+                  ),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      controller: _vertical,
+                      child: SizedBox(
+                        height: rowHeight * kPeriodCount,
+                        child: Stack(
+                          children: <Widget>[
+                            Positioned.fill(
+                              child: CustomPaint(
+                                painter: _GridPainter(
+                                  rowHeight: rowHeight,
+                                  axisWidth: axisWidth,
+                                  dayWidth: dayWidth,
+                                  dayCount: days,
+                                  todayIndex: widget.todayIndex,
+                                  lineColor: dark
+                                      ? Colors.white.withValues(alpha: 0.10)
+                                      : Colors.black.withValues(alpha: 0.06),
+                                  todayColor:
+                                      theme.colorScheme.primary.withValues(
+                                    alpha: dark ? 0.10 : 0.05,
+                                  ),
                                 ),
                               ),
                             ),
-                          ),
-                          Row(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: <Widget>[
-                              SizedBox(
-                                width: axisWidth,
-                                child: _PeriodAxis(rowHeight: rowHeight),
-                              ),
-                              for (int day = 1; day <= days; day++)
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: <Widget>[
                                 SizedBox(
-                                  width: dayWidth,
-                                  child: Stack(
-                                    clipBehavior: Clip.none,
-                                    children: _buildBlocks(day, dayWidth, rowHeight, theme),
-                                  ),
+                                  width: axisWidth,
+                                  child: _PeriodAxis(rowHeight: rowHeight),
                                 ),
-                            ],
-                          ),
-                        ],
+                                for (int day = 1; day <= days; day++)
+                                  SizedBox(
+                                    width: dayWidth,
+                                    child: Stack(
+                                      clipBehavior: Clip.none,
+                                      children: _buildBlocks(
+                                          day, dayWidth, rowHeight, theme),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         );
@@ -207,7 +216,8 @@ class _TimetableGridState extends State<TimetableGrid> {
   }
 
   /// 一天的课程块：同格冲突（不同周次集合导致 Rust 没合并）时横向分道。
-  List<Widget> _buildBlocks(int day, double dayWidth, double rowHeight, ThemeData theme) {
+  List<Widget> _buildBlocks(
+      int day, double dayWidth, double rowHeight, ThemeData theme) {
     final List<StoredCourse> dayCourses = widget.courses
         .where((StoredCourse course) => course.weekday == day)
         .toList(growable: false);
@@ -276,7 +286,8 @@ class _TimetableGridState extends State<TimetableGrid> {
       int lane = -1;
       for (int i = 0; i < lanes.length; i++) {
         final bool free = lanes[i].every((StoredCourse other) =>
-            course.startPeriod > other.endPeriod || course.endPeriod < other.startPeriod);
+            course.startPeriod > other.endPeriod ||
+            course.endPeriod < other.startPeriod);
         if (free) {
           lane = i;
           break;
@@ -300,13 +311,15 @@ class _TimetableGridState extends State<TimetableGrid> {
         }
         maxLane = math.max(maxLane, laneOf[other]!);
       }
-      return _Laned(course: course, lane: laneOf[course]!, laneCount: maxLane + 1);
+      return _Laned(
+          course: course, lane: laneOf[course]!, laneCount: maxLane + 1);
     }).toList(growable: false);
   }
 }
 
 class _Laned {
-  const _Laned({required this.course, required this.lane, required this.laneCount});
+  const _Laned(
+      {required this.course, required this.lane, required this.laneCount});
 
   final StoredCourse course;
   final int lane;
@@ -396,13 +409,16 @@ class _DayHead extends StatelessWidget {
     final Widget content = Column(
       mainAxisAlignment: MainAxisAlignment.center,
       children: <Widget>[
-        Text(label, style: labelStyle, maxLines: 1, overflow: TextOverflow.ellipsis),
+        Text(label,
+            style: labelStyle, maxLines: 1, overflow: TextOverflow.ellipsis),
         if (date != null)
-          Text(date!, style: dateStyle, maxLines: 1, overflow: TextOverflow.ellipsis),
+          Text(date!,
+              style: dateStyle, maxLines: 1, overflow: TextOverflow.ellipsis),
       ],
     );
     if (!isToday) {
-      return Padding(padding: const EdgeInsets.symmetric(horizontal: 2), child: content);
+      return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2), child: content);
     }
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 5),
@@ -440,8 +456,11 @@ class _PeriodAxis extends StatelessWidget {
                 style: theme.textTheme.labelSmall?.copyWith(
                   fontSize: 11,
                   fontWeight: FontWeight.w500,
-                  color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.8),
-                  fontFeatures: const <FontFeature>[FontFeature.tabularFigures()],
+                  color:
+                      theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.8),
+                  fontFeatures: const <FontFeature>[
+                    FontFeature.tabularFigures()
+                  ],
                 ),
               ),
             ),
@@ -535,20 +554,22 @@ class _CourseBlock extends StatelessWidget {
   final int week;
   final VoidCallback onTap;
 
-  static const double _padTop = 5;
-  static const double _padBottom = 4;
+  static const double _padTop = 4;
+  static const double _padBottom = 3;
   static const double _padding = _padTop + _padBottom;
   static const double _nameLine = 17;
-  static const double _roomLine = 15;
+  static const double _roomLine = 14;
   static const double _metaLine = 13;
 
   @override
   Widget build(BuildContext context) {
-    final String? room = (course.room ?? '').trim().isEmpty ? null : course.room!.trim();
+    final String? room =
+        (course.room ?? '').trim().isEmpty ? null : course.room!.trim();
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
         final double height = constraints.maxHeight;
-        final bool showRoom = room != null && height >= _padding + _nameLine + _roomLine;
+        final bool showRoom =
+            room != null && height >= _padding + _nameLine + _roomLine;
         final bool showMeta = span >= 2 &&
             height >=
                 _padding + _nameLine + (showRoom ? _roomLine : 0) + _metaLine;
@@ -592,7 +613,8 @@ class _CourseBlock extends StatelessWidget {
                       ),
                     ),
                     Padding(
-                      padding: const EdgeInsets.fromLTRB(9, _padTop, 4, _padBottom),
+                      padding:
+                          const EdgeInsets.fromLTRB(9, _padTop, 4, _padBottom),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisAlignment: MainAxisAlignment.start,
@@ -613,14 +635,20 @@ class _CourseBlock extends StatelessWidget {
                               room,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 11, height: 1.3, color: tint.inkSoft),
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  height: 1.3,
+                                  color: tint.inkSoft),
                             ),
                           if (showMeta)
                             Text(
                               _metaText(),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 10, height: 1.3, color: tint.inkSoft),
+                              style: TextStyle(
+                                  fontSize: 10,
+                                  height: 1.3,
+                                  color: tint.inkSoft),
                             ),
                         ],
                       ),

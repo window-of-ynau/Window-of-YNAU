@@ -85,6 +85,15 @@ class _TimetablePageState extends State<TimetablePage> {
 
   String get _currentTerm => _term.text.trim();
 
+  /// 操作条统一用 compact 密度：1280×720 下省出来的高度换成"整周可见"。
+  static const ButtonStyle _compactButtonStyle = ButtonStyle(
+    visualDensity: VisualDensity.compact,
+    padding: WidgetStatePropertyAll<EdgeInsets>(
+      EdgeInsets.symmetric(horizontal: 12),
+    ),
+    minimumSize: WidgetStatePropertyAll<Size>(Size(0, 36)),
+  );
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -92,19 +101,21 @@ class _TimetablePageState extends State<TimetablePage> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 6),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
               // 用 Wrap 而不是 Row：按钮文案较长，窄窗口（含 800×600 的 widget test 视口）
               // 下 Row 会直接溢出；Wrap 会自动折行。
+              // 按钮统一 compact 密度：1280×720 下这一行只占 36px 高（默认 48px），
+              // 省下来的高度直接换成"整周可见"。
               Wrap(
                 spacing: 8,
-                runSpacing: 8,
+                runSpacing: 6,
                 crossAxisAlignment: WrapCrossAlignment.center,
                 children: <Widget>[
                   SizedBox(
-                    width: 180,
+                    width: 150,
                     child: TextField(
                       controller: _term,
                       decoration: const InputDecoration(
@@ -116,22 +127,26 @@ class _TimetablePageState extends State<TimetablePage> {
                   ),
                   FilledButton.icon(
                     onPressed: _busy ? null : _fetchFromCampus,
-                    icon: const Icon(Icons.login),
+                    style: _compactButtonStyle,
+                    icon: const Icon(Icons.login, size: 18),
                     label: const Text('登录并抓取课表'),
                   ),
                   OutlinedButton.icon(
                     onPressed: _busy ? null : () => _importFixture(revamped: false),
-                    icon: const Icon(Icons.description_outlined),
+                    style: _compactButtonStyle,
+                    icon: const Icon(Icons.description_outlined, size: 18),
                     label: const Text('导入内置样本'),
                   ),
                   OutlinedButton.icon(
                     onPressed: _busy ? null : () => _importFixture(revamped: true),
-                    icon: const Icon(Icons.bug_report_outlined),
+                    style: _compactButtonStyle,
+                    icon: const Icon(Icons.bug_report_outlined, size: 18),
                     label: const Text('模拟页面改版'),
                   ),
                   TextButton.icon(
                     onPressed: _busy ? null : _importFromClipboard,
-                    icon: const Icon(Icons.content_paste),
+                    style: _compactButtonStyle,
+                    icon: const Icon(Icons.content_paste, size: 18),
                     label: const Text('从剪贴板导入'),
                   ),
                   // 「本学期 N 门课 / 最近一次抓取结果」合成一个 chip。
@@ -681,32 +696,41 @@ class _TimetablePageState extends State<TimetablePage> {
     }
     final week = _currentWeek;
     final weekOne = weekRangeLabel(termStart: draft, week: 1);
-    final subtitle = <String>[
-      '第 1 周：$weekOne',
-      if (week != null && week > 0) '今天按此算第 $week 周',
+    // 已确认：压成**一行**（约 36px）。
+    // 之前是两行卡片（74px），1280×720 下正好把第 10 节挤出屏幕；
+    // 信息层级上它也只是"参考值"，不该占两行。
+    final String detail = <String>[
+      '学期开始日 ${formatIsoDate(draft)}',
+      '第 1 周 $weekOne',
+      if (week != null && week > 0) '今天第 $week 周',
     ].join(' · ');
-    return Container(
-      margin: const EdgeInsets.fromLTRB(12, 6, 12, 0),
-      padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
-        borderRadius: BorderRadius.circular(10),
-      ),
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 2, 8, 0),
       child: Row(
         children: <Widget>[
-          Icon(Icons.event_available_outlined, size: 18, color: theme.colorScheme.onSurfaceVariant),
-          const SizedBox(width: 8),
+          Icon(
+            Icons.event_available_outlined,
+            size: 16,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+          const SizedBox(width: 6),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text('学期开始日（第 1 周周一）：${formatIsoDate(draft)}',
-                    style: theme.textTheme.bodyMedium),
-                Text(subtitle, style: theme.textTheme.bodySmall),
-              ],
+            child: Text(
+              detail,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall,
             ),
           ),
-          TextButton(onPressed: _editTermStart, child: const Text('修改')),
+          TextButton(
+            onPressed: _editTermStart,
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              minimumSize: const Size(0, 32),
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+            ),
+            child: const Text('修改'),
+          ),
         ],
       ),
     );

@@ -30,16 +30,32 @@ class CourseTint {
     required this.ink,
     required this.inkSoft,
     required this.border,
+    this.deep = false,
   });
 
   final Color container;
   final Color ink;
   final Color inkSoft;
   final Color border;
+
+  /// 第二轮的同一色相（本学期课程数超过色板容量时用）：靠深浅区分，不是同色。
+  final bool deep;
+
+  /// 加深一档：底色/描边往 ink 压 16%/26%，课名颜色不变（对比度只会更高，实测 ≥7.0:1）。
+  /// 压得够深才看得出"同色相两档"，压 10% 时分不清（实测对比截图）。
+  CourseTint get deeper => CourseTint(
+        container: Color.alphaBlend(ink.withValues(alpha: 0.16), container),
+        ink: ink,
+        inkSoft: inkSoft,
+        border: Color.alphaBlend(ink.withValues(alpha: 0.26), border),
+        deep: true,
+      );
 }
 
-/// 浅色主题的 9 色板。**故意不放纯红/纯琥珀**：红色留给"解析失败"，
+/// 浅色主题的 11 色板。**故意不放纯红/纯琥珀**：红色留给"解析失败"，
 /// 琥珀留给"未确认学期开始日"，否则用户会把一门课看成报错。
+///
+/// 11 色 × 2 轮（第二轮加深一档）= 22 个槽位：常见学期（6~14 门）不会撞色。
 const List<CourseTint> kCourseTintsLight = <CourseTint>[
   CourseTint(
     container: Color(0xFFE8F1FE),
@@ -94,6 +110,18 @@ const List<CourseTint> kCourseTintsLight = <CourseTint>[
     ink: Color(0xFF2A3470),
     inkSoft: Color(0xFF50588C),
     border: Color(0xFFCCD0E8),
+  ),
+  CourseTint(
+    container: Color(0xFFE1F2FB),
+    ink: Color(0xFF0D4462),
+    inkSoft: Color(0xFF376781),
+    border: Color(0xFFC3DAE6),
+  ),
+  CourseTint(
+    container: Color(0xFFE8EDF3),
+    ink: Color(0xFF2F3E4F),
+    inkSoft: Color(0xFF546170),
+    border: Color(0xFFCED4DC),
   ),
 ];
 
@@ -153,6 +181,18 @@ const List<CourseTint> kCourseTintsDark = <CourseTint>[
     inkSoft: Color(0xFFA2A7CE),
     border: Color(0xFF444967),
   ),
+  CourseTint(
+    container: Color(0xFF0F2C38),
+    ink: Color(0xFFA6D7EF),
+    inkSoft: Color(0xFF89B4CB),
+    border: Color(0xFF2E4E59),
+  ),
+  CourseTint(
+    container: Color(0xFF242B33),
+    ink: Color(0xFFC3CFDD),
+    inkSoft: Color(0xFFA4AFBC),
+    border: Color(0xFF414A55),
+  ),
 ];
 
 /// FNV-1a 32 位。**不要换成 `String.hashCode`**：Dart 只保证同进程内稳定，
@@ -169,22 +209,38 @@ int courseNameFingerprint(String name) {
 /// 本学期「课程名 → 槽位」映射。
 ///
 /// 输入应当是**整学期**的课程名集合（不是本周可见课），否则切周会换色。
-Map<String, int> assignCourseTints(Iterable<String> names, {int paletteSize = 9}) {
+///
+/// 槽位分配分两轮，**先占本色再占加深档**：
+///   1. 第一轮只用 `0..N-1`（色板本色，颜色最鲜）；
+///   2. 第一轮占满后（本学期 > N 门课）才用 `N..2N-1`（同色相加深一档）。
+/// 这样 6~11 门课时整张课表全是本色（不会因为色板变大就变灰），
+/// 12~22 门课时才出现"同色相深浅不同"的两块。
+Map<String, int> assignCourseTints(Iterable<String> names) {
+  const int base = 11; // 与 kCourseTintsLight/Dark 的长度一致（由测试兜底）
   final List<String> ordered = names.toSet().toList()..sort();
   final Set<int> used = <int>{};
   final Map<String, int> result = <String, int>{};
   for (final String name in ordered) {
-    final int start = courseNameFingerprint(name) % paletteSize;
+    final int start = courseNameFingerprint(name) % base;
     int picked = -1;
-    for (int step = 0; step < paletteSize; step++) {
-      final int candidate = (start + step) % paletteSize;
+    for (int step = 0; step < base; step++) {
+      final int candidate = (start + step) % base;
       if (!used.contains(candidate)) {
         picked = candidate;
         break;
       }
     }
     if (picked < 0) {
-      // 课程数超过色板容量：允许复用（同色 + 虚线边框，见 TimetableGrid）
+      for (int step = 0; step < base; step++) {
+        final int candidate = base + (start + step) % base;
+        if (!used.contains(candidate)) {
+          picked = candidate;
+          break;
+        }
+      }
+    }
+    if (picked < 0) {
+      // 超过 2N 门课：只能复用（此时同色不可避免，详情面板里仍可区分）
       picked = start;
     }
     used.add(picked);
@@ -193,7 +249,7 @@ Map<String, int> assignCourseTints(Iterable<String> names, {int paletteSize = 9}
   return result;
 }
 
-/// 取某门课在当前亮度下的一套颜色。
+/// 取某门课在当前亮度下的一套颜色（自动处理"第二轮加深"）。
 CourseTint courseTintOf(
   BuildContext context,
   Map<String, int> assignment,
@@ -202,6 +258,7 @@ CourseTint courseTintOf(
   final List<CourseTint> palette = Theme.of(context).brightness == Brightness.dark
       ? kCourseTintsDark
       : kCourseTintsLight;
-  final int index = assignment[courseName] ?? 0;
-  return palette[index % palette.length];
+  final int slot = assignment[courseName] ?? 0;
+  final CourseTint base = palette[slot % palette.length];
+  return slot >= palette.length ? base.deeper : base;
 }
