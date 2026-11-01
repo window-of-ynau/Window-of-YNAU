@@ -108,6 +108,100 @@ DateTime? parseTermStart(String value) {
 ///
 /// 保留此注释是为了防止有人重新引入全局常量：学期锚点必须按学期存放，
 /// 见 [kSeededTermStarts] 与 [suggestedTermStart]。
+/// 一个候选 cardId（32 位 hex）+ 它在 HTML 里的上下文（用于排序与诊断，不含凭据）。
+class CardIdCandidate {
+  const CardIdCandidate({required this.value, required this.context, required this.order});
+
+  final String value;
+
+  /// 命中处前后各 40 字符（排序/诊断用；不打印整页 HTML）
+  final String context;
+
+  /// 在 HTML 里出现的顺序（越小越靠前）
+  final int order;
+
+  /// 上下文里是否带课表相关线索（排序优先）
+  bool get looksLikeTimetable {
+    final text = context.toLowerCase();
+    return context.contains('课表') ||
+        text.contains('kbsz') ||
+        text.contains('timetable') ||
+        text.contains('schedule');
+  }
+}
+
+/// 从整页 HTML 里抽 32 位 hex 候选：**按出现顺序去重**，课表相关线索排前。
+///
+/// 位置不可靠（owner 实测 18 个命中里有 6 个是重复的，真实 cardId 排第 14），
+/// 所以这里只负责"候选 + 优先级"，命中与否必须靠 [`selectCardIdByProbing`] 探测。
+List<CardIdCandidate> extractCardIdCandidates(String html, {int max = 12}) {
+  if (html.isEmpty || max <= 0) {
+    return const <CardIdCandidate>[];
+  }
+  final pattern = RegExp(r'[0-9a-f]{32}');
+  final seen = <String>{};
+  final ordered = <CardIdCandidate>[];
+  for (final match in pattern.allMatches(html)) {
+    final value = match.group(0)!;
+    if (!seen.add(value)) {
+      continue;
+    }
+    final start = match.start - 40 < 0 ? 0 : match.start - 40;
+    final end = match.end + 40 > html.length ? html.length : match.end + 40;
+    ordered.add(CardIdCandidate(
+      value: value,
+      context: html.substring(start, end),
+      order: ordered.length,
+    ));
+  }
+  final sorted = <CardIdCandidate>[
+    ...ordered.where((CardIdCandidate item) => item.looksLikeTimetable),
+    ...ordered.where((CardIdCandidate item) => !item.looksLikeTimetable),
+  ];
+  return sorted.take(max).toList(growable: false);
+}
+
+/// 探测命中判据：`data.resultsJsonArr` 是一个**行数组**（门户固定 7 天）。
+bool isScheduleProbeHit(Object? decoded) {
+  if (decoded is! Map) {
+    return false;
+  }
+  final data = decoded['data'];
+  if (data is! Map) {
+    return false;
+  }
+  final rows = data['resultsJsonArr'];
+  if (rows is! List || rows.isEmpty) {
+    return false;
+  }
+  return true;
+}
+
+/// 依次探测候选，命中即停（最多 [maxAttempts] 次）。
+///
+/// `probe` 返回 true 表示命中；异常/非 200 都按"不命中"处理（不中断整体流程）。
+Future<CardIdCandidate?> selectCardIdByProbing(
+  List<CardIdCandidate> candidates,
+  Future<bool> Function(CardIdCandidate candidate) probe, {
+  int maxAttempts = 12,
+}) async {
+  var attempts = 0;
+  for (final candidate in candidates) {
+    if (attempts >= maxAttempts) {
+      break;
+    }
+    attempts += 1;
+    try {
+      if (await probe(candidate)) {
+        return candidate;
+      }
+    } on Object {
+      // 单个候选失败不影响后续候选（真实页面里大量 hash 是无关业务 id）
+      continue;
+    }
+  }
+  return null;
+}
 /// 最多拉 20 周（接口 `weekcount` 上限的约定），并发 4，总超时 20s。
 const int kMaxWeeks = 20;
 const int kFetchConcurrency = 4;
@@ -242,7 +336,7 @@ const String kPortalScheduleScript = r'''
   // 诊断用：owner/我们据此判断卡在哪一步（不含任何凭据）
   var DIAG = {
     xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0,
-    hookInstalled: true, candidates: 0, years: '', probeFailed: false
+    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: []
   };
   var TIMEOUT_MS = 20000;
   var timeoutPosted = false;
@@ -341,7 +435,8 @@ const String kPortalScheduleScript = r'''
       hookInstalled: DIAG.hookInstalled,
       candidates: DIAG.candidates,
       years: DIAG.years || '',
-      probeFailed: DIAG.probeFailed
+      probeFailed: DIAG.probeFailed,
+      probeResults: DIAG.probeResults
     });
   };
 
@@ -471,36 +566,73 @@ const String kPortalScheduleScript = r'''
   var AUTO_STARTED = false;
 
   function hexCandidates() {
-    var out = [];
+    var ordered = [];
+    var seen = {};
     try {
       var html = document.documentElement.outerHTML || '';
       var re = /[0-9a-f]{32}/g;
       var match = re.exec(html);
-      while (match && out.length < 12) {
-        if (out.indexOf(match[0]) < 0) { out.push(match[0]); }
+      while (match) {
+        var value = match[0];
+        if (!seen[value]) {
+          seen[value] = true;
+          var start = match.index - 40 < 0 ? 0 : match.index - 40;
+          var end = match.index + 32 + 40 > html.length ? html.length : match.index + 32 + 40;
+          var context = html.slice(start, end);
+          var lower = context.toLowerCase();
+          ordered.push({
+            value: value,
+            context: context,
+            prefers: context.indexOf('课表') >= 0 || lower.indexOf('kbsz') >= 0
+              || lower.indexOf('timetable') >= 0 || lower.indexOf('schedule') >= 0
+          });
+        }
         match = re.exec(html);
       }
     } catch (e) {}
-    return out;
+    // 课表相关线索排前面，其余按出现顺序（位置不可靠，命中与否靠探测）
+    var sorted = [];
+    for (var i = 0; i < ordered.length; i++) { if (ordered[i].prefers) { sorted.push(ordered[i]); } }
+    for (var j = 0; j < ordered.length; j++) { if (!ordered[j].prefers) { sorted.push(ordered[j]); } }
+    return sorted.slice(0, 12);
   }
-
   function termGuess() {
     if (window.__yunongTerm) { return String(window.__yunongTerm); }
     return termFromDom();
   }
 
   function probeCandidate(cardId, years) {
-    var url = API + '?years=' + encodeURIComponent(years) + '&results=1'
+    var week = window.__yunongCurrentWeek || 1;
+    var url = API + '?years=' + encodeURIComponent(years) + '&results=' + week
       + (cardId ? '&cardId=' + encodeURIComponent(cardId) : '')
       + '&_t=' + Date.now();
-    return getJson(url).then(function (body) {
-      var data = body && body.data ? body.data : null;
-      return !!(data && data.resultsJsonArr);
-    }).catch(function () {
+    return rawFetch.call(window, url, {
+      credentials: 'include',
+      headers: { 'Accept': 'application/json, text/plain, */*' }
+    }).then(function (res) {
+      var prefix = cardId ? cardId.slice(0, 8) : '(none)';
+      DIAG.probeResults.push(prefix + ':' + res.status);
+      if (res.status === 401 || res.status === 403) {
+        var authErr = new Error('AUTH');
+        authErr.code = 'AUTH_REQUIRED';
+        throw authErr;
+      }
+      if (res.status < 200 || res.status >= 300) { return false; }
+      return res.text().then(function (text) {
+        var trimmed = (text || '').trim();
+        if (!trimmed || trimmed.charAt(0) !== '{') { return false; }
+        try {
+          var body = JSON.parse(trimmed);
+          var data = body && body.data ? body.data : null;
+          return !!(data && data.resultsJsonArr && data.resultsJsonArr.length);
+        } catch (e) { return false; }
+      });
+    }).catch(function (err) {
+      DIAG.probeResults.push((cardId ? cardId.slice(0, 8) : '(none)') + ':ERR');
+      if (err && err.code === 'AUTH_REQUIRED') { throw err; }
       return false;
     });
   }
-
   function adoptTemplate(cardId, source, years) {
     if (TEMPLATE) { return; }
     TEMPLATE = { cardId: cardId, years: years, weekcount: 20, weekcountFromApi: false };
