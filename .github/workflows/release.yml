@@ -1,10 +1,23 @@
-# 发布：推 v* 标签时构建服务端镜像，并尝试产出 Android APK
+# 发布：推 v* 标签时构建服务端镜像 + Android APK。
+#
+# 关键顺序：**先构建、先冒烟、后推送**。镜像只有在容器里真跑起来、/healthz 与 /readyz
+# 都符合契约之后才 push 到 GHCR——坏镜像不会进发布通道，也不会顶掉 :latest。
+# 冒烟逻辑与 ci.yml 的 docker job 共用 scripts/docker-smoke.sh，改断言只改一处。
+#
+# 手动干跑（验证发布流水线本身，不推送）：gh workflow run release --ref <分支> -f dry_run=true
+#   —— 只跑 server-image（构建 + 冒烟），不跑 APK、不登录 GHCR、不推送。
 name: release
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只构建 + 冒烟，不推送到 GHCR"
+        type: boolean
+        default: true
 
 # 顶层最小权限；只有 server-image 为推 GHCR 提权（全仓唯一提权 workflow）
 permissions:
@@ -15,44 +28,102 @@ jobs:
   server-image:
     name: 服务端镜像（GHCR）
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
+    env:
+      # tag push 一律推送；workflow_dispatch 默认干跑（dry_run=true）
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # 校验"标签指向 main 上的提交"需要完整历史
+          fetch-depth: 0
+      - name: 校验 tag 在 main 上（发布只从 main 打标签）
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --prune origin '+refs/heads/main:refs/remotes/origin/main'
+          git merge-base --is-ancestor HEAD origin/main \
+            || { echo "::error::${GITHUB_REF_NAME} 指向的提交不在 main 上"; exit 1; }
+      - name: 校验 tag 与 workspace 版本一致
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ws=$(awk -F'"' '/^\[workspace\.package\]/{f=1; next} f && /^\[/{exit} f && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          [ -n "$ws" ] || { echo "::error::读不到 Cargo.toml 的 [workspace.package].version"; exit 1; }
+          echo "tag=$tag workspace_version=$ws"
+          [ "$tag" = "$ws" ] \
+            || { echo "::error::tag v$tag 与 Cargo.toml workspace 版本 $ws 不一致——先对齐版本号再打标签"; exit 1; }
+          # 端侧版本由 app/pubspec.yaml 维护，不一致只警告（APK 版本号会对不上，但不阻塞镜像发布）
+          app_ver=$(sed -n 's/^version:[[:space:]]*//p' app/pubspec.yaml | head -n 1)
+          case "$app_ver" in
+            "$tag"+*) echo "app_version=$app_ver" ;;
+            *) echo "::warning::app/pubspec.yaml 版本是 '$app_ver'，与 tag v$tag 不一致" ;;
+          esac
       - name: 启用 buildx
         uses: docker/setup-buildx-action@v3
-      # 用内置 GITHUB_TOKEN，不额外建 PAT（PAT 是长期凭据，泄露面更大）
-      - name: 登录 GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      # 分支名（干跑时）含 / 不能直接当镜像 tag，这里统一归一化；tag push 时 vX.Y.Z 原样保留
+      - name: 计算镜像 tag
+        id: tag
+        run: |
+          set -euo pipefail
+          tag=$(printf '%s' "$GITHUB_REF_NAME" | tr '/:@ ' '----')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$tag"
       # GHCR 仓库名必须全小写：组织名含大写时用 tr 归一化
       - name: 计算镜像名（小写）
         id: image
         run: |
           echo "name=ghcr.io/${{ github.repository_owner }}/yunong-server" \
             | tr '[:upper:]' '[:lower:]' >> "$GITHUB_OUTPUT"
-      - name: 构建并推送
+      # 只 load 到 runner 本地：冒烟通过之后才推，顺序不能反
+      - name: 构建（load 到本地，先不推送）
         uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/Dockerfile.server
-          push: true
+          push: false
+          load: true
           tags: |
-            ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.name }}:${{ steps.tag.outputs.tag }}
             ${{ steps.image.outputs.name }}:latest
+          # 与 ci.yml 的 docker job 共用同一个 gha 缓存（默认 scope=buildkit）
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: 镜像冒烟（真起容器探 /healthz、/readyz，检查二进制大小与 uid）
+        run: |
+          bash scripts/docker-smoke.sh \
+            "${{ steps.image.outputs.name }}:${{ steps.tag.outputs.tag }}" \
+            yunong-release-smoke 18080
+      # 用内置 GITHUB_TOKEN，不额外建 PAT（PAT 是长期凭据，泄露面更大）
+      - name: 登录 GHCR
+        if: env.DRY_RUN != 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 推送镜像（冒烟通过之后）
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          docker push "${{ steps.image.outputs.name }}:${{ steps.tag.outputs.tag }}"
+          docker push "${{ steps.image.outputs.name }}:latest"
+      - name: 干跑说明
+        if: env.DRY_RUN == 'true'
+        run: |
+          echo "DRY_RUN=true：镜像 ${{ steps.image.outputs.name }}:${{ steps.tag.outputs.tag }} 已构建并冒烟通过，未推送到 GHCR"
 
   # ── Android APK ───────────────────────────────────────────────────
   # 签名 secrets 一律先经 job 级 env 中转：secrets 上下文不能直接写进 if 表达式
   android:
     name: Android APK
+    # 干跑只验证镜像那一半（APK 与镜像发布无关、耗时 3~5 分钟）；标签发布时才出产物
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -103,10 +174,18 @@ jobs:
         run: |
           echo "::warning::缺少 KEYSTORE_BASE64 等签名 secrets，只产出 debug APK，不可用于发布"
           flutter build apk --debug
-      - name: 上传 APK
+      # 产物校验和：下载方可以 sha256sum -c 验证，发布产物不带校验和等于让人盲信
+      - name: 生成 APK 校验和
+        working-directory: app/build/app/outputs/flutter-apk
+        run: |
+          set -euo pipefail
+          sha256sum ./*.apk | tee SHA256SUMS
+      - name: 上传 APK 与校验和
         uses: actions/upload-artifact@v7
         with:
           name: yunong-apk-${{ github.ref_name }}
-          path: app/build/app/outputs/flutter-apk/*.apk
+          path: |
+            app/build/app/outputs/flutter-apk/*.apk
+            app/build/app/outputs/flutter-apk/SHA256SUMS
           if-no-files-found: error
           retention-days: 14

@@ -135,4 +135,58 @@ server {
 - SSE 卡住/一次性吐完：99% 是反代缓冲没关，查 `proxy_buffering` / `flush_interval`。
 - `429 CONCURRENCY_LIMIT`：同一用户已有在途流；客户端要保证同一 `turn_id` 串行，别把多轮请求并发出去。
 - `401 UNAUTHORIZED`：接口需要 Bearer token；本地跑 bench 时用 `--token` 传。
-- 构建慢：建议在仓库根加 `.dockerignore`（忽略 `target/`、`app/build/`、`.git/`、`bench/out/` 等），本目录不代建。
+- 构建慢：仓库根已有 `.dockerignore`（忽略 `target/`、`app/`、`.git/`、`.worktrees/`、`deploy/.env` 等），本机构建上下文从 ~10GB 降到 1MB 量级；**新增 Dockerfile `COPY` 目录时记得同步它**，被 ignore 掉的目录会直接构建失败。
+- 镜像"能构建"不等于"能跑"：空壳二进制（Dockerfile 依赖缓存层 mtime 问题）会让容器秒退。CI 的 `docker` job 与发布流水线都会跑 `scripts/docker-smoke.sh`（真起容器 + 探 `/healthz`），本机也可以直接跑：
+
+```bash
+bash scripts/docker-smoke.sh yunong-server:ci   # 或任意本地镜像 tag
+```
+
+## 发布流程（版本标签与产物）
+
+发布由 `.github/workflows/release.yml` 负责，**推 `v*` 标签触发**（不需要手动点按钮）：
+
+```bash
+# 1. 确认 main 上 CI 全绿（rust / flutter / docs / migrations / pg / docker 六个 job）
+gh run list --branch main --limit 3
+
+# 2. 版本号对齐：tag vX.Y.Z 必须等于 Cargo.toml 的 [workspace.package].version
+#    （workflow 会校验，不一致直接红）app/pubspec.yaml 的版本前缀建议同步，不一致只 warning
+grep -A2 '\[workspace.package\]' Cargo.toml
+grep '^version:' app/pubspec.yaml
+
+# 3. 打标签并推送；标签必须指向 main 上的提交（workflow 用 merge-base 校验）
+git checkout main && git pull --ff-only
+git tag -a v0.1.0 -m "云农之窗 v0.1.0"
+git push origin v0.1.0
+```
+
+| 产物 | 位置 | 说明 |
+|---|---|---|
+| 服务端镜像 | `ghcr.io/<owner>/yunong-server:vX.Y.Z` 与 `:latest` | 多阶段构建、非 root、只含二进制 + CA 证书；**冒烟通过后才推送** |
+| Android APK | Actions artifact `yunong-apk-vX.Y.Z` | 4 个签名 secret 齐备才出 release 包，否则降级 debug 并在日志里 `::warning::` |
+| APK 校验和 | 同一 artifact 里的 `SHA256SUMS` | 下载后 `sha256sum -c SHA256SUMS` 验证 |
+
+**镜像先冒烟后推送**：构建只 load 到 runner 本地 → `scripts/docker-smoke.sh` 起容器探 `/healthz`、`/readyz`、检查二进制 ≥2MB 与 uid=10001 → 全过才 `docker push`。坏镜像不会进 GHCR，也不会顶掉 `:latest`。
+
+**干跑**（验证发布流水线本身，不推送 GHCR）：
+
+```bash
+gh workflow run release --ref <分支名> -f dry_run=true
+gh run watch
+```
+
+**回滚**：`:latest` 只是便利标签，回滚请显式部署上一个 tag 的镜像——在 compose 里给 `server` 写死 `image: ghcr.io/<owner>/yunong-server:v0.0.9` 再 `up -d`，不要依赖 `latest`。
+
+## CI 工作流的关键约束（改 `.github/**` 之前先读）
+
+| 约束 | 为什么 |
+|---|---|
+| `ci.yml` 各 job 的 `name:` = 分支保护的必需检查名 | 改名等于静默取消保护。当前必需：`Rust（fmt / clippy / test）`、`Flutter（analyze / test）`、`文档（表格 / 相对链接）`、`迁移脚本（PG16 + pgvector）`、`PostgreSQL（auth 真实 SQL 集成测试）`。改名前先 `gh api repos/<owner>/<repo>/branches/main/protection` 看现状，改完同步更新 required checks |
+| 迁移按文件名 glob **全量**跑（0001 → 最后一个） | 只跑部分文件会漏后加的表/索引；`migrations` 与 `pg` 两个 job 都必须全量 |
+| `persist-credentials: false` 保持 | 不把 token 写进 `.git/config`；需要凭据的步骤（GHCR 登录）单独用 `GITHUB_TOKEN` |
+| `release.yml` 是唯一提权 workflow（`packages: write`） | 不要在 `ci.yml` 里加 `packages: write` / `contents: write` |
+| 镜像冒烟只有一份实现：`scripts/docker-smoke.sh` | CI 的 docker job 与 release 的发布前检查共用，改断言只改一处 |
+| `docker` job 暂不在必需检查里 | 先观察耗时与稳定性；稳定后再用 `gh api` 加入 required checks（加之前它只报警、不阻塞合入） |
+| PG 用例不并行加锁（不要 `--test-threads=1`） | 每条用例用独立 schema（`yunong_pg_<uuid>`）隔离，并行是安全的；单线程只会白白变慢 |
+
