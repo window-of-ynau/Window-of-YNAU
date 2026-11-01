@@ -9,6 +9,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # 校务系统内嵌浏览器（ADR-11：Cookie 只留本机）；自带 Windows 实现，不再引 webview_windows
+  flutter_inappwebview: ^6.1.5
   # 纯 Dart 包（不是插件）：dart:ffi 的 Utf8/内存辅助
   ffi: ^2.1.0
 

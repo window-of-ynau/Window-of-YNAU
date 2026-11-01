@@ -8,6 +8,7 @@
 import 'package:flutter/material.dart';
 
 import 'src/campus/timetable_page.dart';
+import 'src/campus/webview_fetcher.dart';
 import 'src/core/timetable_service.dart';
 
 void main() => runApp(const YunongApp());
@@ -34,6 +35,8 @@ class YunongApp extends StatelessWidget {
     return MaterialApp(
       title: '云农之窗',
       debugShowCheckedModeBanner: false,
+      // WebView 抓取页需要根导航（CampusWebViewPage 全屏 push）
+      navigatorKey: WebViewSchoolFetcher.navigatorKey,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF2563EB)),
         useMaterial3: true,
@@ -167,11 +170,14 @@ class _CampusPane extends StatelessWidget {
   /// 课表服务：进程内复用一个实例（核心库只加载一次）。
   static final TimetableService _service = TimetableService();
 
+  /// 校务取数：WebView 版（Cookie 只留本机）。
+  static final SchoolFetcher _fetcher = WebViewSchoolFetcher();
+
   @override
   Widget build(BuildContext context) {
     // 课表入口：真实链路（WebView 抓取 / 调试导入 → Rust 解析 → SQLite → 列表）
     if (entry == CampusEntry.timetable) {
-      return TimetablePage(service: _service);
+      return TimetablePage(service: _service, fetcher: _fetcher);
     }
     return Center(
       child: Padding(
