@@ -444,6 +444,9 @@ const String kPortalScheduleScript = r'''
     return JSON.stringify({
       stage: STAGE,
       cardDom: !!timetableCardNode(),
+      scans: SCANS,
+      candidates: CANDIDATE_ORDER.length,
+      sinceStageEnter: Math.round((Date.now() - STAGE_ENTERED_AT) / 1000),
       lastProgress: LAST_PROGRESS.what + '（距今 ' + Math.round((Date.now() - LAST_PROGRESS.at) / 1000) + 's）',
       path: safePath(),
       host: (location.hostname || ''),
@@ -659,6 +662,8 @@ const String kPortalScheduleScript = r'''
   installCardObserver();
   setTimeout(watchStage, 600);
   setInterval(watchStage, 1500);
+  // capture 阶段每 500ms 重扫：React 逐步渲染时候选会从 2 涨到 ~12
+  setInterval(rescan, 500);
   // ---- 自动优先（owner 实测：hook 根本没挂上，不能等它）----
   //
   // 顺序：① 从页面读 cardId（DOM 属性 / 初始状态 / 内联 script）→ ② 32 位 hex 候选逐个点接口自验证
@@ -666,36 +671,71 @@ const String kPortalScheduleScript = r'''
   // 全自动，不需要用户点任何东西；都失败才交给 20s 超时给具体诊断。
   var AUTO_STARTED = false;
 
-  function hexCandidates() {
-    var ordered = [];
-    var seen = {};
+  // ---- 扫描范围：整页 outerHTML + 同源 iframe；持续重扫，候选集合累积 ----
+  var CANDIDATE_ORDER = [];   // [{ value, context, prefers }]，按出现顺序
+  var CANDIDATE_SEEN = {};    // value → true
+  var PROBED = {};            // 已探测过的候选
+  var SCANS = 0;
+  var STAGE_ENTERED_AT = Date.now();
+
+  function scanSources() {
+    var sources = [];
+    try { sources.push(document.documentElement.outerHTML || ''); } catch (e) {}
     try {
-      var html = document.documentElement.outerHTML || '';
+      var frames = document.querySelectorAll('iframe');
+      for (var i = 0; i < frames.length; i++) {
+        try {
+          var doc = frames[i].contentDocument;   // 跨域会抛异常，忽略
+          if (doc && doc.documentElement) {
+            sources.push(doc.documentElement.outerHTML || '');
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
+    return sources;
+  }
+
+  // 返回本次**新增**候选数（并并入 CANDIDATE_ORDER，保序去重）
+  function scanCandidates() {
+    SCANS += 1;
+    var added = 0;
+    var sources = scanSources();
+    for (var s = 0; s < sources.length; s++) {
+      var html = sources[s];
+      if (!html) { continue; }
       var re = /[0-9a-f]{32}/g;
       var match = re.exec(html);
       while (match) {
         var value = match[0];
-        if (!seen[value]) {
-          seen[value] = true;
-          var start = match.index - 40 < 0 ? 0 : match.index - 40;
-          var end = match.index + 32 + 40 > html.length ? html.length : match.index + 32 + 40;
-          var context = html.slice(start, end);
+        if (!CANDIDATE_SEEN[value]) {
+          CANDIDATE_SEEN[value] = true;
+          var begin = match.index - 40 < 0 ? 0 : match.index - 40;
+          var finish = match.index + 32 + 40 > html.length ? html.length : match.index + 32 + 40;
+          var context = html.slice(begin, finish);
           var lower = context.toLowerCase();
-          ordered.push({
+          CANDIDATE_ORDER.push({
             value: value,
             context: context,
             prefers: context.indexOf('课表') >= 0 || lower.indexOf('kbsz') >= 0
               || lower.indexOf('timetable') >= 0 || lower.indexOf('schedule') >= 0
           });
+          added += 1;
         }
         match = re.exec(html);
       }
-    } catch (e) {}
-    // 课表相关线索排前面，其余按出现顺序（位置不可靠，命中与否靠探测）
+    }
+    return added;
+  }
+
+  function sortedCandidates() {
     var sorted = [];
-    for (var i = 0; i < ordered.length; i++) { if (ordered[i].prefers) { sorted.push(ordered[i]); } }
-    for (var j = 0; j < ordered.length; j++) { if (!ordered[j].prefers) { sorted.push(ordered[j]); } }
-    return sorted.slice(0, 12);
+    for (var i = 0; i < CANDIDATE_ORDER.length; i++) {
+      if (CANDIDATE_ORDER[i].prefers) { sorted.push(CANDIDATE_ORDER[i]); }
+    }
+    for (var j = 0; j < CANDIDATE_ORDER.length; j++) {
+      if (!CANDIDATE_ORDER[j].prefers) { sorted.push(CANDIDATE_ORDER[j]); }
+    }
+    return sorted;
   }
   function termGuess() {
     if (window.__yunongTerm) { return String(window.__yunongTerm); }
@@ -751,55 +791,53 @@ const String kPortalScheduleScript = r'''
     setTimeout(function () { window.__yunongFetchSchedule(); }, 200);
   }
 
-  function autoStart() {
-    // 登录页阶段绝不扫描/探测（owner 实测的 CAPTURE_TIMEOUT 误报根因）
+  // 进入抓取阶段：**必须重置进展时间戳**（owner 实测 bug：阶段一进就报超时）
+  function enterCapture() {
+    if (STAGE === 'capture') { return; }
+    STAGE = 'capture';
+    STAGE_ENTERED_AT = Date.now();
+    progress('进入抓取阶段');
+    post({ type: 'stage', stage: 'capture', diagnostics: diagnosticsJson() });
+    rescan();
+  }
+
+  // 持续重扫：只在 capture 阶段；每轮把新候选并入集合并逐个探测
+  function rescan() {
+    if (STAGE !== 'capture' || TEMPLATE) { return; }
     if (isLoginPage()) { setStage('login'); return; }
-    if (AUTO_STARTED || TEMPLATE) { return; }
-    AUTO_STARTED = true;
+    var added = scanCandidates();
+    DIAG.candidates = CANDIDATE_ORDER.length;
+    if (added > 0) {
+      progress('扫描到新增候选 ' + added + '（共 ' + CANDIDATE_ORDER.length + '）');
+      probeUnprobed();
+      return;
+    }
+    // 没有新候选也要把未探测过的候选试掉（首次进入时 scan 已经加过）
+    probeUnprobed();
+  }
+
+  function probeUnprobed() {
+    if (TEMPLATE) { return; }
     var years = termGuess();
+    if (!years || !CANDIDATE_ORDER.length) {
+      DIAG.probeFailed = !years;
+      return;
+    }
     DIAG.years = years;
-
-    var direct = cardIdFromPage();
-    var candidates = [];
-    if (direct) { candidates.push({ cardId: direct.cardId, source: direct.source }); }
-    var hex = hexCandidates();
-    for (var i = 0; i < hex.length; i++) {
-      var dup = false;
-      for (var j = 0; j < candidates.length; j++) {
-        if (candidates[j].cardId === hex[i]) { dup = true; }
-      }
-      if (!dup) { candidates.push({ cardId: hex[i], source: 'hex-scan' }); }
-    }
-    DIAG.candidates = candidates.length;
-    progress('扫描到 ' + candidates.length + ' 个候选');
-
-    if (!years) {
-      // 没有学期就什么都试不了：交给超时提示（诊断里会写 years 为空）
-      DIAG.probeFailed = true;
-      return;
-    }
-    if (!candidates.length) {
-      // **候选为空绝不发请求**：登录页/门户首页会返回 200 HTML，
-      // 之前的 "探测 (none):200" 就是这么来的
-      DIAG.probeFailed = true;
-      return;
-    }
-
-    (function tryAt(index) {
-      if (TEMPLATE) { return; }
-      if (index >= candidates.length) {
-        // 候选试完仍未命中：不再发"无 cardId"的请求，直接记失败
-        DIAG.probeFailed = true;
-        return;
-      }
-      probeCandidate(candidates[index].cardId, years).then(function (ok) {
-        if (ok) { adoptTemplate(candidates[index].cardId, candidates[index].source, years); }
-        else { tryAt(index + 1); }
+    var queue = sortedCandidates().filter(function (c) { return !PROBED[c.value]; });
+    if (!queue.length) { return; }
+    (function next(index) {
+      if (TEMPLATE || index >= queue.length) { return; }
+      var cand = queue[index];
+      PROBED[cand.value] = true;
+      probeCandidate(cand.value, years).then(function (ok) {
+        progress('探测 ' + cand.value.slice(0, 8) + (ok ? ' 命中' : ' 未命中'));
+        if (ok) { adoptTemplate(cand.value, cand.source || 'scan', years); }
+        else { next(index + 1); }
       });
     })(0);
   }
-
-  window.__yunongAutoStart = function () { AUTO_STARTED = false; autoStart(); };
+  window.__yunongAutoStart = function () { STAGE_ENTERED_AT = Date.now(); progress('手动触发抓取'); rescan(); };
 
   // 阶段 watcher：登录页期间只报 login；离开登录页才切 capture 并开始自动发现
   // ---- 最后手段：滚动/点击含"课表"的卡片，切换周选择器 ----
