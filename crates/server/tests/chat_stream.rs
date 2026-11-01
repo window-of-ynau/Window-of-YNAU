@@ -1157,29 +1157,60 @@ async fn pg_sample_is_idempotent_per_round() {
     let app = TestApp::with_db(config, Some(db.pool.clone()));
     let token = app.register("replay@ynau.edu.cn").await;
 
-    // 同一 (turn_id, round=1) 连打两次：第二次算"重放"
-    let mut last_request_id = String::new();
-    for _ in 0..2 {
+    // 同一 (turn_id, round=1) 连打两次：第二次算"重放"。
+    //
+    // **不能只等行数**：两轮用同一个幂等键，第一次落库时 count 就已经是 1；
+    // 而记账是"流结束后另起的写任务"，第二次 upsert 可能还没提交 —— 只等行数会读到
+    // 第一次的 req_id（CI run 41302813992 上实际 flake 过一次）。
+    // 这里改成"先确认第一轮已落库，再确认第二轮把它**更新**成新 req_id"：
+    // 既排除了竞态，又真的验证了 `DO UPDATE` 生效（用 `DO NOTHING` 会红）。
+    let mut request_ids = Vec::new();
+    for round in 0..2 {
         let response = app.call(chat_request(Some(&token), "turn-replay")).await;
         assert_eq!(response.status(), StatusCode::OK);
-        last_request_id = header_str(&response, "x-request-id")
-            .expect("必须回写 x-request-id")
-            .to_owned();
+        request_ids.push(
+            header_str(&response, "x-request-id")
+                .expect("必须回写 x-request-id")
+                .to_owned(),
+        );
         let _ = read_events(response).await;
-    }
-    assert!(
-        wait_for_rows(&db, "SELECT count(*) FROM usage_samples", 1).await,
-        "同一轮重放只能有一行"
-    );
-    let stored_req_id: String = sqlx::query_scalar("SELECT req_id FROM usage_samples")
-        .fetch_one(&db.pool)
-        .await
-        .expect("应能读到抽样行");
-    assert_eq!(
-        stored_req_id, last_request_id,
-        "upsert 应该被后一次覆盖，而不是各写一行"
-    );
 
+        if round == 0 {
+            // 第一轮的写入必须真的落库，再发第二轮——这样"先后顺序"由测试控制，不靠调度
+            assert!(
+                wait_for_rows(&db, "SELECT count(*) FROM usage_samples", 1).await,
+                "第一轮应写一行"
+            );
+            let stored: String = sqlx::query_scalar("SELECT req_id FROM usage_samples")
+                .fetch_one(&db.pool)
+                .await
+                .expect("应能读到抽样行");
+            assert_eq!(stored, request_ids[0], "第一轮的 req_id 应落库");
+        }
+    }
+
+    // 第二轮是重放：同一行被更新为第二轮的值，行数仍然只有 1
+    let wanted = &request_ids[1];
+    let mut stored_req_id = String::new();
+    for _ in 0..50 {
+        stored_req_id = sqlx::query_scalar("SELECT req_id FROM usage_samples")
+            .fetch_one(&db.pool)
+            .await
+            .expect("应能读到抽样行");
+        if &stored_req_id == wanted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        &stored_req_id, wanted,
+        "重放应把那一行更新成新 req_id（DO UPDATE 生效，DO NOTHING 会红）"
+    );
+    assert_eq!(
+        count(&db.pool, "SELECT count(*) FROM usage_samples").await,
+        1,
+        "重放不能各写一行"
+    );
     // 同一 turn 的第 2 轮 → 第二行（4 轮工具循环就是 4 行，成本统计才不漏）
     let mut body: Value = serde_json::from_str(&chat_body("turn-replay")).expect("请求体");
     body["round"] = json!(2);
