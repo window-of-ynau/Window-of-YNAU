@@ -15,6 +15,12 @@ pub enum CoreError {
     Invalid(String),
     #[error("未实现：{0}")]
     NotImplemented(String),
+    /// 学期开学日（`terms.starts_on`）未确认或无法识别。
+    ///
+    /// 日历换算**绝不能**拿默认日期顶上：猜错一周，整张课表的日期就全错，
+    /// 而用户几乎发现不了。调用方应引导用户先确认第 1 周周一。
+    #[error("学期开学日期未确认：{0}")]
+    TermStartUnknown(String),
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
     /// 远端（上游厂商或我们的服务端）明确返回了失败。

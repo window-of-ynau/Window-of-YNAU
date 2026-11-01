@@ -20,6 +20,7 @@
 //! | `PARSE_FAILED` | 结构性解析失败（找不到表/表头/列数错位） | "学校页面可能已更新，请反馈" |
 //! | `PARSE_EMPTY` | 解析成功但一门课都没有（**不落库**） | "未解析到课程，请确认是否已排课" |
 //! | `STORAGE` | SQLite 读写失败 | "本地课表保存失败" |
+//! | `TERM_START_UNKNOWN` | 学期开学日未确认/无法识别（**绝不猜默认日期**） | "请先确认本学期开学日期" |
 //! | `INTERNAL` | 兜底 | "内部错误" |
 
 use std::ffi::{c_char, CStr, CString};
@@ -89,6 +90,9 @@ fn map_core_error(err: CoreError) -> (String, String) {
         CoreError::Invalid(message) | CoreError::Storage(message) => {
             ("STORAGE".to_owned(), message)
         }
+        // 单独一个码：Dart 侧要能把用户直接引到"确认开学日"这一步，
+        // 混进 STORAGE 会显示成"本地课表保存失败"，把人带偏。
+        CoreError::TermStartUnknown(message) => ("TERM_START_UNKNOWN".to_owned(), message),
         other => ("INTERNAL".to_owned(), other.to_string()),
     }
 }
@@ -384,6 +388,54 @@ fn is_iso_date(value: &str) -> bool {
         _ => false,
     }
 }
+
+/// 把某学期的课表导出成 `.ics` 日历文件（W7）。
+///
+/// 返回 `{"ok":true,"data":{"path":"…","events":N}}`；`events` 是展开后的**独立事件数**
+/// （= 课程 × 周次，见 `calendar::expand_course`），0 表示这个学期还没排课。
+///
+/// 学期开学日未确认 → `TERM_START_UNKNOWN`：**不生成文件**，也不用默认日期凑——
+/// 猜错一周，整张课表的日期就全错。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_export_ics(
+    term: *const c_char,
+    out_path: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (term, out_path, db_path) = match (
+            read_arg(term, "term"),
+            read_arg(out_path, "out_path"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(term), Ok(out_path), Ok(db_path)) => (term, out_path, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
+        };
+        if term.trim().is_empty() {
+            return err_json("BAD_INPUT", "学期不能为空");
+        }
+        if out_path.trim().is_empty() {
+            return err_json("BAD_INPUT", "导出路径不能为空");
+        }
+        match crate::ics::export_term_ics(term, db_path, out_path) {
+            Ok(report) => ok_json(json!({
+                "path": report.path.to_string_lossy(),
+                "events": report.events,
+            })),
+            Err(err) => {
+                let (code, message) = map_core_error(err);
+                err_json(&code, message)
+            }
+        }
+    })
+}
+
 /// 释放本模块返回的字符串。传 null 是安全的空操作。
 ///
 /// # Safety
@@ -747,6 +799,108 @@ mod tests {
             value["data"]["terms"][0]["starts_on"], "",
             "坏日期不能写库：{value}"
         );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    // ---------------------------------------------------------------------
+    // ICS 导出（W7-1）
+    // ---------------------------------------------------------------------
+
+    fn call_export(term: &str, out_path: &str, db: &str) -> Value {
+        let term = CString::new(term).unwrap();
+        let out_path = CString::new(out_path).unwrap();
+        let db_c = CString::new(db).unwrap();
+        let raw = unsafe { yunong_export_ics(term.as_ptr(), out_path.as_ptr(), db_c.as_ptr()) };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// 与 `temp_db()` 同一个临时目录下的 `.ics` 路径。
+    fn temp_ics(db: &str) -> String {
+        std::path::Path::new(db)
+            .parent()
+            .unwrap()
+            .join("term.ics")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn export_ics_via_ffi_writes_an_all_day_event() {
+        let db = temp_db();
+        assert_eq!(
+            call_schedule(&weekly_json(1), "2026-2027-1", &db)["ok"],
+            true
+        );
+        assert_eq!(
+            call_set_term_start("2026-2027-1", "2026-08-31", &db)["ok"],
+            true
+        );
+        let out = temp_ics(&db);
+        let result = call_export("2026-2027-1", &out, &db);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["events"], 1, "{result}");
+        assert_eq!(result["data"]["path"], out.as_str(), "{result}");
+
+        let text = std::fs::read_to_string(&out).expect("导出文件必须存在");
+        assert!(text.starts_with("BEGIN:VCALENDAR\r\n"), "{text}");
+        assert!(text.contains("DTSTART;VALUE=DATE:20260831"), "{text}");
+        assert!(!text.contains("RRULE"), "{text}");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn export_ics_without_confirmed_start_reports_code_and_writes_nothing() {
+        let db = temp_db();
+        // 只导入课表，不确认开学日
+        assert_eq!(
+            call_schedule(&weekly_json(1), "2026-2027-1", &db)["ok"],
+            true
+        );
+        let out = temp_ics(&db);
+        let result = call_export("2026-2027-1", &out, &db);
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "TERM_START_UNKNOWN", "{result}");
+        assert!(
+            !std::path::Path::new(&out).exists(),
+            "开学日未知时不能生成文件（更不能用默认日期凑一份）"
+        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn export_ics_for_unknown_term_reports_term_start_unknown() {
+        let db = temp_db();
+        assert_eq!(
+            call_schedule(&weekly_json(1), "2026-2027-1", &db)["ok"],
+            true
+        );
+        let out = temp_ics(&db);
+        let result = call_export("1999-2000-1", &out, &db);
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "TERM_START_UNKNOWN", "{result}");
+        assert!(!std::path::Path::new(&out).exists());
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn export_ics_rejects_empty_and_null_arguments() {
+        let db = temp_db();
+        let result = call_export("   ", &temp_ics(&db), &db);
+        assert_eq!(result["code"], "BAD_INPUT", "{result}");
+
+        let result = call_export("2026-2027-1", "  ", &db);
+        assert_eq!(result["code"], "BAD_INPUT", "{result}");
+
+        // null 指针同样只是失败信封，不崩
+        let db_c = CString::new(db.clone()).unwrap();
+        let raw = unsafe { yunong_export_ics(std::ptr::null(), std::ptr::null(), db_c.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
         let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
     }
 }
