@@ -71,6 +71,8 @@ class ChatRequestDto {
     required this.messages,
     this.protocol = ChatProtocol.completions,
     this.apiKey,
+    this.secretKey,
+    this.dataDir,
     this.cloudToken,
     this.baseUrl,
     this.cloudBaseUrl,
@@ -84,8 +86,14 @@ class ChatRequestDto {
   final List<ChatTurn> messages;
   final ChatProtocol protocol;
 
-  /// BYOK 的 Key（仅本次请求使用；UI 不回显）
+  /// BYOK 的 Key（**仅命令行/测试**用；App 走 [secretKey]，明文不经过 Dart）
   final String? apiKey;
+
+  /// 安全存储里的 key 名（如 `byok_api_key`）：由 Rust 自己取明文
+  final String? secretKey;
+
+  /// 应用数据目录（Rust 用它定位 secret store）
+  final String? dataDir;
 
   /// 套餐通道的访问令牌
   final String? cloudToken;
@@ -100,6 +108,9 @@ class ChatRequestDto {
         'protocol': protocol.wire,
         'model': model,
         'messages': messages.map((ChatTurn turn) => turn.toJson()).toList(),
+        if (secretKey != null && secretKey!.isNotEmpty) 'secret_key': secretKey,
+        if (dataDir != null && dataDir!.isNotEmpty) 'data_dir': dataDir,
+        // 仅测试/命令行用；App 正常路径不会带明文
         if (apiKey != null && apiKey!.isNotEmpty) 'api_key': apiKey,
         if (cloudToken != null && cloudToken!.isNotEmpty) 'cloud_token': cloudToken,
         if (baseUrl != null && baseUrl!.isNotEmpty) 'base_url': baseUrl,

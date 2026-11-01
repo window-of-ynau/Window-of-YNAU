@@ -756,6 +756,114 @@ pub extern "C" fn yunong_chat_cancel(handle: i64) -> i32 {
     chat_cancel_registry().cancel(handle as u64);
     1
 }
+// ---------------------------------------------------------------------------
+// 凭据安全存储（W7 P0）：明文永不出 Rust
+// ---------------------------------------------------------------------------
+
+fn secret_store_for(db_path: &str) -> Box<dyn crate::secret::KeyStore> {
+    let base = std::path::Path::new(db_path)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    crate::secret::default_store(base)
+}
+
+fn secret_error_json(err: crate::secret::SecretError) -> Value {
+    match err {
+        crate::secret::SecretError::InvalidKey(message)
+        | crate::secret::SecretError::InvalidValue(message) => err_json("BAD_INPUT", message),
+        crate::secret::SecretError::Storage(message) => err_json("STORAGE", message),
+    }
+}
+
+fn secret_status_json(status: crate::secret::SecretStatus) -> Value {
+    ok_json(json!({
+        "set": status.set,
+        "masked": status.masked,
+        "degraded": status.degraded,
+        "reason": status.reason,
+    }))
+}
+
+/// 写入一条凭据（BYOK API Key 等）。返回值**只有掩码**，不含明文。
+///
+/// 平台安全存储不可用（DPAPI 失败 / 非 Windows）时返回 `degraded:true` +
+/// `reason`：本次仅内存生效，**绝不落明文文件**。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_set_secret(
+    key: *const c_char,
+    value: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (key, value, db_path) = match (
+            read_arg(key, "key"),
+            read_arg(value, "value"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(key), Ok(value), Ok(db_path)) => (key, value, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
+        };
+        let store = secret_store_for(db_path);
+        match store.set(key, value) {
+            Ok(status) => secret_status_json(status),
+            Err(err) => secret_error_json(err),
+        }
+    })
+}
+
+/// 查询凭据状态：**只返回 `{set, masked, degraded, reason}`，任何情况下都没有明文**。
+///
+/// # Safety
+///
+/// 两个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_get_secret(
+    key: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (key, db_path) = match (read_arg(key, "key"), read_arg(db_path, "db_path")) {
+            (Ok(key), Ok(db_path)) => (key, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        let store = secret_store_for(db_path);
+        match store.status(key) {
+            Ok(status) => secret_status_json(status),
+            Err(err) => secret_error_json(err),
+        }
+    })
+}
+
+/// 删除一条凭据；`deleted` 表示之前是否存在（幂等）。
+///
+/// # Safety
+///
+/// 两个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_delete_secret(
+    key: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (key, db_path) = match (read_arg(key, "key"), read_arg(db_path, "db_path")) {
+            (Ok(key), Ok(db_path)) => (key, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        let store = secret_store_for(db_path);
+        match store.delete(key) {
+            Ok(deleted) => ok_json(json!({ "deleted": deleted })),
+            Err(err) => secret_error_json(err),
+        }
+    })
+}
 /// 释放本模块返回的字符串。传 null 是安全的空操作。
 ///
 /// # Safety
@@ -1484,6 +1592,111 @@ mod tests {
             1
         );
         let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+    // ---------------------------------------------------------------------
+    // 凭据 FFI（W7 P0）：明文永不出 Rust
+    // ---------------------------------------------------------------------
+
+    unsafe fn call_secret(json: *mut c_char) -> Value {
+        let text = CStr::from_ptr(json).to_str().unwrap().to_owned();
+        yunong_free_string(json);
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn secret_set_get_delete_never_leaks_plaintext() {
+        let base = std::env::temp_dir().join(format!("yunong-ffi-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let db = CString::new(base.join("t.db").to_string_lossy().to_string()).unwrap();
+        let key = CString::new("byok_api_key").unwrap();
+        let plain = "sk-c12f4e6cba8e4caea103f3a4cea73eee";
+        let value = CString::new(plain).unwrap();
+
+        unsafe {
+            // set
+            let response =
+                call_secret(yunong_set_secret(key.as_ptr(), value.as_ptr(), db.as_ptr()));
+            assert_eq!(response["ok"], true);
+            let masked = response["data"]["masked"].as_str().unwrap().to_owned();
+            assert_eq!(masked, "sk-****3eee");
+            let raw = response.to_string();
+            assert!(!raw.contains(plain), "set 返回里出现明文：{raw}");
+
+            // get：只有 set + 掩码
+            let response = call_secret(yunong_get_secret(key.as_ptr(), db.as_ptr()));
+            assert_eq!(response["ok"], true);
+            assert_eq!(response["data"]["set"], true);
+            assert_eq!(response["data"]["masked"], "sk-****3eee");
+            let raw = response.to_string();
+            assert!(!raw.contains(plain), "get 返回里出现明文：{raw}");
+            assert!(!raw.contains("c12f4e6c"), "get 返回里出现明文片段：{raw}");
+
+            // delete → get(set:false)
+            let response = call_secret(yunong_delete_secret(key.as_ptr(), db.as_ptr()));
+            assert_eq!(response["ok"], true);
+            assert_eq!(response["data"]["deleted"], true);
+            let response = call_secret(yunong_get_secret(key.as_ptr(), db.as_ptr()));
+            assert_eq!(response["data"]["set"], false);
+            // 再删一次是幂等
+            let response = call_secret(yunong_delete_secret(key.as_ptr(), db.as_ptr()));
+            assert_eq!(response["data"]["deleted"], false);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn secret_rejects_bad_inputs() {
+        let base = std::env::temp_dir().join(format!("yunong-ffi-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let db = CString::new(base.join("t.db").to_string_lossy().to_string()).unwrap();
+        let value = CString::new("sk-abc123456789").unwrap();
+        unsafe {
+            let bad_key = CString::new("BAD KEY").unwrap();
+            let response = call_secret(yunong_set_secret(
+                bad_key.as_ptr(),
+                value.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(response["code"], "BAD_INPUT", "{response}");
+
+            let key = CString::new("k").unwrap();
+            let empty = CString::new("").unwrap();
+            let response =
+                call_secret(yunong_set_secret(key.as_ptr(), empty.as_ptr(), db.as_ptr()));
+            assert_eq!(response["code"], "BAD_INPUT", "{response}");
+
+            let too_long = CString::new("a".repeat(4097)).unwrap();
+            let response = call_secret(yunong_set_secret(
+                key.as_ptr(),
+                too_long.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(response["code"], "BAD_INPUT", "{response}");
+            // 非法 key 的 get/delete 同样是 BAD_INPUT
+            let response = call_secret(yunong_get_secret(bad_key.as_ptr(), db.as_ptr()));
+            assert_eq!(response["code"], "BAD_INPUT");
+            let response = call_secret(yunong_delete_secret(bad_key.as_ptr(), db.as_ptr()));
+            assert_eq!(response["code"], "BAD_INPUT");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn secret_degraded_store_reports_reason_without_plaintext() {
+        // 模拟"平台安全存储不可用"：内存实现（`degraded:true` + reason），绝不落明文文件
+        use crate::secret::KeyStore;
+        let store = crate::secret::MemoryKeyStore::new("DPAPI 不可用：本次仅内存生效");
+        let status = store.set("byok_api_key", "sk-abc123456789xyz").unwrap();
+        assert!(status.degraded);
+        assert!(status.reason.unwrap().contains("仅内存"));
+        let json = serde_json::to_string(&serde_json::json!({
+            "set": status.set,
+            "masked": status.masked,
+            "degraded": status.degraded,
+        }))
+        .unwrap();
+        assert!(!json.contains("sk-abc123456789xyz"));
+        assert!(json.contains("sk-****9xyz"));
     }
     // ---------------------------------------------------------------------
     // 流式对话 FFI（W7 P0）

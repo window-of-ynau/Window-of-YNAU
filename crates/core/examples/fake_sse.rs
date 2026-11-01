@@ -133,9 +133,8 @@ async fn handle(mut stream: TcpStream, config: Config) -> std::io::Result<()> {
                 body.extend_from_slice(&buffer[..n]);
             }
             println!(
-                "[fake_sse] {} {} body={} bytes\n{}",
+                "[fake_sse] {} body={} bytes\n{}",
                 first_line(&head),
-                "",
                 body.len(),
                 String::from_utf8_lossy(&body)
             );
@@ -148,7 +147,10 @@ async fn handle(mut stream: TcpStream, config: Config) -> std::io::Result<()> {
 }
 
 fn find_headers_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+    buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
 }
 
 fn first_line(head: &str) -> String {
