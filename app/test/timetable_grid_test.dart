@@ -63,7 +63,7 @@ void main() {
       ];
       final Map<String, int> assigned = assignCourseTints(names);
       expect(assigned.length, names.length);
-      expect(assigned.values.toSet().length, names.length, reason: '9 门课应占满 9 个不同槽位');
+      expect(assigned.values.toSet().length, names.length, reason: '12 门课应有 12 个不同槽位');
     });
 
     test('同一输入算两次结果一致（跨重启/切周稳定）', () {
@@ -71,20 +71,20 @@ void main() {
       expect(assignCourseTints(names), assignCourseTints(names));
     });
 
-    test('先算子集再算全集，已有一门课的颜色不变（只影响排序在后的课）', () {
-      final Map<String, int> few = assignCourseTints(<String>['高等数学I', '大学英语']);
+    test('课程集合变大时，排序最前的课颜色不变（后面可能被挤动，已知取舍）', () {
+      final Map<String, int> few = assignCourseTints(<String>['大学英语', '数据结构']);
       final Map<String, int> many =
-          assignCourseTints(<String>['高等数学I', '大学英语', '数据结构', '操作系统']);
-      expect(many['高等数学I'], few['高等数学I']);
+          assignCourseTints(<String>['大学英语', '数据结构', '操作系统', '高等数学I']);
+      // 排序最前的课没有任何"前人"占用槽位，任何课程集合下都是同一个槽位
       expect(many['大学英语'], few['大学英语']);
     });
 
-    test('超过色板容量不抛异常（允许复用）', () {
+    test('超过 22 个槽位也不抛异常（允许复用）', () {
       final List<String> names =
-          List<String>.generate(14, (int index) => '课程$index');
+          List<String>.generate(24, (int index) => '课程$index');
       final Map<String, int> assigned = assignCourseTints(names);
-      expect(assigned.length, 14);
-      expect(assigned.values.every((int index) => index >= 0 && index < 9), isTrue);
+      expect(assigned.length, 24);
+      expect(assigned.values.every((int index) => index >= 0 && index < 22), isTrue);
     });
 
     test('指纹不是 Dart 的 String.hashCode（跨版本保持稳定）', () {
