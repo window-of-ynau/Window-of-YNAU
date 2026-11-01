@@ -62,6 +62,7 @@ Write-Host "`n== 2/5 单写者检查 ==" -ForegroundColor Cyan
 $singleWriter = @(
     '^crates/shared/',
     '^Cargo\.toml$',
+    '^Cargo\.lock$',   # lock 变了就是对依赖树的实质改动，必须可见
     '^docs/04-ADR\.md$',
     '^docs/0[123]-',
     '^\.github/',

@@ -40,6 +40,8 @@ services:
     environment:
       # db 是 compose 内部服务名，所以 .env 里用 postgres://...@db:5432/...
       DATABASE_URL: ${DATABASE_URL:?请先在 deploy/.env 里设置 DATABASE_URL}
+      # 容器内必须监听 0.0.0.0，否则 ports 映射进来的流量到不了服务（宿主机侧仍只绑回环）
+      YUNONG_BIND: 0.0.0.0:8080
       RUST_LOG: ${RUST_LOG:-info}
       # 套餐按时间授权、不做 token 记账；这里限的是"同时在途流"，不是额度。
       CONCURRENCY_LIMIT: ${CONCURRENCY_LIMIT:-50}
