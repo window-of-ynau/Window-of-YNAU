@@ -864,6 +864,50 @@ pub unsafe extern "C" fn yunong_delete_secret(
         }
     })
 }
+// ---------------------------------------------------------------------------
+// 联网搜索状态（ADR-19 决策 5）：UI 必须诚实
+// ---------------------------------------------------------------------------
+
+/// 查询当前通道/协议下可用的搜索来源。
+///
+/// 返回 `{source, label, available, hint}`：`available:false` 时 UI **必须**常驻提示
+/// “未配置联网搜索”，不允许静默降级。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串（db_path 用于判断 BYOK Key 是否已保存）。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_search_status(
+    channel: *const c_char,
+    protocol: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (channel, protocol, db_path) = match (
+            read_arg(channel, "channel"),
+            read_arg(protocol, "protocol"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(channel), Ok(protocol), Ok(db_path)) => (channel, protocol, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
+        };
+        // BYOK 是否已保存"自带搜索 Key"（复用同一套 secret store，明文不出 Rust）
+        let has_byok_key = {
+            let store = secret_store_for(db_path);
+            matches!(store.load_raw(crate::secret::BYOK_SEARCH_KEY), Ok(Some(_)))
+        };
+        let source = crate::search::resolve_source(channel, protocol, has_byok_key);
+        let status = crate::search::SearchStatus::for_source(source);
+        ok_json(json!({
+            "source": status.source,
+            "label": status.label,
+            "available": status.available,
+            "hint": status.hint,
+        }))
+    })
+}
 /// 释放本模块返回的字符串。传 null 是安全的空操作。
 ///
 /// # Safety
@@ -1603,6 +1647,64 @@ mod tests {
         serde_json::from_str(&text).unwrap()
     }
 
+    #[test]
+    fn search_status_covers_four_channels_honestly() {
+        let base = std::env::temp_dir().join(format!("yunong-search-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let db = CString::new(base.join("t.db").to_string_lossy().to_string()).unwrap();
+        let cloud = CString::new("cloud").unwrap();
+        let byok = CString::new("byok").unwrap();
+        let responses = CString::new("openai_responses").unwrap();
+        let completions = CString::new("openai_completions").unwrap();
+
+        unsafe {
+            // ① 套餐 + Responses → 内置
+            let r = call_secret(yunong_search_status(
+                cloud.as_ptr(),
+                responses.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(r["data"]["source"], "built_in");
+            assert_eq!(r["data"]["label"], "内置");
+            assert_eq!(r["data"]["available"], true);
+
+            // ② 套餐 + Completions → 我方代理
+            let r = call_secret(yunong_search_status(
+                cloud.as_ptr(),
+                completions.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(r["data"]["source"], "proxy");
+            assert_eq!(r["data"]["label"], "我方代理");
+
+            // ③ BYOK 未填 Key → 未配置 + 诚实提示
+            let r = call_secret(yunong_search_status(
+                byok.as_ptr(),
+                completions.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(r["data"]["source"], "none");
+            assert_eq!(r["data"]["available"], false);
+            assert!(r["data"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("未配置联网搜索"));
+
+            // ④ BYOK 已填自带 Key → 自带 Key
+            let store = secret_store_for(&base.join("t.db").to_string_lossy());
+            let _ = store.set(crate::secret::BYOK_SEARCH_KEY, "sk-test-0123456789abcdef");
+            let r = call_secret(yunong_search_status(
+                byok.as_ptr(),
+                completions.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(r["data"]["source"], "byok");
+            assert_eq!(r["data"]["label"], "自带 Key");
+            assert_eq!(r["data"]["available"], true);
+            assert_eq!(r["data"]["hint"], "");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
     #[test]
     fn secret_set_get_delete_never_leaks_plaintext() {
         let base = std::env::temp_dir().join(format!("yunong-ffi-secret-{}", uuid::Uuid::new_v4()));

@@ -17,6 +17,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// BYOK 的“自带搜索 Key”在安全存储里的固定 key 名（与 Dart 侧 `SecretService.byokKeyName` 并列）。
+pub const BYOK_SEARCH_KEY: &str = "byok_search_key";
+
 /// key 名规则：小写字母/数字/下划线/连字符，1..=64。
 pub fn valid_key(key: &str) -> bool {
     !key.is_empty()
