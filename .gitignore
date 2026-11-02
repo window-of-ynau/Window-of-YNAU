@@ -45,3 +45,6 @@ Thumbs.db
 
 # 内部工程规范（不公开）
 .internal/
+
+# Windows 快捷方式（本地创建，不入库）
+*.lnk
