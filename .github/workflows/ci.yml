@@ -369,6 +369,17 @@ jobs:
       # type=gha 缓存与 load: true 都需要 docker-container driver（setup-buildx 的默认）
       - name: 启用 buildx
         uses: docker/setup-buildx-action@v3
+      # 镜像 OCI label 用的构建元数据：commit / 构建时间 / 版本
+      - name: 记录构建元数据（镜像 label 用）
+        id: meta
+        run: |
+          set -euo pipefail
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          version=$(awk -F'"' '/^\[workspace\.package\]/{f=1; next} f && /^\[/{exit} f && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          [ -n "$version" ] || { echo "::error::读不到 Cargo.toml 的 [workspace.package].version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # 镜像里打 OCI label（org.opencontainers.image.revision 等）：容器跑的是哪个提交
+      # 必须能从 `docker inspect` 回答，security 的 L3 复核专门提过这一点。
       - name: docker build（deploy/Dockerfile.server）
         uses: docker/build-push-action@v6
         with:
@@ -380,6 +391,10 @@ jobs:
           # 与 release.yml 同一个 gha 缓存：CI 暖的缓存，打标签发布时直接复用
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            VERSION=${{ steps.meta.outputs.version }}
       # 冒烟逻辑在 scripts/docker-smoke.sh：release.yml 打标签发布时调同一个脚本，
       # 避免"CI 验的"和"发布验的"两处漂移；本机也能直接跑：
       #   bash scripts/docker-smoke.sh yunong-server:ci
@@ -431,20 +446,27 @@ jobs:
   # 非 SSE → 502、流内错误帧 → event: error 且洗掉厂商原文、首事件超时 → 504、
   # 100% 抽样落库（psql 断言 usage_samples）、上游失败写审计（audit_logs decision=error）。
   #
-  # 阶段 1（当前）：整 job continue-on-error —— 只观察，不阻断合入。
-  # 稳定 3~5 个 PR 后删掉 continue-on-error 转阻断，与 docker / security job 同一节奏
-  # （见 deploy/README 的"端到端闭环"与"CI 工作流的关键约束"）。
+  # 观察期已结束（连续多次绿，耗时稳定）：去掉 continue-on-error，命中即红；
+  # 已同步加进分支保护必需检查（改名=静默失效，改 name: 前先看 deploy/README）。
   e2e:
     name: 端到端对话闭环（mock 上游）
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: 启用 buildx
         uses: docker/setup-buildx-action@v3
+      # 镜像 OCI label 用的构建元数据：commit / 构建时间 / 版本
+      - name: 记录构建元数据（镜像 label 用）
+        id: meta
+        run: |
+          set -euo pipefail
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          version=$(awk -F'"' '/^\[workspace\.package\]/{f=1; next} f && /^\[/{exit} f && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          [ -n "$version" ] || { echo "::error::读不到 Cargo.toml 的 [workspace.package].version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       # 与 docker / release 共用同一个 gha 缓存：命中时约 20~30 秒
       - name: docker build（deploy/Dockerfile.server）
         uses: docker/build-push-action@v6
@@ -456,6 +478,10 @@ jobs:
           tags: yunong-server:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            VERSION=${{ steps.meta.outputs.version }}
       - name: 端到端闭环（mock 上游 + PG + 服务端容器 + 脚本客户端）
         run: python3 scripts/e2e-chat.py --image yunong-server:ci
 
@@ -463,13 +489,11 @@ jobs:
   # 这道闸让"把密钥写进代码"在提交前（pre-commit 钩子）和合并前（CI）都直接失败。
   # 规则只有一份：scripts/secret-scan.py —— 钩子脚本装的也是它，不要写第二份。
   #
-  # 阶段 1（当前）：continue-on-error: true，只观察 3~5 个 PR；稳定后删掉这行转阻断，
-  # 再与其他非必需 job 一起用 gh api 加进分支保护（与 docker / security / e2e 同节奏）。
+  # 观察期已结束：去掉 continue-on-error，命中即红；已同步加进分支保护必需检查。
   secret-scan:
     name: 密钥扫描（secret scanning）
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
         with:

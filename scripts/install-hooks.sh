@@ -32,7 +32,14 @@ else
     echo "secret-scan: 找不到 python3/python，跳过密钥扫描（请装 Python 3）" >&2
     exit 0
 fi
-exec "$PY" "$ROOT/scripts/secret-scan.py" --staged
+# fail-open：脚本不存在（例如切到还没有 scripts/secret-scan.py 的旧分支）时放行，
+# 不要因为钩子引用了一个不存在的文件就把所有提交卡死。
+SCAN="$ROOT/scripts/secret-scan.py"
+if [ ! -f "$SCAN" ]; then
+    echo "secret-scan: 找不到 $SCAN，跳过扫描（fail-open）" >&2
+    exit 0
+fi
+exec "$PY" "$SCAN" --staged
 HOOK
 
 chmod +x "$hook" 2>/dev/null || true
