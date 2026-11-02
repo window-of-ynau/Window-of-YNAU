@@ -8,6 +8,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../core/chat_service.dart';
+import '../core/search_service.dart';
 import '../core/secret_service.dart';
 
 /// 会话设置（MVP：密钥只在内存里，进程退出即失效）。
@@ -32,11 +33,19 @@ class ChatBubble {
 
 /// 会话页。
 class ChatPage extends StatefulWidget {
-  const ChatPage({super.key, this.service, this.settings, this.secretService, this.dbPath = ''});
+  const ChatPage({
+    super.key,
+    this.service,
+    this.settings,
+    this.secretService,
+    this.searchService,
+    this.dbPath = '' ,
+  });
 
   final ChatService? service;
   final ChatSettings? settings;
   final SecretService? secretService;
+  final SearchService? searchService;
   final String dbPath;
 
   @override
@@ -48,6 +57,8 @@ class _ChatPageState extends State<ChatPage> {
   late final ChatSettings _settings = widget.settings ?? ChatSettings();
   late final SecretService _secrets = widget.secretService ?? SecretService(dbPath: widget.dbPath);
   SecretStatus _keyStatus = const SecretStatus(set: false, masked: '' );
+  late final SearchService _search = widget.searchService ?? SearchService(dbPath: widget.dbPath);
+  SearchStatus _searchStatus = const SearchStatus.unknown();
   final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
 
@@ -64,6 +75,7 @@ class _ChatPageState extends State<ChatPage> {
     super.initState();
     _channel = _settings.channel;
     unawaited(_refreshKeyStatus());
+    unawaited(_refreshSearchStatus());
   }
 
   @override
@@ -173,6 +185,21 @@ class _ChatPageState extends State<ChatPage> {
     });
   }
 
+  /// 查询搜索来源：未配置时 UI **必须**常驻提示（禁止静默降级）。
+  Future<void> _refreshSearchStatus() async {
+    try {
+      final protocol = _settings.protocol;
+      final status = await _search.status(channel: _channel, protocol: protocol);
+      if (mounted) {
+        setState(() => _searchStatus = status);
+      }
+    } on Object {
+      // 核心库不可用（如测试环境）：诚实显示“未配置”，不假装可用
+      if (mounted) {
+        setState(() => _searchStatus = const SearchStatus.unknown());
+      }
+    }
+  }
   Future<void> _refreshKeyStatus() async {
     try {
       final status = await _secrets.status(SecretService.byokKeyName);
@@ -209,7 +236,11 @@ class _ChatPageState extends State<ChatPage> {
     }
     final result = await showDialog<ChatSettings>(
       context: context,
-      builder: (BuildContext context) => _SettingsDialog(settings: _settings),
+      builder: (BuildContext context) => _SettingsDialog(
+        settings: _settings,
+        searchLabel: _searchStatus.display,
+        searchHint: _searchStatus.available ? '' : _searchStatus.hint,
+      ),
     );
     if (result != null && mounted) {
       if (result.byokKey.isNotEmpty) {
@@ -250,6 +281,7 @@ class _ChatPageState extends State<ChatPage> {
                 selected: <String>{_channel},
                 onSelectionChanged: (Set<String> value) {
                   setState(() => _channel = value.first);
+                  unawaited(_refreshSearchStatus());
                 },
               ),
               const SizedBox(width: 12),
@@ -264,6 +296,7 @@ class _ChatPageState extends State<ChatPage> {
                   '用量 ${_promptTokens ?? '-'} / ${_completionTokens ?? '-'}',
                   style: theme.textTheme.bodySmall,
                 ),
+              Text('搜索 ${_searchStatus.display}', style: theme.textTheme.bodySmall),
               if (_channel == 'byok')
                 Text('Key ${_keyStatus.display}', style: theme.textTheme.bodySmall),
               if (_channel == 'byok' && _keyStatus.set)
@@ -294,6 +327,18 @@ class _ChatPageState extends State<ChatPage> {
             child: Text(
               _error!,
               style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.error),
+            ),
+          ),
+        if (!_searchStatus.available)
+          Container(
+            width: double.infinity,
+            color: theme.colorScheme.surfaceContainerHighest,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            child: Text(
+              _searchStatus.hint.isEmpty
+                  ? '未配置联网搜索，模型无法获取实时信息'
+                  : _searchStatus.hint,
+              style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.tertiary),
             ),
           ),
         Expanded(
@@ -385,9 +430,11 @@ class _MessageBubble extends StatelessWidget {
 
 /// 设置对话框：Key 输入框 `obscureText`，**不回显**已保存的值。
 class _SettingsDialog extends StatefulWidget {
-  const _SettingsDialog({required this.settings});
+  const _SettingsDialog({required this.settings, required this.searchLabel, required this.searchHint});
 
   final ChatSettings settings;
+  final String searchLabel;
+  final String searchHint;
 
   @override
   State<_SettingsDialog> createState() => _SettingsDialogState();
@@ -419,6 +466,19 @@ class _SettingsDialogState extends State<_SettingsDialog> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
+            // 联网搜索来源：**诚实展示**（未配置时把提示也放进设置页）
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text('联网搜索：${widget.searchLabel}'),
+            ),
+            if (widget.searchHint.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 4, bottom: 8),
+                child: Text(
+                  widget.searchHint,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
             DropdownButtonFormField<String>(
               initialValue: _channel,
               decoration: const InputDecoration(labelText: '通道'),
