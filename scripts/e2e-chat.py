@@ -291,7 +291,7 @@ def main() -> int:
             "-e", f"UPSTREAM_MESSAGES_URL=http://host.docker.internal:{args.mock_port}",
             "-e", "UPSTREAM_API_KEY=sk-e2e-mock-not-a-real-key",
             "-e", "USAGE_SAMPLE_PERCENT=100",
-            "-e", "YUNONG_SAMPLE_SALT=e2e-sample-salt-0123456789",
+            "-e", "YUNONG_SAMPLE_SALT=e2e-0123456789abcdef0123456789abcdef0123456789abcdef0123456789"  # 必须 >=32 字节：R3-F1 校验不通过会让服务端启动失败,
             "-e", "UPSTREAM_FIRST_EVENT_TIMEOUT_SECS=2",
             "-e", "RUST_LOG=info",
             args.image,
