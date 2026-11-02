@@ -1691,6 +1691,9 @@ mod tests {
                 .contains("未配置联网搜索"));
 
             // ④ BYOK 已填自带 Key → 自带 Key
+            // 平台差异（与下面的 secret 用例同一条规则）：非 Windows 没有系统安全存储，
+            // set 走降级不落盘，因此读回来仍是「未配置」。断言必须按平台分支，
+            // 否则 Linux CI 上会红（此前就是这样挂的）。
             let store = secret_store_for(&base.join("t.db").to_string_lossy());
             let _ = store.set(crate::secret::BYOK_SEARCH_KEY, "sk-test-0123456789abcdef");
             let r = call_secret(yunong_search_status(
@@ -1698,10 +1701,16 @@ mod tests {
                 completions.as_ptr(),
                 db.as_ptr(),
             ));
-            assert_eq!(r["data"]["source"], "byok");
-            assert_eq!(r["data"]["label"], "自带 Key");
-            assert_eq!(r["data"]["available"], true);
-            assert_eq!(r["data"]["hint"], "");
+            if cfg!(windows) {
+                assert_eq!(r["data"]["source"], "byok");
+                assert_eq!(r["data"]["label"], "自带 Key");
+                assert_eq!(r["data"]["available"], true);
+                assert_eq!(r["data"]["hint"], "");
+            } else {
+                // 降级：Key 未能持久化，必须诚实报「未配置」，不得假装可用
+                assert_eq!(r["data"]["source"], "none");
+                assert_eq!(r["data"]["available"], false);
+            }
         }
         let _ = std::fs::remove_dir_all(&base);
     }
