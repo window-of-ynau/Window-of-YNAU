@@ -60,6 +60,19 @@ RUN (timeout 5 target/release/yunong-server 2>&1 || true) | tee /tmp/boot.log \
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
+# ---- OCI 镜像元数据：容器里跑的是哪个提交，必须能从镜像本身回答（L3 复核要求）----
+# CI / release 构建时传 --build-arg；本地手动构建请传 GIT_SHA=$(git rev-parse HEAD)，
+# 否则 scripts/docker-smoke.sh 的"revision 标签长度 40"断言会拦下来。
+ARG GIT_SHA=""
+ARG BUILD_DATE=""
+ARG VERSION=""
+LABEL org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="https://github.com/window-of-ynau/Window-of-YNAU" \
+      org.opencontainers.image.title="yunong-server" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

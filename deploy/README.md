@@ -140,6 +140,8 @@ server {
 
 ```bash
 bash scripts/docker-smoke.sh yunong-server:ci   # 或任意本地镜像 tag
+# 注意：冒烟会断言 org.opencontainers.image.revision 是 40 位 commit，
+# 本地构建镜像时要传 --build-arg GIT_SHA=$(git rev-parse HEAD)
 ```
 
 ## 发布流程（版本标签与产物）
@@ -169,6 +171,13 @@ git push origin v0.1.0
 
 **镜像先冒烟后推送**：构建只 load 到 runner 本地 → `scripts/docker-smoke.sh` 起容器探 `/healthz`、`/readyz`、检查二进制 ≥2MB 与 uid=10001 → 全过才 `docker push`。坏镜像不会进 GHCR，也不会顶掉 `:latest`。
 
+**镜像自带你需要的元数据（OCI labels）**：`org.opencontainers.image.revision` = 构建时的 commit（CI / release 传 `--build-arg GIT_SHA=${{ github.sha }}`），另有 `created` / `version` / `source` / `title` / `licenses`。排查线上"这容器跑的是哪个提交"时：
+
+```bash
+docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/<owner>/yunong-server:vX.Y.Z
+# 输出 40 位 commit sha；scripts/docker-smoke.sh 也会断言它非空且长度 40
+```
+
 **干跑**（验证发布流水线本身，不推送 GHCR）：
 
 ```bash
@@ -182,12 +191,12 @@ gh run watch
 
 | 约束 | 为什么 |
 |---|---|
-| `ci.yml` 各 job 的 `name:` = 分支保护的必需检查名 | 改名等于静默取消保护。当前必需：`Rust（fmt / clippy / test）`、`Flutter（analyze / test）`、`文档（表格 / 相对链接）`、`迁移脚本（PG16 + pgvector）`、`PostgreSQL（auth 真实 SQL 集成测试）`。改名前先 `gh api repos/<owner>/<repo>/branches/main/protection` 看现状，改完同步更新 required checks |
+| `ci.yml` 各 job 的 `name:` = 分支保护的必需检查名 | 改名等于静默取消保护。当前必需（8 个）：`Rust（fmt / clippy / test）`、`Flutter（analyze / test）`、`文档（表格 / 相对链接）`、`迁移脚本（PG16 + pgvector）`、`PostgreSQL（auth 真实 SQL 集成测试）`、`服务端镜像（build + /healthz 冒烟）`、`端到端对话闭环（mock 上游）`、`密钥扫描（secret scanning）`。改名前先 `gh api repos/<owner>/<repo>/branches/main/protection` 看现状，改完同步更新 required checks |
 | 迁移按文件名 glob **全量**跑（0001 → 最后一个） | 只跑部分文件会漏后加的表/索引；`migrations` 与 `pg` 两个 job 都必须全量 |
 | `persist-credentials: false` 保持 | 不把 token 写进 `.git/config`；需要凭据的步骤（GHCR 登录）单独用 `GITHUB_TOKEN` |
 | `release.yml` 是唯一提权 workflow（`packages: write`） | 不要在 `ci.yml` 里加 `packages: write` / `contents: write` |
 | 镜像冒烟只有一份实现：`scripts/docker-smoke.sh` | CI 的 docker job 与 release 的发布前检查共用，改断言只改一处 |
-| `docker` / `security` / `e2e` / `secret-scan` job 暂不在必需检查里 | 先观察耗时与稳定性；稳定后再用 `gh api` 一次性加入 required checks（加之前它们只报警、不阻塞合入） |
+| `security`（cargo-deny）job 已阻断但暂不在必需检查里 | 依赖门禁刚转阻断（阶段 2），再观察几个 PR 后用 `gh api` 加入；在那之前它变红会「看得见但不阻塞合入」 |
 | PG 用例不并行加锁（不要 `--test-threads=1`） | 每条用例用独立 schema（`yunong_pg_<uuid>`）隔离，并行是安全的；单线程只会白白变慢 |
 
 ## 端到端闭环（无凭据）
@@ -213,7 +222,9 @@ mock 上游(假 SSE) ← 服务端容器 ← 脚本客户端（注册 → 登录
 > 只绑 `127.0.0.1` 时 CI 连不上（本机 Docker Desktop 会做转发，所以只在 CI 暴露过）。脚本已经这么传参。
 
 ```bash
-docker build -f deploy/Dockerfile.server -t yunong-server:ci .
+docker build -f deploy/Dockerfile.server \
+  --build-arg GIT_SHA=$(git rev-parse HEAD) \
+  -t yunong-server:ci .
 python3 scripts/e2e-chat.py --image yunong-server:ci
 # 失败时保留容器排查：python3 scripts/e2e-chat.py --image yunong-server:ci --keep
 ```
@@ -253,6 +264,8 @@ powershell -File scripts/install-hooks.ps1    # Windows PowerShell
 规则：`sk-` + ≥20 位（**`sk-test-` 前缀放行**）、`AKIA`+16 位、`gh[pousr]_`+≥20 位、
 `-----BEGIN … PRIVATE KEY-----`、带 ≥16 位密码的 DSN。误报用 `ALLOW_SECRET=1 git commit …`
 放行一次（会打 `::warning::`），长期误报请改写示例而不是常开这个开关。
+
+**fail-open**：钩子发现 `scripts/secret-scan.py` 不存在（切到旧分支、脚本还没合入）时只警告并放行，不会把提交卡死——这条是踩过的坑，别改成硬失败。
 
 **为什么不用 gitleaks**：gitleaks 规则更全，但要额外引一个 action / 二进制；本项目当前
 只需要"拦住我们实际踩过的那几类"（尤其 `sk-` 前缀），轻量正则 + 一份脚本就能同时服务
