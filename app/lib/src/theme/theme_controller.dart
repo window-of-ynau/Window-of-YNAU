@@ -11,6 +11,7 @@
 import 'package:flutter/material.dart';
 
 import 'themes.dart';
+import 'yunong_tokens.dart';
 
 /// 三套主题。**默认 A（极简黑白）**。
 enum AppThemeId {
@@ -71,6 +72,9 @@ enum AppThemeId {
 abstract final class SettingsKeys {
   static const String themeId = 'ui.theme';
   static const String themeMode = 'ui.themeMode';
+
+  /// 玻璃强度（只有 B 主题有意义）。
+  static const String glassMode = 'ui.glass';
 }
 
 /// 设置存储。**实现方不要自己造第二套存储**：持久化由 core 的 settings 表提供。
@@ -100,17 +104,22 @@ class ThemeController extends ChangeNotifier {
     SettingsStore? store,
     AppThemeId initialTheme = AppThemeId.minimalBlack,
     ThemeMode initialMode = ThemeMode.system,
+    GlassMode initialGlass = GlassMode.auto,
   })  : _store = store ?? MemorySettingsStore(),
         _themeId = initialTheme,
-        _themeMode = initialMode;
+        _themeMode = initialMode,
+        _glassMode = initialGlass;
 
   final SettingsStore _store;
   AppThemeId _themeId;
   ThemeMode _themeMode;
+  GlassMode _glassMode;
 
   AppThemeId get themeId => _themeId;
 
   ThemeMode get themeMode => _themeMode;
+
+  GlassMode get glassMode => _glassMode;
 
   /// 从存储读回用户上次的选择（启动时调用一次；读失败保持默认）。
   Future<void> load() async {
@@ -122,6 +131,14 @@ class ThemeController extends ChangeNotifier {
         final AppThemeId parsed = AppThemeId.fromStorage(id);
         if (parsed != _themeId) {
           _themeId = parsed;
+          changed = true;
+        }
+      }
+      final String? glass = await _store.get(SettingsKeys.glassMode);
+      if (glass != null) {
+        final GlassMode parsedGlass = GlassMode.fromStorage(glass);
+        if (parsedGlass != _glassMode) {
+          _glassMode = parsedGlass;
           changed = true;
         }
       }
@@ -159,8 +176,19 @@ class ThemeController extends ChangeNotifier {
     await _persist(SettingsKeys.themeMode, _modeValue(mode));
   }
 
+  /// 玻璃强度（只有 B 主题有意义；A/C 下改这个不影响任何渲染）。
+  Future<void> setGlassMode(GlassMode mode) async {
+    if (mode == _glassMode) {
+      return;
+    }
+    _glassMode = mode;
+    notifyListeners();
+    await _persist(SettingsKeys.glassMode, mode.storageValue);
+  }
+
   /// 给 `MaterialApp` 用的两套 ThemeData（同一个主题 id、明/暗两档）。
-  ThemeData theme(Brightness brightness) => buildTheme(_themeId, brightness);
+  ThemeData theme(Brightness brightness) =>
+      buildTheme(_themeId, brightness, glassMode: _glassMode);
 
   Future<void> _persist(String key, String value) async {
     try {

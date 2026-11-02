@@ -8,11 +8,13 @@
 import 'package:flutter/material.dart';
 
 import '../theme/theme_controller.dart';
+import '../theme/glass_panel.dart';
 import '../theme/themes.dart';
 import '../theme/yunong_tokens.dart';
 
 class SettingsPage extends StatelessWidget {
-  const SettingsPage({super.key, required this.controller, this.version = '0.9.0（W2b）'});
+  const SettingsPage(
+      {super.key, required this.controller, this.version = '0.9.0（W2b）'});
 
   final ThemeController controller;
   final String version;
@@ -24,7 +26,17 @@ class SettingsPage extends StatelessWidget {
       builder: (BuildContext context, Widget? _) {
         final YunongTokens t = context.tokens;
         return Scaffold(
-          appBar: AppBar(title: const Text('设置')),
+          appBar: AppBar(
+            title: const Text('设置'),
+            backgroundColor: t.glass == null ? t.canvas : Colors.transparent,
+            flexibleSpace: t.glass == null
+                ? null
+                : const GlassPanel(
+                    role: GlassRole.appBar,
+                    borderRadius: BorderRadius.zero,
+                    child: SizedBox.expand(),
+                  ),
+          ),
           body: ListView(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
             children: <Widget>[
@@ -36,7 +48,8 @@ class SettingsPage extends StatelessWidget {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: <Widget>[
-                        Text('主题', style: Theme.of(context).textTheme.titleMedium),
+                        Text('主题',
+                            style: Theme.of(context).textTheme.titleMedium),
                         const SizedBox(height: 2),
                         Text(
                           '切换立即生效，整个 App 一起变；课表里课程的颜色不变。',
@@ -71,25 +84,68 @@ class SettingsPage extends StatelessWidget {
                       style: ButtonStyle(
                         visualDensity: VisualDensity.compact,
                         textStyle: WidgetStatePropertyAll<TextStyle>(
-                          Theme.of(context).textTheme.bodySmall ?? const TextStyle(),
+                          Theme.of(context).textTheme.bodySmall ??
+                              const TextStyle(),
                         ),
-                        foregroundColor: WidgetStateProperty.resolveWith((Set<WidgetState> s) =>
-                            s.contains(WidgetState.selected) ? t.onAccent : t.inkSoft),
-                        backgroundColor: WidgetStateProperty.resolveWith((Set<WidgetState> s) =>
-                            s.contains(WidgetState.selected) ? t.accent : t.surface),
+                        foregroundColor: WidgetStateProperty.resolveWith(
+                            (Set<WidgetState> s) =>
+                                s.contains(WidgetState.selected)
+                                    ? t.onAccent
+                                    : t.inkSoft),
+                        backgroundColor: WidgetStateProperty.resolveWith(
+                            (Set<WidgetState> s) =>
+                                s.contains(WidgetState.selected)
+                                    ? t.accent
+                                    : t.surface),
                         side: WidgetStatePropertyAll<BorderSide>(
-                          BorderSide(color: t.controlBorder, width: t.borderWidth),
+                          BorderSide(
+                              color: t.controlBorder, width: t.borderWidth),
                         ),
                       ),
                       segments: const <ButtonSegment<ThemeMode>>[
-                        ButtonSegment<ThemeMode>(value: ThemeMode.system, label: Text('跟随系统')),
-                        ButtonSegment<ThemeMode>(value: ThemeMode.light, label: Text('浅色')),
-                        ButtonSegment<ThemeMode>(value: ThemeMode.dark, label: Text('深色')),
+                        ButtonSegment<ThemeMode>(
+                            value: ThemeMode.system, label: Text('跟随系统')),
+                        ButtonSegment<ThemeMode>(
+                            value: ThemeMode.light, label: Text('浅色')),
+                        ButtonSegment<ThemeMode>(
+                            value: ThemeMode.dark, label: Text('深色')),
                       ],
                       selected: <ThemeMode>{controller.themeMode},
                       onSelectionChanged: (Set<ThemeMode> value) =>
                           controller.setThemeMode(value.first),
                     ),
+                  ),
+                  // 玻璃强度：只有 B（深蓝玻璃）有意义。A/C 下置灰并说明原因，
+                  // 避免用户以为"选了没反应"。
+                  _Row(
+                    icon: Icons.blur_on_outlined,
+                    title: '玻璃强度',
+                    subtitle: controller.themeId == AppThemeId.deepGlass
+                        ? '自动会按帧率降级（p90 > 55fps 标准）；课程块永远不模糊'
+                        : '当前主题没有玻璃效果（只有「深蓝玻璃」有）',
+                    trailing: controller.themeId == AppThemeId.deepGlass
+                        ? DropdownButton<GlassMode>(
+                            value: controller.glassMode,
+                            underline: const SizedBox.shrink(),
+                            borderRadius: BorderRadius.circular(t.radiusS),
+                            style: Theme.of(context)
+                                .textTheme
+                                .bodySmall
+                                ?.copyWith(color: t.ink),
+                            items: <DropdownMenuItem<GlassMode>>[
+                              for (final GlassMode mode in GlassMode.values)
+                                DropdownMenuItem<GlassMode>(
+                                  value: mode,
+                                  child: Text(mode.label),
+                                ),
+                            ],
+                            onChanged: (GlassMode? mode) {
+                              if (mode != null) {
+                                controller.setGlassMode(mode);
+                              }
+                            },
+                          )
+                        : Text('—', style: TextStyle(color: t.inkFaint)),
                   ),
                 ],
               ),
@@ -142,7 +198,8 @@ class SettingsPage extends StatelessWidget {
 
 /// 一张主题预览卡：用**该主题自己的 token** 画，所见即所切。
 class _ThemeCard extends StatelessWidget {
-  const _ThemeCard({required this.id, required this.selected, required this.onTap});
+  const _ThemeCard(
+      {required this.id, required this.selected, required this.onTap});
 
   final AppThemeId id;
   final bool selected;
@@ -267,7 +324,10 @@ class _Group extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(4, 6, 4, 6),
             child: Text(
               title,
-              style: Theme.of(context).textTheme.labelSmall?.copyWith(color: t.inkSoft),
+              style: Theme.of(context)
+                  .textTheme
+                  .labelSmall
+                  ?.copyWith(color: t.inkSoft),
             ),
           ),
           Container(
@@ -281,7 +341,10 @@ class _Group extends StatelessWidget {
               children: <Widget>[
                 for (int i = 0; i < children.length; i++) ...<Widget>[
                   if (i > 0)
-                    Divider(height: t.borderWidth, thickness: t.borderWidth, color: t.hairline),
+                    Divider(
+                        height: t.borderWidth,
+                        thickness: t.borderWidth,
+                        color: t.hairline),
                   children[i],
                 ],
               ],
@@ -294,7 +357,8 @@ class _Group extends StatelessWidget {
 }
 
 class _Row extends StatelessWidget {
-  const _Row({required this.icon, required this.title, this.subtitle, this.trailing});
+  const _Row(
+      {required this.icon, required this.title, this.subtitle, this.trailing});
 
   final IconData icon;
   final String title;
@@ -329,7 +393,10 @@ class _Row extends StatelessWidget {
               ],
             ),
           ),
-          if (trailing != null) ...<Widget>[const SizedBox(width: 12), trailing!],
+          if (trailing != null) ...<Widget>[
+            const SizedBox(width: 12),
+            trailing!
+          ],
         ],
       ),
     );

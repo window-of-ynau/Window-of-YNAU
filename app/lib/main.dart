@@ -16,6 +16,9 @@ import 'src/campus/webview_fetcher.dart';
 import 'src/core/timetable_service.dart';
 import 'src/settings/settings_page.dart';
 import 'src/theme/theme_controller.dart';
+import 'src/theme/glass_panel.dart';
+import 'src/theme/glass_performance.dart';
+import 'src/theme/themes.dart';
 import 'src/theme/yunong_tokens.dart';
 
 void main() {
@@ -39,17 +42,35 @@ class YunongApp extends StatefulWidget {
 }
 
 class _YunongAppState extends State<YunongApp> {
-  late final ThemeController _controller = widget.themeController ?? ThemeController();
+  late final ThemeController _controller =
+      widget.themeController ?? ThemeController();
+
+  /// 玻璃帧率闸门：**只在 B（深蓝玻璃）主题下挂载**，A/C 完全不启动。
+  final GlassGovernor _glass = GlassGovernor();
 
   @override
   void initState() {
     super.initState();
     // 读回上次选择（默认 A 极简黑白）。存储未接时是内存实现，读不到就用默认值。
     unawaited(_controller.load());
+    _controller.addListener(_syncGlassGovernor);
+    _syncGlassGovernor();
+  }
+
+  void _syncGlassGovernor() {
+    final bool needsGlass = _controller.themeId == AppThemeId.deepGlass &&
+        tokensFor(AppThemeId.deepGlass, Brightness.dark).glass != null;
+    if (needsGlass) {
+      _glass.attach();
+    } else {
+      _glass.detach();
+    }
   }
 
   @override
   void dispose() {
+    _controller.removeListener(_syncGlassGovernor);
+    _glass.dispose();
     if (widget.themeController == null) {
       _controller.dispose();
     }
@@ -58,32 +79,55 @@ class _YunongAppState extends State<YunongApp> {
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: _controller,
-      builder: (BuildContext context, Widget? child) {
-        return MaterialApp(
-          title: '云农之窗',
-          debugShowCheckedModeBanner: false,
-          // WebView 抓取页需要根导航（CampusWebViewPage 全屏 push）
-          navigatorKey: WebViewSchoolFetcher.navigatorKey,
-          theme: _controller.theme(Brightness.light),
-          darkTheme: _controller.theme(Brightness.dark),
-          themeMode: _controller.themeMode,
-          // 有画布渐变的主题（B 深蓝玻璃）：Scaffold 透明，渐变在这里铺，
-          // 所有路由（设置页、课表页）都叠在同一层背景上，切页不会"闪白"。
-          builder: (BuildContext context, Widget? child) {
-            final Gradient? gradient = context.tokens.canvasGradient;
-            if (gradient == null) {
-              return child ?? const SizedBox.shrink();
-            }
-            return DecoratedBox(
-              decoration: BoxDecoration(gradient: gradient),
-              child: child ?? const SizedBox.shrink(),
-            );
-          },
-          home: HomeShell(themeController: _controller),
-        );
-      },
+    return GlassScope(
+      governor: _glass,
+      child: ListenableBuilder(
+        listenable: _controller,
+        builder: (BuildContext context, Widget? child) {
+          return MaterialApp(
+            title: '云农之窗',
+            debugShowCheckedModeBanner: false,
+            // WebView 抓取页需要根导航（CampusWebViewPage 全屏 push）
+            navigatorKey: WebViewSchoolFetcher.navigatorKey,
+            theme: _controller.theme(Brightness.light),
+            darkTheme: _controller.theme(Brightness.dark),
+            themeMode: _controller.themeMode,
+            // 画布背景：B 的深蓝渐变、C 的纸纹都铺在这里（Scaffold 对这些主题透明），
+            // 这样所有路由（设置页、课表页）都叠在同一层背景上，切页不会"闪白"。
+            builder: (BuildContext context, Widget? child) {
+              final YunongTokens tokens = context.tokens;
+              Widget content = child ?? const SizedBox.shrink();
+              if (tokens.canvasGradient != null) {
+                content = DecoratedBox(
+                  decoration: BoxDecoration(gradient: tokens.canvasGradient),
+                  child: content,
+                );
+              }
+              final TextureSpec? texture = tokens.texture;
+              if (texture != null) {
+                content = Stack(
+                  fit: StackFit.expand,
+                  children: <Widget>[
+                    IgnorePointer(
+                      child: Opacity(
+                        opacity: texture.opacity,
+                        child: Image.asset(
+                          texture.asset,
+                          repeat: ImageRepeat.repeat,
+                          fit: BoxFit.none,
+                        ),
+                      ),
+                    ),
+                    content,
+                  ],
+                );
+              }
+              return content;
+            },
+            home: HomeShell(themeController: _controller),
+          );
+        },
+      ),
     );
   }
 }
@@ -107,7 +151,19 @@ class _HomeShellState extends State<HomeShell> {
     final destination = _selected == 0 ? null : entries[_selected - 1];
 
     return Scaffold(
+      // 玻璃主题：AppBar 底下垫一层玻璃（全屏只有这一层会真模糊）；
+      // A/C 的 tokens.glass == null，GlassPanel 退化成普通表面 → 0 个 BackdropFilter。
       appBar: AppBar(
+        backgroundColor: context.tokens.glass == null
+            ? context.tokens.canvas
+            : Colors.transparent,
+        flexibleSpace: context.tokens.glass == null
+            ? null
+            : const GlassPanel(
+                role: GlassRole.appBar,
+                borderRadius: BorderRadius.zero,
+                child: SizedBox.expand(),
+              ),
         title: Text(destination?.label ?? '云农之窗'),
         actions: <Widget>[
           IconButton(
@@ -152,7 +208,8 @@ class _HomeShellState extends State<HomeShell> {
   void _openSettings() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (BuildContext context) => SettingsPage(controller: widget.themeController),
+        builder: (BuildContext context) =>
+            SettingsPage(controller: widget.themeController),
       ),
     );
   }
@@ -189,8 +246,7 @@ class _CampusPane extends StatelessWidget {
     if (entry == CampusEntry.timetable) {
       return TimetablePage(service: _service, fetcher: _fetcher);
     }
-    return const ChatPage(
-    );
+    return const ChatPage();
     // ignore: dead_code
     return Center(
       child: Padding(
