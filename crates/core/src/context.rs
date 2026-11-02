@@ -12,7 +12,31 @@ use yunong_shared::COMPRESS_TRIGGER_RATIO;
 /// - CJK 字符：1 字 ≈ 1 token
 /// - 其他字符（拉丁/数字/符号）：4 字 ≈ 1 token
 ///
-/// 注意：这是**估算**，用于预算与"先拒后转"；真实计费以厂商返回的 usage 为准。
+/// # 这是**刻意的保守估计**，不是"接近真实分词器"
+///
+/// 这个数字只用于**准入预算与压缩触发**（`should_compress` / `plan_compaction`），
+/// 不用于计费（计费以厂商返回的 `usage` 为准）。两种误差的代价不对称：
+///
+/// - **高估** → 提前压缩，丢一点上下文（用户能感知但可接受）；
+/// - **低估** → 请求溢出（直接失败）或超预算（花钱）。
+///
+/// 所以我们选高估。参照 DSH-DCP 的 CJK 计价（约 **2 字符/token**，见
+/// `.internal/research/dsh-dcp-evaluation.md` §2.3 与 `dsh-dcp/lib/summarizer.js:98-102`），
+/// 同一段文本上我们的估值约为它的 **1.0–1.9 倍**：
+///
+/// | 样本 | 我们 | DCP | 倍数 |
+/// |---|---|---|---|
+/// | 纯中文散文 1047 字 | 714 | 431 | 1.66× |
+/// | 单条中文对话 77 字 | 73 | 39 | 1.87× |
+/// | 中文注释 + 代码 4747 字 | 1450 | 1289 | 1.12× |
+/// | 中英混排 310 字 | 121 | 93 | 1.30× |
+/// | 纯 ASCII | 21 | 21 | 1.00× |
+///
+/// 纯汉字理论上限是 **2.0×**（我们 1 字/token，DCP 2 字符/token）；含中文标点时略低，
+/// 因为 `is_cjk` 没把全角标点算进 CJK（按 4 字符/token 反而更保守）。
+///
+/// **若将来接入真实 tokenizer（按模型实测），用它的计数替换本函数再校准一次**；
+/// 在那之前，别为了"看起来更准"把 1 字/token 调成 0.5——那会把上面的误差方向反过来。
 pub fn estimate_tokens(text: &str) -> u32 {
     let mut cjk = 0_u32;
     let mut other = 0_u32;
@@ -170,5 +194,57 @@ mod tests {
         let plan = plan_compaction(&msgs, 1000);
         assert!(plan.is_empty());
         assert_eq!(plan.projected_tokens, 1998);
+    }
+
+    /// DSH-DCP 的 CJK 计价（`dsh-dcp/lib/summarizer.js:98-102`）：CJK 2 字符/token，
+    /// 其余 4 字符/token。这里只用来**对照方向**，不是要改成它。
+    fn dcp_estimate(text: &str) -> u32 {
+        let (mut cjk, mut other) = (0_f32, 0_f32);
+        for ch in text.chars() {
+            // DCP 把假名/谚文/全角标点也算 CJK；中文正文里主要差在标点上
+            let code = ch as u32;
+            let wide = matches!(code, 0x3000..=0x303F | 0x3040..=0x30FF | 0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0xAC00..=0xD7AF);
+            if wide {
+                cjk += 1.0;
+            } else {
+                other += 1.0;
+            }
+        }
+        (cjk / 2.0 + other / 4.0).ceil() as u32
+    }
+
+    /// 我们**刻意高估**：中文上永远不小于 DCP 的估值（纯汉字接近 2 倍）。
+    ///
+    /// 这条用例锁的是**方向**，不是具体倍数：将来若有人把 1 字/token 改成 0.5 去"贴近
+    /// 真实分词器"，这个断言会立刻红，提醒他先读完 `estimate_tokens` 的文档。
+    #[test]
+    fn cjk_estimate_is_deliberately_conservative_versus_dcp() {
+        let cases = [
+            // 纯汉字：1 字/token vs 0.5 字/token → 约 2 倍
+            "帮我把这学期的课表整理一下周一到周五每天有哪几门课哪几门是单周上的",
+            // 含中文标点
+            "下周三下午想去图书馆，帮我看看有没有课；如果有，能不能换到周五。",
+            // 中文 + 代码标识符（混排）
+            "这段 plan_compaction 为什么先剪大的？是不是按时间顺序更合理？",
+            // 纯 ASCII：两者必须一致（都不高估英文）
+            "fn main() { let plan = plan_compaction(&messages, 32000); }",
+        ];
+        for text in cases {
+            let ours = estimate_tokens(text);
+            let theirs = dcp_estimate(text);
+            assert!(
+                ours >= theirs,
+                "我们的估值必须 ≥ DCP（高估是刻意的）：{text:?} ours={ours} dcp={theirs}"
+            );
+            // 也不该高估到荒谬（超过 2.1 倍说明公式写错了）
+            assert!(
+                ours as f32 <= theirs as f32 * 2.1 + 1.0,
+                "{text:?} ours={ours} dcp={theirs} 倍数过大"
+            );
+        }
+        // 纯 ASCII 上两者相等：保守只针对 CJK
+        let ascii = "fn main() { let plan = plan_compaction(&messages, 32000); }";
+        assert_eq!(estimate_tokens(ascii), dcp_estimate(ascii));
     }
 }
