@@ -17,6 +17,7 @@ pub mod gateway;
 pub mod ics;
 pub mod index;
 pub mod keystore;
+pub mod local_search;
 pub mod memory;
 pub mod memory_items;
 pub mod parse;
@@ -53,6 +54,10 @@ pub mod prelude {
     pub use crate::ics::{build_events, export_term_ics, IcsExport};
     pub use crate::index::{Bm25Index, LocalIndex, SearchHit};
     pub use crate::keystore::{SecretKind, SecretStore};
+    pub use crate::local_search::{
+        SearchDoc, SearchResult, SearchStats, SearchStore, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT,
+        SNIPPET_RADIUS,
+    };
     pub use crate::memory::{Blob, BlobKind, MemoryStore, Message};
     pub use crate::memory_items::{
         MemoryDraft, MemoryItem, MemoryItemStore, MemoryKind, MemoryWrite,
