@@ -187,7 +187,7 @@ gh run watch
 | `persist-credentials: false` 保持 | 不把 token 写进 `.git/config`；需要凭据的步骤（GHCR 登录）单独用 `GITHUB_TOKEN` |
 | `release.yml` 是唯一提权 workflow（`packages: write`） | 不要在 `ci.yml` 里加 `packages: write` / `contents: write` |
 | 镜像冒烟只有一份实现：`scripts/docker-smoke.sh` | CI 的 docker job 与 release 的发布前检查共用，改断言只改一处 |
-| `docker` / `security` / `e2e` job 暂不在必需检查里 | 先观察耗时与稳定性；稳定后再用 `gh api` 一次性加入 required checks（加之前它们只报警、不阻塞合入） |
+| `docker` / `security` / `e2e` / `secret-scan` job 暂不在必需检查里 | 先观察耗时与稳定性；稳定后再用 `gh api` 一次性加入 required checks（加之前它们只报警、不阻塞合入） |
 | PG 用例不并行加锁（不要 `--test-threads=1`） | 每条用例用独立 schema（`yunong_pg_<uuid>`）隔离，并行是安全的；单线程只会白白变慢 |
 
 ## 端到端闭环（无凭据）
@@ -221,9 +221,42 @@ python3 scripts/e2e-chat.py --image yunong-server:ci
 **当前节奏**：该 job 带 `continue-on-error: true`，先观察 3~5 个 PR，稳定后删掉这行转阻断，
 最后再与其他非必需 job 一起用 `gh api` 加进分支保护。
 
-> 仓库里还有 `crates/core/examples/fake_sse.rs`（端侧人工联调用的假上游）。它只提供
-> ok/429/html 三种形态，没有"流内错误帧"和"挂起"，覆盖不了 `event: error` 与超时路径，
-> 所以 CI 闭环用 `scripts/mock-upstream/` 这份；两者互不替代，也别把断言逻辑写两遍。
+### 两个"假上游"的分工（别合并，也别互相替代）
+
+| 工具 | 用途 | 谁用 |
+|---|---|---|
+| `crates/core/examples/fake_sse.rs` | **端侧 BYOK 手动联调**（Dart/Flutter 发真实请求，看逐字输出） | 开发者本机 |
+| `scripts/mock-upstream/mock_upstream.py` | **CI 服务端 E2E**（6 种场景、容器网络、psql 断言） | CI |
+
+`fake_sse` 只有 ok/429/html 三种形态、没有"流内错误帧"和"挂起"，覆盖不了 `event: error`
+与超时路径；CI 闭环用 `scripts/mock-upstream/` 这份。两者是**不同层面的测试替身**，
+不是重复实现——断言逻辑只写在 `scripts/e2e-chat.py` 一处。
+
+## 密钥泄露防护（secret scanning）
+
+**事故留档（2026-11）**：owner 的真实 API Key 曾被写进测试代码并推到 GitHub。处置：立即吊销并换新 Key → 脱敏（示例值统一改成 `sk-test-…`）→ 加下面这道闸。影响面：该 Key 在泄露窗口内可被任意人使用，需按"已泄露"看待（吊销是唯一正确的收尾），不是改代码就能当没发生。
+
+**现在的双保险**（规则只有一份：`scripts/secret-scan.py`）：
+
+| 时机 | 触发 | 行为 |
+|---|---|---|
+| 提交前 | `.git/hooks/pre-commit` → `scripts/secret-scan.py --staged` | 命中即**拒绝提交** |
+| PR / push main | CI `密钥扫描（secret scanning）` job → `scripts/secret-scan.py --all` | 命中即红（当前阶段 1 `continue-on-error`，观察 3~5 个 PR 后转阻断） |
+
+**每台开发机装一次钩子**：
+
+```bash
+bash scripts/install-hooks.sh                 # Linux / macOS / Git Bash
+powershell -File scripts/install-hooks.ps1    # Windows PowerShell
+```
+
+规则：`sk-` + ≥20 位（**`sk-test-` 前缀放行**）、`AKIA`+16 位、`gh[pousr]_`+≥20 位、
+`-----BEGIN … PRIVATE KEY-----`、带 ≥16 位密码的 DSN。误报用 `ALLOW_SECRET=1 git commit …`
+放行一次（会打 `::warning::`），长期误报请改写示例而不是常开这个开关。
+
+**为什么不用 gitleaks**：gitleaks 规则更全，但要额外引一个 action / 二进制；本项目当前
+只需要"拦住我们实际踩过的那几类"（尤其 `sk-` 前缀），轻量正则 + 一份脚本就能同时服务
+CI 与 pre-commit，且**离线可跑、规则可读**。等规则明显不够用时再换。
 
 ## 依赖安全与许可证（cargo-deny）
 

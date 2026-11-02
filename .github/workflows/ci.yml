@@ -458,3 +458,22 @@ jobs:
           cache-to: type=gha,mode=max
       - name: 端到端闭环（mock 上游 + PG + 服务端容器 + 脚本客户端）
         run: python3 scripts/e2e-chat.py --image yunong-server:ci
+
+  # 密钥泄露防护：owner 的真实 API Key 曾被写进测试代码并推到 GitHub（已吊销 + 脱敏）。
+  # 这道闸让"把密钥写进代码"在提交前（pre-commit 钩子）和合并前（CI）都直接失败。
+  # 规则只有一份：scripts/secret-scan.py —— 钩子脚本装的也是它，不要写第二份。
+  #
+  # 阶段 1（当前）：continue-on-error: true，只观察 3~5 个 PR；稳定后删掉这行转阻断，
+  # 再与其他非必需 job 一起用 gh api 加进分支保护（与 docker / security / e2e 同节奏）。
+  secret-scan:
+    name: 密钥扫描（secret scanning）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # 扫 git 跟踪的文件（不含 ignored / 未跟踪文件），规则清单见脚本头部注释
+      - name: 扫描密钥（规则与 pre-commit 钩子共用 scripts/secret-scan.py）
+        run: python3 scripts/secret-scan.py --all
