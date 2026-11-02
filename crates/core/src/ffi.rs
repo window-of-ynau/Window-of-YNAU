@@ -816,7 +816,7 @@ pub unsafe extern "C" fn yunong_search_delete(
 /// 流式回调：`chunk_json` **只在本次回调期间有效**（Rust 分配、Rust 释放，Dart 侧绝不能 free）；
 /// 返回 `1` = 调用方要求取消（停止读取上游），`0` = 继续。
 pub type ChatChunkCallback =
-    unsafe extern "C" fn(chunk_json: *const c_char, user: *mut c_void) -> i32;
+    unsafe extern "C" fn(chunk_json: *const c_char, user: *mut c_void);
 
 static CHAT_CANCEL: OnceLock<crate::chat_ffi::CancelRegistry> = OnceLock::new();
 
@@ -838,17 +838,15 @@ unsafe impl Send for ChatCallback {}
 
 impl ChatCallback {
     fn emit(&self, json: &str) -> bool {
-        let Ok(text) = CString::new(json.replace('\0', "")) else {
-            return true;
-        };
-        // catch_unwind：Dart 侧回调抛异常不能把 Rust 进程带崩
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            (self.on_chunk)(text.as_ptr(), self.user)
-        }));
-        // 字符串 `text` 在本次调用期间有效，返回后即释放（Dart 侧不得保存指针）
-        drop(text);
-        match result {
-            Ok(value) => value == 0,
+        // 回调是 void：Dart 的 `NativeCallable.listener` 只能返回 void，
+        // 返回寄存器内容未定义，若当成"非 0 即取消"会把每个 chunk 都判成取消，
+        // 流立刻结束、done 永远不来。取消只由 `yunong_chat_cancel` 的 registry 判定。
+        match CString::new(json) {
+            Ok(c) => {
+                unsafe { (self.on_chunk)(c.as_ptr(), self.user) };
+                true
+            }
+            // 含 NUL 的非法 JSON：无法安全投递，按终止处理
             Err(_) => false,
         }
     }
@@ -2180,14 +2178,13 @@ mod tests {
     // 流式对话 FFI（W7 P0）
     // ---------------------------------------------------------------------
 
-    extern "C" fn collect_chunk(chunk_json: *const c_char, user: *mut c_void) -> i32 {
+    extern "C" fn collect_chunk(chunk_json: *const c_char, user: *mut c_void) {
         let sink = unsafe { &mut *(user as *mut Vec<String>) };
         let text = unsafe { CStr::from_ptr(chunk_json) }
             .to_str()
             .unwrap()
             .to_owned();
         sink.push(text);
-        0
     }
 
     #[test]
