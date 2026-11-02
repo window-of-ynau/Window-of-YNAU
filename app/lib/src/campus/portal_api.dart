@@ -557,7 +557,7 @@ const String kPortalScheduleScript = r'''
   // 诊断用：owner/我们据此判断卡在哪一步（不含任何凭据）
   var DIAG = {
     xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0,
-    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: [], probeParams: null, steps: []
+    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: [], probeParams: null, steps: [], probeAttempts: 0
   };
   // **没有任何"从页面打开算起"的绝对超时**：只有"无进展兜底"（见 watchdog）
   var LAST_PROGRESS = { at: Date.now(), what: 'start' };
@@ -673,7 +673,8 @@ const String kPortalScheduleScript = r'''
       probeFailed: DIAG.probeFailed,
       probeResults: DIAG.probeResults,
       probeParams: DIAG.probeParams,
-      steps: DIAG.steps
+      steps: DIAG.steps,
+      probeAttempts: DIAG.probeAttempts
     });
   };
 
@@ -1047,6 +1048,7 @@ const String kPortalScheduleScript = r'''
     (function next(index) {
       if (TEMPLATE || index >= queue.length) { return; }
       var cand = queue[index];
+      DIAG.probeAttempts = (DIAG.probeAttempts || 0) + 1;
       DIAG.steps.push('→ ' + cand.value.slice(0, 8));
       var pending;
       try {
