@@ -14,6 +14,7 @@
 // - 网络/证书 → `NETWORK` / `CERT`，只给可读提示，不弹异常栈。
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:collection';
 
 import 'package:flutter/material.dart';
@@ -34,6 +35,21 @@ enum CampusFetchMode {
 }
 
 /// WebView 版取数实现（真实登录 + 会话复用）。
+/// 学期格式：`YYYY-YYYY-N`（1 或 2 学期）。
+///
+/// 学期是**我们自己的固定格式**，不接受自由文本：这个值会被拼进校务 origin 上的
+/// 注入脚本（CAS 会话所在域），任何"字符串拼接"都可能变成代码执行（R4-F1）。
+bool isValidTermFormat(String term) => _termPattern.hasMatch(term);
+
+final RegExp _termPattern = RegExp(r'^20\d\d-20\d\d-[12]$');
+
+/// 生成设置学期变量的注入脚本。
+///
+/// **必须用 `jsonEncode`**：产出的双引号字符串字面量会转义内部引号/反斜杠/换行，
+/// 用户输入无法跳出字符串；历史上用单引号直接拼 `'$term'`，可被
+/// `x';globalThis.PWNED=1;//` 这类输入执行任意 JS（R4-F1）。
+String termAssignmentJs(String term) => 'window.__yunongTerm = ${jsonEncode(term)};';
+
 class WebViewSchoolFetcher implements SchoolFetcher {
   WebViewSchoolFetcher({this.timeout = const Duration(minutes: 5)});
 
@@ -54,12 +70,26 @@ class WebViewSchoolFetcher implements SchoolFetcher {
   ///
   /// 与 HTML 路径共用同一个 WebView 页面（`CampusWebViewPage` 的 `mode` 区分）。
   @override
-  Future<ScheduleApiResult> fetchSchedule({required String entryUrl, String? term}) =>
-      _open<ScheduleApiResult>(
-        entryUrl: entryUrl,
-        mode: CampusFetchMode.portalApi,
-        term: term,
-      );
+  Future<ScheduleApiResult> fetchSchedule({required String entryUrl, String? term}) async {
+    _requireValidTerm(term);
+    return _open<ScheduleApiResult>(
+      entryUrl: entryUrl,
+      mode: CampusFetchMode.portalApi,
+      term: term,
+    );
+  }
+
+  /// 学期格式不合法 → 直接报错（不把自由文本带进校务页面）。
+  void _requireValidTerm(String? term) {
+    if (term == null || term.isEmpty || isValidTermFormat(term)) {
+      return;
+    }
+    throw const FetchException(
+      code: 'BAD_INPUT',
+      userHint: '学期格式应形如 2026-2027-1',
+      message: '学期格式非法（只接受 YYYY-YYYY-1/2）',
+    );
+  }
 
   Future<FetchedPage> fetchTimetablePage({required String entryUrl}) =>
       _open<FetchedPage>(
@@ -462,8 +492,16 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       }
                       final term = widget.term;
                       if (term != null && term.isNotEmpty) {
+                        // 纵深防御：入口已校验，这里再挡一次；注入语句用 jsonEncode 生成
+                        if (!isValidTermFormat(term)) {
+                          throw const FetchException(
+                            code: 'BAD_INPUT',
+                            userHint: '学期格式应形如 2026-2027-1',
+                            message: '学期格式非法（只接受 YYYY-YYYY-1/2）',
+                          );
+                        }
                         await _controller?.evaluateJavascript(
-                          source: "window.__yunongTerm = '$term';",
+                          source: termAssignmentJs(term),
                         );
                       }
                       // 门户模式 + 已离开登录页：立刻跑一次"自动优先"发现流程
