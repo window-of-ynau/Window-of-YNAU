@@ -24,6 +24,7 @@ pub mod protocols;
 pub mod schedule;
 pub mod secret;
 pub mod store;
+pub mod tool_loop;
 pub mod tools;
 
 pub use error::{CoreError, CoreResult};
@@ -61,5 +62,6 @@ pub mod prelude {
         compress_weeks, merge, MergedSchedule, SchedulePayload, WeekPayload,
     };
     pub use crate::store::{CourseStore, ImportOutcome, StoredCourse, TermRecord};
+    pub use crate::tool_loop::{run as run_tool_loop, LoopConfig, LoopEvent, LoopOutcome};
     pub use crate::tools::{ToolCall, ToolOutcome, ToolRegistry};
 }
