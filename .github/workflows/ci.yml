@@ -381,7 +381,7 @@ jobs:
       # 镜像里打 OCI label（org.opencontainers.image.revision 等）：容器跑的是哪个提交
       # 必须能从 `docker inspect` 回答，security 的 L3 复核专门提过这一点。
       - name: docker build（deploy/Dockerfile.server）
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile.server
@@ -469,7 +469,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       # 与 docker / release 共用同一个 gha 缓存：命中时约 20~30 秒
       - name: docker build（deploy/Dockerfile.server）
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile.server
