@@ -30,6 +30,7 @@ use std::sync::OnceLock;
 use serde_json::{json, Value};
 
 use crate::error::CoreError;
+use crate::local_search::{SearchDoc, SearchStore};
 use crate::memory_items::{MemoryDraft, MemoryItemStore, MemoryKind};
 use crate::parse::{ParseError, ParseReport};
 use crate::schedule::{merge, SchedulePayload};
@@ -439,16 +440,16 @@ pub unsafe extern "C" fn yunong_export_ics(
 }
 
 // -------------------------------------------------------------------------
-// 本地记忆（W7-3）：`memory_items` 的增删查。正文只在本机，不上云（ADR-02）。
+// 本地记忆（W7-3）与本地检索（W9）：`memory_items` / `search_*` 的增删查。
+// 正文只在本机，不上云（ADR-02 / ADR-19）。
 // -------------------------------------------------------------------------
 
-/// 记忆相关的错误映射：**校验类**问题统一 `BAD_INPUT`。
+/// 校验类错误统一 `BAD_INPUT` 的映射（记忆与检索共用）。
 ///
 /// 共享的 [`map_core_error`] 把 `Invalid` 归到 `STORAGE`（课表那几个函数的历史行为，
-/// 改动它等于改既有契约）。但"记忆类型写错"不是存储故障：界面若显示
-/// "本地记忆保存失败"，用户会去查磁盘而不是改输入。所以这里只给记忆这三个函数
-/// 单独把 `Invalid` 映射成 `BAD_INPUT`。
-fn memory_error(err: CoreError) -> Value {
+/// 改动它等于改既有契约）。但"记忆类型写错""limit 越界"不是存储故障：界面若显示
+/// "本地数据保存失败"，用户会去查磁盘而不是改输入。所以这两个模块单独映射。
+fn input_error(err: CoreError) -> Value {
     match err {
         CoreError::Invalid(message) => err_json("BAD_INPUT", message),
         other => {
@@ -526,7 +527,7 @@ pub unsafe extern "C" fn yunong_memory_upsert(
         };
         let kind = match MemoryKind::parse(kind) {
             Ok(kind) => kind,
-            Err(err) => return memory_error(err),
+            Err(err) => return input_error(err),
         };
         let id = match parse_optional_id(id_or_empty) {
             Ok(id) => id,
@@ -534,7 +535,7 @@ pub unsafe extern "C" fn yunong_memory_upsert(
         };
         let mut store = match MemoryItemStore::open(db_path) {
             Ok(store) => store,
-            Err(err) => return memory_error(err),
+            Err(err) => return input_error(err),
         };
         let draft = MemoryDraft {
             kind,
@@ -545,7 +546,7 @@ pub unsafe extern "C" fn yunong_memory_upsert(
         };
         match store.upsert(&draft, id) {
             Ok(write) => ok_json(json!({ "id": write.id, "evicted": write.evicted })),
-            Err(err) => memory_error(err),
+            Err(err) => input_error(err),
         }
     })
 }
@@ -580,7 +581,7 @@ pub unsafe extern "C" fn yunong_memory_list(
             "" => None,
             text => match MemoryKind::parse(text) {
                 Ok(kind) => Some(kind),
-                Err(err) => return memory_error(err),
+                Err(err) => return input_error(err),
             },
         };
         let limit = match parse_list_limit(limit) {
@@ -589,11 +590,11 @@ pub unsafe extern "C" fn yunong_memory_list(
         };
         let store = match MemoryItemStore::open(db_path) {
             Ok(store) => store,
-            Err(err) => return memory_error(err),
+            Err(err) => return input_error(err),
         };
         match store.list(kind, limit) {
             Ok(items) => ok_json(json!(items)),
-            Err(err) => memory_error(err),
+            Err(err) => input_error(err),
         }
     })
 }
@@ -624,11 +625,186 @@ pub unsafe extern "C" fn yunong_memory_delete(
         };
         let mut store = match MemoryItemStore::open(db_path) {
             Ok(store) => store,
-            Err(err) => return memory_error(err),
+            Err(err) => return input_error(err),
         };
         match store.delete(id) {
             Ok(deleted) => ok_json(json!({ "deleted": deleted })),
-            Err(err) => memory_error(err),
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+// -------------------------------------------------------------------------
+// 本地检索（ADR-19 决策 1）：SQLite 上的 BM25，中文 bigram，不做 embedding。
+// -------------------------------------------------------------------------
+
+/// 解析检索的 `limit`：空串 = 默认 10；**超过 100 按 100 处理（不报错）**；
+/// 0 / 非数字才报 `BAD_INPUT`（"要 0 条"是调用方的 bug，静默返回空数组会掩盖它）。
+fn parse_search_limit(text: &str) -> Result<usize, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(crate::local_search::DEFAULT_SEARCH_LIMIT);
+    }
+    match text.parse::<usize>() {
+        Ok(0) => Err("limit 必须是正整数".to_owned()),
+        Ok(limit) => Ok(limit.min(crate::local_search::MAX_SEARCH_LIMIT)),
+        Err(_) => Err(format!("limit 必须是整数：{text}")),
+    }
+}
+
+/// 请求 id（响应里带一个，便于 Dart 侧把"哪次点搜索"与日志对上）。
+fn new_request_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// 本地 BM25 检索（**契约已锁**，不要再改形状）。
+///
+/// ```json
+/// {"ok":true,"data":{"hits":[{"id":12,"kind":"note","title":"…","snippet":"…","score":3.2741}]},"request_id":"…"}
+/// ```
+///
+/// - 空查询 / 只含标点 / 无命中 → `{"ok":true,"data":{"hits":[]}}`（"没搜到"不是错误）；
+/// - `limit` 缺省 10，上限 100（超出按 100 处理，不报错）；
+/// - `id` 是数字（记忆页 = `memory_items.id`），`kind` 与记忆一致（note/summary/fact），
+///   `score` 保留 4 位小数。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_search_local(
+    query: *const c_char,
+    limit: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (query, limit, db_path) = match (
+            read_arg(query, "query"),
+            read_arg(limit, "limit"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(query), Ok(limit), Ok(db_path)) => (query, limit, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
+        };
+        let limit = match parse_search_limit(limit) {
+            Ok(limit) => limit,
+            Err(err) => return err_json("BAD_INPUT", err),
+        };
+        let store = match SearchStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return input_error(err),
+        };
+        match store.search(query, limit) {
+            // 契约：**必须**包 `data.hits`（不是 data 直接是数组）
+            Ok(results) => json!({
+                "ok": true,
+                "data": { "hits": results },
+                "request_id": new_request_id(),
+            }),
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 写入/更新一篇可检索文档（索引**增量**更新，不重建）。
+///
+/// 返回 `{"ok":true,"data":{"id":12,"terms":37}}`，`terms` = 该文档的倒排行数。
+/// 同一数字 `doc_id` 反复调用 = 覆盖（旧倒排会被清掉）。
+/// `kind` 与 `memory_items` 一致：`note` / `summary` / `fact`。
+///
+/// # Safety
+///
+/// 五个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_search_upsert(
+    doc_id: *const c_char,
+    kind: *const c_char,
+    title: *const c_char,
+    content: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (doc_id, kind, title, content, db_path) = match (
+            read_arg(doc_id, "doc_id"),
+            read_arg(kind, "kind"),
+            read_arg(title, "title"),
+            read_arg(content, "content"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(id), Ok(kind), Ok(title), Ok(content), Ok(db_path)) => {
+                (id, kind, title, content, db_path)
+            }
+            _ => return err_json("BAD_INPUT", "参数不完整或不是 UTF-8"),
+        };
+        // id 是数字：契约（`data.hits[].id`）是 number，不是 "memory:12" 这种字符串
+        let id = match doc_id.trim().parse::<i64>() {
+            Ok(id) if id > 0 => id,
+            _ => {
+                return err_json(
+                    "BAD_INPUT",
+                    format!("doc_id 必须是正整数：{}", doc_id.trim()),
+                )
+            }
+        };
+        let kind = match MemoryKind::parse(kind) {
+            Ok(kind) => kind,
+            Err(err) => return input_error(err),
+        };
+        let mut store = match SearchStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return input_error(err),
+        };
+        let title = if title.trim().is_empty() {
+            None
+        } else {
+            Some(title)
+        };
+        let doc = SearchDoc {
+            id,
+            kind: kind.as_str(),
+            title,
+            content,
+        };
+        match store.upsert(&doc) {
+            Ok(terms) => ok_json(json!({ "id": id, "terms": terms })),
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 从索引里删除一篇文档（倒排 + 文档行），返回 `{"ok":true,"data":{"deleted":0|1}}`。
+///
+/// # Safety
+///
+/// 两个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_search_delete(
+    doc_id: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (doc_id, db_path) = match (read_arg(doc_id, "doc_id"), read_arg(db_path, "db_path")) {
+            (Ok(doc_id), Ok(db_path)) => (doc_id, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        let id = match doc_id.trim().parse::<i64>() {
+            Ok(id) if id > 0 => id,
+            _ => {
+                return err_json(
+                    "BAD_INPUT",
+                    format!("doc_id 必须是正整数：{}", doc_id.trim()),
+                )
+            }
+        };
+        let mut store = match SearchStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return input_error(err),
+        };
+        match store.delete(id) {
+            Ok(deleted) => ok_json(json!({ "deleted": deleted })),
+            Err(err) => input_error(err),
         }
     })
 }
@@ -1637,6 +1813,186 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
     }
+
+    // ---------------------------------------------------------------------
+    // 本地检索 FFI（ADR-19 决策 1）
+    // ---------------------------------------------------------------------
+
+    fn call_search_upsert(doc_id: &str, kind: &str, title: &str, content: &str, db: &str) -> Value {
+        let (doc_id, kind, title, content, db) = (
+            CString::new(doc_id).unwrap(),
+            CString::new(kind).unwrap(),
+            CString::new(title).unwrap(),
+            CString::new(content).unwrap(),
+            CString::new(db).unwrap(),
+        );
+        let raw = unsafe {
+            yunong_search_upsert(
+                doc_id.as_ptr(),
+                kind.as_ptr(),
+                title.as_ptr(),
+                content.as_ptr(),
+                db.as_ptr(),
+            )
+        };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn call_search_local(query: &str, limit: &str, db: &str) -> Value {
+        let (query, limit, db) = (
+            CString::new(query).unwrap(),
+            CString::new(limit).unwrap(),
+            CString::new(db).unwrap(),
+        );
+        let raw = unsafe { yunong_search_local(query.as_ptr(), limit.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn call_search_delete(doc_id: &str, db: &str) -> Value {
+        let (doc_id, db) = (CString::new(doc_id).unwrap(), CString::new(db).unwrap());
+        let raw = unsafe { yunong_search_delete(doc_id.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn search_roundtrip_via_ffi_matches_the_locked_contract() {
+        let db = temp_db();
+        let written = call_search_upsert(
+            "1",
+            "note",
+            "课表提醒",
+            "周三下午三门课，最后一门在尚农楼1-18",
+            &db,
+        );
+        assert_eq!(written["ok"], true, "{written}");
+        // 契约：data.id 是**数字**
+        assert_eq!(written["data"]["id"], 1, "{written}");
+        assert!(written["data"]["terms"].as_u64().unwrap() > 0, "{written}");
+        call_search_upsert("2", "fact", "图书馆", "图书馆开放到晚十点", &db);
+
+        let found = call_search_local("尚农楼", "", &db);
+        assert_eq!(found["ok"], true, "{found}");
+        // 契约：必须包 `data.hits`，且带 request_id
+        assert!(found["data"].is_object(), "{found}");
+        let hits = found["data"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{found}");
+        assert_eq!(hits[0]["id"], 1, "id 必须是数字");
+        assert_eq!(hits[0]["kind"], "note");
+        assert_eq!(hits[0]["title"], "课表提醒");
+        assert!(hits[0]["snippet"].as_str().unwrap().contains("尚农楼"));
+        assert!(hits[0]["score"].as_f64().unwrap() > 0.0);
+        assert!(
+            found["request_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "响应必须带 request_id：{found}"
+        );
+
+        // limit 生效
+        let one = call_search_local("三门", "1", &db);
+        assert_eq!(one["data"]["hits"].as_array().unwrap().len(), 1, "{one}");
+
+        // 删除后不再命中
+        assert_eq!(call_search_delete("1", &db)["data"]["deleted"], 1);
+        assert!(call_search_local("尚农楼", "", &db)["data"]["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(call_search_delete("1", &db)["data"]["deleted"], 0);
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn search_empty_query_bad_limits_and_kind_via_ffi() {
+        let db = temp_db();
+        call_search_upsert("1", "note", "笔记", "高等数学笔记", &db);
+        // 空查询 = 空数组，不是错误
+        let empty = call_search_local("   ", "", &db);
+        assert_eq!(empty["ok"], true, "{empty}");
+        assert!(
+            empty["data"]["hits"].as_array().unwrap().is_empty(),
+            "{empty}"
+        );
+        // 无命中也不是错误
+        let miss = call_search_local("量子力学", "", &db);
+        assert_eq!(miss["ok"], true, "{miss}");
+        assert!(
+            miss["data"]["hits"].as_array().unwrap().is_empty(),
+            "{miss}"
+        );
+        // limit：0 / 非数字是 BAD_INPUT；超过 100 **夹到 100 不报错**
+        for bad in ["0", "abc", "-1"] {
+            let result = call_search_local("数学", bad, &db);
+            assert_eq!(result["code"], "BAD_INPUT", "limit={bad} => {result}");
+        }
+        let clamped = call_search_local("数学", "999", &db);
+        assert_eq!(clamped["ok"], true, "{clamped}");
+        assert_eq!(
+            clamped["data"]["hits"].as_array().unwrap().len(),
+            1,
+            "{clamped}"
+        );
+
+        // doc_id 必须是正整数；kind 只接受 note/summary/fact
+        assert_eq!(
+            call_search_upsert("memory:1", "note", "标题", "正文", &db)["code"],
+            "BAD_INPUT"
+        );
+        assert_eq!(
+            call_search_upsert("0", "note", "标题", "正文", &db)["code"],
+            "BAD_INPUT"
+        );
+        assert_eq!(
+            call_search_upsert("2", "doc", "标题", "正文", &db)["code"],
+            "BAD_INPUT"
+        );
+        assert_eq!(
+            call_search_upsert("2", "", "标题", "正文", &db)["code"],
+            "BAD_INPUT"
+        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn search_null_arguments_do_not_crash() {
+        let raw =
+            unsafe { yunong_search_local(std::ptr::null(), std::ptr::null(), std::ptr::null()) };
+        assert!(!raw.is_null(), "绝不返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+
+        let raw = unsafe {
+            yunong_search_upsert(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+
+        let raw = unsafe { yunong_search_delete(std::ptr::null(), std::ptr::null()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+    }
+
     // ---------------------------------------------------------------------
     // 凭据 FFI（W7 P0）：明文永不出 Rust
     // ---------------------------------------------------------------------
