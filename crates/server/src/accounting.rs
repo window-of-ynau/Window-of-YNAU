@@ -65,6 +65,26 @@ pub mod audit_action {
     pub const CHAT_STREAM: &str = "chat.stream";
     /// 鉴权中间件拒绝了请求（令牌无效 / 过期 / 已吊销 / 用户被停用）。
     pub const AUTHENTICATE: &str = "auth.authenticate";
+    /// RAG 匿名哈希上报（ADR-19）。**target 里只有月份，不含 hash**。
+    pub const RAG_REFERRALS: &str = "rag.referrals";
+}
+
+/// RAG 上报被拒的原因（进审计的 `reason`，可聚合）。
+#[derive(Debug, Clone, Copy)]
+pub enum RagLimit {
+    /// 本月累计超限
+    Monthly { limit: usize },
+    /// 写库失败
+    Failed,
+}
+
+impl RagLimit {
+    fn reason(self) -> String {
+        match self {
+            Self::Monthly { limit } => format!("monthly_quota_exceeded limit={limit}"),
+            Self::Failed => "store_failed".to_owned(),
+        }
+    }
 }
 
 /// 一条审计（对应 `audit_logs` 一行）。**不放正文**，只放动作与原因。
@@ -106,6 +126,43 @@ impl AuditEntry {
             target: Some(target.into()),
             decision: AuditDecision::Deny,
             reason: Some(reason.into()),
+            req_id: req_id.into(),
+        }
+    }
+
+    /// RAG 哈希上报成功（ADR-19）。
+    ///
+    /// **不记 hash**：审计日志一旦记了哈希，就成了"谁在什么时候浏览了什么"的记录，
+    /// 与 ADR-19 的隐私要求冲突。这里只留月份、接受条数（进 reason）。
+    pub fn rag_report(
+        user_id: Uuid,
+        req_id: impl Into<String>,
+        month: impl Into<String>,
+        accepted: usize,
+    ) -> Self {
+        Self {
+            user_id: Some(user_id),
+            action: audit_action::RAG_REFERRALS.to_owned(),
+            target: Some(month.into()),
+            decision: AuditDecision::Allow,
+            reason: Some(format!("accepted={accepted}")),
+            req_id: req_id.into(),
+        }
+    }
+
+    /// RAG 上报被拒（配额/写库失败）。
+    pub fn rag_deny(
+        user_id: Uuid,
+        req_id: impl Into<String>,
+        month: impl Into<String>,
+        limit: RagLimit,
+    ) -> Self {
+        Self {
+            user_id: Some(user_id),
+            action: audit_action::RAG_REFERRALS.to_owned(),
+            target: Some(month.into()),
+            decision: AuditDecision::Deny,
+            reason: Some(limit.reason()),
             req_id: req_id.into(),
         }
     }
