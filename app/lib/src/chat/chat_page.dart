@@ -8,8 +8,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../core/chat_service.dart';
+import '../core/local_search_service.dart';
+import '../core/memory_service.dart';
 import '../core/search_service.dart';
 import '../core/secret_service.dart';
+import '../memory/memory_page.dart';
 
 /// 会话设置（MVP：密钥只在内存里，进程退出即失效）。
 ///
@@ -39,6 +42,8 @@ class ChatPage extends StatefulWidget {
     this.settings,
     this.secretService,
     this.searchService,
+    this.localSearchService,
+    this.memoryService,
     this.dbPath = '' ,
   });
 
@@ -46,6 +51,8 @@ class ChatPage extends StatefulWidget {
   final ChatSettings? settings;
   final SecretService? secretService;
   final SearchService? searchService;
+  final LocalSearchService? localSearchService;
+  final MemoryService? memoryService;
   final String dbPath;
 
   @override
@@ -59,6 +66,14 @@ class _ChatPageState extends State<ChatPage> {
   SecretStatus _keyStatus = const SecretStatus(set: false, masked: '' );
   late final SearchService _search = widget.searchService ?? SearchService(dbPath: widget.dbPath);
   SearchStatus _searchStatus = const SearchStatus.unknown();
+  late final LocalSearchService _localSearch =
+      widget.localSearchService ?? LocalSearchService(dbPath: widget.dbPath);
+  late final MemoryService _memory = widget.memoryService ?? MemoryService(dbPath: widget.dbPath);
+  bool _localPanelOpen = false;
+  bool _localBusy = false;
+  String? _localError;
+  List<LocalSearchHit> _localHits = const <LocalSearchHit>[];
+  final TextEditingController _localQuery = TextEditingController();
   final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
 
@@ -186,6 +201,51 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   /// 查询搜索来源：未配置时 UI **必须**常驻提示（禁止静默降级）。
+  /// 本地资料检索：结果**只来自本机**（与联网搜索区分，不混淆）。
+  Future<void> _runLocalSearch() async {
+    final query = _localQuery.text.trim();
+    if (query.isEmpty) {
+      return;
+    }
+    setState(() {
+      _localBusy = true;
+      _localError = null;
+      _localHits = const <LocalSearchHit>[];
+    });
+    try {
+      final hits = await _localSearch.search(query);
+      if (mounted) {
+        setState(() => _localHits = hits);
+      }
+    } on LocalSearchUnavailable catch (unavailable) {
+      if (mounted) {
+        setState(() => _localError = unavailable.userHint);
+      }
+    } on Object {
+      if (mounted) {
+        setState(() => _localError = '本地搜索失败，请稍后重试');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _localBusy = false);
+      }
+    }
+  }
+
+  /// 把本地资料作为**引用**插入输入框（带来源标题，模型能看出这是资料不是指令）。
+  void _insertCitation(LocalSearchHit hit) {
+    final existing = _input.text.trim();
+    _input.text = existing.isEmpty ? hit.citation : '${hit.citation}\n\n$existing';
+    setState(() => _localPanelOpen = false);
+    _localHits = const <LocalSearchHit>[];
+    _localQuery.clear();
+  }
+
+  Future<void> _openMemory() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(builder: (BuildContext context) => MemoryPage(service: _memory)),
+    );
+  }
   Future<void> _refreshSearchStatus() async {
     try {
       final protocol = _settings.protocol;
@@ -306,6 +366,16 @@ class _ChatPageState extends State<ChatPage> {
                   icon: const Icon(Icons.key_off_outlined, size: 18),
                 ),
               IconButton(
+                tooltip: '搜索本地资料（只查本机，不联网）',
+                onPressed: () => setState(() => _localPanelOpen = !_localPanelOpen),
+                icon: const Icon(Icons.manage_search, size: 20),
+              ),
+              IconButton(
+                tooltip: '记忆',
+                onPressed: _openMemory,
+                icon: const Icon(Icons.memory, size: 20),
+              ),
+              IconButton(
                 tooltip: '设置',
                 onPressed: _openSettings,
                 icon: const Icon(Icons.settings_outlined),
@@ -341,7 +411,69 @@ class _ChatPageState extends State<ChatPage> {
               style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.tertiary),
             ),
           ),
-        Expanded(
+        if (_localPanelOpen)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            padding: const EdgeInsets.all(10),
+            // Material 包一层：ListTile 的水波纹要画在最近 Material 上，否则会被背景色盖住
+            child: Material(
+              color: theme.colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(8),
+              child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  '本地资料（只查这台设备，不联网）',
+                  style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: TextField(
+                        controller: _localQuery,
+                        decoration: const InputDecoration(
+                          hintText: '搜索本机记忆/资料…',
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                        ),
+                        onSubmitted: (_) => _runLocalSearch(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      onPressed: _localBusy ? null : _runLocalSearch,
+                      child: const Text('搜索'),
+                    ),
+                  ],
+                ),
+                if (_localError != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      _localError!,
+                      style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.error),
+                    ),
+                  ),
+                if (!_localBusy && _localError == null && _localHits.isEmpty && _localQuery.text.trim().isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text('本机没有匹配的资料', style: theme.textTheme.bodySmall),
+                  ),
+                for (final hit in _localHits)
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.description_outlined, size: 18),
+                    title: Text(hit.displayTitle, style: theme.textTheme.bodyMedium),
+                    subtitle: Text(hit.snippet, maxLines: 2, overflow: TextOverflow.ellipsis),
+                    onTap: () => _insertCitation(hit),
+                  ),
+              ],
+              ),
+            ),
+          ),        Expanded(
           child: _bubbles.isEmpty
               ? Center(
                   child: Text(
