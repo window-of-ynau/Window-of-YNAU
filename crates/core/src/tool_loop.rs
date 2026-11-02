@@ -62,19 +62,22 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use yunong_shared::{
-    ChatMessage, ChatRequest, Chunk, ErrorCode, FinishReason, ToolCallRef, Usage, MAX_ROUNDS,
-};
+use yunong_shared::{ChatMessage, ChatRequest, Chunk, ErrorCode, FinishReason, ToolCallRef, Usage};
 
 use crate::error::{CoreError, CoreResult};
 use crate::gateway::{Flow, ModelGateway};
 use crate::tools::{ToolOutcome, ToolRegistry};
 
-/// 默认轮次上限。
+/// 默认轮次上限（**BYOK 直连**通道）。
 ///
 /// pi 的 agent-core 没有上限（一次坏循环能烧光额度），所以这个数字是**我们自己定**的：
 /// 24 轮 ≈ 23 次工具往返，覆盖"查课表 → 查记忆 → 算日程 → 复核"这类多跳任务，
 /// 又不至于让一次绕圈把整晚的免费额度吃掉。超限**报错**而不是静默停。
+///
+/// **套餐通道不同**：服务端按 ADR-05 只接受 `round ≤ MAX_ROUNDS`（4 轮，防模型转圈烧钱，
+/// 烧的是我们的钱）。套餐调用方必须把 [`LoopConfig::wire_max_rounds`] 设成
+/// `Some(MAX_ROUNDS)`，循环会在第 5 轮**报错收尾**——绝不把轮次号压回 4：
+/// 抽样记账的幂等键是 `(turn_id, round)`，压轮次会让第 5..N 轮反复覆盖第 4 轮的用量行。
 pub const DEFAULT_MAX_ROUNDS: u8 = 24;
 
 /// 单个工具的执行上限。
@@ -92,7 +95,16 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// 循环参数（默认值见各常量；测试与设置项可以按需改）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopConfig {
+    /// 本地循环预算：最多发起几轮请求（默认 24）。
     pub max_rounds: u8,
+    /// **通道上限**：走我们自己的套餐代理时，服务端契约只接受 `round ≤ MAX_ROUNDS`
+    /// （ADR-05：最多 4 轮，防模型转圈烧钱），传 `Some(MAX_ROUNDS)`；
+    /// BYOK 直连不经过我们的服务端，传 `None`（只受 `max_rounds` 约束）。
+    ///
+    /// **绝不把 `round` 压到上限**：服务端抽样记账的幂等键是 `(turn_id, round)`
+    /// （ADR-05 约束 4），压轮次会让第 5..N 轮全部 upsert 到同一行、覆盖第 4 轮的用量，
+    /// 记账系统性少计。所以到顶就**报错收尾**，不静默复用轮次号。
+    pub wire_max_rounds: Option<u8>,
     pub tool_timeout: Duration,
     pub max_output_lines: usize,
     pub max_output_bytes: usize,
@@ -102,6 +114,8 @@ impl Default for LoopConfig {
     fn default() -> Self {
         Self {
             max_rounds: DEFAULT_MAX_ROUNDS,
+            // 默认按 BYOK 直连（不经过我们服务端）；套餐调用方必须显式设成 Some(MAX_ROUNDS)
+            wire_max_rounds: None,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -113,6 +127,9 @@ impl LoopConfig {
     fn validate(&self) -> CoreResult<()> {
         if self.max_rounds == 0 {
             return Err(CoreError::Invalid("max_rounds 必须 ≥ 1".into()));
+        }
+        if self.wire_max_rounds == Some(0) {
+            return Err(CoreError::Invalid("wire_max_rounds 必须 ≥ 1".into()));
         }
         if self.tool_timeout.is_zero() {
             return Err(CoreError::Invalid("tool_timeout 必须 > 0".into()));
@@ -210,6 +227,17 @@ pub async fn run<G: ModelGateway + ?Sized>(
                 config.max_rounds
             )));
         }
+        // 套餐通道：服务端契约只接受 `round ≤ MAX_ROUNDS`（ADR-05：最多 4 轮）。
+        // 到顶就**报错收尾**，不能把 `round` 压回上限——抽样记账的幂等键是
+        // `(turn_id, round)`（ADR-05 约束 4），压轮次会让第 5..N 轮反复 upsert
+        // 同一行、覆盖第 4 轮的用量，记账系统性少计，而我们是按轮计费的。
+        if let Some(cap) = config.wire_max_rounds {
+            if round >= cap {
+                return Err(CoreError::RoundLimit(format!(
+                    "套餐通道按 ADR-05 最多 {cap} 轮（已用满仍要调用工具）：改用 BYOK 直连，或把问题拆小"
+                )));
+            }
+        }
         round += 1;
         // 调用方在"还没发请求"时就取消：直接收尾，省掉一次网络请求
         if on_event(LoopEvent::RoundStarted { round }) == Flow::Stop {
@@ -225,10 +253,9 @@ pub async fn run<G: ModelGateway + ?Sized>(
 
         // ---- 组装本轮请求（无状态：每轮都是完整上下文） ----
         let mut round_request = request.clone();
-        // 契约里 `round` 只允许 1..=MAX_ROUNDS（shared）；本地循环预算（默认 24）比它大，
-        // 所以 wire 上取 min：超出的轮次在契约看来仍是最后一轮。真要让服务端看到 24，
-        // 需要放宽 shared 的 MAX_ROUNDS（契约变更，见任务 t40 的报告）。
-        round_request.round = round.min(MAX_ROUNDS);
+        // 上报**真实**轮次：套餐通道的 `wire_max_rounds` 在上面的出口已经拦住超限，
+        // 所以这里不会出现"第 5 轮报 4"这种会破坏 `(turn_id, round)` 幂等的写法。
+        round_request.round = round;
         round_request.messages = base_messages.clone();
         round_request.messages.extend(added.iter().cloned());
 
@@ -1425,9 +1452,9 @@ mod tests {
     // 契约细节
     // ------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn wire_round_is_clamped_to_the_contract_max() {
-        let turns: Vec<Vec<Chunk>> = (0..6)
+    /// 一轮都不收敛的脚本：每轮都请求工具。
+    fn always_tool_turns(count: usize) -> Vec<Vec<Chunk>> {
+        (0..count)
             .map(|index| {
                 vec![
                     tool_call(
@@ -1439,13 +1466,21 @@ mod tests {
                     done(FinishReason::ToolCalls),
                 ]
             })
-            .collect();
-        let gateway = Script::new(turns);
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn proxy_channel_stops_at_the_contract_round_cap_without_reusing_round_numbers() {
+        // 套餐通道：服务端只接受 round ≤ MAX_ROUNDS（ADR-05，4 轮）。
+        // 第 5 轮必须**报错收尾**，且上报的轮次序列必须是 [1,2,3,4]——
+        // 绝不能是 [1,2,3,4,4]（那会让 (turn_id, round) 幂等键覆盖第 4 轮的用量行）。
+        let gateway = Script::new(always_tool_turns(6));
         let calls = Arc::new(AtomicUsize::new(0));
         let registry = registry(Arc::clone(&calls));
         let (_log, mut sink) = recorder();
         let config = LoopConfig {
             max_rounds: 6,
+            wire_max_rounds: Some(yunong_shared::MAX_ROUNDS),
             ..LoopConfig::default()
         };
 
@@ -1457,7 +1492,48 @@ mod tests {
             &mut sink,
         )
         .await
-        .expect_err("6 轮都还在调工具 → 上限报错");
+        .expect_err("套餐通道第 5 轮必须报错收尾");
+        assert!(matches!(error, CoreError::RoundLimit(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("套餐"),
+            "错误信息要说清是哪条通道的上限：{error}"
+        );
+
+        let rounds: Vec<u8> = gateway
+            .requests()
+            .iter()
+            .map(|request| request.round)
+            .collect();
+        assert_eq!(
+            rounds,
+            vec![1, 2, 3, 4],
+            "绝不能复用 round=4 上报第 5 轮（会破坏抽样记账的幂等键）"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "只执行前 4 轮的工具");
+    }
+
+    #[tokio::test]
+    async fn byok_channel_reports_real_round_numbers_up_to_the_local_budget() {
+        // BYOK 直连不经我们服务端：只受本地预算约束，上报真实轮次（不夹取）。
+        let gateway = Script::new(always_tool_turns(6));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = registry(Arc::clone(&calls));
+        let (_log, mut sink) = recorder();
+        let config = LoopConfig {
+            max_rounds: 6,
+            wire_max_rounds: None,
+            ..LoopConfig::default()
+        };
+
+        let error = run(
+            gateway.as_ref(),
+            &registry,
+            base_request(),
+            config,
+            &mut sink,
+        )
+        .await
+        .expect_err("本地预算用满 → 报错");
         assert!(matches!(error, CoreError::RoundLimit(_)), "{error:?}");
 
         let rounds: Vec<u8> = gateway
@@ -1465,7 +1541,7 @@ mod tests {
             .iter()
             .map(|request| request.round)
             .collect();
-        assert_eq!(rounds, vec![1, 2, 3, 4, MAX_ROUNDS, MAX_ROUNDS]);
+        assert_eq!(rounds, vec![1, 2, 3, 4, 5, 6], "BYOK 上报真实轮次");
     }
 
     #[tokio::test]
@@ -1559,6 +1635,10 @@ mod tests {
         for config in [
             LoopConfig {
                 max_rounds: 0,
+                ..LoopConfig::default()
+            },
+            LoopConfig {
+                wire_max_rounds: Some(0),
                 ..LoopConfig::default()
             },
             LoopConfig {
