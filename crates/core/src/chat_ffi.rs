@@ -35,9 +35,15 @@ pub struct ChatRunConfig {
     /// BYOK 的厂商 base url（缺省按协议给默认值）
     #[serde(default)]
     pub base_url: Option<String>,
-    /// BYOK 的 API Key（只在本次请求里用，用完即弃，不进日志）
+    /// BYOK 的 API Key（**仅测试/命令行**用；App 应传 `secret_key` 让明文留在 Rust）
     #[serde(default)]
     pub api_key: Option<String>,
+    /// 凭据在平台安全存储里的 key 名（如 `byok_api_key`）：由 Rust 自己取明文，Dart 不见明文
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// 应用数据目录（用于定位 secret store；缺省用当前目录）
+    #[serde(default)]
+    pub data_dir: Option<String>,
     /// 套餐通道的 access token
     #[serde(default)]
     pub cloud_token: Option<String>,
@@ -77,6 +83,10 @@ impl ChatRunConfig {
         }
         match config.channel.as_str() {
             "byok" => {
+                // 只要给了 secret_key，明文由 Rust 从安全存储取，不要求 Dart 传 Key
+                if config.secret_key.is_some() {
+                    return Ok(config);
+                }
                 if config
                     .api_key
                     .as_deref()
@@ -224,6 +234,25 @@ pub fn run_stream(
     config: ChatRunConfig,
     on_chunk: impl FnMut(String) -> bool,
 ) -> Result<(), (ErrorCode, String)> {
+    // BYOK + secret_key：明文只在 Rust 内部取一次，绝不经过 Dart
+    let api_key = match (config.secret_key.as_deref(), config.api_key.clone()) {
+        (Some(name), _) => {
+            let base = config.data_dir.clone().unwrap_or_else(|| ".".to_owned());
+            let store = crate::secret::default_store(&base);
+            match store.load_raw(name) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        "还没设置 API Key：请在设置里填写".to_owned(),
+                    ))
+                }
+                Err(err) => return Err((ErrorCode::Internal, format!("读取凭据失败：{err}"))),
+            }
+        }
+        (None, Some(value)) => value,
+        (None, None) => String::new(),
+    };
     let request = config.to_request();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -262,7 +291,7 @@ pub fn run_stream(
                 config.base_url.clone().unwrap_or_default(),
                 config.model.clone(),
             )
-            .with_api_key(config.api_key.clone().unwrap_or_default());
+            .with_api_key(api_key.clone());
             runtime.block_on(gateway.chat_stream(&request, &mut |chunk| {
                 if emit(chunk) {
                     crate::gateway::Flow::Stop
