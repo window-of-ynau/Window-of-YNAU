@@ -13,6 +13,7 @@ pub mod auth;
 pub mod config;
 pub mod gate;
 pub mod limiter;
+pub mod rag;
 pub mod state;
 pub mod upstream;
 
@@ -54,9 +55,18 @@ pub fn app(state: state::AppState) -> Router {
         .route("/api/v1/auth/logout", post(api::auth::logout))
         .route("/api/v1/me", get(api::me::me))
         .route("/api/v1/chat/stream", post(api::chat::chat_stream))
+        // RAG 2.0（ADR-19）：盐下发 + 匿名哈希上报。都需要 Bearer，
+        // 但上报里不含 user_id，服务端也不把它写进聚合表。
+        .route("/api/v1/rag/salt", get(api::rag::salt))
+        .route("/api/v1/rag/referrals", post(api::rag::referrals))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             api::body_limit::enforce_api,
+        ))
+        // RAG 上报按客户端配额（进程内），需要 ClientIp；放在 auth 内侧、body 闸外侧
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::client_ip::inject,
         ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

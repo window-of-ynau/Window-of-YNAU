@@ -64,6 +64,12 @@ pub struct Config {
     /// 是否信任 `X-Forwarded-For`（R2-F6）。默认 **false**：没有反向代理时，
     /// XFF 是攻击者随便填的，按它分桶等于没有限流。部署在 Caddy/Nginx 后面再打开。
     pub trust_proxy: bool,
+    /// RAG 月度盐的进程内缓存 TTL（秒，ADR-19 决策 2）。0 = 每次都查库。
+    pub rag_salt_ttl_secs: u64,
+    /// 单次上报条数上限（ADR-19 决策 3）
+    pub rag_max_items_per_request: usize,
+    /// 单月单客户端累计上报条数上限（防放大）
+    pub rag_max_items_per_month: usize,
     /// 套餐通道的上游供应商（三家协议可各配一套；Key 只存在服务端）
     pub upstream: UpstreamConfig,
 }
@@ -104,6 +110,9 @@ impl Config {
             auth_refresh_per_min: env_parse("AUTH_REFRESH_PER_MIN", 60),
             body_limit_bytes: env_parse("YUNONG_BODY_LIMIT_BYTES", 1024 * 1024),
             auth_body_limit_bytes: env_parse("AUTH_BODY_LIMIT_BYTES", 8 * 1024),
+            rag_salt_ttl_secs: env_parse("RAG_SALT_TTL_SECS", 600),
+            rag_max_items_per_request: env_parse("RAG_MAX_ITEMS_PER_REQUEST", 200),
+            rag_max_items_per_month: env_parse("RAG_MAX_ITEMS_PER_MONTH", 2_000),
             trust_proxy: env::var("YUNONG_TRUST_PROXY")
                 .ok()
                 .map(|value| {
@@ -144,6 +153,9 @@ impl Config {
             body_limit_bytes: 1024 * 1024,
             auth_body_limit_bytes: 8 * 1024,
             trust_proxy: false,
+            rag_salt_ttl_secs: 600,
+            rag_max_items_per_request: 200,
+            rag_max_items_per_month: 2_000,
             // 测试用固定盐：抽样判定在用例之间必须可复现。
             // 这里刻意用"64 字符小写十六进制"——它必须能通过 `validate_sample_salt`，
             // 否则将来有人把校验接到 for_tests 上会整片测试挂掉。

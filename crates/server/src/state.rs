@@ -10,6 +10,7 @@ use crate::auth::AuthService;
 use crate::config::Config;
 use crate::gate::TurnGate;
 use crate::limiter::AuthLimiter;
+use crate::rag::RagService;
 use crate::upstream::UpstreamClient;
 
 #[derive(Clone)]
@@ -27,6 +28,8 @@ pub struct AppState {
     pub upstream: Arc<UpstreamClient>,
     /// 未鉴权端点的限流（红队 H1）：并发闸钉死 Argon2 内存峰值、令牌桶掐撞库。
     pub limiter: Arc<AuthLimiter>,
+    /// RAG 2.0 地基（ADR-19 决策 2/3）：月度盐 + 匿名哈希聚合。
+    pub rag: Arc<RagService>,
     started_at: Instant,
 }
 
@@ -48,6 +51,7 @@ impl AppState {
             config.auth_register_per_min,
             config.auth_refresh_per_min,
         ));
+        let rag = Arc::new(RagService::new(&config, db.clone()));
         let upstream = Arc::new(UpstreamClient::new(
             config.upstream.clone(),
             config.upstream_timeouts(),
@@ -60,6 +64,7 @@ impl AppState {
             accounting,
             upstream,
             limiter,
+            rag,
             started_at: Instant::now(),
         }
     }
