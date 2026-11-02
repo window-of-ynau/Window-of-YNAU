@@ -162,7 +162,7 @@ void main() {
         home: Scaffold(body: ChatPage(service: chats, secretService: secrets)),
       ));
       await tester.pumpAndSettle();
-      expect(find.textContaining('未设置'), findsOneWidget);
+      expect(find.textContaining('未设置'), findsWidgets);
       expect(find.text(_plain), findsNothing);
     });
   });

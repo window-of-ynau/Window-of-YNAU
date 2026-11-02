@@ -368,7 +368,7 @@ jobs:
           sh -n deploy/migrate.sh
       # type=gha 缓存与 load: true 都需要 docker-container driver（setup-buildx 的默认）
       - name: 启用 buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       # 镜像 OCI label 用的构建元数据：commit / 构建时间 / 版本
       - name: 记录构建元数据（镜像 label 用）
         id: meta
@@ -381,7 +381,7 @@ jobs:
       # 镜像里打 OCI label（org.opencontainers.image.revision 等）：容器跑的是哪个提交
       # 必须能从 `docker inspect` 回答，security 的 L3 复核专门提过这一点。
       - name: docker build（deploy/Dockerfile.server）
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile.server
@@ -457,7 +457,7 @@ jobs:
         with:
           persist-credentials: false
       - name: 启用 buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       # 镜像 OCI label 用的构建元数据：commit / 构建时间 / 版本
       - name: 记录构建元数据（镜像 label 用）
         id: meta
@@ -469,7 +469,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       # 与 docker / release 共用同一个 gha 缓存：命中时约 20~30 秒
       - name: docker build（deploy/Dockerfile.server）
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile.server

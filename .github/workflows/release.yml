@@ -65,7 +65,7 @@ jobs:
             *) echo "::warning::app/pubspec.yaml 版本是 '$app_ver'，与 tag v$tag 不一致" ;;
           esac
       - name: 启用 buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       # 分支名（干跑时）含 / 不能直接当镜像 tag，这里统一归一化；tag push 时 vX.Y.Z 原样保留
       - name: 计算镜像 tag
         id: tag
@@ -89,7 +89,7 @@ jobs:
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       # 只 load 到 runner 本地：冒烟通过之后才推，顺序不能反
       - name: 构建（load 到本地，先不推送）
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile.server

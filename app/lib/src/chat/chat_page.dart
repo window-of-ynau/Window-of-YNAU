@@ -6,6 +6,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../theme/glass_panel.dart';
 import '../theme/yunong_tokens.dart';
@@ -114,9 +115,55 @@ class _ChatPageState extends State<ChatPage> {
     _scroll.jumpTo(_scroll.position.maxScrollExtent);
   }
 
+  /// 通道是否就绪 + 未就绪原因（**“就绪”不能是假的**）。
+  ///
+  /// - BYOK：必须已在安全存储里保存 Key；
+  /// - 套餐：必须有访问令牌；
+  /// - 其它：未选择通道。
+  ({bool ready, String reason, String code}) get _channelState {
+    if (_channel == 'byok') {
+      if (_keyStatus.set) {
+        return (ready: true, reason: '', code: '');
+      }
+      return (ready: false, reason: '未设置 API Key：点右上角设置填入', code: 'MISSING_API_KEY');
+    }
+    if (_channel == 'cloud') {
+      if (_settings.cloudToken.isNotEmpty) {
+        return (ready: true, reason: '', code: '');
+      }
+      return (ready: false, reason: '套餐未登录：请先在设置里填写访问令牌', code: 'MISSING_ACCESS_TOKEN');
+    }
+    return (ready: false, reason: '未选择对话通道', code: 'NO_CHANNEL');
+  }
+  /// Enter 发送 / Shift+Enter 换行；输入法组合（拼音未上屏）期间不发送。
+  KeyEventResult _handleInputKey(KeyEvent event) {
+    if (event is! KeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (key != LogicalKeyboardKey.enter && key != LogicalKeyboardKey.numpadEnter) {
+      return KeyEventResult.ignored;
+    }
+    // Shift+Enter：让 TextField 自己插入换行
+    if (HardwareKeyboard.instance.isShiftPressed) {
+      return KeyEventResult.ignored;
+    }
+    // 输入法组合中：拼音/候选还没上屏，回车是"确认候选"，绝不能当发送
+    if (_input.value.composing.isValid) {
+      return KeyEventResult.ignored;
+    }
+    _send();
+    return KeyEventResult.handled;
+  }
   Future<void> _send() async {
     final text = _input.text.trim();
     if (text.isEmpty || _streaming) {
+      return;
+    }
+    // 本地拦截：通道没就绪就不发请求（不要“看起来发了”）
+    final state = _channelState;
+    if (!state.ready) {
+      setState(() => _error = state.reason);
       return;
     }
     _input.clear();
@@ -152,10 +199,34 @@ class _ChatPageState extends State<ChatPage> {
       cloudToken: _settings.cloudToken,
     );
 
-    final stream = _service.send(request);
+    final ChatStream stream;
+    try {
+      stream = _service.send(request);
+    } on Object catch (err) {
+      setState(() {
+        _streaming = false;
+        _error = '端侧核心调用失败：' + describeChatError('INTERNAL') + '（' + err.runtimeType.toString() + '）';
+      });
+      return;
+    }
     _stream = stream;
+    // 无事件兜底：Rust 回调 ABI 不匹配时事件永远不来，界面就会停在占位三点。
+    var sawEvent = false;
+    final watchdog = Timer(const Duration(seconds: 15), () {
+      if (!mounted || sawEvent || !_streaming) {
+        return;
+      }
+      stream.cancel();
+      setState(() {
+        _streaming = false;
+        _stream = null;
+        _error = '端侧核心没有返回任何事件（可能是回调 ABI 不匹配，见报告）';
+      });
+    });
     stream.events.listen(
       (ChatEvent event) {
+        sawEvent = true;
+        watchdog.cancel();
         if (!mounted) {
           return;
         }
@@ -177,6 +248,7 @@ class _ChatPageState extends State<ChatPage> {
         _scrollToBottom();
       },
       onDone: () {
+        watchdog.cancel();
         if (!mounted) {
           return;
         }
@@ -358,7 +430,9 @@ class _ChatPageState extends State<ChatPage> {
               const SizedBox(width: 12),
               Expanded(
                 child: Text(
-                  _streaming ? '正在生成…' : '就绪',
+                  _streaming
+                      ? '正在生成…'
+                      : (_channelState.ready ? '就绪' : _channelState.reason),
                   style: theme.textTheme.bodySmall,
                 ),
               ),
@@ -542,15 +616,18 @@ class _ChatPageState extends State<ChatPage> {
     return Row(
       children: <Widget>[
         Expanded(
-          child: TextField(
-            controller: _input,
-            minLines: 1,
-            maxLines: 4,
-            onSubmitted: (_) => _send(),
-            decoration: const InputDecoration(
-              hintText: '输入消息…',
-              isDense: true,
-              border: OutlineInputBorder(),
+          child: Focus(
+            onKeyEvent: (FocusNode node, KeyEvent event) => _handleInputKey(event),
+            child: TextField(
+              controller: _input,
+              minLines: 1,
+              maxLines: 4,
+              onSubmitted: (_) => _send(),
+              decoration: const InputDecoration(
+                hintText: '输入消息…',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
             ),
           ),
         ),

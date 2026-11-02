@@ -38,6 +38,9 @@ class CampusBridge {
   /// 批量拉周完成（原样交给 Rust 合并）
   final void Function(ScheduleApiResult result)? onScheduleApi;
 
+  /// Dart 侧收到的 schedule_api 消息数（用于和脚本侧探测计数对照）。
+  int scheduleApiCount = 0;
+
   /// 阶段变化：`login`（等用户登录，**不抓取**）/ `capture`（登录完成，开始抓）
   final void Function(String stage, Map<String, dynamic>? diagnostics)? onStageChange;
 
@@ -80,7 +83,7 @@ class CampusBridge {
         _fail(FetchException(
           code: 'CAPTURE_TIMEOUT',
           userHint: '请在页面里打开「课表」卡片，或切换一次周次后重试',
-          message: _formatDiagnostics(message['diagnostics']),
+          message: _formatDiagnostics(message['diagnostics'], dartScheduleApiCount: scheduleApiCount),
         ));
         return true;
 
@@ -88,7 +91,7 @@ class CampusBridge {
         _fail(FetchException(
           code: 'PORTAL_PAGE',
           userHint: '当前是门户页，需要先打开「课表」卡片',
-          message: _formatDiagnostics(message['diagnostics']),
+          message: _formatDiagnostics(message['diagnostics'], dartScheduleApiCount: scheduleApiCount),
         ));
         return true;
       case 'stage':
@@ -111,7 +114,8 @@ class CampusBridge {
         return true;
 
       case 'schedule_api':
-        final result = ScheduleApiResult.fromMessage(message);
+        scheduleApiCount += 1;
+      final result = ScheduleApiResult.fromMessage(message);
         if (_delivered) {
           return true;
         }
@@ -215,7 +219,7 @@ String classifyWebViewError(String? description, {String? type}) {
 }
 
 /// 把脚本带回的诊断信息压成一行（给人看，**不含任何凭据**）。
-String _formatDiagnostics(Object? raw) {
+String _formatDiagnostics(Object? raw, {int dartScheduleApiCount = 0}) {
   if (raw is! Map) {
     return '';
   }
@@ -257,6 +261,13 @@ String _formatDiagnostics(Object? raw) {
   if (probeParams is Map) {
     parts.add('参数 years=${probeParams['years']} results=${probeParams['results']}');
   }
+  // 两侧计数对照：脚本侧"探测了几次" vs Dart 侧"收到几条 schedule_api"。
+  // 两者都 0 → 真的没发；脚本 >0 而 Dart=0 → 发了没上报（桥接问题）。
+  final scriptProbes = raw['probeAttempts'];
+  final scriptProbeCount = scriptProbes is num
+      ? scriptProbes.toInt()
+      : (raw['probeResults'] is List ? (raw['probeResults'] as List).length : 0);
+  parts.add('桥接 脚本探测$scriptProbeCount 次 / Dart收到 $dartScheduleApiCount 条');
   final probeResults = raw['probeResults'];
   if (probeResults is List && probeResults.isNotEmpty) {
     final tried = probeResults.take(12).map((dynamic item) => '[$item]').join(' ');
