@@ -292,7 +292,8 @@ def main() -> int:
             "-e", "UPSTREAM_API_KEY=sk-e2e-mock-not-a-real-key",
             "-e", "USAGE_SAMPLE_PERCENT=100",
             # 抽样盐必须 >=32 字节、且不能含 "0123456789"/"abcdefghij" 这类明显序列：
-            # R3-F1 的启动校验不通过会让服务端直接 panic（容器起不来）。这里用 64 位随机 hex。
+            # R3-F1 的启动校验不通过会让服务端直接 panic（容器起不来）。
+            # 生成方式：`openssl rand -hex 32`（64 字符）；下面这个值是给测试固定下来的，**不是真盐**。
             "-e", "YUNONG_SAMPLE_SALT=4f3a9c1e7b2d8065af19c4e3b7d2508f6a1c9e4d3b7f2058c6a92e1d4b7f3085",
             "-e", "UPSTREAM_FIRST_EVENT_TIMEOUT_SECS=2",
             "-e", "RUST_LOG=info",
