@@ -14,6 +14,8 @@ import 'package:yunong/main.dart';
 import 'package:yunong/src/campus/timetable/course_palette.dart';
 import 'package:yunong/src/settings/settings_page.dart';
 import 'package:yunong/src/theme/theme_controller.dart';
+import 'package:yunong/src/theme/glass_panel.dart';
+import 'package:yunong/src/theme/glass_performance.dart';
 import 'package:yunong/src/theme/themes.dart';
 import 'package:yunong/src/theme/yunong_tokens.dart';
 
@@ -188,6 +190,119 @@ void main() {
       // assignCourseTints 与主题无关（签名里根本没有 theme），这里锁一下行为
       expect(assignCourseTints(names), assignment);
       expect(assignment['高等数学I'], isNotNull);
+    });
+  });
+  group('玻璃闸门（批次 2：只有 B 主题会用到）', () {
+    test('帧耗时 p90 超标时逐级降档，L0 后不再降', () {
+      final GlassGovernor governor = GlassGovernor(minSamples: 3);
+      expect(governor.level, GlassLevel.l3, reason: '默认从最高档开始');
+
+      governor.feed(<double>[20, 21, 22]);
+      expect(governor.level, GlassLevel.l2);
+      governor.feed(<double>[20, 21, 22]);
+      expect(governor.level, GlassLevel.l1);
+      governor.feed(<double>[20, 21, 22]);
+      expect(governor.level, GlassLevel.l0);
+      governor.feed(<double>[20, 21, 22]);
+      expect(governor.level, GlassLevel.l0, reason: 'L0 是地板');
+    });
+
+    test('恢复要等迟滞时间；且只升一档', () {
+      final GlassGovernor governor =
+          GlassGovernor(minSamples: 3, upgradeHold: Duration.zero);
+      governor.feed(<double>[20, 20, 20]);
+      expect(governor.level, GlassLevel.l2);
+      governor.feed(<double>[8, 9, 10]);
+      expect(governor.level, GlassLevel.l3, reason: '迟滞归零后可以升回去');
+    });
+
+    test('手动锁定档位时不再自动降级', () {
+      final GlassGovernor governor = GlassGovernor(minSamples: 3);
+      governor.lock(GlassLevel.l1);
+      governor.feed(<double>[40, 40, 40]);
+      expect(governor.level, GlassLevel.l1);
+    });
+
+    testWidgets('B + L3：玻璃面板真的用了 BackdropFilter', (WidgetTester tester) async {
+      final GlassGovernor governor = GlassGovernor();
+      await tester.pumpWidget(
+        GlassScope(
+          governor: governor,
+          child: MaterialApp(
+            theme: buildTheme(AppThemeId.deepGlass, Brightness.dark),
+            home: const Scaffold(
+              body: Center(
+                child: SizedBox(
+                  width: 300,
+                  height: 60,
+                  child: GlassPanel(role: GlassRole.composer, child: SizedBox.expand()),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(find.byType(BackdropFilter), findsOneWidget);
+    });
+
+    testWidgets('B + L1（降级后）：BackdropFilter 消失，但面板还在', (WidgetTester tester) async {
+      final GlassGovernor governor = GlassGovernor()..lock(GlassLevel.l1);
+      await tester.pumpWidget(
+        GlassScope(
+          governor: governor,
+          child: MaterialApp(
+            theme: buildTheme(AppThemeId.deepGlass, Brightness.dark),
+            home: const Scaffold(
+              body: Center(
+                child: SizedBox(
+                  width: 300,
+                  height: 60,
+                  child: GlassPanel(role: GlassRole.composer, child: SizedBox.expand()),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(find.byType(GlassPanel), findsOneWidget);
+      expect(find.byType(BackdropFilter), findsNothing);
+    });
+
+    testWidgets('卡片类面板永远不模糊（即使 L3）', (WidgetTester tester) async {
+      final GlassGovernor governor = GlassGovernor();
+      await tester.pumpWidget(
+        GlassScope(
+          governor: governor,
+          child: MaterialApp(
+            theme: buildTheme(AppThemeId.deepGlass, Brightness.dark),
+            home: const Scaffold(
+              body: Center(
+                child: SizedBox(
+                  width: 300,
+                  height: 60,
+                  // 默认 role = flat
+                  child: GlassPanel(child: SizedBox.expand()),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(find.byType(BackdropFilter), findsNothing);
+    });
+
+    test('玻璃档位能落盘并在重启后恢复', () async {
+      final MemorySettingsStore store = MemorySettingsStore();
+      final ThemeController controller = ThemeController(
+        store: store,
+        initialTheme: AppThemeId.deepGlass,
+      );
+      await controller.setGlassMode(GlassMode.liquid);
+      expect(await store.get(SettingsKeys.glassMode), 'liquid');
+
+      final ThemeController restored = ThemeController(store: store);
+      await restored.load();
+      expect(restored.glassMode, GlassMode.liquid);
     });
   });
 }

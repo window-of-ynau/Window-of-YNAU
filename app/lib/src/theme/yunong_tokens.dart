@@ -240,6 +240,46 @@ class YunongTokens extends ThemeExtension<YunongTokens> {
     );
   }
 
+  /// 用指定的玻璃参数替换（传 null = 去掉玻璃，copyWith 做不到这点）。
+  YunongTokens withGlass(GlassSpec? glass) => YunongTokens(
+        canvas: canvas,
+        surface: surface,
+        surfaceAlt: surfaceAlt,
+        ink: ink,
+        inkSoft: inkSoft,
+        inkFaint: inkFaint,
+        hairline: hairline,
+        controlBorder: controlBorder,
+        focusRing: focusRing,
+        accent: accent,
+        onAccent: onAccent,
+        accentWash: accentWash,
+        warnBg: warnBg,
+        warnFg: warnFg,
+        warnLine: warnLine,
+        radiusS: radiusS,
+        radiusM: radiusM,
+        radiusL: radiusL,
+        borderWidth: borderWidth,
+        appBarElevation: appBarElevation,
+        displayFontFamily: displayFontFamily,
+        titleSize: titleSize,
+        bodySize: bodySize,
+        metaSize: metaSize,
+        bodyHeight: bodyHeight,
+        metaLetterSpacing: metaLetterSpacing,
+        titleWeight: titleWeight,
+        strongWeight: strongWeight,
+        shadowPanel: shadowPanel,
+        shadowFloat: shadowFloat,
+        glass: glass,
+        texture: texture,
+        canvasGradient: canvasGradient,
+        useDarkCoursePalette: useDarkCoursePalette,
+        fast: fast,
+        ease: ease,
+      );
+
   @override
   YunongTokens lerp(ThemeExtension<YunongTokens>? other, double t) {
     if (other is! YunongTokens) {
@@ -335,3 +375,87 @@ const YunongTokens kTokensALight = YunongTokens(
   fast: Duration(milliseconds: 120),
   ease: Curves.easeOutCubic,
 );
+
+// ─────────────────────────────────────────────────────────────────────
+// 玻璃强度（批次 2）：只有 B 主题有意义；A/C 选什么都无效（glass == null）。
+// ─────────────────────────────────────────────────────────────────────
+
+/// 玻璃质感档位。`auto` 由 `GlassGovernor` 按帧率自动升降。
+enum GlassMode {
+  auto,
+  frosted,
+  liquid,
+  fluid,
+  off;
+
+  String get label {
+    switch (this) {
+      case GlassMode.auto:
+        return '自动';
+      case GlassMode.frosted:
+        return '磨砂';
+      case GlassMode.liquid:
+        return '液态';
+      case GlassMode.fluid:
+        return '流体';
+      case GlassMode.off:
+        return '关闭';
+    }
+  }
+
+  String get storageValue => name;
+
+  static GlassMode fromStorage(String? value) {
+    for (final GlassMode mode in GlassMode.values) {
+      if (mode.name == value) {
+        return mode;
+      }
+    }
+    return GlassMode.auto;
+  }
+}
+
+extension GlassSpecX on GlassSpec {
+  GlassSpec copyWith({
+    double? blurSigma,
+    Color? tint,
+    Color? highlightTop,
+    LinearGradient? innerGlow,
+    bool? allowBackdropFilter,
+    double? saturate,
+  }) {
+    return GlassSpec(
+      blurSigma: blurSigma ?? this.blurSigma,
+      tint: tint ?? this.tint,
+      highlightTop: highlightTop ?? this.highlightTop,
+      innerGlow: innerGlow ?? this.innerGlow,
+      allowBackdropFilter: allowBackdropFilter ?? this.allowBackdropFilter,
+      saturate: saturate ?? this.saturate,
+    );
+  }
+}
+
+/// 按档位给出玻璃参数。**数值全部来自设计稿**（磨砂 18 / 流体 26 / 液态 0）。
+GlassSpec glassSpecFor(GlassMode mode, GlassSpec base) {
+  switch (mode) {
+    case GlassMode.frosted:
+      return base.copyWith(blurSigma: 18, allowBackdropFilter: true, innerGlow: null);
+    case GlassMode.liquid:
+      // 液态 = 纯渐变高光 + 双内阴影，**零 blur**（这是它便宜的原因）
+      return base.copyWith(
+        blurSigma: 0,
+        allowBackdropFilter: false,
+        innerGlow: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: <Color>[Color(0x38FFFFFF), Color(0x0AFFFFFF), Color(0x1A00DCFF)],
+          stops: <double>[0.0, 0.55, 1.0],
+        ),
+      );
+    case GlassMode.fluid:
+      return base.copyWith(blurSigma: 26, allowBackdropFilter: true, innerGlow: null);
+    case GlassMode.off:
+    case GlassMode.auto:
+      return base.copyWith(allowBackdropFilter: true, innerGlow: null);
+  }
+}

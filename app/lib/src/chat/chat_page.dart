@@ -7,6 +7,9 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../theme/glass_panel.dart';
+import '../theme/yunong_tokens.dart';
+
 import '../core/chat_service.dart';
 import '../core/local_search_service.dart';
 import '../core/memory_service.dart';
@@ -44,7 +47,7 @@ class ChatPage extends StatefulWidget {
     this.searchService,
     this.localSearchService,
     this.memoryService,
-    this.dbPath = '' ,
+    this.dbPath = '',
   });
 
   final ChatService? service;
@@ -62,13 +65,16 @@ class ChatPage extends StatefulWidget {
 class _ChatPageState extends State<ChatPage> {
   late final ChatService _service = widget.service ?? ChatService();
   late final ChatSettings _settings = widget.settings ?? ChatSettings();
-  late final SecretService _secrets = widget.secretService ?? SecretService(dbPath: widget.dbPath);
-  SecretStatus _keyStatus = const SecretStatus(set: false, masked: '' );
-  late final SearchService _search = widget.searchService ?? SearchService(dbPath: widget.dbPath);
+  late final SecretService _secrets =
+      widget.secretService ?? SecretService(dbPath: widget.dbPath);
+  SecretStatus _keyStatus = const SecretStatus(set: false, masked: '');
+  late final SearchService _search =
+      widget.searchService ?? SearchService(dbPath: widget.dbPath);
   SearchStatus _searchStatus = const SearchStatus.unknown();
   late final LocalSearchService _localSearch =
       widget.localSearchService ?? LocalSearchService(dbPath: widget.dbPath);
-  late final MemoryService _memory = widget.memoryService ?? MemoryService(dbPath: widget.dbPath);
+  late final MemoryService _memory =
+      widget.memoryService ?? MemoryService(dbPath: widget.dbPath);
   bool _localPanelOpen = false;
   bool _localBusy = false;
   String? _localError;
@@ -235,7 +241,8 @@ class _ChatPageState extends State<ChatPage> {
   /// 把本地资料作为**引用**插入输入框（带来源标题，模型能看出这是资料不是指令）。
   void _insertCitation(LocalSearchHit hit) {
     final existing = _input.text.trim();
-    _input.text = existing.isEmpty ? hit.citation : '${hit.citation}\n\n$existing';
+    _input.text =
+        existing.isEmpty ? hit.citation : '${hit.citation}\n\n$existing';
     setState(() => _localPanelOpen = false);
     _localHits = const <LocalSearchHit>[];
     _localQuery.clear();
@@ -243,13 +250,16 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<void> _openMemory() async {
     await Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(builder: (BuildContext context) => MemoryPage(service: _memory)),
+      MaterialPageRoute<void>(
+          builder: (BuildContext context) => MemoryPage(service: _memory)),
     );
   }
+
   Future<void> _refreshSearchStatus() async {
     try {
       final protocol = _settings.protocol;
-      final status = await _search.status(channel: _channel, protocol: protocol);
+      final status =
+          await _search.status(channel: _channel, protocol: protocol);
       if (mounted) {
         setState(() => _searchStatus = status);
       }
@@ -260,6 +270,7 @@ class _ChatPageState extends State<ChatPage> {
       }
     }
   }
+
   Future<void> _refreshKeyStatus() async {
     try {
       final status = await _secrets.status(SecretService.byokKeyName);
@@ -356,9 +367,11 @@ class _ChatPageState extends State<ChatPage> {
                   '用量 ${_promptTokens ?? '-'} / ${_completionTokens ?? '-'}',
                   style: theme.textTheme.bodySmall,
                 ),
-              Text('搜索 ${_searchStatus.display}', style: theme.textTheme.bodySmall),
+              Text('搜索 ${_searchStatus.display}',
+                  style: theme.textTheme.bodySmall),
               if (_channel == 'byok')
-                Text('Key ${_keyStatus.display}', style: theme.textTheme.bodySmall),
+                Text('Key ${_keyStatus.display}',
+                    style: theme.textTheme.bodySmall),
               if (_channel == 'byok' && _keyStatus.set)
                 IconButton(
                   tooltip: '删除已保存的 Key',
@@ -367,7 +380,8 @@ class _ChatPageState extends State<ChatPage> {
                 ),
               IconButton(
                 tooltip: '搜索本地资料（只查本机，不联网）',
-                onPressed: () => setState(() => _localPanelOpen = !_localPanelOpen),
+                onPressed: () =>
+                    setState(() => _localPanelOpen = !_localPanelOpen),
                 icon: const Icon(Icons.manage_search, size: 20),
               ),
               IconButton(
@@ -388,7 +402,8 @@ class _ChatPageState extends State<ChatPage> {
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: Text(
               'Key ${_keyStatus.degradedHint}',
-              style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.tertiary),
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.tertiary),
             ),
           ),
         if (_error != null)
@@ -396,7 +411,8 @@ class _ChatPageState extends State<ChatPage> {
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: Text(
               _error!,
-              style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.error),
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.error),
             ),
           ),
         if (!_searchStatus.available)
@@ -408,7 +424,8 @@ class _ChatPageState extends State<ChatPage> {
               _searchStatus.hint.isEmpty
                   ? '未配置联网搜索，模型无法获取实时信息'
                   : _searchStatus.hint,
-              style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.tertiary),
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.tertiary),
             ),
           ),
         if (_localPanelOpen)
@@ -421,64 +438,74 @@ class _ChatPageState extends State<ChatPage> {
               color: theme.colorScheme.surfaceContainerHighest,
               borderRadius: BorderRadius.circular(8),
               child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(
-                  '本地资料（只查这台设备，不联网）',
-                  style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 6),
-                Row(
-                  children: <Widget>[
-                    Expanded(
-                      child: TextField(
-                        controller: _localQuery,
-                        decoration: const InputDecoration(
-                          hintText: '搜索本机记忆/资料…',
-                          isDense: true,
-                          border: OutlineInputBorder(),
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text(
+                    '本地资料（只查这台设备，不联网）',
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: TextField(
+                          controller: _localQuery,
+                          decoration: const InputDecoration(
+                            hintText: '搜索本机记忆/资料…',
+                            isDense: true,
+                            border: OutlineInputBorder(),
+                          ),
+                          onSubmitted: (_) => _runLocalSearch(),
                         ),
-                        onSubmitted: (_) => _runLocalSearch(),
+                      ),
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: _localBusy ? null : _runLocalSearch,
+                        child: const Text('搜索'),
+                      ),
+                    ],
+                  ),
+                  if (_localError != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(
+                        _localError!,
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: theme.colorScheme.error),
                       ),
                     ),
-                    const SizedBox(width: 8),
-                    FilledButton(
-                      onPressed: _localBusy ? null : _runLocalSearch,
-                      child: const Text('搜索'),
+                  if (!_localBusy &&
+                      _localError == null &&
+                      _localHits.isEmpty &&
+                      _localQuery.text.trim().isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child:
+                          Text('本机没有匹配的资料', style: theme.textTheme.bodySmall),
                     ),
-                  ],
-                ),
-                if (_localError != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Text(
-                      _localError!,
-                      style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.error),
+                  for (final hit in _localHits)
+                    ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.description_outlined, size: 18),
+                      title: Text(hit.displayTitle,
+                          style: theme.textTheme.bodyMedium),
+                      subtitle: Text(hit.snippet,
+                          maxLines: 2, overflow: TextOverflow.ellipsis),
+                      onTap: () => _insertCitation(hit),
                     ),
-                  ),
-                if (!_localBusy && _localError == null && _localHits.isEmpty && _localQuery.text.trim().isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Text('本机没有匹配的资料', style: theme.textTheme.bodySmall),
-                  ),
-                for (final hit in _localHits)
-                  ListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    leading: const Icon(Icons.description_outlined, size: 18),
-                    title: Text(hit.displayTitle, style: theme.textTheme.bodyMedium),
-                    subtitle: Text(hit.snippet, maxLines: 2, overflow: TextOverflow.ellipsis),
-                    onTap: () => _insertCitation(hit),
-                  ),
-              ],
+                ],
               ),
             ),
-          ),        Expanded(
+          ),
+        Expanded(
           child: _bubbles.isEmpty
               ? Center(
                   child: Text(
                     '问点什么吧——课表、成绩、校园生活都行',
-                    style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: theme.hintColor),
                   ),
                 )
               : ListView.builder(
@@ -491,39 +518,55 @@ class _ChatPageState extends State<ChatPage> {
                   },
                 ),
         ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-          child: Row(
-            children: <Widget>[
-              Expanded(
-                child: TextField(
-                  controller: _input,
-                  minLines: 1,
-                  maxLines: 4,
-                  onSubmitted: (_) => _send(),
-                  decoration: const InputDecoration(
-                    hintText: '输入消息…',
-                    isDense: true,
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              if (_streaming)
-                OutlinedButton.icon(
-                  onPressed: _stop,
-                  icon: const Icon(Icons.stop, size: 18),
-                  label: const Text('停止'),
-                )
-              else
-                FilledButton.icon(
-                  onPressed: _send,
-                  icon: const Icon(Icons.send, size: 18),
-                  label: const Text('发送'),
-                ),
-            ],
+        // B（深蓝玻璃）下输入条是一块玻璃：这是**全屏第二层也是最后一层** BackdropFilter。
+        // A/C 没有玻璃 token，这里退回普通 Padding，不产生任何模糊。
+        if (context.tokens.glass != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+            child: GlassPanel(
+              role: GlassRole.composer,
+              padding: const EdgeInsets.all(8),
+              child: _composer(),
+            ),
+          )
+        else
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+            child: _composer(),
+          ),
+      ],
+    );
+  }
+
+  Widget _composer() {
+    return Row(
+      children: <Widget>[
+        Expanded(
+          child: TextField(
+            controller: _input,
+            minLines: 1,
+            maxLines: 4,
+            onSubmitted: (_) => _send(),
+            decoration: const InputDecoration(
+              hintText: '输入消息…',
+              isDense: true,
+              border: OutlineInputBorder(),
+            ),
           ),
         ),
+        const SizedBox(width: 8),
+        if (_streaming)
+          OutlinedButton.icon(
+            onPressed: _stop,
+            icon: const Icon(Icons.stop, size: 18),
+            label: const Text('停止'),
+          )
+        else
+          FilledButton.icon(
+            onPressed: _send,
+            icon: const Icon(Icons.send, size: 18),
+            label: const Text('发送'),
+          ),
       ],
     );
   }
@@ -562,7 +605,10 @@ class _MessageBubble extends StatelessWidget {
 
 /// 设置对话框：Key 输入框 `obscureText`，**不回显**已保存的值。
 class _SettingsDialog extends StatefulWidget {
-  const _SettingsDialog({required this.settings, required this.searchLabel, required this.searchHint});
+  const _SettingsDialog(
+      {required this.settings,
+      required this.searchLabel,
+      required this.searchHint});
 
   final ChatSettings settings;
   final String searchLabel;
@@ -618,7 +664,8 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                 DropdownMenuItem<String>(value: 'byok', child: Text('BYOK 直连')),
                 DropdownMenuItem<String>(value: 'cloud', child: Text('套餐通道')),
               ],
-              onChanged: (String? value) => setState(() => _channel = value ?? _channel),
+              onChanged: (String? value) =>
+                  setState(() => _channel = value ?? _channel),
             ),
             TextField(
               controller: _model,
@@ -629,13 +676,16 @@ class _SettingsDialogState extends State<_SettingsDialog> {
               decoration: const InputDecoration(labelText: '协议'),
               items: const <DropdownMenuItem<String>>[
                 DropdownMenuItem<String>(
-                    value: 'openai_completions', child: Text('OpenAI Completions')),
+                    value: 'openai_completions',
+                    child: Text('OpenAI Completions')),
                 DropdownMenuItem<String>(
                     value: 'openai_responses', child: Text('OpenAI Responses')),
                 DropdownMenuItem<String>(
-                    value: 'anthropic_messages', child: Text('Anthropic Messages')),
+                    value: 'anthropic_messages',
+                    child: Text('Anthropic Messages')),
               ],
-              onChanged: (String? value) => setState(() => _protocol = value ?? _protocol),
+              onChanged: (String? value) =>
+                  setState(() => _protocol = value ?? _protocol),
             ),
             TextField(
               controller: _key,
@@ -662,12 +712,16 @@ class _SettingsDialogState extends State<_SettingsDialog> {
         ),
       ),
       actions: <Widget>[
-        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('取消')),
+        TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消')),
         FilledButton(
           onPressed: () {
             widget.settings
               ..channel = _channel
-              ..model = _model.text.trim().isEmpty ? 'deepseek-chat' : _model.text.trim()
+              ..model = _model.text.trim().isEmpty
+                  ? 'deepseek-chat'
+                  : _model.text.trim()
               ..protocol = _protocol
               ..byokKey = _key.text.trim()
               ..cloudToken = _token.text.trim();

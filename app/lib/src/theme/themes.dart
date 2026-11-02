@@ -255,8 +255,16 @@ YunongTokens tokensFor(AppThemeId id, Brightness brightness) {
 
 /// 组装 ThemeData：Material 只做"骨架"（涟漪、语义色、焦点），
 /// 真正的视觉参数全部来自 [YunongTokens]。
-ThemeData buildTheme(AppThemeId id, Brightness brightness) {
-  final YunongTokens t = tokensFor(id, brightness);
+ThemeData buildTheme(
+  AppThemeId id,
+  Brightness brightness, {
+  GlassMode glassMode = GlassMode.auto,
+}) {
+  YunongTokens t = tokensFor(id, brightness);
+  // 玻璃档位只影响 B（其它主题 glass == null，这里不动）
+  if (t.glass != null) {
+    t = t.withGlass(glassMode == GlassMode.off ? null : glassSpecFor(glassMode, t.glass!));
+  }
   final ThemeData base = ThemeData(brightness: brightness, useMaterial3: true);
   final ColorScheme scheme = ColorScheme.fromSeed(
     seedColor: t.accent,
