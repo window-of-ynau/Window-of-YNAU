@@ -342,11 +342,15 @@ class ChatPageState extends State<ChatPage> {
                     b.isTool && b.toolCallId != null && b.toolCallId == event.toolCallId);
                 if (index >= 0) {
                   final ChatBubble target = _bubbles[index];
-                  target.toolStatus = (event.toolOk ?? false) ? ToolCallStatus.ok : ToolCallStatus.failed;
-                  target.toolSummary = event.toolSummary ?? (event.toolOk ?? false ? '已完成' : null);
-                  target.toolError = (event.toolOk ?? false)
-                      ? null
-                      : (event.toolSummary ?? event.errorMessage ?? '工具调用失败');
+                  final bool ok = event.toolOk ?? false;
+                  // t104：CANCELLED 与失败语义不同（用户主动停止），UI 要分开显示
+                  if (!ok && event.errorCode == 'CANCELLED') {
+                    target.toolStatus = ToolCallStatus.cancelled;
+                  } else {
+                    target.toolStatus = ok ? ToolCallStatus.ok : ToolCallStatus.failed;
+                  }
+                  target.toolSummary = event.toolSummary ?? (ok ? '已完成' : null);
+                  target.toolError = ok ? null : toolFailureText(event.errorCode, fallback: event.toolSummary ?? event.errorMessage);
                 }
               });
             case ChatEventKind.usage:
