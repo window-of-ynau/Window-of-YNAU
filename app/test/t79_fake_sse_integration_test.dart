@@ -47,8 +47,9 @@ void main() {
   test('fake_sse 上游：真实 FFI 全链路能收到 delta + done', () async {
     final fakeSse = _findFakeSse();
     final dll = _findDll();
-    if (fakeSse == null || dll == null) {
-      markTestSkipped('缺少 fake_sse 或 yunong_core.dll（fake=${fakeSse?.path}, dll=$dll）');
+    final envDll = Platform.environment['YUNONG_CORE_DLL'] ?? '';
+    if (fakeSse == null || dll == null || envDll.isEmpty) {
+      markTestSkipped('需要显式设置 YUNONG_CORE_DLL（或缺少 fake_sse/dll）：fake=${fakeSse?.path}, dll=$dll）');
       return;
     }
     Platform.environment['YUNONG_CORE_DLL']; // 说明：真正生效的是进程环境变量（见测试脚本）
@@ -76,7 +77,7 @@ void main() {
     final backend = FfiChatBackend();
     final chunks = <Map<String, dynamic>>[];
     final done = Completer<void>();
-    final handle = backend.start(jsonEncode(request), (String chunkJson) {
+    final handle = backend.start(request, (String chunkJson) {
       final decoded = jsonDecode(chunkJson);
       if (decoded is Map<String, dynamic>) {
         chunks.add(decoded);
@@ -99,5 +100,5 @@ void main() {
     expect(deltas, isNotEmpty, reason: 'fake_sse 必须能推 delta');
     expect(backend.framesFired, greaterThan(0), reason: '回调确实被触发');
     backend.cancel(handle);
-  }, timeout: const Timeout(Duration(minutes: 2)), skip: '等待 Rust 侧修字符串所有权（悬垂指针，见文件头）');
+  }, timeout: const Timeout(Duration(minutes: 2)));
 }

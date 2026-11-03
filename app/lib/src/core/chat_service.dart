@@ -316,11 +316,19 @@ class FfiChatBackend implements ChatBackend {
   FfiChatBackend() : _lib = CoreLibrary.openCoreLibrary() {
     _stream = _lib.lookupFunction<_StreamNative, _StreamDart>('yunong_chat_stream');
     _cancelFn = _lib.lookupFunction<_CancelNative, _CancelDart>('yunong_chat_cancel');
+    // 回调字符串由 Rust CString::into_raw 移交所有权，必须由 Dart 释放
+    try {
+      _freeString = _lib.lookupFunction<Void Function(Pointer<Utf8>), void Function(Pointer<Utf8>)>('yunong_free_string');
+    } on ArgumentError {
+      // 旧包没有该符号：退化为不释放（宁可泄漏也不 double free）
+      _freeString = (Pointer<Utf8> _) {};
+    }
   }
 
   final DynamicLibrary _lib;
   late final _StreamDart _stream;
   late final _CancelDart _cancelFn;
+  late final void Function(Pointer<Utf8>) _freeString;
 
   int _nextStreamId = 1;
   final Map<int, _ChatSink> _sinks = <int, _ChatSink>{};
@@ -335,9 +343,14 @@ class FfiChatBackend implements ChatBackend {
     final callable = NativeCallable<_ChunkCbNative>.listener(
       (Pointer<Utf8> chunkJson, Pointer<Void> user) {
         framesFired += 1;
+        // 回调返回的指针由 Rust `CString::into_raw` 移交所有权：
+        // **必须先拷出内容，再 `yunong_free_string`**——直接把指针当字符串用就是
+        // 悬垂读（t79 的 `Missing extension byte` 就是这么来的）；
+        // 不释放会泄漏，**重复释放是 UB**。
+        final String json = chunkJson.toDartString();
+        _freeString(chunkJson);
         final sink = _sinks[user.address];
-        final text = chunkJson.toDartString();
-        (sink?.onChunk ?? onChunk)(text);
+        (sink?.onChunk ?? onChunk)(json);
       },
     );
     // **先登记再调用**（见类文档）

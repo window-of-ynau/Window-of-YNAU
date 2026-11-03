@@ -376,7 +376,9 @@ class _ChatPageState extends State<ChatPage> {
   /// “收到几条 delta、第几条之后停止、是否收到 done/error”。
   Future<void> _showDiagnostics() async {
     final diag = _diagnostics;
-    final text = diag == null ? '还没有发起过对话' : diag.toClipboardText();
+    final keyLine =
+        'key=`${_keyStatus.masked.isEmpty ? '未设置' : _keyStatus.masked} | protocol=`${_settings.protocol}';
+    final text = keyLine + '\n' + (diag == null ? '还没有发起过对话' : diag.toClipboardText());
     if (!mounted) {
       return;
     }
@@ -552,7 +554,9 @@ class _ChatPageState extends State<ChatPage> {
       }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('已保存 ${status.masked}')),
+          SnackBar(
+            content: Text('已保存 · 掩码 ${status.masked} · 协议 ${_settings.protocol}'),
+          ),
         );
       }
     } on SecretException catch (failure) {
