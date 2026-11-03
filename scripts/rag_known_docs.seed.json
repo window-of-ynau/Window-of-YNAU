@@ -1,0 +1,18 @@
+{
+  "_comment": [
+    "RAG 已知语料种子（ADR-19 决策 3）。只放**公开可抓**的学术资源与公开规章页。",
+    "用法：cargo run -p yunong-server --bin rag_index_known_docs -- --seed scripts/rag_known_docs.seed.json",
+    "注意：标识会经 canonical_identifier 归一化（小写、去 query/fragment、去 arXiv 版本号），",
+    "     端侧上报时必须用同一套归一化，否则 join 命中不了。",
+    "示例只放少量真实可公开访问的条目；生产语料库另用清单文件替换本文件的内容。"
+  ],
+  "docs": [
+    { "identifier": "2401.01234", "source": "arxiv" },
+    { "identifier": "2401.05678", "source": "arxiv" },
+    { "identifier": "2305.10101", "source": "arxiv" },
+    { "identifier": "10.1038/s41586-023-00001-1", "source": "doi" },
+    { "identifier": "10.1145/3613904.3642083", "source": "doi" },
+    { "identifier": "https://www.ynau.edu.cn/xxgk/gzzd", "source": "web" },
+    { "identifier": "https://www.ynau.edu.cn/jwc/xsgl", "source": "web" }
+  ]
+}
