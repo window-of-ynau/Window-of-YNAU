@@ -28,6 +28,15 @@ class AppPaths {
     return <String>[Directory.current.path, '.yunong'].join(Platform.pathSeparator);
   }
 
+  /// 从库文件路径推出**目录**（Rust 的 `data_dir` 是目录，不是文件）。
+  static String dataDirOf(String dbPath) {
+    if (dbPath.isEmpty) {
+      return '';
+    }
+    final index = dbPath.lastIndexOf(RegExp(r'[/\\\\]'));
+    return index <= 0 ? dbPath : dbPath.substring(0, index);
+  }
+
   /// 会话/课表共用的 SQLite 库；凭据密文放在同目录的 `secrets/`。
   static String get databasePath => <String>[dataDir, 'yunong.db'].join(Platform.pathSeparator);
 }
