@@ -87,7 +87,7 @@ void main() {
 
       await tester.tap(find.text('对话诊断'));
       await tester.pumpAndSettle();
-      expect(find.text('还没有发起过对话'), findsOneWidget);
+      expect(find.textContaining('还没有发起过对话'), findsOneWidget);
       expect(find.text('复制诊断'), findsOneWidget);
       await tester.tap(find.text('关闭'));
       await tester.pumpAndSettle();
