@@ -125,6 +125,65 @@ fn done_count(chunks: &[Chunk]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// 慢速上游 / 帧被 TCP 切开（owner 报"说到三个字就停"的回归）
+// ---------------------------------------------------------------------------
+
+/// 上游**慢慢吐** 20 帧（每帧间隔 5ms）：一帧都不许丢，done 必须到。
+///
+/// 这条用例锁的是"读到 Pending 就当成结束"这一类 bug——慢上游最容易触发它。
+#[tokio::test]
+async fn slow_upstream_frames_all_arrive() {
+    let mut steps = Vec::new();
+    for index in 0..20 {
+        steps.push(Step::Write(completions_delta(&format!("字{index}"))));
+        steps.push(Step::Sleep(Duration::from_millis(5)));
+    }
+    steps.push(Step::Write(completions_finish()));
+    steps.push(Step::Write(sse_data("[DONE]")));
+    steps.push(Step::Close);
+    let server = FakeServer::start(200, "text/event-stream", Vec::new(), steps).await;
+
+    let provider = byok(&server, Protocol::OpenaiCompletions);
+    let req = request(Protocol::OpenaiCompletions);
+    let (chunks, outcome) = run(&provider, &req, None).await;
+    let outcome = outcome.unwrap();
+
+    let expected: String = (0..20).map(|index| format!("字{index}")).collect();
+    assert_eq!(deltas(&chunks), expected, "慢速上游不许丢帧：{chunks:?}");
+    assert_eq!(done_count(&chunks), 1, "{chunks:?}");
+    assert_eq!(outcome.finish, FinishReason::Stop);
+}
+
+/// 一帧被 TCP 切成两半（两次 write，中间隔 20ms）：解码器必须拼回整帧。
+#[tokio::test]
+async fn frame_split_across_writes_is_reassembled() {
+    let frame = completions_delta("你可以继续问我");
+    let (head, tail) = frame.split_at(frame.len() / 2);
+    let server = FakeServer::start(
+        200,
+        "text/event-stream",
+        Vec::new(),
+        vec![
+            Step::Write(head.to_owned()),
+            Step::Sleep(Duration::from_millis(20)),
+            Step::Write(tail.to_owned()),
+            Step::Write(completions_finish()),
+            Step::Write(sse_data("[DONE]")),
+            Step::Close,
+        ],
+    )
+    .await;
+
+    let provider = byok(&server, Protocol::OpenaiCompletions);
+    let req = request(Protocol::OpenaiCompletions);
+    let (chunks, outcome) = run(&provider, &req, None).await;
+    let outcome = outcome.unwrap();
+
+    assert_eq!(deltas(&chunks), "你可以继续问我", "{chunks:?}");
+    assert_eq!(done_count(&chunks), 1);
+    assert_eq!(outcome.finish, FinishReason::Stop);
+}
+
 // BYOK：成功
 // ---------------------------------------------------------------------------
 

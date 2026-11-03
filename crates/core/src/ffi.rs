@@ -545,7 +545,23 @@ pub unsafe extern "C" fn yunong_memory_upsert(
             expires_at: None,
         };
         match store.upsert(&draft, id) {
-            Ok(write) => ok_json(json!({ "id": write.id, "evicted": write.evicted })),
+            Ok(write) => {
+                // P0-2：记忆写完**必须**同步进本地检索索引，否则"存了却搜不到"。
+                // 索引失败不回滚记忆（内容已经安全落库），但要如实告诉调用方。
+                let title = if title.trim().is_empty() {
+                    None
+                } else {
+                    Some(title)
+                };
+                let (indexed, index_error) =
+                    index_memory_for_search(db_path, write.id, kind.as_str(), title, content);
+                ok_json(json!({
+                    "id": write.id,
+                    "evicted": write.evicted,
+                    "indexed": indexed,
+                    "index_error": index_error,
+                }))
+            }
             Err(err) => input_error(err),
         }
     })
@@ -628,10 +644,50 @@ pub unsafe extern "C" fn yunong_memory_delete(
             Err(err) => return input_error(err),
         };
         match store.delete(id) {
-            Ok(deleted) => ok_json(json!({ "deleted": deleted })),
+            Ok(deleted) => {
+                // P0-2：删记忆必须同步删索引，否则"删了还能搜到"（孤儿倒排）
+                let unindexed = unindex_memory_for_search(db_path, id);
+                ok_json(json!({ "deleted": deleted, "unindexed": unindexed }))
+            }
             Err(err) => input_error(err),
         }
     })
+}
+
+/// 把一条记忆写进本地检索索引；返回 `(是否成功, 失败原因)`。
+///
+/// 失败**不阻断**记忆写入：正文已经安全落库，索引可以重建（`yunong_search_upsert` 也能补）。
+/// 但要如实回给调用方，否则又会变成"存了搜不到"且无人知情。
+fn index_memory_for_search(
+    db_path: &str,
+    id: i64,
+    kind: &str,
+    title: Option<&str>,
+    content: &str,
+) -> (bool, Option<String>) {
+    match SearchStore::open(db_path) {
+        Ok(mut search) => {
+            let doc = SearchDoc {
+                id,
+                kind,
+                title,
+                content,
+            };
+            match search.upsert(&doc) {
+                Ok(_) => (true, None),
+                Err(err) => (false, Some(err.to_string())),
+            }
+        }
+        Err(err) => (false, Some(err.to_string())),
+    }
+}
+
+/// 从本地检索索引里删掉一条记忆；返回是否删成功（失败只影响搜索，不影响记忆本身）。
+fn unindex_memory_for_search(db_path: &str, id: i64) -> bool {
+    match SearchStore::open(db_path) {
+        Ok(mut search) => search.delete(id).is_ok(),
+        Err(_) => false,
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -1873,6 +1929,97 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    // ---------------------------------------------------------------------
+    // P0-2：记忆写入/更新/删除必须同步本地检索索引
+    // ---------------------------------------------------------------------
+
+    fn search_hits(query: &str, db: &str) -> Vec<serde_json::Value> {
+        let value = call_search_local(query, "", db);
+        assert_eq!(value["ok"], true, "{value}");
+        value["data"]["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// owner 实测场景：**不填标题**、正文「雨伞是黑色的」，搜「雨伞」「黑色」都要能命中。
+    #[test]
+    fn memory_upsert_is_searchable_even_without_title() {
+        let db = temp_db();
+        let created = call_memory_upsert("note", "", "雨伞是黑色的", "user", "", &db);
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(created["data"]["indexed"], true, "{created}");
+        let id = created["data"]["id"].as_i64().unwrap();
+
+        for query in ["雨伞", "黑色", "雨伞是黑色的"] {
+            let hits = search_hits(query, &db);
+            assert!(
+                hits.iter().any(|hit| hit["id"].as_i64() == Some(id)),
+                "搜 {query:?} 应当命中记忆 {id}，实际：{hits:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    /// 带标题的记忆：标题与正文都能搜到，kind 跟着记忆走。
+    #[test]
+    fn memory_upsert_indexes_title_and_kind() {
+        let db = temp_db();
+        let created = call_memory_upsert("fact", "宿舍", "水壶在柜子里", "user", "", &db);
+        assert_eq!(created["data"]["indexed"], true, "{created}");
+        let id = created["data"]["id"].as_i64().unwrap();
+        let hits = search_hits("水壶", &db);
+        let hit = hits
+            .iter()
+            .find(|hit| hit["id"].as_i64() == Some(id))
+            .unwrap_or_else(|| panic!("没命中：{hits:?}"));
+        assert_eq!(hit["kind"], "fact");
+        assert_eq!(hit["title"], "宿舍");
+        assert!(search_hits("宿舍", &db)
+            .iter()
+            .any(|h| h["id"].as_i64() == Some(id)));
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    /// 更新记忆：索引换成新内容，**不是**多出一条。
+    #[test]
+    fn memory_update_replaces_index_entry() {
+        let db = temp_db();
+        let created = call_memory_upsert("note", "", "雨伞是黑色的", "user", "", &db);
+        let id = created["data"]["id"].as_i64().unwrap().to_string();
+
+        let updated = call_memory_upsert("note", "", "雨伞是蓝色的", "user", &id, &db);
+        assert_eq!(updated["ok"], true, "{updated}");
+        assert_eq!(updated["data"]["id"].as_i64(), id.parse::<i64>().ok());
+
+        assert!(
+            search_hits("黑色", &db).is_empty(),
+            "旧内容不该还能搜到（否则是没更新索引）"
+        );
+        let hits = search_hits("蓝色", &db);
+        assert_eq!(hits.len(), 1, "更新后只该有一条：{hits:?}");
+        assert_eq!(hits[0]["id"].as_i64(), id.parse::<i64>().ok());
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    /// 删除记忆：索引里也要消失。
+    #[test]
+    fn memory_delete_removes_index_entry() {
+        let db = temp_db();
+        let created = call_memory_upsert("note", "", "雨伞是黑色的", "user", "", &db);
+        let id = created["data"]["id"].as_i64().unwrap();
+        assert!(!search_hits("雨伞", &db).is_empty());
+
+        let deleted = call_memory_delete(&id.to_string(), &db);
+        assert_eq!(deleted["data"]["deleted"], 1, "{deleted}");
+        assert_eq!(deleted["data"]["unindexed"], true, "{deleted}");
+        assert!(
+            search_hits("雨伞", &db).is_empty(),
+            "删了记忆还搜得到 = 索引没清"
         );
         let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
     }
