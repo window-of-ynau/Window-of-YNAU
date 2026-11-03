@@ -76,6 +76,9 @@ pub const SUMMARY_MARKER: &str = "【压缩摘要】";
 /// 存档分片大小：`memory_items.content` 上限 64 KiB，留点余量。
 const ARCHIVE_CHUNK_BYTES: usize = 48 * 1024;
 
+/// 单条超长消息被替换成 `memory://` 引用后，正文里保留多少字预览。
+pub const OVERLONG_PREVIEW_CHARS: usize = 500;
+
 /// 压缩参数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompactConfig {
@@ -88,6 +91,8 @@ pub struct CompactConfig {
     pub model_switch_min_tokens: u32,
     pub max_items: usize,
     pub max_item_chars: usize,
+    /// 摘要自身的 token 预算（超了就按 4 级降级往下压）
+    pub max_summary_tokens: u32,
 }
 
 impl Default for CompactConfig {
@@ -101,9 +106,13 @@ impl Default for CompactConfig {
             model_switch_min_tokens: MODEL_SWITCH_MIN_TOKENS,
             max_items: DEFAULT_MAX_ITEMS,
             max_item_chars: DEFAULT_MAX_ITEM_CHARS,
+            max_summary_tokens: DEFAULT_MAX_SUMMARY_TOKENS,
         }
     }
 }
+
+/// 摘要自身的默认 token 预算（约 2k；超了就降级）。
+pub const DEFAULT_MAX_SUMMARY_TOKENS: u32 = 2_048;
 
 /// 为什么压（写进摘要的「关键上下文」与调用方日志）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,32 +429,143 @@ impl Summary {
     }
 }
 
-/// 生成摘要（纯函数；`archive_refs` 为空表示原文没落库）。
+/// 摘要详略（阶段 2 的「3 档密度」）：压力越高，压得越狠。
+///
+/// 密度**只影响渲染**，不影响抽取——同一份事实换不同详略，
+/// 保证"同一输入 + 同一密度 ⇒ 逐字节相同"这条可复现性。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Density {
+    /// 完整：所有 8 段，条目上限 = `max_items`
+    Full,
+    /// 精简：每段最多 6 条、每条截到 120 字
+    Compact,
+    /// 极简：只留「意图 / 错误 / 待办 / 上下文」四段，每段最多 3 条、每条截到 60 字
+    Terse,
+}
+
+impl Density {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Compact => "compact",
+            Self::Terse => "terse",
+        }
+    }
+
+    /// 每段最多几条
+    const fn max_items(self) -> usize {
+        match self {
+            Self::Full => usize::MAX,
+            Self::Compact => 6,
+            Self::Terse => 3,
+        }
+    }
+
+    /// 每条最多多少字符
+    const fn max_chars(self) -> usize {
+        match self {
+            Self::Full => usize::MAX,
+            Self::Compact => 120,
+            Self::Terse => 60,
+        }
+    }
+
+    /// 保留第几段（0 基下标，顺序同 [`SECTIONS`]）
+    const fn keeps(self, index: usize) -> bool {
+        match self {
+            Self::Full | Self::Compact => true,
+            // 意图 / 错误 / 待办 / 上下文
+            Self::Terse => matches!(index, 0 | 3 | 6 | 7),
+        }
+    }
+}
+
+/// 按当前压力挑密度：以 [`pressure_tokens`] 为 1.0。
+///
+/// - `< 1.15` → `Full`（刚到阈值，别急着砍）
+/// - `1.15 ~ 1.6` → `Compact`
+/// - `>= 1.6` → `Terse`（已经超得很厉害，只留骨架）
+pub fn density_for(used_tokens: u32, cfg: &CompactConfig) -> Density {
+    let pressure = pressure_tokens(cfg).max(1);
+    let ratio = used_tokens as f32 / pressure as f32;
+    if ratio >= 1.6 {
+        Density::Terse
+    } else if ratio >= 1.15 {
+        Density::Compact
+    } else {
+        Density::Full
+    }
+}
+
+/// 生成摘要（纯函数；`archive_refs` 为空表示原文没落库）。密度 = [`Density::Full`]。
 pub fn summarize(
     messages: &[Message],
     cfg: &CompactConfig,
     archive_refs: &[i64],
     trigger: Trigger,
 ) -> Summary {
-    let facts = extract(messages, cfg);
-    render(&facts, archive_refs, trigger)
+    summarize_with_density(messages, cfg, archive_refs, trigger, Density::Full)
 }
 
-fn extract(messages: &[Message], cfg: &CompactConfig) -> Facts {
+/// 生成指定密度的摘要（纯函数，可复现）。
+pub fn summarize_with_density(
+    messages: &[Message],
+    cfg: &CompactConfig,
+    archive_refs: &[i64],
+    trigger: Trigger,
+    density: Density,
+) -> Summary {
+    let runs = build_runs(messages);
+    let facts = extract(&runs, cfg);
+    let full = render(&facts, archive_refs, trigger);
+    match density {
+        Density::Full => full,
+        other => retexture(&full, other),
+    }
+}
+
+/// 把**连续**完全相同的消息折成一条：`(消息, 重复次数)`。不相邻的重复不算。
+///
+/// 这是阶段 2 的 `dedup` 规则：用户把同一句话粘 10 遍，摘要里只该有一条。
+fn build_runs(messages: &[Message]) -> Vec<(Message, usize)> {
+    let mut runs: Vec<(Message, usize)> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if let Some((last, count)) = runs.last_mut() {
+            if last.role == message.role && last.content == message.content {
+                *count += 1;
+                continue;
+            }
+        }
+        runs.push((message.clone(), 1));
+    }
+    runs
+}
+
+fn extract(runs: &[(Message, usize)], cfg: &CompactConfig) -> Facts {
     let mut facts = Facts {
-        message_count: messages.len(),
+        message_count: runs.iter().map(|(_, count)| *count).sum(),
         ..Facts::default()
     };
     let mut seen_intents: Vec<String> = Vec::new();
     let mut seen_errors: Vec<String> = Vec::new();
+    // purgeErrors：连续出现的错误只留**最后一条**（重试 5 次失败 = 1 条）
+    let mut pending_error: Option<String> = None;
 
-    for message in messages {
+    /// 错误连续段结束时，把暂存的那条吐出来
+    fn flush_error(pending: &mut Option<String>, seen: &mut Vec<String>) {
+        if let Some(item) = pending.take() {
+            seen.push(item);
+        }
+    }
+
+    for (message, repeat) in runs {
         let text = message.content.trim();
         if text.is_empty() {
             continue;
         }
         match message.role.as_str() {
             "user" => {
+                flush_error(&mut pending_error, &mut seen_errors);
                 // 规则 1：用户原话；跳过我们自己的摘要（它会被"继承"，不该重复列）
                 if is_summary(text) {
                     merge_carried(&mut facts.carried, parse_sections(text));
@@ -457,7 +577,10 @@ fn extract(messages: &[Message], cfg: &CompactConfig) -> Facts {
                 facts.last_user = clip(text, cfg.max_item_chars);
                 // 待办行（`- [ ] …` / `TODO: …`）属于「待办事项」段，不再算一条"用户意图"
                 if !is_todo_line(text) {
-                    let item = clip(&first_lines(text, 1), cfg.max_item_chars);
+                    let mut item = clip(&first_lines(text, 1), cfg.max_item_chars);
+                    if *repeat > 1 {
+                        item = format!("{item}（重复 {repeat} 次）");
+                    }
                     if !seen_intents.iter().any(|existing| existing == &item) {
                         seen_intents.push(item);
                     }
@@ -465,6 +588,7 @@ fn extract(messages: &[Message], cfg: &CompactConfig) -> Facts {
                 collect_todos(text, &mut facts.todos);
             }
             "assistant" => {
+                flush_error(&mut pending_error, &mut seen_errors);
                 if is_summary(text) {
                     merge_carried(&mut facts.carried, parse_sections(text));
                     continue;
@@ -474,23 +598,30 @@ fn extract(messages: &[Message], cfg: &CompactConfig) -> Facts {
                 collect_tool_calls(text, &mut facts);
             }
             "tool" => {
-                facts.tool_results += 1;
+                facts.tool_results += *repeat as u32;
                 // 规则 4：报错只留首行
                 let line = first_lines(text, 1);
                 if is_error(&line) {
-                    let item = clip(&line, cfg.max_item_chars);
-                    if !seen_errors.iter().any(|existing| existing == &item) {
-                        seen_errors.push(item);
+                    let mut item = clip(&line, cfg.max_item_chars);
+                    if *repeat > 1 {
+                        item = format!("{item}（重复 {repeat} 次）");
                     }
+                    // 覆盖上一条：连续错误只留最后一条
+                    pending_error = Some(item);
+                } else {
+                    flush_error(&mut pending_error, &mut seen_errors);
                 }
             }
-            _ => {}
+            _ => {
+                flush_error(&mut pending_error, &mut seen_errors);
+            }
         }
     }
+    flush_error(&mut pending_error, &mut seen_errors);
 
     // 概念：用户话里出现过的词表命中项（保持首次出现顺序）
     let mut concepts: Vec<String> = Vec::new();
-    for message in messages {
+    for (message, _) in runs {
         let lower = message.content.to_lowercase();
         for word in COMMAND_CONCEPTS {
             if lower.contains(word) && !concepts.iter().any(|c| c == word) {
@@ -851,6 +982,253 @@ fn render_section(index: usize, items: &[String]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// 阶段 2：3 档密度的渲染层重排 + 4 级降级 + 单条超长消息落库
+// ---------------------------------------------------------------------------
+
+/// 把**已经渲染好的**摘要按密度重排（只动文本，不动事实，因此依然可复现）。
+fn retexture(summary: &Summary, density: Density) -> Summary {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut counts = [0_usize; 8];
+    let mut current: Option<usize> = None;
+    let mut items: Vec<String> = Vec::new();
+
+    // 段外的行（开头的【压缩摘要】标记、结尾的「被压原文…」说明）原样保留
+    let flush = |blocks: &mut Vec<String>,
+                 counts: &mut [usize; 8],
+                 current: &mut Option<usize>,
+                 items: &mut Vec<String>| {
+        if let Some(index) = *current {
+            if density.keeps(index) {
+                let keep = density.max_items();
+                let elided = items.len().saturating_sub(keep);
+                blocks.push(format!("## {}", SECTIONS[index].1));
+                if items.is_empty() {
+                    blocks.push("- （无）".to_owned());
+                } else {
+                    if elided > 0 {
+                        blocks.push(format!("- （另 {elided} 条略）"));
+                    }
+                    for item in &items[elided..] {
+                        blocks.push(format!("- {}", clip(item, density.max_chars())));
+                    }
+                }
+                counts[index] = items.len();
+            }
+            items.clear();
+        }
+        *current = None;
+    };
+
+    for line in summary.text.lines() {
+        if let Some(name) = line.strip_prefix("## ") {
+            flush(&mut blocks, &mut counts, &mut current, &mut items);
+            current = SECTIONS
+                .iter()
+                .position(|(_, header)| *header == name.trim());
+            if current.is_none() {
+                // 认不出来的段头：原样保留
+                blocks.push(line.to_owned());
+            }
+        } else if let Some(item) = line.strip_prefix("- ") {
+            if current.is_some() && item != "（无）" && !item.starts_with("（另 ") {
+                items.push(item.to_owned());
+            } else {
+                blocks.push(line.to_owned());
+            }
+        } else if line.trim().is_empty() {
+            continue;
+        } else {
+            blocks.push(line.to_owned());
+        }
+    }
+    flush(&mut blocks, &mut counts, &mut current, &mut items);
+
+    let mut text = blocks.join("\n");
+    text.push('\n');
+    Summary {
+        text,
+        section_items: counts,
+    }
+}
+
+/// 4 级降级中的第 2~4 级（第 1 级是完整摘要）。
+///
+/// - `2` 关键行：每段只留**第一条**
+/// - `3` 只留标题：段头 + `（N 条）`
+/// - `4` 只留 ref_id：只留 `memory://` 引用行与摘要标记
+fn degrade(summary: &Summary, level: u8) -> String {
+    // 第 4 级：只留引用行（它们可能带 `- ` 前缀，也可能不带，靠内容判断）
+    if level >= 4 {
+        let refs: Vec<&str> = summary
+            .text
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("memory://"))
+            .collect();
+        let mut text = format!(
+            "{SUMMARY_MARKER}（已降到第 4 级：只保留 {} 个 memory:// 引用）\n",
+            refs.len()
+        );
+        for line in refs {
+            text.push_str(line);
+            text.push('\n');
+        }
+        return text;
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut current: Option<usize> = None;
+    let mut items: Vec<String> = Vec::new();
+    let push_section =
+        |out: &mut Vec<String>, current: &mut Option<usize>, items: &mut Vec<String>| {
+            if let Some(index) = *current {
+                let header = SECTIONS[index].1;
+                match level {
+                    2 => {
+                        out.push(format!("## {header}"));
+                        match items.first() {
+                            Some(first) => out.push(format!("- {first}")),
+                            None => out.push("- （无）".to_owned()),
+                        }
+                    }
+                    3 => {
+                        out.push(format!("## {header}"));
+                        out.push(format!("- （{} 条）", items.len()));
+                    }
+                    _ => {}
+                }
+                items.clear();
+            }
+            *current = None;
+        };
+
+    for line in summary.text.lines() {
+        if let Some(name) = line.strip_prefix("## ") {
+            push_section(&mut out, &mut current, &mut items);
+            if level >= 4 {
+                continue;
+            }
+            current = SECTIONS
+                .iter()
+                .position(|(_, header)| *header == name.trim());
+            if current.is_none() {
+                out.push(line.to_owned());
+            }
+        } else if let Some(item) = line.strip_prefix("- ") {
+            if current.is_some() && item != "（无）" && !item.starts_with("（另 ") {
+                items.push(item.to_owned());
+            }
+        } else if line.contains("memory://") || line.contains(SUMMARY_MARKER) {
+            out.push(line.to_owned());
+        }
+    }
+    push_section(&mut out, &mut current, &mut items);
+
+    let mut text = out.join("\n");
+    text.push('\n');
+    text
+}
+
+/// 让摘要塞进 `cfg.max_summary_tokens`：够小就第 1 级，否则逐级降。
+///
+/// 返回 `(文本, 级别)`，级别 1~4。
+pub fn fit_summary(summary: &Summary, cfg: &CompactConfig) -> (String, u8) {
+    if summary.tokens() <= cfg.max_summary_tokens {
+        return (summary.text.clone(), 1);
+    }
+    for level in 2..=4 {
+        let text = degrade(summary, level);
+        if level == 4 || estimate_tokens(&text) <= cfg.max_summary_tokens {
+            return (text, level);
+        }
+    }
+    (summary.text.clone(), 1)
+}
+
+/// 单条消息超过窗口一半就"落库 + 换引用"，避免一条巨长粘贴把压缩卡死。
+///
+/// 返回 `(新消息列表, 被替换的条数)`；落库失败时**原样返回**（不阻塞，只是没省）。
+pub fn shrink_oversized(
+    store: &mut MemoryItemStore,
+    session: &str,
+    messages: &[Message],
+    cfg: &CompactConfig,
+) -> CoreResult<(Vec<Message>, usize)> {
+    let threshold = (cfg.window / 2).max(1);
+    let mut out = Vec::with_capacity(messages.len());
+    let mut shrunk = 0_usize;
+    for (index, message) in messages.iter().enumerate() {
+        if estimate_tokens(&message.content) <= threshold {
+            out.push(message.clone());
+            continue;
+        }
+        match archive_long_message(store, session, message, index) {
+            Ok(refs) if !refs.is_empty() => {
+                shrunk += 1;
+                let preview: String = message
+                    .content
+                    .chars()
+                    .take(OVERLONG_PREVIEW_CHARS)
+                    .collect();
+                let refs_text = refs
+                    .iter()
+                    .map(|id| format!("memory://{id}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let content = format!(
+                    "{refs_text}\n（单条超长消息已落库：{} 字，下面是前 {OVERLONG_PREVIEW_CHARS} 字预览）\n{preview}",
+                    message.content.chars().count()
+                );
+                let mut replaced = message.clone();
+                replaced.tokens = estimate_tokens(&content);
+                replaced.content = content;
+                out.push(replaced);
+            }
+            _ => out.push(message.clone()),
+        }
+    }
+    Ok((out, shrunk))
+}
+
+/// 单条超长消息的落库：超过单条容量就切多片，返回**按顺序**的 id。
+fn archive_long_message(
+    store: &mut MemoryItemStore,
+    session: &str,
+    message: &Message,
+    index: usize,
+) -> CoreResult<Vec<i64>> {
+    let body = message.content.as_str();
+    let mut ids = Vec::new();
+    let mut offset = 0_usize;
+    while offset < body.len() {
+        let end = (offset + ARCHIVE_CHUNK_BYTES).min(body.len());
+        // 不切断 UTF-8：往前找一个字符边界
+        let mut cut = end;
+        while cut > offset && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut == offset {
+            break;
+        }
+        let piece = &body[offset..cut];
+        let title = format!("{session} · 第 {} 条（超长消息原文）", index + 1);
+        let write = store.upsert(
+            &MemoryDraft {
+                kind: MemoryKind::Summary,
+                title: Some(&title),
+                content: piece,
+                source: Some("compact"),
+                expires_at: None,
+            },
+            None,
+        )?;
+        ids.push(write.id);
+        offset = cut;
+    }
+    Ok(ids)
+}
+
 fn first_lines(text: &str, n: usize) -> String {
     text.lines()
         .map(str::trim)
@@ -882,6 +1260,12 @@ pub struct Outcome {
     pub archived_lines: usize,
     /// 为了腾容量被淘汰的记忆条数（透传 `memory_items`）
     pub evicted: usize,
+    /// 本次用的摘要密度（阶段 2）
+    pub density: Density,
+    /// 摘要降到第几级（1 = 完整，2 关键行，3 只留标题，4 只留 ref_id）
+    pub degradation: u8,
+    /// 被"落库 + 换引用"的单条超长消息数（阶段 2）
+    pub shrunk: usize,
 }
 
 impl Outcome {
@@ -914,6 +1298,14 @@ pub fn compact(
     cfg: &CompactConfig,
     trigger: Trigger,
 ) -> CoreResult<Outcome> {
+    // 阶段 2：先把"单条超长"的消息落库换成 `memory://` 引用——
+    // 这样一条巨长的粘贴不会让 plan 判成 blocked（阶段 1 的遗留问题）。
+    // 密度按**压缩前**的压力挑：压完再看压力就没意义了（永远刚好在阈值附近）
+    let used_before: u32 = messages.iter().map(|message| message.tokens).sum();
+    let (shrunk_messages, shrunk) =
+        shrink_oversized(store, session, messages, cfg).unwrap_or_else(|_| (messages.to_vec(), 0));
+    let messages = shrunk_messages.as_slice();
+
     let plan = plan(messages, cfg, trigger);
     if !plan.applied() {
         return Ok(Outcome {
@@ -922,20 +1314,30 @@ pub fn compact(
             archive_ids: Vec::new(),
             archived_lines: 0,
             evicted: 0,
+            density: Density::Full,
+            degradation: 1,
+            shrunk,
         });
     }
     let compacted = &messages[..plan.cut_index];
     let mut archived_lines = 0_usize;
     let archive_ids =
         archive_originals(store, session, compacted, &mut archived_lines).unwrap_or_default();
-    let summary = summarize(compacted, cfg, &archive_ids, plan.trigger);
+    // 压力越高，摘要越简略（按压缩前的用量算）
+    let density = density_for(used_before, cfg);
+    let summary = summarize_with_density(compacted, cfg, &archive_ids, plan.trigger, density);
+    // 摘要自己也得守预算：超了按 4 级降级往下压
+    let (text, degradation) = fit_summary(&summary, cfg);
     let evicted = 0; // `archive_originals` 内部已按片累计；见下
     Ok(Outcome {
         plan,
-        summary: summary.text,
+        summary: text,
         archive_ids,
         archived_lines,
         evicted,
+        density,
+        degradation,
+        shrunk,
     })
 }
 
@@ -1010,6 +1412,305 @@ mod tests {
             ),
             tokens,
         )
+    }
+
+    // ------------------------------------------------------------------
+    // 阶段 2：dedup / purgeErrors / 3 档密度 / 4 级降级 / 单条超长 / memory:// 找回
+    // ------------------------------------------------------------------
+
+    fn compact_cfg() -> CompactConfig {
+        // 小窗口让压缩真的触发（32k 窗口 → 压力 17_600）
+        CompactConfig {
+            window: 32_000,
+            ..CompactConfig::default()
+        }
+    }
+
+    fn long_history(prefix: &str, count: usize) -> Vec<Message> {
+        (0..count)
+            .map(|index| {
+                msg(
+                    index as i64 + 1,
+                    if index % 2 == 0 { "user" } else { "assistant" },
+                    &format!("{prefix} 第 {index} 轮：我们是云农之窗，在校内做课表与日程。"),
+                    600,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dedup_collapses_identical_messages_into_one_line() {
+        // 先来点别的把上下文撑满，再把重复消息放在**最近**的位置
+        // （更早的意图会被"省略 N 条较早的用户消息"规则挤掉，那样测的就不是 dedup 了）
+        let mut messages = long_history("上下文", 60);
+        for index in 0..10 {
+            messages.push(msg(100 + index, "user", "周三带雨具", 500));
+        }
+        let summary = summarize(&messages, &compact_cfg(), &[], Trigger::Pressure);
+        // 注意：「关键上下文」「下一步」里也会引用最后一条用户消息，所以只数**带重复标记**的那条
+        let hits: Vec<&str> = summary
+            .text
+            .lines()
+            .filter(|line| line.contains("周三带雨具") && line.contains("（重复 10 次）"))
+            .collect();
+        assert_eq!(hits.len(), 1, "10 条重复只留 1 条：{}", summary.text);
+        // 意图段里也不许再出现第二条"周三带雨具"
+        let section_start = summary.text.find("## 主要请求与意图").unwrap();
+        let section_end = summary.text[section_start + 1..]
+            .find("\n## ")
+            .map(|offset| section_start + 1 + offset + 1)
+            .unwrap_or(summary.text.len());
+        let intent_lines = summary.text[section_start..section_end]
+            .lines()
+            .filter(|line| line.contains("周三带雨具"))
+            .count();
+        assert_eq!(
+            intent_lines,
+            1,
+            "意图段只该有一条：{}",
+            &summary.text[section_start..section_end]
+        );
+    }
+
+    #[test]
+    fn purge_errors_keeps_only_the_last_of_a_consecutive_run() {
+        let mut messages = Vec::new();
+        for index in 0..5 {
+            messages.push(msg(
+                index + 1,
+                "tool",
+                &format!("Error: 第 {index} 次重试失败（连接超时）"),
+                300,
+            ));
+        }
+        messages.extend(long_history("背景", 50));
+        let summary = summarize(&messages, &compact_cfg(), &[], Trigger::Pressure);
+        let error_lines: Vec<&str> = summary
+            .text
+            .lines()
+            .filter(|line| line.contains("重试失败"))
+            .collect();
+        assert_eq!(
+            error_lines.len(),
+            1,
+            "连续 5 条错误只留 1 条：{}",
+            summary.text
+        );
+        assert!(
+            error_lines[0].contains("第 4 次"),
+            "留下的是**最后**一条：{}",
+            error_lines[0]
+        );
+    }
+
+    #[test]
+    fn identical_consecutive_errors_also_collapse_to_one() {
+        let mut messages = Vec::new();
+        for index in 0..5 {
+            messages.push(msg(index + 1, "tool", "Error: 429 Too Many Requests", 300));
+        }
+        messages.extend(long_history("背景", 50));
+        let summary = summarize(&messages, &compact_cfg(), &[], Trigger::Pressure);
+        let error_lines: Vec<&str> = summary
+            .text
+            .lines()
+            .filter(|line| line.contains("429"))
+            .collect();
+        assert_eq!(error_lines.len(), 1, "{}", summary.text);
+        assert!(
+            error_lines[0].contains("（重复 5 次）"),
+            "{}",
+            error_lines[0]
+        );
+    }
+
+    #[test]
+    fn three_densities_produce_different_verbosity() {
+        let messages = long_history("密度", 80);
+        let cfg = compact_cfg();
+        let full = summarize_with_density(
+            &messages,
+            &cfg,
+            &[1, 2, 3],
+            Trigger::Pressure,
+            Density::Full,
+        );
+        let compact = summarize_with_density(
+            &messages,
+            &cfg,
+            &[1, 2, 3],
+            Trigger::Pressure,
+            Density::Compact,
+        );
+        let terse = summarize_with_density(
+            &messages,
+            &cfg,
+            &[1, 2, 3],
+            Trigger::Pressure,
+            Density::Terse,
+        );
+        assert!(
+            full.tokens() > compact.tokens(),
+            "full({}) 应比 compact({}) 长",
+            full.tokens(),
+            compact.tokens()
+        );
+        assert!(
+            compact.tokens() > terse.tokens(),
+            "compact({}) 应比 terse({}) 长",
+            compact.tokens(),
+            terse.tokens()
+        );
+        // 可复现：同样输入同样密度，两次逐字节相同
+        let again = summarize_with_density(
+            &messages,
+            &cfg,
+            &[1, 2, 3],
+            Trigger::Pressure,
+            Density::Terse,
+        );
+        assert_eq!(terse.text, again.text, "同输入同密度必须逐字节相同");
+    }
+
+    #[test]
+    fn density_follows_pressure() {
+        let cfg = compact_cfg();
+        let pressure = pressure_tokens(&cfg);
+        assert_eq!(density_for(pressure, &cfg), Density::Full);
+        assert_eq!(
+            density_for((pressure as f32 * 1.2) as u32, &cfg),
+            Density::Compact
+        );
+        assert_eq!(
+            density_for((pressure as f32 * 2.0) as u32, &cfg),
+            Density::Terse
+        );
+    }
+
+    #[test]
+    fn degradation_ladder_shrinks_the_summary_to_budget() {
+        let messages = long_history("降级", 80);
+        let cfg = compact_cfg();
+        let summary =
+            summarize_with_density(&messages, &cfg, &[7], Trigger::Pressure, Density::Full);
+        // 逐级往下：token 数必须不增
+        let level2 = degrade(&summary, 2);
+        let level3 = degrade(&summary, 3);
+        let level4 = degrade(&summary, 4);
+        let sizes = [
+            summary.tokens(),
+            estimate_tokens(&level2),
+            estimate_tokens(&level3),
+            estimate_tokens(&level4),
+        ];
+        assert!(
+            sizes.windows(2).all(|pair| pair[0] >= pair[1]),
+            "降级必须越降越小：{sizes:?}"
+        );
+        assert!(sizes[3] < sizes[0], "第 4 级要比完整摘要小：{sizes:?}");
+        // 第 4 级只留 ref_id
+        assert!(level4.contains("memory://7"), "第 4 级要留引用：{level4}");
+        assert!(level4.contains("第 4 级"), "{level4}");
+        assert!(!level4.contains("## "), "第 4 级不该再有段头：{level4}");
+
+        // 预算给得极小：fit_summary 必然降级（level ≥ 2）
+        let tiny = CompactConfig {
+            max_summary_tokens: 1,
+            ..cfg
+        };
+        let (text, level) = fit_summary(&summary, &tiny);
+        assert!(level >= 2, "预算 1 token 时不该还是完整摘要：{level}");
+        assert!(estimate_tokens(&text) < summary.tokens(), "降级后必须更小");
+
+        // 预算够大：保持第 1 级
+        let (unchanged, level) = fit_summary(&summary, &cfg);
+        assert_eq!(level, 1);
+        assert_eq!(unchanged, summary.text);
+    }
+
+    #[test]
+    fn overlong_message_is_archived_and_retrievable() {
+        let mut store = MemoryItemStore::open_in_memory().unwrap();
+        let cfg = compact_cfg();
+        // 40 000 字 ≈ 40k token > 窗口一半（16k）：必须被"落库换引用"
+        let huge: String = "长".repeat(40_000);
+        let mut messages = long_history("前置", 40);
+        messages.push(msg(999, "user", &huge, 40_000));
+        messages.extend(long_history("后置", 20));
+
+        let outcome = compact(&mut store, "s1", &messages, &cfg, Trigger::Pressure).unwrap();
+        assert!(
+            !outcome.plan.blocked,
+            "单条超长不该把压缩卡死：{:?}",
+            outcome.plan
+        );
+        assert_eq!(outcome.shrunk, 1, "应有 1 条被落库换引用");
+
+        // 压缩后的历史里，那条巨大的内容已经被替换成 memory://
+        let (shrunk_messages, count) = shrink_oversized(&mut store, "s1", &messages, &cfg).unwrap();
+        assert_eq!(count, 1);
+        let replaced = shrunk_messages.iter().find(|m| m.id == 999).unwrap();
+        assert!(
+            replaced.content.starts_with("memory://"),
+            "{}",
+            replaced.content
+        );
+        assert!(replaced.content.contains("前 500 字预览"));
+        assert_eq!(replaced.tokens, estimate_tokens(&replaced.content));
+
+        // 原文能完整取回：40k 汉字 ≈ 120KB，会被切成多片，按顺序拼回来必须**逐字节一致**
+        let refs = crate::memory_ref::parse_refs(&replaced.content);
+        assert!(!refs.is_empty(), "{}", replaced.content);
+        let pieces = crate::memory_ref::expand_text(&store, &replaced.content).unwrap();
+        let restored: String = pieces.iter().map(|piece| piece.content.as_str()).collect();
+        assert_eq!(restored, huge, "取回的原文必须与压缩前逐字节一致");
+    }
+
+    #[test]
+    fn archived_originals_are_retrievable_via_memory_refs() {
+        let mut store = MemoryItemStore::open_in_memory().unwrap();
+        let cfg = compact_cfg();
+        let mut messages = long_history("找回", 90);
+        messages.push(msg(777, "user", "记住：宿舍楼 3 栋 502", 600));
+        messages.extend(long_history("收尾", 20));
+
+        let outcome = compact(&mut store, "s1", &messages, &cfg, Trigger::Pressure).unwrap();
+        assert!(outcome.applied(), "{:?}", outcome.plan);
+        assert!(!outcome.archive_ids.is_empty(), "原文应该落库了");
+
+        // 摘要里写了引用；按引用能取回原文
+        let refs = crate::memory_ref::parse_refs(&outcome.summary);
+        assert!(
+            !refs.is_empty(),
+            "摘要里应有 memory:// 引用：{}",
+            outcome.summary
+        );
+        let restored = crate::memory_ref::expand(&store, refs[0]).unwrap().unwrap();
+        assert!(
+            restored.content.contains("宿舍楼 3 栋 502"),
+            "取回内容应含被压原文：{}",
+            &restored.content[..restored.content.len().min(200)]
+        );
+
+        // 换个方向：按关键词检索也能找到
+        let hits = crate::memory_ref::search_refs(&store, "宿舍楼", 5).unwrap();
+        assert!(!hits.is_empty(), "检索应命中压缩摘要");
+        assert!(hits[0].snippet.contains("宿舍楼"));
+    }
+
+    #[test]
+    fn compaction_stays_byte_identical_across_runs() {
+        let cfg = compact_cfg();
+        let messages = long_history("稳定", 90);
+        let mut store_a = MemoryItemStore::open_in_memory().unwrap();
+        let mut store_b = MemoryItemStore::open_in_memory().unwrap();
+        let first = compact(&mut store_a, "s1", &messages, &cfg, Trigger::Pressure).unwrap();
+        let second = compact(&mut store_b, "s1", &messages, &cfg, Trigger::Pressure).unwrap();
+        assert_eq!(first.summary, second.summary, "两次压缩摘要必须逐字节相同");
+        assert_eq!(first.archive_ids, second.archive_ids);
+        assert_eq!(first.density, second.density);
+        assert_eq!(first.degradation, second.degradation);
     }
 
     // ------------------------------------------------------------------
