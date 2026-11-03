@@ -709,12 +709,11 @@ class ChatPageState extends State<ChatPage> {
           ),
         Expanded(
           child: _bubbles.isEmpty
-              ? Center(
-                  child: Text(
-                    '问点什么吧——课表、成绩、校园生活都行',
-                    style: theme.textTheme.bodySmall
-                        ?.copyWith(color: theme.hintColor),
-                  ),
+              ? _EmptyState(
+                  onPick: (String text) {
+                    _input.text = text;
+                    _input.selection = TextSelection.collapsed(offset: text.length);
+                  },
                 )
               : ListView.builder(
                   controller: _scroll,
@@ -784,6 +783,140 @@ class ChatPageState extends State<ChatPage> {
 }
 
 /// 一条消息气泡（中性：用主题语义色，不写死颜色）。
+/// 空态编排（A/C 共用）：
+/// A 学 ChatGPT——居中问候 + 建议 chip + 状态行（"简约但不单调"的全部秘密）；
+/// C 学 Anthropic——overline 标签 + 38px 衬线大标题 + 深色引文块（明暗交替制造章节感）。
+class _EmptyState extends StatelessWidget {
+  const _EmptyState({required this.onPick});
+
+  final ValueChanged<String> onPick;
+
+  static const List<String> _suggestions = <String>[
+    '第 8 周哪天最累？',
+    '把课表导出成日历',
+    '这门课的考核方式',
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final YunongTokens t = context.tokens;
+    final bool book = t.bookLayout;
+
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 560),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: <Widget>[
+              if (book)
+                Text(
+                  '本地优先 · 数据不出电脑',
+                  style: theme.textTheme.labelSmall?.copyWith(color: t.inkSoft),
+                ),
+              if (book) const SizedBox(height: 14),
+              Text(
+                '今天想从哪儿开始？',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.displaySmall,
+              ),
+              const SizedBox(height: 10),
+              Text(
+                '问点什么吧——课表、成绩、校园生活都行。',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodyMedium?.copyWith(color: t.inkSoft),
+              ),
+              const SizedBox(height: 22),
+              Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 8,
+                runSpacing: 8,
+                children: <Widget>[
+                  for (final String text in _suggestions)
+                    _SuggestionChip(label: text, onTap: () => onPick(text)),
+                ],
+              ),
+              if (book) ...<Widget>[
+                const SizedBox(height: 26),
+                // 深色引文块：Anthropic 的"章节"靠明暗交替，不靠装饰
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.fromLTRB(22, 18, 22, 18),
+                  decoration: BoxDecoration(
+                    color: t.ink,
+                    borderRadius: BorderRadius.circular(t.radiusL),
+                  ),
+                  child: Text(
+                    '选课不是"选更重要的那门"，而是"选损失更小的那门"。',
+                    // 不覆盖字体/字重：直接继承 titleMedium（主题已配好衬线 + 中文回退）
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      color: t.canvas,
+                      height: 1.5,
+                    ),
+                  ),
+                ),
+              ],
+              if (!book) ...<Widget>[
+                const SizedBox(height: 20),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF10A37F),
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      '课表已同步 · 数据只在这台电脑上',
+                      style: theme.textTheme.bodySmall?.copyWith(color: t.inkSoft),
+                    ),
+                  ],
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 建议 chip：环形阴影（不占布局）而不是边框。
+class _SuggestionChip extends StatelessWidget {
+  const _SuggestionChip({required this.label, required this.onTap});
+
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final YunongTokens t = context.tokens;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(999),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 7),
+          decoration: BoxDecoration(
+            color: t.surface,
+            borderRadius: BorderRadius.circular(999),
+            boxShadow: ringShadow(t.hairline),
+          ),
+          child: Text(label, style: Theme.of(context).textTheme.bodySmall),
+        ),
+      ),
+    );
+  }
+}
+
 class _MessageBubble extends StatelessWidget {
   const _MessageBubble({required this.bubble});
 

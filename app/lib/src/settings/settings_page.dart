@@ -347,11 +347,11 @@ class _Group extends StatelessWidget {
             ),
           ),
           Container(
+            // 环形阴影代替边框（不占布局、随圆角走）
             decoration: BoxDecoration(
               color: t.surface,
               borderRadius: BorderRadius.circular(t.radiusL),
-              border: Border.all(color: t.hairline, width: t.borderWidth),
-              boxShadow: t.shadowPanel,
+              boxShadow: <BoxShadow>[...t.shadowPanel, ...ringShadow(t.hairline)],
             ),
             child: Column(
               children: <Widget>[
