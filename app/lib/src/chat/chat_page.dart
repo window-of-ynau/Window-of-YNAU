@@ -12,6 +12,7 @@ import 'package:flutter/services.dart';
 import '../theme/glass_panel.dart';
 import '../theme/yunong_tokens.dart';
 
+import '../core/app_paths.dart';
 import '../core/chat_service.dart';
 import '../core/local_search_service.dart';
 import '../core/memory_service.dart';
@@ -211,7 +212,9 @@ class _ChatPageState extends State<ChatPage> {
       // BYOK：只传 key 名，明文由 Rust 从安全存储取（Dart 不见明文）
       baseUrl: _settings.baseUrl,
       secretKey: _channel == 'byok' ? SecretService.byokKeyName : null,
-      dataDir: widget.dbPath,
+      // Rust 侧把 data_dir 当**目录**用（secrets 子目录）：必须传目录，不能传 .db 文件路径，
+      // 否则 set_secret（按 db_path 的父目录）与 chat（按 data_dir）各看一个目录 → 读不到 Key（t54 之后的新根因）。
+      dataDir: _dataDir,
       cloudToken: _settings.cloudToken,
     );
 
@@ -449,6 +452,9 @@ class _ChatPageState extends State<ChatPage> {
       _showError('保存失败：端侧核心不可用');
     }
   }
+  /// 端侧数据**目录**（Rust `data_dir`）：由 `AppPaths.dataDirOf` 统一推导。
+  String get _dataDir => AppPaths.dataDirOf(widget.dbPath);
+
   Future<void> _deleteKey() async {
     try {
       await _secrets.delete(SecretService.byokKeyName);
@@ -932,7 +938,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
               decoration: const InputDecoration(
                 labelText: 'BYOK API Key',
                 hintText: 'sk-…',
-                helperText: '只保存在本机；不会显示在界面上，也不进日志',
+                helperText: '填到域名即可，带不带 /v1 都行；只保存在本机，不回显、不进日志',
               ),
             ),
             const SizedBox(height: 12),
