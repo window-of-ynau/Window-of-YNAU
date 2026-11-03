@@ -402,16 +402,24 @@ void main() {
       }
     });
 
-    testWidgets('建议 chip 贴着输入框（空态时位于输入框上方）', (WidgetTester tester) async {
+    testWidgets('空态整簇在内容区垂直居中（不再贴底）', (WidgetTester tester) async {
       await tester.binding.setSurfaceSize(const Size(1100, 760));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       final ThemeController controller = ThemeController();
       await tester.pumpWidget(YunongApp(themeController: controller));
       await tester.pumpAndSettle();
-      final double chipY = tester.getCenter(find.text('第 8 周哪天最累？')).dy;
-      final double inputY = tester.getCenter(find.byType(TextField).last).dy;
-      expect(chipY, lessThan(inputY), reason: 'chip 应在输入框上方');
-      expect(inputY - chipY, lessThan(160), reason: 'chip 必须贴近输入框，而不是浮在页面中央');
+
+      // 整簇 = 问候语上沿 → chip 下沿；内容区 = 提示条以下 → 输入框以上
+      final double clusterTop = tester.getTopLeft(find.text('今天想从哪儿开始？')).dy;
+      final double clusterBottom = tester.getBottomLeft(find.text('这学期一共几门课？')).dy;
+      final double clusterCenter = (clusterTop + clusterBottom) / 2;
+
+      final double areaTop = tester.getBottomLeft(find.textContaining('未配置联网搜索')).dy;
+      final double areaBottom = tester.getTopLeft(find.byType(TextField).last).dy;
+      final double areaCenter = (areaTop + areaBottom) / 2;
+
+      expect((clusterCenter - areaCenter).abs(), lessThan(60),
+          reason: '整簇应垂直居中于内容区（偏差 <60px），实际 ${(clusterCenter - areaCenter).abs().toStringAsFixed(1)}px');
     });
 
     test('环形阴影是 spreadRadius=1 / blurRadius=0（不是 Border）', () {
