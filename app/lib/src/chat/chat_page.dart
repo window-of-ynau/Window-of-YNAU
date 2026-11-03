@@ -72,16 +72,29 @@ class ChatPage extends StatefulWidget {
   final String dbPath;
 
   @override
-  State<ChatPage> createState() => _ChatPageState();
+  State<ChatPage> createState() => ChatPageState();
 }
 
-class _ChatPageState extends State<ChatPage> {
+/// 公开（而非 `_`）只为 `@visibleForTesting` 的 getter 能被测试读取。
+class ChatPageState extends State<ChatPage> {
   late final ChatService _service = widget.service ?? ChatService();
   late final ChatSettings _settings =
       widget.settings ?? widget.chatSettings?.settings ?? ChatSettings();
   late final SecretService _secrets =
       widget.secretService ?? SecretService(dbPath: widget.dbPath);
   SecretStatus _keyStatus = const SecretStatus(set: false, masked: '');
+  /// 最近一次「取 Key 状态」失败的原因（诊断可观测；为空 = 没失败过）。
+  String? _keyStatusError;
+
+  /// 测试用：当前 Key 状态文案（`未设置` / 打码串）。
+  ///
+  /// 不走 Tooltip 断言——前三次失败都是读错了 Tooltip（另一个控件或 offstage 文案）。
+  @visibleForTesting
+  String get keyStatusLabel => _keyStatus.display;
+
+  /// 测试用：最近一次取 Key 状态失败的原因（正常时应为空）。
+  @visibleForTesting
+  String? get keyStatusError => _keyStatusError;
   late final AuthService _auth = widget.authService ?? AuthService();
   late final SearchService _search =
       widget.searchService ?? SearchService(dbPath: widget.dbPath);
@@ -115,6 +128,8 @@ class _ChatPageState extends State<ChatPage> {
   void initState() {
     super.initState();
     _channel = _settings.channel;
+    // 共享设置源变化（例如在设置页保存了 Key）→ 立即刷新本页状态
+    widget.chatSettings?.addListener(_onSharedSettingsChanged);
     unawaited(_refreshKeyStatus());
     unawaited(_refreshSearchStatus());
   }
@@ -380,7 +395,8 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _showDiagnostics() async {
     final diag = _diagnostics;
     final keyLine =
-        'key=`${_keyStatus.masked.isEmpty ? '未设置' : _keyStatus.masked} | protocol=`${_settings.protocol}';
+        'key=`${_keyStatus.masked.isEmpty ? '未设置' : _keyStatus.masked} | protocol=`${_settings.protocol}'
+        ' | key_status_error=`${_keyStatusError ?? ''}';
     final text = keyLine + '\n' + (diag == null ? '还没有发起过对话' : diag.toClipboardText());
     if (!mounted) {
       return;
@@ -488,11 +504,11 @@ class _ChatPageState extends State<ChatPage> {
       if (mounted) {
         setState(() => _error = failure.userHint);
       }
-    } on Object {
-      // 核心库不可用（例如 widget 测试环境没有 DLL）：保持“未设置”，不打扰用户
-      if (mounted) {
-        setState(() => _keyStatus = const SecretStatus(set: false, masked: ''));
-      }
+    } on Object catch (failure) {
+      // 读取失败**不再重置为“未设置”**（那会把用户的“已配置”抹掉、连带禁用发送），
+      // 保留上一次的已知状态，只把原因记录到诊断里。
+      _keyStatusError = '${failure.runtimeType}: $failure';
+      debugPrint('[chat] key status refresh failed: $_keyStatusError');
     }
   }
 
