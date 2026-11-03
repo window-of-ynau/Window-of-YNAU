@@ -304,7 +304,8 @@ jobs:
       - name: 上传安装包与校验和
         uses: actions/upload-artifact@v7
         with:
-          name: yunong-windows-setup-${{ github.ref_name }}
+          # 不能直接用 ref_name：分支名带 / 时 artifact 名非法（干跑会红）
+          name: yunong-windows-setup-${{ github.run_number }}
           path: |
             dist/*.exe
             dist/SHA256SUMS
