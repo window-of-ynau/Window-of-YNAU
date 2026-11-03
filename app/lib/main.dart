@@ -13,6 +13,7 @@ import 'src/campus/campus_entries.dart';
 import 'src/campus/timetable_page.dart';
 import 'src/core/app_paths.dart';
 import 'src/core/titlebar_service.dart';
+import 'src/chat/chat_settings_section.dart';
 import 'src/theme/file_settings_store.dart';
 import 'src/chat/chat_page.dart';
 import 'src/campus/webview_fetcher.dart';
@@ -205,16 +206,19 @@ class _HomeShellState extends State<HomeShell> {
         ),
       ),
       body: destination == null
-          ? const _ChatPane()
+          ? _ChatPane(chatSettings: _chatSettings)
           : _CampusPane(entry: destination),
     );
   }
+
+  /// 对话设置与设置页**共享**同一个状态源（t86：一处改，两处立即见）
+  late final ChatSettingsController _chatSettings = ChatSettingsController();
 
   void _openSettings() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (BuildContext context) =>
-            SettingsPage(controller: widget.themeController),
+            SettingsPage(controller: widget.themeController, chatSettings: _chatSettings),
       ),
     );
   }
@@ -227,10 +231,13 @@ class _HomeShellState extends State<HomeShell> {
 
 /// 对话主区：真正的流式对话（`ChatPage`）。
 class _ChatPane extends StatelessWidget {
-  const _ChatPane();
+  const _ChatPane({required this.chatSettings});
+
+  final ChatSettingsController chatSettings;
 
   @override
-  Widget build(BuildContext context) => ChatPage(dbPath: AppPaths.databasePath);
+  Widget build(BuildContext context) =>
+      ChatPage(dbPath: AppPaths.databasePath, chatSettings: chatSettings);
 }
 
 /// 校务入口（后续替换为真实 WebView；Cookie 只留在本机，ADR-11）。

@@ -7,6 +7,8 @@
 
 import 'package:flutter/material.dart';
 
+import '../chat/chat_settings_section.dart';
+
 import '../theme/theme_controller.dart';
 import '../theme/glass_panel.dart';
 import '../theme/themes.dart';
@@ -14,9 +16,12 @@ import '../theme/yunong_tokens.dart';
 
 class SettingsPage extends StatelessWidget {
   const SettingsPage(
-      {super.key, required this.controller, this.version = '0.9.0（W2b）'});
+      {super.key, required this.controller, this.chatSettings, this.version = '0.9.0（W2b）'});
 
   final ThemeController controller;
+
+  /// 对话设置的共享状态源（与对话页同一实例）：本页改了对话页立即生效
+  final ChatSettingsController? chatSettings;
   final String version;
 
   @override
@@ -40,7 +45,35 @@ class SettingsPage extends StatelessWidget {
           body: ListView(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
             children: <Widget>[
-              _Group(
+              // t86：对话设置收进**同一个**设置页（owner：不要两个设置面板）
+              if (chatSettings != null)
+                _Group(
+                  title: '对话',
+                  children: <Widget>[
+                    InkWell(
+                      onTap: () => openChatSettingsDialog(context, chatSettings!),
+                      child: const _Row(
+                        icon: Icons.chat_bubble_outline,
+                        title: '对话设置',
+                        subtitle: '通道 / 模型 / 协议 / Key / 令牌',
+                        trailing: const Icon(Icons.chevron_right, size: 18),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                      child: ListenableBuilder(
+                        listenable: chatSettings!,
+                        builder: (BuildContext context, Widget? _) => Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(
+                            chatSettings!.summary,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),              _Group(
                 title: '外观',
                 children: <Widget>[
                   Padding(
@@ -359,5 +392,21 @@ class _Row extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+/// t86：从设置页打开对话设置（与对话页共享同一个 controller，保存即同步）。
+Future<void> openChatSettingsDialog(
+    BuildContext context, ChatSettingsController controller) async {
+  final ChatSettings? result = await showDialog<ChatSettings>(
+    context: context,
+    builder: (BuildContext context) => ChatSettingsSection(
+      settings: controller.settings,
+      searchLabel: '（在对话页查看）',
+      searchHint: '',
+    ),
+  );
+  if (result != null) {
+    controller.apply(result);
   }
 }

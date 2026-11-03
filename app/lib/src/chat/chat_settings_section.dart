@@ -194,3 +194,41 @@ class _ChatSettingsSectionState extends State<ChatSettingsSection> {
     );
   }
 }
+
+/// 对话设置的**共享状态源**（t86）：设置页与对话页用同一个实例，
+/// 避免“设置页改了、对话页没变”。
+class ChatSettingsController extends ChangeNotifier {
+  ChatSettingsController({ChatSettings? initial}) : settings = initial ?? ChatSettings();
+
+  final ChatSettings settings;
+
+  /// 摘要（设置页卡片用）：通道 / 模型 / 协议。
+  String get summary {
+    final String channelLabel = settings.channel == 'cloud' ? '套餐通道' : 'BYOK 直连';
+    return '通道：$channelLabel · 模型：${settings.model} · 协议：${protocolLabel(settings.protocol)}';
+  }
+
+  static String protocolLabel(String protocol) {
+    switch (protocol) {
+      case 'openai_responses':
+        return 'OpenAI Responses';
+      case 'anthropic_messages':
+        return 'Anthropic Messages';
+      default:
+        return 'OpenAI Completions';
+    }
+  }
+
+  /// 保存后合并新值并通知两处刷新。
+  void apply(ChatSettings next) {
+    settings
+      ..channel = next.channel
+      ..providerId = next.providerId
+      ..baseUrl = next.baseUrl
+      ..byokKey = next.byokKey
+      ..cloudToken = next.cloudToken
+      ..model = next.model
+      ..protocol = next.protocol;
+    notifyListeners();
+  }
+}
