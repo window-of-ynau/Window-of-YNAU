@@ -144,8 +144,11 @@ class _ChatPageState extends State<ChatPage> {
   /// - 其它：未选择通道。
   ({bool ready, String reason, String code}) get _channelState {
     if (_channel == 'byok') {
-      if (_keyStatus.set) {
+      if (_keyStatus.usable) {
         return (ready: true, reason: '', code: '');
+      }
+      if (_keyStatus.broken) {
+        return (ready: false, reason: '本地凭据已损坏，请重新填写 Key', code: 'SECRET_BROKEN');
       }
       return (ready: false, reason: '未设置 API Key：点右上角设置填入', code: 'MISSING_API_KEY');
     }
@@ -379,6 +382,10 @@ class _ChatPageState extends State<ChatPage> {
       if (mounted) {
         setState(() => _localHits = hits);
       }
+    } on SearchQueryTooLong catch (tooLong) {
+      if (mounted) {
+        setState(() => _localError = tooLong.userHint);
+      }
     } on LocalSearchUnavailable catch (unavailable) {
       if (mounted) {
         setState(() => _localError = unavailable.userHint);
@@ -432,6 +439,9 @@ class _ChatPageState extends State<ChatPage> {
       final status = await _secrets.status(SecretService.byokKeyName);
       if (mounted) {
         setState(() => _keyStatus = status);
+      }
+      if (status.broken) {
+        _showError('本地凭据已损坏，请重新填写 Key');
       }
     } on SecretException catch (failure) {
       if (mounted) {
