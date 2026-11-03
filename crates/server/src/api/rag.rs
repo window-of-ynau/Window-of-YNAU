@@ -19,8 +19,11 @@ use crate::auth::Principal;
 use crate::rag::{parse_hash, RagError, ReferralItem};
 use crate::state::AppState;
 
-/// 单条 `count` 的上限：防止用"一条 10 亿"把聚合数打爆。
-const MAX_COUNT_PER_ITEM: u32 = 10_000;
+/// 单条 `count` 的上限（R5-F1：从 10_000 收到 100）。
+///
+/// 真实用户一个月引用同一篇文档超过 100 次几乎不可能；配合"月配额按 count 总和算"
+/// 与库侧 `LEAST(..., 100_000)`，一次请求再也无法把某个 hash 顶到霸榜位置。
+const MAX_COUNT_PER_ITEM: u32 = 100;
 
 #[derive(Debug, Serialize)]
 struct SaltBody {
@@ -109,11 +112,21 @@ pub async fn referrals(
             count: item.count,
         });
     }
-    let item_count = items.len();
+    // 单次条数上限（与 count 总和上限是两件事）
+    if items.len() > state.rag.max_items_per_request() {
+        return Err(AppError::new(
+            ErrorCode::ValidationError,
+            format!("单次最多 {} 条", state.rag.max_items_per_request()),
+            &req_id.0,
+        ));
+    }
+
+    // R5-F1：配额按 **count 总和** 算，不按条数
+    let total_count: u32 = items.iter().map(|item| item.count).sum();
 
     state
         .rag
-        .check_quota(&request.month, &client.0, item_count)
+        .check_quota(&request.month, &client.0, total_count)
         .map_err(|error| {
             // 配额拒绝也要留审计（否则无法解释"为什么这条客户端被限"）
             if let RagError::MonthlyQuota { limit } = error {
@@ -121,7 +134,9 @@ pub async fn referrals(
                     principal.user_id,
                     &req_id.0,
                     request.month.clone(),
-                    RagLimit::Monthly { limit },
+                    RagLimit::Monthly {
+                        limit: limit as usize,
+                    },
                 ));
             }
             into_app_error(error, &req_id.0)
@@ -140,6 +155,11 @@ pub async fn referrals(
             ));
             into_app_error(error, &req_id.0)
         })?;
+
+    // R5-F8：**先落库成功、再记配额**（`record` 内部是事务，失败即回滚且不扣额度）
+    state
+        .rag
+        .commit_quota(&request.month, &client.0, total_count);
 
     // 审计**只记条数与月份**：不记 hash（否则审计日志就成了浏览记录）
     state

@@ -73,6 +73,34 @@ fn bounded_key(key: &str) -> String {
     format!("sha256:{digest:x}")
 }
 
+/// 淘汰策略（R2-F4 的限流桶与 R5-F4 的 RAG 配额共用，**只有这一份实现**）。
+///
+/// 优先淘汰"未回满/未用满"的条目；全都是惩罚/用满状态时，才退化为淘汰最旧的一条。
+/// 为什么不能按最旧直接淘汰：攻击者只要灌新键，就能把受害者正在冷却的桶挤掉、
+/// 使其额度立刻重置（R2-F4 与 R5-F4 是同一个洞）。
+pub fn evict_oldest_unexhausted<K, V>(
+    map: &mut std::collections::HashMap<K, V>,
+    is_exhausted: impl Fn(&V) -> bool,
+    updated_at: impl Fn(&V) -> std::time::Instant,
+) -> bool
+where
+    K: Clone + std::cmp::Eq + std::hash::Hash,
+{
+    let victim = map
+        .iter()
+        .filter(|(_, value)| !is_exhausted(value))
+        .min_by_key(|(_, value)| updated_at(value))
+        .or_else(|| map.iter().min_by_key(|(_, value)| updated_at(value)))
+        .map(|(key, _)| key.clone());
+    match victim {
+        Some(victim) => {
+            map.remove(&victim);
+            true
+        }
+        None => false,
+    }
+}
+
 /// 一个令牌桶。
 #[derive(Debug)]
 struct Bucket {
@@ -143,15 +171,13 @@ impl AuthLimiter {
         // 打到 429 之后灌 1024 个新键，就能把这个账号的惩罚桶挤掉、额度立刻重置
         // （2000 个新邮箱 ≈ 1.5s 一次，成本极低）。只有整张表都是惩罚桶时才动它们。
         if buckets.len() >= MAX_BUCKETS && !buckets.contains_key(&(route, key.clone())) {
-            let victim = buckets
-                .iter()
-                .filter(|(_, bucket)| bucket.tokens >= 1.0)
-                .min_by_key(|(_, bucket)| bucket.updated)
-                .or_else(|| buckets.iter().min_by_key(|(_, bucket)| bucket.updated))
-                .map(|(k, _)| k.clone());
-            if let Some(victim) = victim {
-                buckets.remove(&victim);
-            }
+            // 跳过"还没回满"的惩罚桶（R2-F4）——共用实现见 `evict_oldest_unexhausted`。
+            // 注意谓词是 `is_exhausted`：**tokens < 1.0 才算惩罚桶**（极性别反）。
+            evict_oldest_unexhausted(
+                &mut buckets,
+                |bucket| bucket.tokens < 1.0,
+                |bucket| bucket.updated,
+            );
         }
 
         let burst = f64::from(limit.max(1));
