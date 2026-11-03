@@ -50,6 +50,13 @@ abstract class LocalSearchBackend {
   });
 }
 
+/// 查询过长（上限 512 字符）：显式报错，不静默返回空。
+class SearchQueryTooLong implements Exception {
+  const SearchQueryTooLong();
+
+  String get userHint => '查询过长（最多 512 字符），请精简后再搜';
+}
+
 /// 本地搜索还没就绪（符号未合入 / 核心库不可用）。
 class LocalSearchUnavailable implements Exception {
   const LocalSearchUnavailable(this.reason);
@@ -140,6 +147,9 @@ class LocalSearchService {
     final trimmed = query.trim();
     if (trimmed.isEmpty) {
       return const <LocalSearchHit>[];
+    }
+    if (trimmed.runes.length > 512) {
+      throw const SearchQueryTooLong();
     }
     final hits = _resolve().search(query: trimmed, limit: limit, dbPath: _dbPath);
     return hits.map(LocalSearchHit.fromJson).toList();
