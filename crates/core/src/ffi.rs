@@ -1216,6 +1216,35 @@ pub unsafe extern "C" fn yunong_free_string(ptr: *mut c_char) {
     drop(CString::from_raw(ptr));
 }
 
+/// 让 Windows 原生标题栏跟随 App 主题（深色/浅色）。
+///
+/// ```json
+/// {"ok":true,"data":{"dark":true,"attribute":20,"hwnd":1234567}}
+/// {"ok":false,"code":"UNSUPPORTED","message":"当前平台不支持设置标题栏颜色（仅 Windows）"}
+/// {"ok":false,"code":"NOT_FOUND","message":"没找到云农之窗的窗口（标题栏设置需在窗口创建之后调用）"}
+/// {"ok":false,"code":"DWM_FAILED","message":"设置标题栏颜色失败：…"}
+/// ```
+///
+/// - 属性号先试 **20**（Win10 20H1+ / Win11）再试 **19**（1809~2004），两个都失败才报错；
+/// - **必须在窗口创建之后调用**：启动时调一次 + 用户切主题时再调；
+/// - 非 Windows 返回 `UNSUPPORTED`（不 panic）；找不到窗口返回 `NOT_FOUND`（可重试）。
+///
+/// # Safety
+///
+/// 无指针参数，任何线程调用都安全（内部只做 Win32 调用）。
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn yunong_set_titlebar_dark(dark: i32) -> *mut c_char {
+    respond(|| match crate::titlebar::set_dark(dark != 0) {
+        Ok(report) => ok_json(json!({
+            "dark": report.dark,
+            "attribute": report.attribute,
+            "hwnd": report.hwnd,
+        })),
+        Err(err) => err_json(err.code(), err.message()),
+    })
+}
+
 /// 版本号（用于 Dart 侧确认 DLL 与 app 匹配）。返回静态字符串，**不要** free。
 #[no_mangle]
 pub extern "C" fn yunong_core_version() -> *const c_char {
@@ -2642,6 +2671,36 @@ mod tests {
             .unwrap()
             .to_owned();
         sink.push(text);
+    }
+
+    /// T75：标题栏深色开关——信封形态正确、任何平台都不 panic。
+    #[test]
+    fn set_titlebar_dark_returns_envelope_without_panicking() {
+        let raw = yunong_set_titlebar_dark(1);
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        if cfg!(windows) {
+            if value["ok"] == true {
+                let attribute = value["data"]["attribute"].as_u64().unwrap();
+                assert!(attribute == 20 || attribute == 19, "{value}");
+                assert!(value["data"]["hwnd"].as_u64().unwrap_or(0) > 0, "{value}");
+            } else {
+                let code = value["code"].as_str().unwrap_or_default();
+                assert!(
+                    code == "NOT_FOUND" || code == "DWM_FAILED",
+                    "Windows 上只该是 NOT_FOUND/DWM_FAILED：{value}"
+                );
+            }
+        } else {
+            assert_eq!(value["ok"], false, "{value}");
+            assert_eq!(value["code"], "UNSUPPORTED", "{value}");
+        }
+        // 浅色也调一次（同样不许 panic）
+        let raw = yunong_set_titlebar_dark(0);
+        assert!(!raw.is_null());
+        unsafe { yunong_free_string(raw) };
     }
 
     #[test]
