@@ -48,8 +48,10 @@ SignedUninstaller=no
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 
-[Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; 不加载第三方简体中文 .isl：官方 Inno Setup 6 不附带 ChineseSimplified.isl（社区补丁），
+; 在 CI 里引它会 "Couldn't open include file" 直接失败。向导按钮用默认英文，界面字符串
+; （AppName / 快捷方式 / 卸载提示）本身都是中文，用户感知一致。要全中文向导可自行放入
+; Languages\ChineseSimplified.isl 并在本机 ISCC 里加 [Languages] 段。
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: unchecked
