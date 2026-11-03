@@ -45,6 +45,7 @@ class ChatPage extends StatefulWidget {
     super.key,
     this.service,
     this.settings,
+    this.chatSettings,
     this.secretService,
     this.searchService,
     this.localSearchService,
@@ -56,6 +57,9 @@ class ChatPage extends StatefulWidget {
 
   final ChatService? service;
   final ChatSettings? settings;
+
+  /// 共享状态源（与设置页同一个实例）：设置页改完这里立即生效
+  final ChatSettingsController? chatSettings;
   final SecretService? secretService;
   final SearchService? searchService;
   final LocalSearchService? localSearchService;
@@ -74,7 +78,8 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   late final ChatService _service = widget.service ?? ChatService();
-  late final ChatSettings _settings = widget.settings ?? ChatSettings();
+  late final ChatSettings _settings =
+      widget.settings ?? widget.chatSettings?.settings ?? ChatSettings();
   late final SecretService _secrets =
       widget.secretService ?? SecretService(dbPath: widget.dbPath);
   SecretStatus _keyStatus = const SecretStatus(set: false, masked: '');
