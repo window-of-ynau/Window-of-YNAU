@@ -47,7 +47,12 @@ use time::OffsetDateTime;
 use crate::config::Config;
 use crate::rag::{RagError, RagService};
 
-/// 单条标识的最大长度（规范化之前）。超过就是畸形输入。
+/// 单条标识的最大长度（规范化之前），按 **UTF-8 字节** 计。
+///
+/// ⚠️ 跨语言陷阱（t77 顺带查出来的）：Rust 的 `str::len()` 是 UTF-8 字节数，
+/// 而 Dart 的 `String.length` 是 **UTF-16 码元**数 —— 171 个汉字是 513 字节但只有 171 个码元。
+/// 端侧必须用 `utf8.encode(s).length` 来判这条上限，否则"171 个汉字"在两端会有不同结论。
+/// 向量文件里有一条 513 字节的拒绝用例来钉住这条。
 const MAX_IDENTIFIER_BYTES: usize = 512;
 
 /// 日志里允许出现的哈希前缀长度（**绝不打印完整哈希**）。
@@ -396,7 +401,39 @@ fn truncate_error(message: &str) -> String {
     message.chars().take(200).collect()
 }
 
+/// **固定 ASCII 空白集合**（t77 的跨语言契约）。
+///
+/// 只有这 6 个字符会被裁掉；`U+FEFF`（BOM）、`U+00A0`（NBSP）、`U+2028` 等都**不裁**——
+/// 它们在不同语言的 `trim()` 里行为不一致（Dart 裁、Rust 不裁），正是 t77 的根因。
+const ASCII_WHITESPACE: [char; 6] = [' ', '\t', '\n', '\r', '\x0c', '\x0b'];
+
+/// 只裁 [`ASCII_WHITESPACE`] 里的字符（两端）。
+///
+/// 不能直接用 `str::trim()`：它是 Unicode White_Space 语义，但**不含** U+FEFF；
+/// 而 Dart 的 `String.trim()` **含** U+FEFF —— 两端就此分叉。
+fn trim_ascii_whitespace(raw: &str) -> &str {
+    raw.trim_matches(|ch: char| ASCII_WHITESPACE.contains(&ch))
+}
+
 /// 规范化标识（契约见模块文档）。返回 `None` 表示畸形输入（空 / 超长 / 归一后为空）。
+///
+/// # 规则是 **ASCII-only**，不是 Unicode 语义（t77）
+///
+/// 标识本来就是 URL / DOI / arXiv 这类 ASCII 文本，不需要 Unicode case folding。
+/// 用 Unicode 语义会**跨语言不一致**，实测两类：
+///
+/// - `İ`（U+0130）：Rust 的 `to_lowercase()` 走完整映射 → `i` + U+0307（2 个码点），
+///   Dart 的 `toLowerCase()` → 单个 `i` ⇒ 两端哈希不同；
+/// - U+FEFF（BOM）：Dart 的 `trim()` 把它当空白裁掉，Rust 的 `str::trim()` 不裁
+///   （BOM 不属于 Unicode White_Space）⇒ 粘贴带 BOM 的引用文本就会 0 命中。
+///
+/// 所以这里只做两件**逐字节确定**的事：
+/// 1. 裁**固定 ASCII 空白集合**（空格 / `\t` / `\n` / `\r` / `\x0c` / `\x0b`），
+///    其它任何字符（含 BOM、NBSP、U+2028）都**原样保留**；
+/// 2. 只把 ASCII `A–Z` 转小写（`to_ascii_lowercase`），非 ASCII 字符大小写**不动**；
+/// 3. 不做 NFC/NFKC 归一化、不做 Unicode case folding。
+///
+/// 端侧（Dart）必须实现同一套规则：`String.trim()` 是 Unicode 感知的，**不能直接用它**。
 ///
 /// # ⚠️ 改规则必须先改向量文件
 ///
@@ -411,11 +448,12 @@ fn truncate_error(message: &str) -> String {
 /// 守卫用例 `rag_vectors_match_implementation` 会比对文件与当前实现，改漏了 CI 直接红。
 /// 没有这道闸门时的后果是"服务端 join 永远 0 命中且不报错"——线上静默失效。
 pub fn canonical_identifier(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
+    let trimmed = trim_ascii_whitespace(raw);
     if trimmed.is_empty() || trimmed.len() > MAX_IDENTIFIER_BYTES {
         return None;
     }
-    let mut value = trimmed.to_lowercase();
+    // 只转 ASCII：非 ASCII（İ/Ü/П/全角…）一律原样保留，保证两端逐字节一致
+    let mut value = trimmed.to_ascii_lowercase();
     if let Some(index) = value.find('#') {
         value.truncate(index);
     }
@@ -661,6 +699,101 @@ mod tests {
         assert_eq!(canonical_identifier("#only-fragment"), None);
     }
 
+    /// t77：ASCII 空白才裁，Unicode 空白与 BOM **原样保留**。
+    #[test]
+    fn ascii_only_trimming_keeps_bom_and_nbsp() {
+        // 6 个 ASCII 空白都被裁
+        for raw in [
+            "\thttps://example.com/a\n",
+            "\r\x0c\x0bhttps://example.com/a \t\n",
+        ] {
+            assert_eq!(
+                canonical_identifier(raw).as_deref(),
+                Some("https://example.com/a"),
+                "ASCII 空白应被裁：{raw:?}"
+            );
+        }
+        // BOM / NBSP / U+2028 不是 ASCII 空白 → 必须原样保留
+        for (raw, expected) in [
+            (
+                "\u{feff}https://example.com/z",
+                "\u{feff}https://example.com/z",
+            ),
+            (
+                "https://example.com/z\u{feff}",
+                "https://example.com/z\u{feff}",
+            ),
+            (
+                "\u{00a0}https://example.com/z",
+                "\u{00a0}https://example.com/z",
+            ),
+            (
+                "\u{2028}https://example.com/z",
+                "\u{2028}https://example.com/z",
+            ),
+        ] {
+            assert_eq!(
+                canonical_identifier(raw).as_deref(),
+                Some(expected),
+                "非 ASCII 空白不得被裁（Dart/Rust trim 语义不同，t77）：{raw:?}"
+            );
+        }
+        // 只有 ASCII 空白的输入 → 拒绝
+        assert_eq!(canonical_identifier(" \t\n\r\x0c\x0b "), None);
+        // 只有 BOM 的输入不是"空"（BOM 原样保留）
+        assert_eq!(
+            canonical_identifier("\u{feff}").as_deref(),
+            Some("\u{feff}")
+        );
+    }
+
+    /// t77：只做 ASCII 小写；非 ASCII 字符的大小写与组合形式**一律不动**。
+    #[test]
+    fn ascii_only_lowercasing_keeps_unicode_intact() {
+        let cases = [
+            // U+0130（İ）：Rust to_lowercase() 会产出 i + U+0307，Dart 产出 i —— 都不该发生
+            ("İSTANBUL-Üniversite", "İstanbul-Üniversite"),
+            // 拉丁扩展：Ü 保持大写
+            ("https://example.com/Über", "https://example.com/Über"),
+            // Cyrillic 保持大写
+            ("https://example.com/ПРИВЕТ", "https://example.com/ПРИВЕТ"),
+            // 全角字母不是 ASCII，不做小写
+            ("https://example.com/ＡＢＣ", "https://example.com/ＡＢＣ"),
+            // 组合符原样保留（不做 NFC）
+            (
+                "https://example.com/e\u{0301}",
+                "https://example.com/e\u{0301}",
+            ),
+            // emoji 原样
+            ("https://example.com/🚀", "https://example.com/🚀"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                canonical_identifier(raw).as_deref(),
+                Some(expected),
+                "ASCII-only 规则不对：{raw:?}"
+            );
+        }
+        // 关键：İ 的规范化结果里**不能**出现 U+0307（那是 to_lowercase 的产物）
+        let canonical = canonical_identifier("İSTANBUL").expect("能规范化");
+        assert!(
+            !canonical.contains('\u{0307}'),
+            "出现了 Unicode 分解产物（to_lowercase 的副作用）：{canonical:?}"
+        );
+    }
+
+    /// t77：长度上限按 **UTF-8 字节** 计（不是字符数，也不是 UTF-16 码元数）。
+    #[test]
+    fn identifier_limit_is_utf8_bytes() {
+        // 170 个汉字 = 510 字节 → 通过
+        assert!(canonical_identifier(&"论".repeat(170)).is_some());
+        // 171 个汉字 = 513 字节 → 拒绝（字符数只有 171，按字符算会误放行）
+        assert_eq!(canonical_identifier(&"论".repeat(171)), None);
+        // 512 个 ASCII 字符 = 512 字节 → 通过；513 → 拒绝
+        assert!(canonical_identifier(&"a".repeat(512)).is_some());
+        assert_eq!(canonical_identifier(&"a".repeat(513)), None);
+    }
+
     #[test]
     fn hash_is_stable_and_salt_bound() {
         let canonical = "2401.01234";
@@ -819,10 +952,35 @@ mod rag_vectors_tests {
             "https://site1.example.com/v2",
             // v10 但没有前导数字：不该被当版本号
             "https://example.com/notes/v10",
+            // ——— t77：跨语言 Unicode 语料（规则：**非 ASCII 原样保留**）———
+            // U+0130（İ）：Rust 的 to_lowercase() 会产出 i + U+0307、Dart 的 toLowerCase() 产 i，
+            // 两端就此分叉；ASCII-only 规则下它必须原样保留
+            "İSTANBUL-Üniversite",
+            // U+FEFF（BOM）：Dart 的 trim() 会裁、Rust 的 trim() 不裁 —— 现在两端都不裁
+            "\u{feff}https://example.com/z",
+            "https://example.com/z\u{feff}",
+            // U+00A0（NBSP）：不是 ASCII 空白，不裁
+            "\u{00a0}https://example.com/nbsp\u{00a0}",
+            // U+2028（行分隔符）：同上
+            "\u{2028}https://example.com/ls",
+            // CJK 路径原样
+            "https://example.com/论文",
+            // 拉丁扩展：只做 ASCII 小写，Ü 保持大写
+            "https://example.com/Über",
+            // Cyrillic 保持大写
+            "https://example.com/ПРИВЕТ",
+            // 全角字母不是 ASCII，不做小写
+            "https://example.com/ＡＢＣ",
+            // 组合符：不做 NFC 归一化
+            "https://example.com/e\u{0301}",
+            // emoji 原样
+            "https://example.com/🚀",
+            // U+0130 在路径中间
+            "https://example.com/İstanbul/İ",
         ]
     }
 
-    fn rejected_inputs() -> Vec<&'static str> {
+    fn rejected_inputs() -> Vec<String> {
         vec![
             "",
             "   ",
@@ -831,7 +989,15 @@ mod rag_vectors_tests {
             // 归一后为空
             "#only-fragment",
             "?only-query",
+            // t77：全是 ASCII 空白 → 裁完为空（注意：含 BOM 的输入**不**算空）
+            " \t\n\r\x0c\x0b ",
         ]
+        .into_iter()
+        .map(str::to_owned)
+        // t77：171 个汉字 = 513 UTF-8 **字节**（> 512）但只有 171 个 UTF-16 码元。
+        // 这条用例钉住"上限按字节算"；端侧若用 String.length 会算成 171 而误接受。
+        .chain(std::iter::once("论".repeat(171)))
+        .collect()
     }
 
     fn build_vectors() -> VectorsFile {
@@ -850,13 +1016,15 @@ mod rag_vectors_tests {
             .collect();
         VectorsFile {
             salt: VECTORS_SALT.to_owned(),
-            version: 1,
+            // t77：规则从"Unicode 语义"改为"ASCII-only"，属于**破坏性变更** → 版本号 +1。
+            // 端侧（Dart）必须同步实现 ASCII-only 规则，否则 join 永远 0 命中。
+            version: 2,
             note: "由 crates/server 的 canonical_identifier()/hash_identifier() 生成；\
                    端侧 Flutter 实现必须逐条对齐。改规则请重新生成：\
                    cargo test -p yunong-server rag_vectors -- --ignored"
                 .to_owned(),
             cases,
-            rejects: rejected_inputs().into_iter().map(str::to_owned).collect(),
+            rejects: rejected_inputs(),
         }
     }
 
@@ -944,7 +1112,7 @@ mod rag_vectors_tests {
         // 拒绝清单：实现确实返回 None
         for raw in rejected_inputs() {
             assert_eq!(
-                canonical_identifier(raw),
+                canonical_identifier(&raw),
                 None,
                 "这条应当被拒绝却通过了：{raw:?}"
             );
