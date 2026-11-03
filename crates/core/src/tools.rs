@@ -62,6 +62,88 @@ impl ToolOutcome {
 /// （见 [`crate::tool_loop`]），`Arc<dyn Fn>` 能在不借用整个注册表的前提下克隆一份可调用句柄。
 pub type Handler = Arc<dyn Fn(&serde_json::Value) -> CoreResult<ToolOutcome> + Send + Sync>;
 
+/// 端侧内置工具：对话流里模型可以调用的**真实**能力。
+///
+/// 目前只有两个，因为"能改数据"的工具要非常克制（写错了用户就得手动收拾）：
+///
+/// | 名字 | 作用 | 参数 |
+/// |---|---|---|
+/// | `memory_search` | 搜本地记忆/压缩存档 | `{ "query": "雨伞", "limit": 5 }` |
+/// | `timetable_query` | 查课表 | `{ "week": 8 }`（缺省 = 当前周） |
+///
+/// `db_path` 为空时返回一个**空注册表**——调用方据此走"不带工具"的普通流
+/// （老行为完全不变）。工具返回值是**给人看的一句话 + 结论**，大 JSON 不进对话流
+/// （见 [`crate::tool_events`] 的摘要约束）。
+pub fn builtin_registry(db_path: Option<String>) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    let Some(db_path) = db_path.filter(|path| !path.trim().is_empty()) else {
+        return registry;
+    };
+
+    // 1) 本地记忆检索（复用 BM25 索引）
+    let db_for_memory = db_path.clone();
+    registry.register("memory_search", move |args| {
+        let query = args
+            .get("query")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| CoreError::Invalid("memory_search 需要 query".into()))?;
+        let limit = args
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 20) as usize;
+        let store = crate::local_search::SearchStore::open(&db_for_memory)?;
+        let hits = store.search(query, limit)?;
+        if hits.is_empty() {
+            return Ok(format!("没搜到「{query}」相关的本地记忆"));
+        }
+        let mut out = format!("「{query}」找到 {} 条本地记忆：\n", hits.len());
+        for hit in hits.iter().take(limit) {
+            let title = hit.title.as_deref().unwrap_or("（无标题）");
+            out.push_str(&format!("- {title}：{}\n", hit.snippet));
+        }
+        Ok(out)
+    });
+
+    // 2) 课表查询（读同一个库里的 courses 表）
+    let db_for_schedule = db_path;
+    registry.register("timetable_query", move |args| {
+        let week_hint = args.get("week").and_then(|value| value.as_u64());
+        let store = crate::store::CourseStore::open(&db_for_schedule)?;
+        let terms = store.list_terms()?;
+        let Some(term) = terms.first().map(|record| record.term.clone()) else {
+            return Ok("还没有导入课表：先在课表页导入".to_owned());
+        };
+        let courses = store.list_courses(&term)?;
+        if courses.is_empty() {
+            return Ok(format!("学期 {term} 还没有课程数据"));
+        }
+        let mut out = format!("学期 {term} 共 {} 门课", courses.len());
+        if let Some(week) = week_hint {
+            out.push_str(&format!("（想看第 {week} 周，目前按全学期列出）"));
+        }
+        out.push_str("：\n");
+        for course in courses.iter().take(20) {
+            let room = course.room.as_deref().unwrap_or("地点待定");
+            out.push_str(&format!(
+                "- 周{} 第 {}-{} 节 {}（{}），周次 {}",
+                course.weekday,
+                course.start_period,
+                course.end_period,
+                course.name,
+                room,
+                course.weeks
+            ));
+            out.push('\n');
+        }
+        if courses.len() > 20 {
+            out.push_str(&format!("（还有 {} 门未列出）\n", courses.len() - 20));
+        }
+        Ok(out)
+    });
+    registry
+}
+
 /// 能力白名单：只有注册进来的名字可以被调用。
 #[derive(Default)]
 pub struct ToolRegistry {
