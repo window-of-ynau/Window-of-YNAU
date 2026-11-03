@@ -2733,6 +2733,144 @@ mod tests {
         assert_eq!(yunong_chat_cancel(handle), 1);
     }
 
+    // ---------------------------------------------------------------------
+    // T80：user 指针透传 + 首帧即 meta
+    // ---------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    static USER_CB_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static USER_CB_LAST_USER: AtomicUsize = AtomicUsize::new(0);
+    static USER_CB_FIRST_TYPE: Mutex<Option<String>> = Mutex::new(None);
+    static USER_CB_SECOND_TYPE: Mutex<Option<String>> = Mutex::new(None);
+    static CALLBACK_RETURNED: AtomicBool = AtomicBool::new(false);
+    static FIRST_CB_BEFORE_RETURN: AtomicBool = AtomicBool::new(false);
+
+    fn reset_user_probe() {
+        USER_CB_COUNT.store(0, Ordering::SeqCst);
+        USER_CB_LAST_USER.store(0, Ordering::SeqCst);
+        *USER_CB_FIRST_TYPE.lock().unwrap() = None;
+        *USER_CB_SECOND_TYPE.lock().unwrap() = None;
+        CALLBACK_RETURNED.store(false, Ordering::SeqCst);
+        FIRST_CB_BEFORE_RETURN.store(false, Ordering::SeqCst);
+    }
+
+    /// 记录每次回调收到的 `user`（**只比较，不解引用**），顺带记下前两帧的类型。
+    unsafe extern "C" fn record_user_cb(json: *const c_char, user: *mut std::os::raw::c_void) {
+        let count = USER_CB_COUNT.fetch_add(1, Ordering::SeqCst);
+        USER_CB_LAST_USER.store(user as usize, Ordering::SeqCst);
+        if count == 0 && !CALLBACK_RETURNED.load(Ordering::SeqCst) {
+            FIRST_CB_BEFORE_RETURN.store(true, Ordering::SeqCst);
+        }
+        let text = unsafe { CStr::from_ptr(json) }
+            .to_string_lossy()
+            .into_owned();
+        let kind = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+            value
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
+        match count {
+            0 => *USER_CB_FIRST_TYPE.lock().unwrap() = kind,
+            1 => *USER_CB_SECOND_TYPE.lock().unwrap() = kind,
+            _ => {}
+        }
+    }
+
+    fn byok_request_with_dead_upstream() -> CString {
+        // 上游不可达：正好验证"meta 不等上游就会到"，随后收到 error 帧
+        let request = serde_json::json!({
+            "channel": "byok",
+            "protocol": "openai_completions",
+            "model": "deepseek-chat",
+            "base_url": "http://127.0.0.1:1",
+            "api_key": "sk-test",
+            "messages": [{ "role": "user", "content": "你好" }]
+        });
+        CString::new(request.to_string()).unwrap()
+    }
+
+    fn wait_for_user_callbacks(target: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while USER_CB_COUNT.load(Ordering::SeqCst) < target {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "等回调超时：只收到 {} 次（期望 ≥{target}）",
+                    USER_CB_COUNT.load(Ordering::SeqCst)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// `user` 原样透传 + 首帧即 meta + 竞态测量（一个测试里顺序做，避免并行测试互相踩静态量）。
+    #[test]
+    fn chat_stream_user_pointer_and_early_meta() {
+        // 1) user 必须原样传回每一次回调（Dart 侧拿它当 sink 的键）
+        reset_user_probe();
+        // 一个绝不可能被解引用的哨兵值：回调里只比较，不 deref
+        let sentinel = 0xDEAD_BEEF_usize as *mut std::os::raw::c_void;
+        let request = byok_request_with_dead_upstream();
+        let db = CString::new("").unwrap();
+        let handle = unsafe {
+            yunong_chat_stream(
+                request.as_ptr(),
+                db.as_ptr(),
+                Some(record_user_cb),
+                sentinel,
+            )
+        };
+        assert!(handle > 0, "handle 应该是正整数");
+        CALLBACK_RETURNED.store(true, Ordering::SeqCst);
+        wait_for_user_callbacks(2);
+        assert_eq!(
+            USER_CB_LAST_USER.load(Ordering::SeqCst),
+            sentinel as usize,
+            "回调收到的 user 被改写了（Dart 会因此找不到 sink）"
+        );
+        // 2) 首帧必须是 meta（不等上游），第二帧是 error（不是重复 meta）
+        assert_eq!(
+            USER_CB_FIRST_TYPE.lock().unwrap().as_deref(),
+            Some("meta"),
+            "首帧必须是 meta（Dart 靠它区分'没投递'与'上游慢'）"
+        );
+        assert_eq!(
+            USER_CB_SECOND_TYPE.lock().unwrap().as_deref(),
+            Some("error"),
+            "上游不可达时第二帧应当是 error"
+        );
+        assert_eq!(
+            USER_CB_COUNT.load(Ordering::SeqCst),
+            2,
+            "meta + error，各一条"
+        );
+
+        // 3) 量一下"首帧早于 handle 返回"的竞态幅度（Dart 不能用 handle 做键的直接理由）
+        const ROUNDS: usize = 20;
+        let mut early = 0;
+        for _ in 0..ROUNDS {
+            reset_user_probe();
+            let request = byok_request_with_dead_upstream();
+            let handle = unsafe {
+                yunong_chat_stream(
+                    request.as_ptr(),
+                    db.as_ptr(),
+                    Some(record_user_cb),
+                    sentinel,
+                )
+            };
+            assert!(handle > 0);
+            CALLBACK_RETURNED.store(true, Ordering::SeqCst);
+            if FIRST_CB_BEFORE_RETURN.load(Ordering::SeqCst) {
+                early += 1;
+            }
+            wait_for_user_callbacks(2);
+        }
+        println!("{ROUNDS} 轮里，首帧早于 handle 返回的有 {early} 轮");
+    }
+
     #[test]
     fn chat_stream_rejects_null_arguments_without_spawning() {
         let db = CString::new(":memory:").unwrap();

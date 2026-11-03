@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::Deserialize;
-use yunong_shared::{ChatMessage, ChatRequest, Chunk, ErrorCode, FinishReason, Protocol};
+use yunong_shared::{Channel, ChatMessage, ChatRequest, Chunk, ErrorCode, FinishReason, Protocol};
 
 use crate::gateway::ModelGateway;
 
@@ -226,6 +226,17 @@ impl<F: FnMut(String) -> bool> SendableClosure<F> {
     }
 }
 
+/// 取消之后补一帧终态（`done(stop)`）。
+///
+/// 语义：**本条流已结束**，不代表模型正常说完——客户端自己发起的取消，它自己知道。
+/// 契约里没有 `finish: cancelled`（加它要动 shared），所以用 stop。
+fn emit_terminal_done<F: FnMut(String) -> bool>(callback: &mut SendableClosure<F>) {
+    let terminal = serde_json::to_string(&Chunk::Done {
+        finish: FinishReason::Stop,
+    })
+    .unwrap_or_else(|_| error_chunk_json(ErrorCode::Internal, "序列化失败"));
+    let _ = callback.call(terminal);
+}
 /// 跑一次流：每个 Chunk 交给 `on_chunk`（返回 false = 调用方要求取消）。
 ///
 /// 返回的 `Err` **只表示"没能开始"**（配置错误、运行时没建起来）；一旦开始，
@@ -271,54 +282,86 @@ pub fn run_stream(
         cancelled
     };
 
-    let outcome = match config.channel.as_str() {
-        "cloud" => {
-            let gateway = crate::gateway::CloudProxy::new(
-                config.cloud_base_url.clone().unwrap_or_default(),
-                config.cloud_token.clone().unwrap_or_default(),
-            );
-            runtime.block_on(gateway.chat_stream(&request, &mut |chunk| {
-                if emit(chunk) {
-                    crate::gateway::Flow::Stop
-                } else {
-                    crate::gateway::Flow::Continue
-                }
-            }))
-        }
-        _ => {
-            let gateway = crate::gateway::DirectProvider::new(
-                parse_protocol(&config.protocol),
-                config.base_url.clone().unwrap_or_default(),
-                config.model.clone(),
-            )
-            .with_api_key(api_key.clone());
-            runtime.block_on(gateway.chat_stream(&request, &mut |chunk| {
-                if emit(chunk) {
-                    crate::gateway::Flow::Stop
-                } else {
-                    crate::gateway::Flow::Continue
-                }
-            }))
-        }
+    // T80：流一启动就发一条 `meta`，**不等上游**。
+    //
+    // 这样 Dart 侧立刻能证明"回调通了"，不再把"回调没投递"和"上游慢"混成同一个
+    // `events_received = 0`。之后装配器还会再送一条 meta（带上游的 request_id），
+    // 这里用一个标志位把**后面那条**丢掉，保证契约里"meta 必首且唯一"。
+    let channel = if config.channel.as_str() == "cloud" {
+        Channel::Plan
+    } else {
+        Channel::Byok
+    };
+    let early_request_id = format!("{}_{}", channel.as_str(), uuid::Uuid::new_v4().simple());
+    let meta_cancelled = emit(Chunk::Meta {
+        request_id: early_request_id,
+        model: config.model.clone(),
+        channel,
+    });
+
+    // 首帧（meta）就被要求取消：不联网，直接走下面的终帧逻辑
+    let outcome: Option<crate::error::CoreResult<crate::gateway::StreamOutcome>> = if meta_cancelled
+    {
+        None
+    } else {
+        Some(match config.channel.as_str() {
+            "cloud" => {
+                let gateway = crate::gateway::CloudProxy::new(
+                    config.cloud_base_url.clone().unwrap_or_default(),
+                    config.cloud_token.clone().unwrap_or_default(),
+                );
+                runtime.block_on(gateway.chat_stream(&request, &mut |chunk| {
+                    // 首帧 meta 已经在上面发过（早于上游）：装配器再送的那条丢掉，
+                    // 保证契约里"meta 必首且唯一"。上游的 request_id 仍记在 outcome 里。
+                    if matches!(chunk, Chunk::Meta { .. }) {
+                        return crate::gateway::Flow::Continue;
+                    }
+                    if emit(chunk) {
+                        crate::gateway::Flow::Stop
+                    } else {
+                        crate::gateway::Flow::Continue
+                    }
+                }))
+            }
+            _ => {
+                let gateway = crate::gateway::DirectProvider::new(
+                    parse_protocol(&config.protocol),
+                    config.base_url.clone().unwrap_or_default(),
+                    config.model.clone(),
+                )
+                .with_api_key(api_key.clone());
+                runtime.block_on(gateway.chat_stream(&request, &mut |chunk| {
+                    if matches!(chunk, Chunk::Meta { .. }) {
+                        return crate::gateway::Flow::Continue;
+                    }
+                    if emit(chunk) {
+                        crate::gateway::Flow::Stop
+                    } else {
+                        crate::gateway::Flow::Continue
+                    }
+                }))
+            }
+        })
     };
 
     match outcome {
-        Ok(_) => {
+        // 首帧即取消：没联网，但客户端仍要收到终帧
+        None => {
+            emit_terminal_done(&mut callback);
+            Ok(())
+        }
+        Some(Ok(_)) => {
             // R5-F7：用户取消后必须补一帧终态，否则客户端停在"加载中"看不到结束。
             //
             // 语义说明（契约里没有 `finish: cancelled`，加它要动 shared，本次不加）：
             // 补的是 `done(finish=stop)`——表示**本条流已结束**，不代表"模型正常说完"。
             // 客户端自己发起的取消，它知道这是取消；这一帧只是让它能收尾。
             if cancelled {
-                let terminal = serde_json::to_string(&Chunk::Done {
-                    finish: FinishReason::Stop,
-                })
-                .unwrap_or_else(|_| error_chunk_json(ErrorCode::Internal, "序列化失败"));
-                let _ = callback.call(terminal);
+                emit_terminal_done(&mut callback);
             }
             Ok(())
         }
-        Err(err) => {
+        Some(Err(err)) => {
             let (code, message) = map_core_error(err);
             let _ = callback.call(error_chunk_json(code, message));
             Ok(())
@@ -425,6 +468,23 @@ mod tests {
         assert_eq!(last["finish"], "stop");
         // 取消之前的 chunk 照常到达
         assert!(chunks.len() >= 2, "{chunks:?}");
+        // T80：早发的那条 meta + 装配器那条必须去重，wire 上只能有一条 meta
+        let metas = chunks
+            .iter()
+            .filter(|chunk| {
+                serde_json::from_str::<serde_json::Value>(chunk)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("meta")
+            })
+            .count();
+        assert_eq!(metas, 1, "meta 必须唯一：{chunks:?}");
     }
 
     #[test]
