@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 
 pub mod auth;
+pub mod backfill;
 pub mod calendar;
 pub mod chat_ffi;
 pub mod compact;

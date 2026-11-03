@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
+use crate::backfill;
 use crate::error::CoreError;
 use crate::local_search::{SearchDoc, SearchStore};
 use crate::memory_items::{MemoryDraft, MemoryItemStore, MemoryKind};
@@ -605,12 +606,61 @@ pub unsafe extern "C" fn yunong_memory_list(
             Ok(limit) => limit,
             Err(err) => return err_json("BAD_INPUT", err),
         };
+        // 列表里看得到的记忆，索引里也该有（老库补齐；幂等，补齐后几乎零成本）
+        let _ = backfill::run(db_path, backfill::DEFAULT_BATCH);
         let store = match MemoryItemStore::open(db_path) {
             Ok(store) => store,
             Err(err) => return input_error(err),
         };
         match store.list(kind, limit) {
             Ok(items) => ok_json(json!(items)),
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 回填派生数据（升级路径，W2b/t95）。
+///
+/// 老版本的行缺少派生数据（最典型的是 `memory_items` 没有 `search_docs` 索引条目），
+/// 这个接口按 `PRAGMA user_version` 记录的版本号**一次性**补齐：幂等、可中断、有单次上限。
+///
+/// 返回 `{"ok":true,"data":{"from_version":0,"to_version":1,"latest_version":1,"processed":5,"remaining":0,"steps_run":[1],"done":true}}`
+///
+/// - `limit` 是单次最多处理条数（十进制字符串；空 = 默认 200）；`remaining > 0` 就下次接着调；
+/// - **建议 App 启动时调一次**（不阻塞：上限内处理完就返回）；即使不调，`yunong_search_local`
+///   与 `yunong_memory_list` 也会懒回填一批，保证"老记忆搜得到"；
+/// - `limit = "0"` 只报进度不干活（用来判断"还欠多少"）。
+///
+/// # Safety
+///
+/// 两个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_maintenance_backfill(
+    limit: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (limit, db_path) = match (read_arg(limit, "limit"), read_arg(db_path, "db_path")) {
+            (Ok(limit), Ok(db_path)) => (limit, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        // 空 = 默认批量；"0" = 只报进度不干活（判断"还欠多少"用）
+        let batch = match limit.trim() {
+            "" => backfill::DEFAULT_BATCH,
+            "0" => 0,
+            other => match parse_list_limit(other) {
+                Ok(batch) => batch,
+                Err(err) => return err_json("BAD_INPUT", err),
+            },
+        };
+        match backfill::run(db_path, batch) {
+            Ok(report) => {
+                // `done` 是派生值（不是字段），显式塞进 JSON，客户端不用自己算
+                let done = report.done();
+                let mut value = json!(report);
+                value["done"] = json!(done);
+                ok_json(value)
+            }
             Err(err) => input_error(err),
         }
     })
@@ -831,6 +881,9 @@ pub unsafe extern "C" fn yunong_search_local(
             Ok(limit) => limit,
             Err(err) => return err_json("BAD_INPUT", err),
         };
+        // 升级路径：老版本存下的记忆没有索引条目，搜之前先补一批（有上限，幂等）。
+        // 失败不回滚搜索：本版本先按现有索引搜，下次再补。
+        let _ = backfill::run(db_path, backfill::DEFAULT_BATCH);
         let store = match SearchStore::open(db_path) {
             Ok(store) => store,
             Err(err) => return input_error(err),
@@ -2098,6 +2151,104 @@ mod tests {
     // ---------------------------------------------------------------------
     // W8 阶段 2：memory:// 找回（expand / search_refs）
     // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // W2b/t95：升级路径回填（老记忆没有索引条目）
+    // ---------------------------------------------------------------------
+
+    fn call_backfill(limit: &str, db: &str) -> Value {
+        let limit = CString::new(limit).unwrap();
+        let db = CString::new(db).unwrap();
+        let raw = unsafe { yunong_maintenance_backfill(limit.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null());
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn search_hits_of(query: &str, db: &str) -> Vec<Value> {
+        let query = CString::new(query).unwrap();
+        let limit = CString::new("10").unwrap();
+        let db_c = CString::new(db).unwrap();
+        let raw = unsafe { yunong_search_local(query.as_ptr(), limit.as_ptr(), db_c.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        value["data"]["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 造"上个版本的库"：记忆在，索引条目被拿掉（模拟升级前写入的数据）。
+    fn legacy_memory(db: &str, content: &str) -> i64 {
+        let created = call_memory_upsert("note", "", content, "user", "", db);
+        assert_eq!(created["ok"], true, "{created}");
+        let id = created["data"]["id"].as_i64().unwrap();
+        let id_text = CString::new(id.to_string()).unwrap();
+        let db_c = CString::new(db).unwrap();
+        let raw = unsafe { yunong_search_delete(id_text.as_ptr(), db_c.as_ptr()) };
+        assert!(!raw.is_null());
+        unsafe { yunong_free_string(raw) };
+        id
+    }
+
+    /// 首次搜索就自动回填：老记忆**不用删掉重加**也能搜到。
+    #[test]
+    fn legacy_memory_is_found_by_the_first_search() {
+        let db = temp_db();
+        let id = legacy_memory(&db, "雨伞是黑色的，放在宿舍楼 3 栋 502");
+        // 反证：直接查索引是空的
+        let store = SearchStore::open(&db).unwrap();
+        assert_eq!(store.len().unwrap(), 0, "构造失败：索引里不该有条目");
+        drop(store);
+
+        // 第一次搜索：懒回填 → 命中
+        let hits = search_hits_of("雨伞", &db);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0]["id"].as_i64(), Some(id));
+        // 第二次搜索（已补齐，幂等）
+        assert_eq!(search_hits_of("雨伞", &db).len(), 1);
+        // 回填只做一次：版本号已抬到 1，再调 maintenance 不干活
+        let again = call_backfill("200", &db);
+        assert_eq!(again["data"]["processed"], 0, "{again}");
+        assert_eq!(again["data"]["to_version"], 1, "{again}");
+    }
+
+    /// 维护接口：有上限、可中断、幂等。
+    #[test]
+    fn maintenance_backfill_is_bounded_and_resumable() {
+        let db = temp_db();
+        for index in 0..3 {
+            legacy_memory(&db, &format!("老记忆 {index}：周三带雨具"));
+        }
+        // limit=0：只报进度
+        let progress = call_backfill("0", &db);
+        assert_eq!(progress["ok"], true, "{progress}");
+        assert_eq!(progress["data"]["processed"], 0, "{progress}");
+        assert_eq!(progress["data"]["remaining"], 3, "{progress}");
+        assert_eq!(progress["data"]["done"], false, "{progress}");
+
+        // limit=2：补 2 条，剩下 1 条，版本号不动
+        let partial = call_backfill("2", &db);
+        assert_eq!(partial["data"]["processed"], 2, "{partial}");
+        assert_eq!(partial["data"]["remaining"], 1, "{partial}");
+        assert_eq!(partial["data"]["to_version"], 0, "{partial}");
+        assert_eq!(partial["data"]["done"], false, "{partial}");
+
+        // 补齐：版本号抬到 1
+        let done = call_backfill("200", &db);
+        assert_eq!(done["data"]["processed"], 1, "{done}");
+        assert_eq!(done["data"]["remaining"], 0, "{done}");
+        assert_eq!(done["data"]["to_version"], 1, "{done}");
+        assert_eq!(done["data"]["done"], true, "{done}");
+        assert_eq!(done["data"]["steps_run"], serde_json::json!([1]));
+
+        // 三条都能搜到
+        assert_eq!(search_hits_of("雨具", &db).len(), 3);
+        // 空 limit：用默认批量；库已补齐 → 什么都不做
+        assert_eq!(call_backfill("", &db)["data"]["processed"], 0);
+    }
 
     fn call_memory_expand(ref_id: &str, db: &str) -> Value {
         let ref_id = CString::new(ref_id).unwrap();
