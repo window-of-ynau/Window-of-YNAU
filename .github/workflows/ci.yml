@@ -64,6 +64,71 @@ jobs:
       - name: flutter test
         run: flutter test
 
+  # 端侧真 DLL 端到端：构建 core 的 cdylib + fake_sse，设 YUNONG_CORE_DLL 后跑
+  # app/test/t79_fake_sse_integration_test.dart —— 这条护栏验证"注册早于调用"后真能收到 delta/done。
+  #
+  # 为什么单独一个 job：该用例在**没设** YUNONG_CORE_DLL 时会 markTestSkipped（Flutter job 里就是
+  # 这个状态：`292 tests passed, 1 skipped`）。我们最有价值的端到端护栏不能默认不跑，所以这里
+  # 显式设环境变量 + 断言"必须真跑、一条都不许 skip"（skip 即红）。
+  dll-e2e:
+    name: 端侧真 DLL 端到端（fake_sse 全链路）
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 构建 core cdylib 与 fake_sse 假上游
+        run: |
+          set -euo pipefail
+          cargo build -p yunong-core --example fake_sse
+          cargo build -p yunong-core
+          ls -l target/debug/libyunong_core.so target/debug/examples/fake_sse
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+      - name: 真 DLL 端到端（禁止 skip）
+        working-directory: app
+        env:
+          # 用例的查找顺序：target/debug/*.dll → 环境变量；Linux 上是 libyunong_core.so
+          YUNONG_CORE_DLL: ${{ github.workspace }}/target/debug/libyunong_core.so
+        run: |
+          set -uo pipefail
+          # 不 set -e：失败时也要先把输出打出来，否则只剩 exit code
+          if ! out=$(flutter test test/t79_fake_sse_integration_test.dart 2>&1); then
+            printf '%s\n' "$out" | tail -n 60
+            echo "::error::真 DLL 端到端失败（完整输出见上）"
+            exit 1
+          fi
+          printf '%s\n' "$out" | tail -n 15
+          # 防假绿（锚定整行）：这一条用例必须真跑，出现 skip 标记即红。
+          if printf '%s\n' "$out" | grep -Eq 'All tests skipped|⏭️'; then
+            echo "::error::用例被 skip 了：检查 YUNONG_CORE_DLL=$YUNONG_CORE_DLL 与 target/debug/examples/fake_sse 是否存在"
+            exit 1
+          fi
+          # 锚定"确有 ✅ 的通过行"，而不是只看退出码
+          if ! printf '%s\n' "$out" | grep -F 't79_fake_sse_integration_test.dart' | grep -q '✅'; then
+            echo "::error::没有看到该用例的 ✅ 通过行（可能根本没执行）"
+            exit 1
+          fi
+          # 再卡一道下限：通过的条数 ≥ 1，且汇总行里不许出现 skipped
+          summary=$(printf '%s\n' "$out" | grep -E '[0-9]+ tests? passed' | tail -n 1)
+          if [ -z "$summary" ] || printf '%s' "$summary" | grep -q skipped; then
+            echo "::error::测试汇总缺失或含 skipped：${summary:-<empty>}"
+            exit 1
+          fi
+          passed=$(printf '%s' "$summary" | sed -E 's/.*[^0-9]([0-9]+) tests? passed.*/\1/')
+          if [ "${passed:-0}" -lt 1 ]; then
+            echo "::error::只跑了 ${passed:-0} 条用例（预期 ≥1）"
+            exit 1
+          fi
+
   docs:
     name: 文档（表格 / 相对链接）
     runs-on: ubuntu-latest

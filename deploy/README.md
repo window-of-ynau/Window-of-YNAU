@@ -52,6 +52,7 @@ done
 
 - 顺序执行，别打乱；`CREATE EXTENSION vector` 需要超级用户，compose 里的 `POSTGRES_USER`（yunong）是超级用户，够用。
 - **`-1`（单事务）不能去掉**：迁移里有 `DROP CONSTRAINT → ADD CONSTRAINT` 这类顺序敏感的 DDL。
+- **`-1` 只能加在 `-f`（整份迁移文件）上**：`psql -1 -c "CREATE DATABASE ..."` 会报 `cannot run inside a transaction block`——`CREATE DATABASE` 不能在事务块里跑。CI 的迁移 job 里，前缀只带 `-v ON_ERROR_STOP=1`，`-1` 只加在文件级 `psql -f`（t81/M2 的真实教训，别统一加）。
   非单事务时，ADD 失败而 DROP 已提交，等于**把约束永久删掉**（RAG 的 `rag_candidates_status_check`
   就踩过这个坑：库里存在 `status='fetching'` 的行时重跑会让约束丢失）。
   加 `-1` 后每份迁移要么全生效、要么全回滚。
