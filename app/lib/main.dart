@@ -16,6 +16,7 @@ import 'src/core/titlebar_service.dart';
 import 'src/chat/chat_settings_section.dart';
 import 'src/core/auth_service.dart';
 import 'src/core/secret_service.dart';
+import 'src/theme/context_menu.dart';
 import 'src/theme/file_settings_store.dart';
 import 'src/chat/chat_page.dart';
 import 'src/campus/webview_fetcher.dart';
@@ -107,6 +108,7 @@ class _YunongAppState extends State<YunongApp> {
             debugShowCheckedModeBanner: false,
             // WebView 抓取页需要根导航（CampusWebViewPage 全屏 push）
             navigatorKey: WebViewSchoolFetcher.navigatorKey,
+            // t96：右键/长按的文本选择菜单必须实心（glass 主题下默认会透底）
             theme: _controller.theme(Brightness.light),
             darkTheme: _controller.theme(Brightness.dark),
             // P1-3：不再单独选明暗；主题自身决定（B 深蓝玻璃=深色，A/C=浅色）
@@ -117,7 +119,9 @@ class _YunongAppState extends State<YunongApp> {
             // 这样所有路由（设置页、课表页）都叠在同一层背景上，切页不会"闪白"。
             builder: (BuildContext context, Widget? child) {
               final YunongTokens tokens = context.tokens;
+              // t96：文本选择菜单/浮层必须不透明（glass 主题下默认会透底），这里统一抬高 surface alpha
               Widget content = child ?? const SizedBox.shrink();
+              content = Theme(data: solidSurfaceTheme(Theme.of(context)), child: content);
               if (tokens.canvasGradient != null) {
                 content = DecoratedBox(
                   decoration: BoxDecoration(gradient: tokens.canvasGradient),

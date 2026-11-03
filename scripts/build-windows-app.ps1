@@ -56,7 +56,14 @@ if (-not $SkipFlutter) {
     Step "构建 Flutter Windows（$profile）"
     Push-Location (Join-Path $repo "app")
     try {
-        flutter build windows --$profile
+# t96：把构建标识注入 Dart（设置页底部 + 诊断里可见）。
+        # 为什么不用文件时间戳：yunong.exe 是 C++ runner 桩、时间戳永远旧，
+        # 真正的 Dart 产物是 data/app.so —— 只能靠注入的 commit/时间判断版本。
+        $buildCommit = (git rev-parse --short HEAD 2>$null)
+        if (-not $buildCommit) { $buildCommit = 'unknown' }
+        $buildTime = Get-Date -Format 'MM-dd HH:mm'
+        Step "构建标识：$buildCommit · $buildTime"
+        flutter build windows --$profile --dart-define=BUILD_COMMIT=$buildCommit --dart-define=BUILD_TIME=$buildTime
         if ($LASTEXITCODE -ne 0) { throw "flutter build windows 失败" }
     } finally { Pop-Location }
 }
