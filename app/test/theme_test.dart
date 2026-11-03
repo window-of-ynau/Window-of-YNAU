@@ -384,25 +384,34 @@ void main() {
       expect(c.displaySmall!.fontSize! / c.bodyMedium!.fontSize!, greaterThan(2.2));
     });
 
-    testWidgets('A 主题空态有问候语 + 建议 chip + 状态行', (WidgetTester tester) async {
+    testWidgets('三主题空态结构一致：问候 + 副标题 + 建议 chip', (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1100, 760));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      for (final AppThemeId id in AppThemeId.values) {
+        final ThemeController controller = ThemeController(initialTheme: id);
+        await tester.pumpWidget(YunongApp(themeController: controller));
+        await tester.pumpAndSettle();
+        expect(find.text('今天想从哪儿开始？'), findsOneWidget, reason: '${id.label} 缺问候语');
+        expect(find.textContaining('问点什么吧'), findsOneWidget, reason: '${id.label} 缺副标题');
+        expect(find.text('第 8 周哪天最累？'), findsOneWidget, reason: '${id.label} 缺建议 chip');
+        expect(find.text('这学期一共几门课？'), findsOneWidget, reason: '${id.label} chip 数量应为 4');
+        // t97：C 主题独占的"深色引文块"与 A 独占的状态行都已删除
+        expect(find.textContaining('选损失更小的那门'), findsNothing);
+        expect(find.textContaining('本地优先'), findsNothing);
+        expect(find.textContaining('课表已同步'), findsNothing);
+      }
+    });
+
+    testWidgets('建议 chip 贴着输入框（空态时位于输入框上方）', (WidgetTester tester) async {
       await tester.binding.setSurfaceSize(const Size(1100, 760));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       final ThemeController controller = ThemeController();
       await tester.pumpWidget(YunongApp(themeController: controller));
       await tester.pumpAndSettle();
-      expect(find.text('今天想从哪儿开始？'), findsOneWidget);
-      expect(find.text('第 8 周哪天最累？'), findsOneWidget);
-      expect(find.textContaining('课表已同步'), findsOneWidget);
-    });
-
-    testWidgets('C 主题空态有 overline + 深色引文块', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(1100, 760));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
-      final ThemeController controller = ThemeController(initialTheme: AppThemeId.paperCoral);
-      await tester.pumpWidget(YunongApp(themeController: controller));
-      await tester.pumpAndSettle();
-      expect(find.textContaining('本地优先'), findsOneWidget);
-      expect(find.textContaining('选损失更小的那门'), findsOneWidget);
+      final double chipY = tester.getCenter(find.text('第 8 周哪天最累？')).dy;
+      final double inputY = tester.getCenter(find.byType(TextField).last).dy;
+      expect(chipY, lessThan(inputY), reason: 'chip 应在输入框上方');
+      expect(inputY - chipY, lessThan(160), reason: 'chip 必须贴近输入框，而不是浮在页面中央');
     });
 
     test('环形阴影是 spreadRadius=1 / blurRadius=0（不是 Border）', () {
