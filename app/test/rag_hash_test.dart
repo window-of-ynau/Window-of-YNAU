@@ -123,4 +123,24 @@ void main() {
     expect(hash.contains('10.1145'), isFalse);
     expect(hash.contains('1234567'), isFalse);
   });
+
+  group('ASCII-only 契约（不依赖向量文件，防 Unicode 分叉）', () {
+    test('U+0130（İ）原样保留，只把 ASCII A–Z 转小写', () {
+      // unicode 全映射会把 İ 变成 i + U+0307；ASCII-only 必须保持两个码点不同
+      expect(canonicalIdentifier('İSTANBUL'), 'İstanbul');
+      expect(canonicalIdentifier('İSTANBUL')!.runes.length, 'İstanbul'.runes.length);
+    });
+
+    test('BOM（U+FEFF）不被裁剪（String.trim 会裁掉它）', () {
+      final canonical = canonicalIdentifier('\uFEFFhttps://x.com/z');
+      expect(canonical, isNotNull);
+      expect(canonical!.startsWith('\uFEFF'), isTrue, reason: 'BOM 必须原样保留');
+      expect(canonical, '\uFEFFhttps://x.com/z');
+    });
+
+    test('只裁 ASCII 空白：\\t/\\n/\\r 裁掉，NBSP 保留', () {
+      expect(canonicalIdentifier('\t\n https://x.com/y \r\n'), 'https://x.com/y');
+      expect(canonicalIdentifier('\u00A0https://x.com/y'), '\u00A0https://x.com/y');
+    });
+  });
 }
