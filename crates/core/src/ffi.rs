@@ -1037,6 +1037,59 @@ pub unsafe extern "C" fn yunong_delete_secret(
         }
     })
 }
+
+/// 用**存储里的 refresh** 换一个新的 access（"重启免登录"的最后一环）。
+///
+/// refresh 明文**永不跨过这道边界**：Rust 自己从平台安全存储读出来发请求，
+/// 只把新的 access 交给 Dart；服务端若轮换了 refresh，也由 Rust 直接写回存储。
+///
+/// ```json
+/// {"ok":true,"data":{"access_token":"…","expires_in":3600}}
+/// {"ok":false,"code":"UNAUTHORIZED","message":"登录已失效，请重新登录"}
+/// {"ok":false,"code":"NETWORK","message":"网络不可用：…"}
+/// ```
+///
+/// **失败分级**（这是本函数最要紧的语义）：
+/// - 401 / 403 → 删掉本地 access + refresh，返回 `UNAUTHORIZED`（UI 回未登录态）；
+/// - 网络不可达 / 超时 / 5xx / 429 → **保留令牌**，返回 `NETWORK`（让用户重试，而不是重新登录）。
+///
+/// # 阻塞说明
+///
+/// 这是一次同步 HTTP 调用（最长 `connect 5s + total 10s`）。**Dart 侧应放在后台 isolate 里调**，
+/// 别在 UI isolate 上直接调用。
+///
+/// # Safety
+///
+/// 两个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_auth_refresh_from_store(
+    cloud_base_url: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (base_url, db_path) = match (
+            read_arg(cloud_base_url, "cloud_base_url"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(base_url), Ok(db_path)) => (base_url, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        let store = secret_store_for(db_path);
+        auth_refresh_json(store.as_ref(), base_url)
+    })
+}
+
+/// `yunong_auth_refresh_from_store` 的本体（把 store 作为参数，方便测试注入内存实现）。
+fn auth_refresh_json(store: &dyn crate::secret::KeyStore, base_url: &str) -> Value {
+    match crate::auth::refresh_blocking(store, base_url, Default::default()) {
+        Ok(refreshed) => ok_json(json!({
+            "access_token": refreshed.access_token,
+            "expires_in": refreshed.expires_in,
+            "rotated": refreshed.rotated,
+        })),
+        Err(err) => err_json(err.code(), err.message()),
+    }
+}
 // ---------------------------------------------------------------------------
 // 联网搜索状态（ADR-19 决策 5）：UI 必须诚实
 // ---------------------------------------------------------------------------
@@ -1988,6 +2041,211 @@ mod tests {
         unsafe { yunong_free_string(raw) };
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["code"], "BAD_INPUT", "{value}");
+    }
+
+    // ---------------------------------------------------------------------
+    // 套餐令牌刷新 FFI（T61）：refresh 明文不出 Rust，失败分级清/不清存储
+    // ---------------------------------------------------------------------
+
+    const AUTH_OK_BODY: &str = r#"{"ok":true,"data":{"user_id":"u1","access_token":"new-access-9","expires_in":3600,"refresh_token":"rotated-9"}}"#;
+
+    fn memory_store_with(
+        refresh: Option<&str>,
+        access: Option<&str>,
+    ) -> crate::secret::MemoryKeyStore {
+        use crate::secret::KeyStore;
+        let store = crate::secret::MemoryKeyStore::new("测试内存存储");
+        if let Some(value) = refresh {
+            store.set(crate::auth::REFRESH_KEY, value).unwrap();
+        }
+        if let Some(value) = access {
+            store.set(crate::auth::ACCESS_KEY, value).unwrap();
+        }
+        store
+    }
+
+    fn raw_of(store: &crate::secret::MemoryKeyStore, key: &str) -> Option<String> {
+        use crate::secret::KeyStore;
+        store.load_raw(key).unwrap()
+    }
+
+    /// 成功：返回新 access、把轮换后的 refresh 写回存储。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_refresh_success_returns_access_and_rotates_refresh() {
+        let server =
+            crate::gateway::fake_server::FakeServer::reply(200, "application/json", AUTH_OK_BODY)
+                .await;
+        let store = std::sync::Arc::new(memory_store_with(Some("old-refresh"), Some("old-access")));
+        let base = server.base_url();
+        let store_for_call = std::sync::Arc::clone(&store);
+        // `auth_refresh_json` 内部会自己 block_on 一个 runtime，所以放到阻塞线程里跑，
+        // 否则会把测试自己的多线程运行时堵住（假上游也就没线程驱动了）。
+        let result =
+            tokio::task::spawn_blocking(move || auth_refresh_json(store_for_call.as_ref(), &base))
+                .await
+                .unwrap();
+
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["access_token"], "new-access-9");
+        assert_eq!(result["data"]["expires_in"], 3600);
+        assert_eq!(result["data"]["rotated"], true);
+        assert_eq!(server.captured().path(), crate::auth::REFRESH_PATH);
+        assert_eq!(server.captured().json()["refresh_token"], "old-refresh");
+        assert_eq!(
+            raw_of(&store, crate::auth::REFRESH_KEY).as_deref(),
+            Some("rotated-9"),
+            "轮换后的 refresh 必须写回，否则下次刷新就 401"
+        );
+        assert_eq!(
+            raw_of(&store, crate::auth::ACCESS_KEY).as_deref(),
+            Some("new-access-9")
+        );
+    }
+
+    /// 401：返回 UNAUTHORIZED，且本地 access + refresh 都被清掉。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_refresh_unauthorized_clears_store() {
+        let server = crate::gateway::fake_server::FakeServer::reply(
+            401,
+            "application/json",
+            r#"{"ok":false,"code":"UNAUTHORIZED","message":"刷新令牌无效"}"#,
+        )
+        .await;
+        let store =
+            std::sync::Arc::new(memory_store_with(Some("dead-refresh"), Some("dead-access")));
+        let base = server.base_url();
+        let store_for_call = std::sync::Arc::clone(&store);
+        let result =
+            tokio::task::spawn_blocking(move || auth_refresh_json(store_for_call.as_ref(), &base))
+                .await
+                .unwrap();
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "UNAUTHORIZED");
+        assert_eq!(result["message"], "登录已失效，请重新登录");
+        assert_eq!(raw_of(&store, crate::auth::REFRESH_KEY), None);
+        assert_eq!(raw_of(&store, crate::auth::ACCESS_KEY), None);
+    }
+
+    /// 网络不可达：返回 NETWORK，且**存储内容一个字节都不动**。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_refresh_network_failure_keeps_store() {
+        let store =
+            std::sync::Arc::new(memory_store_with(Some("good-refresh"), Some("good-access")));
+        let store_for_call = std::sync::Arc::clone(&store);
+        let result = tokio::task::spawn_blocking(move || {
+            auth_refresh_json(store_for_call.as_ref(), "http://127.0.0.1:1")
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "NETWORK", "{result}");
+        assert_eq!(
+            raw_of(&store, crate::auth::REFRESH_KEY).as_deref(),
+            Some("good-refresh"),
+            "断网不能把用户登出"
+        );
+        assert_eq!(
+            raw_of(&store, crate::auth::ACCESS_KEY).as_deref(),
+            Some("good-access")
+        );
+    }
+
+    #[test]
+    fn auth_refresh_ffi_rejects_null_and_bad_base_url() {
+        let raw = unsafe { yunong_auth_refresh_from_store(std::ptr::null(), std::ptr::null()) };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+
+        let base = CString::new("").unwrap();
+        let db = CString::new(temp_db()).unwrap();
+        let raw = unsafe { yunong_auth_refresh_from_store(base.as_ptr(), db.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+        assert!(value["message"]
+            .as_str()
+            .unwrap()
+            .contains("cloud_base_url"));
+    }
+
+    /// 平台差异（与 secret 用例同一条规则）：非 Windows 没有系统安全存储，
+    /// `default_store` 每次调用都是**新的内存实例**，所以 FFI 这条路上读不到 refresh →
+    /// 如实返回 UNAUTHORIZED。Windows 上则真的能读出来并刷新（下一个用例）。
+    #[cfg(not(windows))]
+    #[test]
+    fn auth_refresh_ffi_reports_unauthorized_on_degraded_storage() {
+        let base = CString::new("http://127.0.0.1:1").unwrap();
+        let db = CString::new(temp_db()).unwrap();
+        let raw = unsafe { yunong_auth_refresh_from_store(base.as_ptr(), db.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "UNAUTHORIZED", "{value}");
+    }
+
+    /// Windows 端到端：走真实 FFI + DPAPI 文件存储，验证"存进去 → 刷新 → 轮换写回"。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_refresh_ffi_end_to_end_on_windows() {
+        let server =
+            crate::gateway::fake_server::FakeServer::reply(200, "application/json", AUTH_OK_BODY)
+                .await;
+        let dir = std::env::temp_dir().join(format!("yunong-ffi-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("timetable.db").to_string_lossy().into_owned();
+
+        // 先用 FFI 把一对令牌存进平台安全存储（模拟登录那次）
+        let db = CString::new(db_path.clone()).unwrap();
+        let refresh_key = CString::new(crate::auth::REFRESH_KEY).unwrap();
+        let refresh_value = CString::new("old-refresh").unwrap();
+        unsafe {
+            let response = call_secret(yunong_set_secret(
+                refresh_key.as_ptr(),
+                refresh_value.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(response["ok"], true, "{response}");
+            let access_key = CString::new(crate::auth::ACCESS_KEY).unwrap();
+            let access_value = CString::new("old-access").unwrap();
+            let response = call_secret(yunong_set_secret(
+                access_key.as_ptr(),
+                access_value.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(response["ok"], true, "{response}");
+        }
+
+        // 再走刷新 FFI。注意：`refresh_blocking` 会自建 runtime，
+        // 所以必须在**阻塞线程**上调用（tokio 不允许在 runtime 里再 block_on 一个 runtime）。
+        let base = CString::new(server.base_url()).unwrap();
+        let db_for_call = db.clone();
+        let text = tokio::task::spawn_blocking(move || unsafe {
+            let raw = yunong_auth_refresh_from_store(base.as_ptr(), db_for_call.as_ptr());
+            assert!(!raw.is_null(), "绝不能返回 NULL");
+            let text = CStr::from_ptr(raw).to_str().unwrap().to_owned();
+            yunong_free_string(raw);
+            text
+        })
+        .await
+        .unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["ok"], true, "{value}");
+        assert_eq!(value["data"]["access_token"], "new-access-9");
+        assert_eq!(value["data"]["rotated"], true);
+
+        // 轮换后的 refresh 真的写回了存储
+        let store = secret_store_for(&db_path);
+        assert_eq!(
+            store.load_raw(crate::auth::REFRESH_KEY).unwrap().as_deref(),
+            Some("rotated-9")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------------------------------------------------------------------

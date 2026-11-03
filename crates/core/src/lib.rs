@@ -9,6 +9,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod auth;
 pub mod calendar;
 pub mod chat_ffi;
 pub mod compact;
@@ -45,6 +46,10 @@ pub fn version() -> &'static str {
 
 /// 常用导入。
 pub mod prelude {
+    pub use crate::auth::{
+        refresh_blocking, refresh_with, AuthRefreshError, RefreshTimeouts, Refreshed, ACCESS_KEY,
+        REFRESH_KEY,
+    };
     pub use crate::calendar::{parse_term_start, parse_weeks, Course, IcsEvent};
     pub use crate::compact::{
         compact, pressure_tokens, retain_tokens, should_compact, should_compact_on_model_switch,
