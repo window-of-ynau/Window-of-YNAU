@@ -224,12 +224,12 @@ gh run watch
 
 | 约束 | 为什么 |
 |---|---|
-| `ci.yml` 各 job 的 `name:` = 分支保护的必需检查名 | 改名等于静默取消保护。当前必需（8 个）：`Rust（fmt / clippy / test）`、`Flutter（analyze / test）`、`文档（表格 / 相对链接）`、`迁移脚本（PG16 + pgvector）`、`PostgreSQL（auth 真实 SQL 集成测试）`、`服务端镜像（build + /healthz 冒烟）`、`端到端对话闭环（mock 上游）`、`密钥扫描（secret scanning）`。改名前先 `gh api repos/<owner>/<repo>/branches/main/protection` 看现状，改完同步更新 required checks |
+| `ci.yml` 各 job 的 `name:` = 分支保护的必需检查名 | 改名等于静默取消保护。当前必需（9 个）：`Rust（fmt / clippy / test）`、`Flutter（analyze / test）`、`文档（表格 / 相对链接）`、`迁移脚本（PG16 + pgvector）`、`PostgreSQL（auth 真实 SQL 集成测试）`、`服务端镜像（build + /healthz 冒烟）`、`端到端对话闭环（mock 上游）`、`密钥扫描（secret scanning）`、`依赖安全与许可证（cargo-deny）`。改名前先 `gh api repos/<owner>/<repo>/branches/main/protection` 看现状，改完同步更新 required checks |
 | 迁移按文件名 glob **全量**跑（0001 → 最后一个） | 只跑部分文件会漏后加的表/索引；`migrations` 与 `pg` 两个 job 都必须全量 |
 | `persist-credentials: false` 保持 | 不把 token 写进 `.git/config`；需要凭据的步骤（GHCR 登录）单独用 `GITHUB_TOKEN` |
 | `release.yml` 是唯一提权 workflow（`packages: write`） | 不要在 `ci.yml` 里加 `packages: write` / `contents: write` |
 | 镜像冒烟只有一份实现：`scripts/docker-smoke.sh` | CI 的 docker job 与 release 的发布前检查共用，改断言只改一处 |
-| `security`（cargo-deny）job 已阻断但暂不在必需检查里 | 依赖门禁刚转阻断（阶段 2），再观察几个 PR 后用 `gh api` 加入；在那之前它变红会「看得见但不阻塞合入」 |
+| `security`（cargo-deny）job 已是必需检查 | 连续多次绿后（t69）加入；依赖升级 / 新增依赖后若红，先看 `deny.toml` 白名单与 `cargo deny check advisories` 输出 |
 | PG 用例不并行加锁（不要 `--test-threads=1`） | 每条用例用独立 schema（`yunong_pg_<uuid>`）隔离，并行是安全的；单线程只会白白变慢 |
 
 ## 端到端闭环（无凭据）
