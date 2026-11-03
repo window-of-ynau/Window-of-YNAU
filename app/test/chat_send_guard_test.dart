@@ -80,7 +80,7 @@ void main() {
     await tester.enterText(find.byType(TextField).first, '你好');
     await tester.tap(find.text('发送'), warnIfMissed: false);
     await tester.pumpAndSettle();
-    expect(find.textContaining('请先登录套餐账号'), findsWidgets);    expect(backend.starts, 0);
+    expect(find.textContaining('套餐未登录'), findsWidgets);    expect(backend.starts, 0);
   });
 
   testWidgets('就绪后 Enter 发送，Shift+Enter 换行', (WidgetTester tester) async {
