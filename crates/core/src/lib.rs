@@ -11,6 +11,7 @@
 
 pub mod calendar;
 pub mod chat_ffi;
+pub mod compact;
 pub mod context;
 pub mod error;
 pub mod gateway;
@@ -45,6 +46,10 @@ pub fn version() -> &'static str {
 /// 常用导入。
 pub mod prelude {
     pub use crate::calendar::{parse_term_start, parse_weeks, Course, IcsEvent};
+    pub use crate::compact::{
+        compact, pressure_tokens, retain_tokens, should_compact, should_compact_on_model_switch,
+        summarize, CompactConfig, Outcome, Plan as CompactPlan, Summary, Trigger,
+    };
     pub use crate::context::{estimate_tokens, plan_compaction, should_compress, CompactionPlan};
     pub use crate::error::{CoreError, CoreResult};
     pub use crate::gateway::{
