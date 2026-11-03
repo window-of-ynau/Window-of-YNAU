@@ -21,6 +21,7 @@ import '../core/secret_service.dart';
 import '../memory/memory_page.dart';
 import '../core/build_info.dart';
 import 'chat_settings_section.dart';
+import 'tool_call_card.dart';
 
 // `ChatSettings` 已随设置面板搬到 `chat_settings_section.dart`；这里 re-export，
 // 保持既有调用方/测试的 `import chat_page.dart` 不变（纯搬迁，行为不变）。
@@ -33,10 +34,36 @@ import 'chat_top_bar.dart';
 /// 让 Key 落到系统安全存储、永不回显。本轮的 UI 已经按"不回显"设计。
 /// 一条气泡。
 class ChatBubble {
-  ChatBubble({required this.fromUser, required this.text});
+  ChatBubble({required this.fromUser, required this.text})
+      : isTool = false,
+        toolName = null,
+        toolArgs = null,
+        toolStatus = ToolCallStatus.ok,
+        toolSummary = null,
+        toolError = null,
+        toolCallId = null;
+
+  /// 工具调用气泡（t102）：不显示为聊天气泡，而显示为卡片。
+  ChatBubble.tool({
+    required String this.toolName,
+    this.toolArgs,
+    this.toolCallId,
+    this.toolStatus = ToolCallStatus.running,
+    this.toolSummary,
+    this.toolError,
+  })  : fromUser = false,
+        text = '',
+        isTool = true;
 
   final bool fromUser;
   String text;
+  final bool isTool;
+  final String? toolName;
+  final String? toolArgs;
+  final String? toolCallId;
+  ToolCallStatus toolStatus;
+  String? toolSummary;
+  String? toolError;
 }
 
 /// 会话页。
@@ -301,6 +328,27 @@ class ChatPageState extends State<ChatPage> {
           switch (event.kind) {
             case ChatEventKind.delta:
               _bubbles.last.text += event.text ?? '';
+            case ChatEventKind.toolCall:
+              setState(() {
+                _bubbles.add(ChatBubble.tool(
+                  toolName: event.toolName ?? 'tool',
+                  toolArgs: event.toolArgs,
+                  toolCallId: event.toolCallId,
+                ));
+              });
+            case ChatEventKind.toolResult:
+              setState(() {
+                final int index = _bubbles.indexWhere((ChatBubble b) =>
+                    b.isTool && b.toolCallId != null && b.toolCallId == event.toolCallId);
+                if (index >= 0) {
+                  final ChatBubble target = _bubbles[index];
+                  target.toolStatus = (event.toolOk ?? false) ? ToolCallStatus.ok : ToolCallStatus.failed;
+                  target.toolSummary = event.toolSummary ?? (event.toolOk ?? false ? '已完成' : null);
+                  target.toolError = (event.toolOk ?? false)
+                      ? null
+                      : (event.toolSummary ?? event.errorMessage ?? '工具调用失败');
+                }
+              });
             case ChatEventKind.usage:
               _promptTokens = event.promptTokens ?? _promptTokens;
               _completionTokens = event.completionTokens ?? _completionTokens;
@@ -744,7 +792,16 @@ class ChatPageState extends State<ChatPage> {
                   itemCount: _bubbles.length,
                   itemBuilder: (BuildContext context, int index) {
                     final bubble = _bubbles[index];
-                    return _MessageBubble(bubble: bubble);
+                    if (bubble.isTool) {
+        return ToolCallCard(
+          toolName: bubble.toolName ?? '',
+          status: bubble.toolStatus,
+          args: bubble.toolArgs,
+          summary: bubble.toolSummary,
+          errorText: bubble.toolError,
+        );
+      }
+      return _MessageBubble(bubble: bubble);
                   },
                 ),
         ),

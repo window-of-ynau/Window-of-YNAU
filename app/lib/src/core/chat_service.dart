@@ -138,6 +138,11 @@ class ChatEvent {
     this.promptTokens,
     this.completionTokens,
     this.finishReason,
+    this.toolCallId,
+    this.toolName,
+    this.toolArgs,
+    this.toolOk,
+    this.toolSummary,
   });
 
   final ChatEventKind kind;
@@ -150,6 +155,18 @@ class ChatEvent {
   final int? promptTokens;
   final int? completionTokens;
   final String? finishReason;
+
+  // ---- 工具调用（t102）----
+  /// 同一次调用的 started/completed 用同一个 id 配对。
+  final String? toolCallId;
+  /// 工具名（如 `timetable_query`）。
+  final String? toolName;
+  /// 参数 JSON 原文（UI 折叠展示，不做结构假设）。
+  final String? toolArgs;
+  /// 结果是否成功；失败时 [errorCode]/[errorMessage] 会带上原因。
+  final bool? toolOk;
+  /// 结果的一句话摘要（如「5 条结果」），不含大段 JSON。
+  final String? toolSummary;
 
   bool get isTerminal => kind == ChatEventKind.done || kind == ChatEventKind.error;
 
@@ -179,6 +196,11 @@ class ChatEvent {
       completionTokens:
           _intOf(decoded['completion_tokens'] ?? (usage is Map ? usage['completion_tokens'] : null)),
       finishReason: decoded['finish'] as String? ?? decoded['reason'] as String?,
+      toolCallId: (decoded['call_id'] as String?) ?? (decoded['id'] as String?),
+      toolName: decoded['name'] as String?,
+      toolArgs: _toolArgsText(decoded['args'] ?? decoded['arguments']),
+      toolOk: decoded['ok'] is bool ? decoded['ok'] as bool : null,
+      toolSummary: decoded['summary'] as String?,
     );
   }
 
@@ -480,5 +502,20 @@ class ChatService {
       close();
     }
     return ChatStream._(controller.stream, handle, _backend, close, diag);
+  }
+}
+
+/// 把工具参数转成可折叠展示的文本：字符串原样，其它用紧凑 JSON。
+String? _toolArgsText(Object? raw) {
+  if (raw == null) {
+    return null;
+  }
+  if (raw is String) {
+    return raw;
+  }
+  try {
+    return jsonEncode(raw);
+  } on Object {
+    return raw.toString();
   }
 }
