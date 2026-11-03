@@ -102,6 +102,8 @@ pub struct FetchConfig {
     pub backoff: Duration,
     /// 是否把上次失败的候选也纳入本轮（默认 false：默认只跑 pending，保证幂等）
     pub retry_failed: bool,
+    /// 同一轮内两次抓取之间的最小间隔（限速；arXiv 官方要求礼貌访问）
+    pub min_interval: Duration,
 }
 
 impl FetchConfig {
@@ -111,6 +113,7 @@ impl FetchConfig {
             retries: config.rag_fetch_retries,
             backoff: Duration::from_millis(config.rag_fetch_backoff_ms),
             retry_failed: false,
+            min_interval: Duration::from_millis(config.rag_fetch_min_interval_ms),
         }
     }
 }
@@ -154,6 +157,8 @@ pub struct FetchPipeline {
     rag: Arc<RagService>,
     fetcher: Arc<dyn Fetcher>,
     config: FetchConfig,
+    /// 限速闸：上一次实际发起抓取的时刻（同一轮内串行处理，所以一个时刻就够）
+    last_fetch_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl FetchPipeline {
@@ -168,6 +173,31 @@ impl FetchPipeline {
             rag,
             fetcher,
             config,
+            last_fetch_at: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 限速：等到"距上次抓取至少 `min_interval`"再放行。
+    ///
+    /// 为什么不并发抓：已知语料是公开资源站（arXiv 等），礼貌访问比吞吐重要；
+    /// 单实例串行 + 间隔已经足够（每轮上限是 `top_n`）。
+    async fn wait_for_slot(&self) {
+        let wait = {
+            let mut last = self
+                .last_fetch_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let wait = match *last {
+                Some(at) => remaining_wait(at, self.config.min_interval),
+                None => None,
+            };
+            *last = Some(std::time::Instant::now());
+            wait
+        };
+        if let Some(wait) = wait {
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
         }
     }
 
@@ -328,6 +358,7 @@ impl FetchPipeline {
         let mut last_error = String::new();
         while attempts <= self.config.retries {
             attempts += 1;
+            self.wait_for_slot().await;
             match self.fetcher.fetch(target).await {
                 Ok(text) => return (attempts, String::new(), Some(text)),
                 Err(error) => {
@@ -344,6 +375,15 @@ impl FetchPipeline {
         }
         (attempts, last_error, None)
     }
+}
+
+/// 距上次抓取还要等多久（`min_interval` 为 0 时返回 `None`，表示不用等）。
+fn remaining_wait(last: std::time::Instant, min_interval: Duration) -> Option<Duration> {
+    if min_interval.is_zero() {
+        return None;
+    }
+    let elapsed = last.elapsed();
+    (elapsed < min_interval).then(|| min_interval - elapsed)
 }
 
 /// 只保留哈希前 8 位 —— **日志里绝不允许出现完整哈希**（否则日志会变成可 join 的字典）。
@@ -646,6 +686,20 @@ mod tests {
         assert_eq!(previous_months("2026-01", 1), "2025-12");
         assert_eq!(previous_months("2026-01", 3), "2025-10");
         assert_eq!(previous_months("bogus", 3), "bogus");
+    }
+
+    #[test]
+    fn rate_limit_wait_is_bounded_by_min_interval() {
+        // 刚抓过 → 需要等满一个间隔
+        let now = std::time::Instant::now();
+        let wait = remaining_wait(now, Duration::from_millis(500)).expect("应需要等待");
+        assert!(wait <= Duration::from_millis(500));
+        assert!(wait > Duration::from_millis(400));
+        // 间隔为 0 → 不限速
+        assert_eq!(remaining_wait(now, Duration::ZERO), None);
+        // 已经等够了 → 不用等（用过去的时刻模拟）
+        let long_ago = now - Duration::from_secs(10);
+        assert_eq!(remaining_wait(long_ago, Duration::from_millis(500)), None);
     }
 
     #[test]

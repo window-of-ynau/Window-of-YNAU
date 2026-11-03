@@ -120,6 +120,7 @@ impl Fixture {
                 retries,
                 backoff: Duration::ZERO, // 测试不等退避
                 retry_failed: false,
+                min_interval: Duration::ZERO, // 测试不限速
             },
         )
     }

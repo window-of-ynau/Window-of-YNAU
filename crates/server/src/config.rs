@@ -80,6 +80,8 @@ pub struct Config {
     pub rag_fetch_backoff_ms: u64,
     /// 抓取 HTTP 超时（秒）
     pub rag_fetch_timeout_secs: u64,
+    /// 同一轮内两次抓取之间的最小间隔（毫秒）——限速，对 arXiv 这类要求礼貌访问的源必要
+    pub rag_fetch_min_interval_ms: u64,
     /// `rag_known_docs` 保留月数（0 = 不清理）。与盐的保留期**分开配置**：
     /// "语料保留多久"和"盐保留多久"是两类不同决策。
     pub rag_known_docs_retention_months: u32,
@@ -133,6 +135,7 @@ impl Config {
             rag_fetch_retries: env_parse("RAG_FETCH_RETRIES", 3),
             rag_fetch_backoff_ms: env_parse("RAG_FETCH_BACKOFF_MS", 200),
             rag_fetch_timeout_secs: env_parse("RAG_FETCH_TIMEOUT_SECS", 10),
+            rag_fetch_min_interval_ms: env_parse("RAG_FETCH_MIN_INTERVAL_MS", 1_000),
             rag_known_docs_retention_months: env_parse("RAG_KNOWN_DOCS_RETENTION_MONTHS", 3),
             rag_salts_retention_months: env_parse("RAG_SALTS_RETENTION_MONTHS", 3),
             trust_proxy: env::var("YUNONG_TRUST_PROXY")
@@ -184,6 +187,8 @@ impl Config {
             rag_fetch_retries: 3,
             rag_fetch_backoff_ms: 0,
             rag_fetch_timeout_secs: 10,
+            rag_fetch_min_interval_ms: 0, // 测试里不限速（否则用例会变慢）
+
             rag_known_docs_retention_months: 3,
             rag_salts_retention_months: 3,
             // 测试用固定盐：抽样判定在用例之间必须可复现。
