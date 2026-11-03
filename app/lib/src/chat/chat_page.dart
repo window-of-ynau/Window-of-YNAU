@@ -4,6 +4,7 @@
 // 消息列表与输入区拆成独立 widget，后续整体换主题不需要改逻辑。
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -48,6 +49,7 @@ class ChatPage extends StatefulWidget {
     this.searchService,
     this.localSearchService,
     this.memoryService,
+    this.keyValidator,
     this.dbPath = '',
   });
 
@@ -57,6 +59,10 @@ class ChatPage extends StatefulWidget {
   final SearchService? searchService;
   final LocalSearchService? localSearchService;
   final MemoryService? memoryService;
+
+  /// 保存前的 Key 轻校验（默认真的请求上游 `/models`；测试可注入）。
+  /// 返回 null = 可用；否则返回可读错误文案。
+  final Future<String?> Function(String apiKey)? keyValidator;
   final String dbPath;
 
   @override
@@ -361,6 +367,76 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  /// 轻量校验：请求一次 `/models`（OpenAI 兼容），8s 超时。
+  ///
+  /// 返回 null = 可用；否则返回可读错误（**不显示原始错误串**）。
+  static Future<String?> _validateByokKey(String apiKey) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+    try {
+      final request = await client
+          .getUrl(Uri.parse('https://api.deepseek.com/models'))
+          .timeout(const Duration(seconds: 8));
+      request.headers.set('Authorization', 'Bearer $apiKey');
+      final response = await request.close().timeout(const Duration(seconds: 8));
+      await response.drain<void>();
+      if (response.statusCode == 200) {
+        return null;
+      }
+      if (response.statusCode == 401 || response.statusCode == 403) {
+        return 'Key 无效（上游返回 ${response.statusCode}）';
+      }
+      return '上游暂不可用（HTTP ${response.statusCode}），请稍后重试';
+    } on Object {
+      return '网络不可达，无法校验 Key（请检查网络后重试）';
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  void _showError(String message) {
+    if (!mounted) {
+      return;
+    }
+    setState(() => _error = message);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// 保存 Key：**先校验、再落盘、再回读**，任一失败都不假装成功。
+  Future<void> _saveKey(String apiKey) async {
+    final validator = widget.keyValidator ?? _validateByokKey;
+    final reason = await validator(apiKey);
+    if (reason != null) {
+      _showError(reason);
+      return;
+    }
+    try {
+      final saved = await _secrets.save(SecretService.byokKeyName, apiKey);
+      if (!saved.set) {
+        _showError('保存失败：安全存储没有确认写入');
+        return;
+      }
+      final status = await _secrets.status(SecretService.byokKeyName);
+      if (!status.set || status.masked.isEmpty) {
+        _showError('保存后回读失败：Key 没有真正落盘');
+        return;
+      }
+      if (mounted) {
+        setState(() {
+          _keyStatus = status;
+          _error = null;
+        });
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('已保存 ${status.masked}')),
+        );
+      }
+    } on SecretException catch (failure) {
+      _showError(failure.userHint);
+    } on Object {
+      _showError('保存失败：端侧核心不可用');
+    }
+  }
   Future<void> _deleteKey() async {
     try {
       await _secrets.delete(SecretService.byokKeyName);
@@ -387,18 +463,14 @@ class _ChatPageState extends State<ChatPage> {
     );
     if (result != null && mounted) {
       if (result.byokKey.isNotEmpty) {
-        // 明文只交给 Rust 一次，随后从 Dart 状态里清掉
-        try {
-          await _secrets.save(SecretService.byokKeyName, result.byokKey);
-          result.byokKey = '';
-          await _refreshKeyStatus();
-        } on SecretException catch (failure) {
-          if (mounted) {
-            setState(() => _error = failure.userHint);
-          }
+        // 明文只在这一行里出现，交给 _saveKey 后立刻清掉
+        final apiKey = result.byokKey;
+        result.byokKey = '';
+        await _saveKey(apiKey);
+        if (!mounted) {
+          return;
         }
-      }
-      setState(() {
+      }      setState(() {
         _settings.cloudToken = result.cloudToken;
         _settings.model = result.model;
         _settings.protocol = result.protocol;
