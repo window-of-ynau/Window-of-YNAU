@@ -48,7 +48,7 @@ mod cloud;
 mod cloud_sse;
 mod direct;
 #[cfg(test)]
-mod fake_server;
+pub(crate) mod fake_server;
 pub mod sse;
 #[cfg(test)]
 mod tests;
