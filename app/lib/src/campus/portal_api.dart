@@ -569,13 +569,44 @@ const String kPortalScheduleScript = r'''
     timeoutPosted = false;
   }
 
+  // t94：注入脚本可能早于 flutter_inappwebview 的 polyfill（AT_DOCUMENT_START），
+  // 此时 `window.flutter_inappwebview` 还不存在——**旧实现在这里静默 return false，消息直接丢了**，
+  // 于是诊断出现“脚本探测 1 次 / Dart 收到 0 条”。现在改为排队 + 定时/加载后补发。
+  var PENDING = [];
+  var BRIDGE = { queued: 0, flushed: 0, dropped: 0 };
+  DIAG.bridgeQueued = 0;
   function post(payload) {
     try {
-      if (!window.flutter_inappwebview) { return false; }
+      if (!window.flutter_inappwebview) {
+        PENDING.push(payload); DIAG.bridgeQueued += 1; BRIDGE.queued += 1;
+        return false;
+      }
       window.flutter_inappwebview.callHandler('yunongBridge', JSON.stringify(payload));
       return true;
-    } catch (e) { return false; }
+    } catch (e) {
+      PENDING.push(payload); DIAG.bridgeQueued += 1; BRIDGE.queued += 1;
+      return false;
+    }
   }
+
+  function flushPending() {
+    if (!PENDING.length) { return; }
+    if (!window.flutter_inappwebview) { return; }
+    var items = PENDING; PENDING = [];
+    for (var i = 0; i < items.length; i++) {
+      try {
+        window.flutter_inappwebview.callHandler('yunongBridge', JSON.stringify(items[i]));
+        BRIDGE.flushed += 1;
+      } catch (e) {
+        PENDING.push(items[i]); BRIDGE.dropped += 1;
+      }
+    }
+  }
+  try {
+    setInterval(flushPending, 200);
+    window.addEventListener('load', flushPending);
+    document.addEventListener('DOMContentLoaded', flushPending);
+  } catch (e) {}
 
   function parseUrl(raw) {
     try { return new URL(raw, location.href); } catch (e) { return null; }

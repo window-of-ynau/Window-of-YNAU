@@ -95,6 +95,10 @@ class ChatPageState extends State<ChatPage> {
   /// 测试用：最近一次取 Key 状态失败的原因（正常时应为空）。
   @visibleForTesting
   String? get keyStatusError => _keyStatusError;
+
+  /// 测试用：通道就绪判定（含协议不支持的提前拦截）。
+  @visibleForTesting
+  ({bool ready, String reason, String code}) get channelStateForTest => _channelState;
   late final AuthService _auth = widget.authService ?? AuthService();
   late final SearchService _search =
       widget.searchService ?? SearchService(dbPath: widget.dbPath);
@@ -164,13 +168,22 @@ class ChatPageState extends State<ChatPage> {
   /// - 其它：未选择通道。
   ({bool ready, String reason, String code}) get _channelState {
     if (_channel == 'byok') {
+      // t94：DeepSeek/OpenAI 只提供 OpenAI 兼容接口，没有 Anthropic Messages API。
+      // 提前拦住，别让用户看到笼统的 UPSTREAM_ERROR。
+      if (_settings.protocol == 'anthropic_messages' && isOpenAiOnlyUpstream(_settings.baseUrl)) {
+        return (
+          ready: false,
+          reason: '该上游不支持 Anthropic Messages 协议，请改用 OpenAI Completions',
+          code: 'PROTOCOL_UNSUPPORTED',
+        );
+      }
       if (_keyStatus.usable) {
         return (ready: true, reason: '', code: '');
       }
       if (_keyStatus.broken) {
         return (ready: false, reason: '本地凭据已损坏，请重新填写 Key', code: 'SECRET_BROKEN');
       }
-      return (ready: false, reason: '未设置 API Key：点右上角设置填入', code: 'MISSING_API_KEY');
+      return (ready: false, reason: '未设置 API Key：到设置页填入', code: 'MISSING_API_KEY');
     }
     if (_channel == 'cloud') {
       if (_auth.signedIn || _settings.cloudToken.isNotEmpty) {
@@ -990,3 +1003,12 @@ class _MessageBubble extends StatelessWidget {
 /// 设置对话框：Key 输入框 `obscureText`，**不回显**已保存的值。
 
 /// 套餐账号登录对话框（邮箱 + 密码；密码不回显）。
+
+/// 只提供 OpenAI 兼容接口的上游（没有 Anthropic Messages API）。
+///
+/// t94：`anthropic_messages` + 这些上游 = 预期内失败，必须在发送前就提示，
+/// 而不是让用户看到一个笼统的 `UPSTREAM_ERROR`。
+bool isOpenAiOnlyUpstream(String baseUrl) {
+  final String host = Uri.tryParse(baseUrl)?.host.toLowerCase() ?? baseUrl.toLowerCase();
+  return host.contains('deepseek') || host.contains('openai') || host.contains('moonshot');
+}
