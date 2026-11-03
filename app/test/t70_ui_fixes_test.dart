@@ -108,9 +108,52 @@ void main() {
       }
     });
   });
+
+  group('P0-3 主题持久化回读（模拟重启）', () {
+    test('select 写入后新实例能读回同一主题', () async {
+      final dir = Directory.systemTemp.createTempSync('t78-settings');
+      final path = '${dir.path}/settings.json';
+      addTearDown(() => dir.deleteSync(recursive: true));
+
+      final writer = ThemeController(store: FileSettingsStore(path: path));
+      writer.select(AppThemeId.paperCoral);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(File(path).existsSync(), isTrue);
+
+      final reader = ThemeController(store: FileSettingsStore(path: path));
+      await reader.load();
+      expect(reader.themeId, AppThemeId.paperCoral);
+      final saved = jsonDecode(File(path).readAsStringSync()) as Map<String, dynamic>;
+      expect(saved.containsKey(SettingsKeys.themeId), isTrue);
+    });
+  });
+
+  testWidgets('诊断里能看到 delta 计数（P0-1 观测口径）', (WidgetTester tester) async {
+    await _pumpChat(tester, backend: _PartialStreamBackend(), keySet: true);
+    await tester.enterText(find.byType(TextField).first, '你好');
+    await tester.tap(find.text('发送'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.more_vert));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('对话诊断'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('send_called=true'), findsOneWidget);
+    expect(find.textContaining('events_received='), findsOneWidget);
+  });
+
+  testWidgets('本地资料面板可关闭（× 按钮）', (WidgetTester tester) async {
+    await _pumpChat(tester);
+    await tester.tap(find.byIcon(Icons.more_vert));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('搜索本地资料（不联网）'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('只查这台设备'), findsOneWidget);
+    await tester.tap(find.byTooltip('关闭本地资料'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('只查这台设备'), findsNothing);
+  });
 }
 
-/// 模拟 owner 观察到的"三个字就停"：3 条 delta，然后**没有 done**。
 class _PartialStreamBackend implements ChatBackend {
   @override
   int start(String requestJson, bool Function(String chunkJson) onChunk) {

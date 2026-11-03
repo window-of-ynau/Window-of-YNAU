@@ -697,11 +697,23 @@ class _ChatPageState extends State<ChatPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
-                  Text(
-                    '本地资料（只查这台设备，不联网）',
-                    style: theme.textTheme.bodySmall
-                        ?.copyWith(fontWeight: FontWeight.w600),
-                  ),
+                Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: Text(
+                        '本地资料（只查这台设备，不联网）',
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '关闭本地资料',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => setState(() => _localPanelOpen = false),
+                      icon: const Icon(Icons.close, size: 16),
+                    ),
+                  ],
+                ),
                   const SizedBox(height: 6),
                   Row(
                     children: <Widget>[
