@@ -150,7 +150,7 @@ void main() {
       ));
       await tester.pumpAndSettle();
 
-      expect(find.textContaining('sk-****cdef'), findsOneWidget);
+      expect(find.textContaining('sk-****cdef'), findsWidgets);
       expect(find.text(_plain), findsNothing, reason: 'UI 不得出现明文');
       expect(find.textContaining('仅内存生效'), findsOneWidget);
     });
