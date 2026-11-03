@@ -64,21 +64,18 @@ Future<void> _pump(WidgetTester tester, ChatBackend backend) async {
 }
 
 void main() {
-  testWidgets('3 秒无事件 → 界面出现诊断横幅（含 handle/回调注册/事件数）', (WidgetTester tester) async {
+  testWidgets('5 秒无事件 → 只提示、**不取消流**（t79：首字慢不是错误）', (WidgetTester tester) async {
     final backend = SilentBackend();
     await _pump(tester, backend);
 
     await tester.enterText(find.byType(TextField).first, '你好');
     await tester.tap(find.text('发送'));
-    await tester.pump(); // 触发 _send
-    await tester.pump(const Duration(seconds: 4)); // 越过 3s 看门狗
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 6));
     await tester.pumpAndSettle();
 
-    expect(find.textContaining('对话没有启动'), findsOneWidget);
+    expect(find.textContaining('5 秒内还没收到任何数据'), findsOneWidget);
     expect(find.textContaining('handle=7'), findsOneWidget);
-    expect(find.textContaining('回调注册=成功'), findsOneWidget);
-    expect(find.textContaining('已收到事件=0'), findsOneWidget);
-    expect(find.text('复制诊断'), findsOneWidget);
   });
 
   testWidgets('有事件时不出现“对话没有启动”横幅', (WidgetTester tester) async {

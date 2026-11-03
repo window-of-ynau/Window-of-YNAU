@@ -107,6 +107,8 @@ class _ChatPageState extends State<ChatPage> {
   ChatStream? _stream;
   bool _streaming = false;
   String? _error;
+  /// 首字慢的非致命提示（不取消流）
+  String? _slowHint;
 
   /// 最近一轮对话的诊断（3 秒无事件时显示横幅 + 可复制）。
   ChatDiagnostics? _diagnostics;
@@ -242,21 +244,24 @@ class _ChatPageState extends State<ChatPage> {
     // P0-1（t56）：失败必须可观测——内存诊断，不依赖 Release 看不了的日志
     _diagnostics = stream.diagnostics;
     var sawEvent = false;
-    final watchdog = Timer(const Duration(seconds: 3), () {
-      if (!mounted || sawEvent || !_streaming) {
+    // P0-1（t79）：**只提示，不取消**。DeepSeek/思考模型首个 token 常 >3s；
+    // 之前 3s 看门狗直接 cancel → handle=1、callback_registered=true、events=0、无错误，
+    // 正是 owner 看到的“默默被杀”。取消只由用户点「停止」触发。
+    final watchdog = Timer(const Duration(seconds: 5), () {
+      if (!mounted || sawEvent) {
         return;
       }
-      stream.cancel();
       setState(() {
-        _streaming = false;
-        _stream = null;
-        _error = stream.diagnostics.banner;
+        _slowHint = '流已启动，但 5 秒内还没收到任何数据（handle=${stream.diagnostics.handle}），仍在等待…';
       });
     });
     stream.events.listen(
       (ChatEvent event) {
         sawEvent = true;
         watchdog.cancel();
+        if (_slowHint != null) {
+          setState(() => _slowHint = null);
+        }
         if (!mounted) {
           return;
         }
@@ -640,6 +645,11 @@ class _ChatPageState extends State<ChatPage> {
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.tertiary),
             ),
+          ),
+        if (_slowHint != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+            child: Text(_slowHint!, style: theme.textTheme.bodySmall),
           ),
         if (_error != null)
           Padding(
