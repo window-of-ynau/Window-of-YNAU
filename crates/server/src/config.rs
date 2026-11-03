@@ -70,6 +70,23 @@ pub struct Config {
     pub rag_max_items_per_request: usize,
     /// 单月单客户端累计上报条数上限（防放大）
     pub rag_max_items_per_month: usize,
+    /// 是否启用抓取 worker（默认 **false**：CI 与离线环境都不允许联网抓取）
+    pub rag_fetch_enabled: bool,
+    /// 每轮抓取最多处理多少个候选（按 count 排序）
+    pub rag_fetch_top_n: usize,
+    /// 抓取失败的重试次数（总计 retries+1 次尝试）
+    pub rag_fetch_retries: u32,
+    /// 重试退避基数（毫秒）：第 n 次等 backoff * 2^(n-1)
+    pub rag_fetch_backoff_ms: u64,
+    /// 抓取 HTTP 超时（秒）
+    pub rag_fetch_timeout_secs: u64,
+    /// 同一轮内两次抓取之间的最小间隔（毫秒）——限速，对 arXiv 这类要求礼貌访问的源必要
+    pub rag_fetch_min_interval_ms: u64,
+    /// `rag_known_docs` 保留月数（0 = 不清理）。与盐的保留期**分开配置**：
+    /// "语料保留多久"和"盐保留多久"是两类不同决策。
+    pub rag_known_docs_retention_months: u32,
+    /// `rag_salts` 保留月数（0 = 不清理）。删掉旧盐后，跨月"同标识"就不可证明了。
+    pub rag_salts_retention_months: u32,
     /// 套餐通道的上游供应商（三家协议可各配一套；Key 只存在服务端）
     pub upstream: UpstreamConfig,
 }
@@ -113,6 +130,14 @@ impl Config {
             rag_salt_ttl_secs: env_parse("RAG_SALT_TTL_SECS", 600),
             rag_max_items_per_request: env_parse("RAG_MAX_ITEMS_PER_REQUEST", 200),
             rag_max_items_per_month: env_parse("RAG_MAX_ITEMS_PER_MONTH", 2_000),
+            rag_fetch_enabled: env_flag("RAG_FETCH_ENABLED"),
+            rag_fetch_top_n: env_parse("RAG_FETCH_TOP_N", 100),
+            rag_fetch_retries: env_parse("RAG_FETCH_RETRIES", 3),
+            rag_fetch_backoff_ms: env_parse("RAG_FETCH_BACKOFF_MS", 200),
+            rag_fetch_timeout_secs: env_parse("RAG_FETCH_TIMEOUT_SECS", 10),
+            rag_fetch_min_interval_ms: env_parse("RAG_FETCH_MIN_INTERVAL_MS", 1_000),
+            rag_known_docs_retention_months: env_parse("RAG_KNOWN_DOCS_RETENTION_MONTHS", 3),
+            rag_salts_retention_months: env_parse("RAG_SALTS_RETENTION_MONTHS", 3),
             trust_proxy: env::var("YUNONG_TRUST_PROXY")
                 .ok()
                 .map(|value| {
@@ -156,6 +181,16 @@ impl Config {
             rag_salt_ttl_secs: 600,
             rag_max_items_per_request: 200,
             rag_max_items_per_month: 2_000,
+            // 测试默认不联网；需要抓取的用例自己注入 mock Fetcher
+            rag_fetch_enabled: false,
+            rag_fetch_top_n: 100,
+            rag_fetch_retries: 3,
+            rag_fetch_backoff_ms: 0,
+            rag_fetch_timeout_secs: 10,
+            rag_fetch_min_interval_ms: 0, // 测试里不限速（否则用例会变慢）
+
+            rag_known_docs_retention_months: 3,
+            rag_salts_retention_months: 3,
             // 测试用固定盐：抽样判定在用例之间必须可复现。
             // 这里刻意用"64 字符小写十六进制"——它必须能通过 `validate_sample_salt`，
             // 否则将来有人把校验接到 for_tests 上会整片测试挂掉。
@@ -257,6 +292,19 @@ pub fn validate_sample_salt(salt: &str) -> Result<(), String> {
 /// 单独抽出来是为了可测：配置错误必须能被回归抓住，而不是等上线后被放大。
 pub fn clamp_auth_hash_concurrency(configured: usize) -> usize {
     configured.clamp(1, MAX_AUTH_HASH_CONCURRENCY)
+}
+
+/// 布尔开关：`1/true/yes/on` 为真（大小写不敏感），其余为假。
+fn env_flag(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn env_or(key: &str, default: &str) -> String {

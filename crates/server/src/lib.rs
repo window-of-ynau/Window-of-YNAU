@@ -14,6 +14,7 @@ pub mod config;
 pub mod gate;
 pub mod limiter;
 pub mod rag;
+pub mod rag_fetch;
 pub mod state;
 pub mod upstream;
 
@@ -80,6 +81,18 @@ pub fn app(state: state::AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(api::request_id::attach))
         .with_state(state)
+}
+
+/// 初始化 tracing（服务端与 CLI 共用；重复调用是幂等的）。
+pub fn init_tracing() {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,tower_http=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .try_init();
 }
 
 /// 服务版本。
