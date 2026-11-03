@@ -13,6 +13,9 @@
 //! cargo run -p yunong-core --example chat_ffi_probe -- --bad-url
 //! cargo run -p yunong-core --example chat_ffi_probe -- --frames 50 --interval-ms 50
 //! cargo run -p yunong-core --example chat_ffi_probe -- --frames 50 --interval-ms 50 --split
+//! # 工具事件端到端（打 fake_sse --mode tool；要带 db_path 才会挂内置工具）
+//! cargo run -p yunong-core --example fake_sse -- --port 8791 --mode tool
+//! cargo run -p yunong-core --example chat_ffi_probe -- --external http://127.0.0.1:8791/v1 --db .\tool-e2e.db
 //! ```
 //!
 //! 退出码：`0` = 符合预期；`2` = 超时/没收齐；`3` = 一条 chunk 都没收到；
@@ -26,7 +29,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use yunong_core::ffi::{yunong_chat_cancel, yunong_chat_stream, yunong_free_string};
+use yunong_core::ffi::{
+    yunong_chat_cancel, yunong_chat_stream, yunong_free_string, yunong_memory_upsert,
+};
 
 /// 回调里累积的状态。
 ///
@@ -36,6 +41,9 @@ struct Sink {
     count: AtomicUsize,
     /// 收到的 `delta` 条数（和上游发的帧数对账）
     deltas: AtomicUsize,
+    /// 收到的 `tool_call` / `tool_result` 条数（工具事件配对检查）
+    tool_calls: AtomicUsize,
+    tool_results: AtomicUsize,
     /// 泄漏模式用：不打印每条 chunk
     quiet: bool,
 
@@ -51,6 +59,8 @@ impl Sink {
             chunks: Mutex::new(Vec::new()),
             count: AtomicUsize::new(0),
             deltas: AtomicUsize::new(0),
+            tool_calls: AtomicUsize::new(0),
+            tool_results: AtomicUsize::new(0),
             quiet: false,
             cancel_after,
             handle: AtomicI64::new(0),
@@ -93,8 +103,17 @@ unsafe extern "C" fn on_chunk(json: *const std::os::raw::c_char, user: *mut std:
         return;
     };
     let n = sink.count.fetch_add(1, Ordering::SeqCst) + 1;
-    if chunk_type(&text).as_deref() == Some("delta") {
-        sink.deltas.fetch_add(1, Ordering::SeqCst);
+    match chunk_type(&text).as_deref() {
+        Some("delta") => {
+            sink.deltas.fetch_add(1, Ordering::SeqCst);
+        }
+        Some("tool_call") => {
+            sink.tool_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Some("tool_result") => {
+            sink.tool_results.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
     }
     if !sink.quiet {
         println!("[probe] chunk #{n:<3} {}", brief(&text, 160));
@@ -345,6 +364,10 @@ struct Args {
     no_done: bool,
     /// `--leak N`：跑 N 次完整流做泄漏检查（0 = 不跑）
     leak_rounds: usize,
+    /// `--external <url>`：不启内置假上游，直接打这个地址（用于 fake_sse --mode tool）
+    external: Option<String>,
+    /// `--db <path>`：本地库路径（挂内置工具用；缺省用临时库）
+    db_path: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -358,6 +381,8 @@ fn parse_args() -> Args {
         crlf: false,
         no_done: false,
         leak_rounds: 0,
+        external: None,
+        db_path: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -380,6 +405,8 @@ fn parse_args() -> Args {
                     .and_then(|v| v.parse().ok())
                     .expect("--interval-ms 需要一个数字");
             }
+            "--external" => args.external = iter.next(),
+            "--db" => args.db_path = iter.next(),
             "--bad-url" => args.bad_url = true,
             "--split" => args.split = true,
             "--crlf" => args.crlf = true,
@@ -410,8 +437,16 @@ fn main() {
     }
     println!("=== C ABI 探针：yunong_chat_stream ===");
 
-    // 1) 假上游（--bad-url 时故意指向一个没人监听的端口）
-    let upstream = if args.bad_url {
+    // 1) 假上游（--bad-url 时故意指向一个没人监听的端口；--external 时用外部 mock）
+    let upstream = if let Some(url) = &args.external {
+        println!("模式: --external {url}（打外部 mock，例如 fake_sse --mode tool）");
+        FakeUpstream {
+            port: 0,
+            seen: Arc::new(Mutex::new(None)),
+            stats: Arc::new(UpstreamStats::new()),
+            handle: thread::spawn(|| {}),
+        }
+    } else if args.bad_url {
         println!("模式: --bad-url（指向未监听的端口，验证错误能否回调到 UI）");
         FakeUpstream {
             port: 1,
@@ -451,19 +486,54 @@ fn main() {
     let seen = Arc::clone(&upstream.seen);
     let stats = Arc::clone(&upstream.stats);
 
-    // 2) 组装 Dart 侧会传的 request JSON（字段与 ChatRunConfig 一致）
+    // 2) 准备本地库（挂内置工具）+ 种一条记忆，让 memory_search 能搜到东西
+    let db_path = args.db_path.clone().unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join(format!("yunong-tool-e2e-{}.db", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    });
+    if args.external.is_some() {
+        let kind = CString::new("note").unwrap();
+        let title = CString::new("").unwrap();
+        let content = CString::new("雨伞是黑色的，放在宿舍楼 3 栋 502").unwrap();
+        let source = CString::new("user").unwrap();
+        let id = CString::new("").unwrap();
+        let db = CString::new(db_path.clone()).unwrap();
+        let raw = unsafe {
+            yunong_memory_upsert(
+                kind.as_ptr(),
+                title.as_ptr(),
+                content.as_ptr(),
+                source.as_ptr(),
+                id.as_ptr(),
+                db.as_ptr(),
+            )
+        };
+        if !raw.is_null() {
+            let text = unsafe { CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { yunong_free_string(raw) };
+            println!("本地库 {db_path} 已种一条记忆：{text}");
+        }
+    }
+
+    // 3) 组装 Dart 侧会传的 request JSON（字段与 ChatRunConfig 一致）
     let request = serde_json::json!({
         "channel": "byok",
         "protocol": "openai_completions",
         "model": "gpt-probe",
-        "base_url": format!("http://127.0.0.1:{port}/v1"),
+        "base_url": args.external.clone().unwrap_or_else(|| format!("http://127.0.0.1:{port}/v1")),
         "api_key": "sk-probe-not-a-real-key",
         "messages": [{ "role": "user", "content": "说三个字" }],
-        "max_output_tokens": 64
+        "max_output_tokens": 64,
+        // 带了 db_path 就会挂端侧内置工具（memory_search / timetable_query）
+        "db_path": db_path.clone(),
     });
     let request =
         CString::new(serde_json::to_string(&request).expect("序列化请求失败")).expect("请求含 NUL");
-    let db_path = CString::new("").expect("空串");
+    let db_path = CString::new(db_path.clone()).expect("库路径含 NUL");
 
     // 3) 通过 C ABI 启动流；回调状态挂在 user 指针上
     let sink = Arc::new(Sink::new(args.cancel_after));
@@ -545,6 +615,25 @@ fn main() {
     if count == 0 {
         eprintln!("\n❌ 结论：一条 chunk 都没到回调 → **FFI 这条路不通**（Rust 侧问题）");
         std::process::exit(3);
+    }
+    // --external（如 fake_sse --mode tool）：内置假上游根本没启动，计数为 0 是正常的，
+    // 判定改成看"有没有 done"和"工具事件是否配对"
+    if args.external.is_some() {
+        let tool_calls = sink.tool_calls.load(Ordering::SeqCst);
+        let tool_results = sink.tool_results.load(Ordering::SeqCst);
+        println!("\n=== 工具事件配对检查 ===");
+        println!("tool_call   = {tool_calls}");
+        println!("tool_result = {tool_results}");
+        if done {
+            if tool_calls == tool_results {
+                println!("\n✅ 结论：外部 mock 端到端通 —— 工具事件配对（{tool_calls}/{tool_results}）、done 已到");
+                return;
+            }
+            eprintln!("\n❌ 结论：出现了悬空的 tool_call（{tool_calls}/{tool_results}）");
+            std::process::exit(5);
+        }
+        eprintln!("\n❌ 结论：没等到 done → 流没走完");
+        std::process::exit(2);
     }
     if expect_error {
         if errored {
