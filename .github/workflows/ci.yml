@@ -133,6 +133,63 @@ jobs:
             echo "::error::只跑了 ${passed:-0} 条用例（预期 ≥1）"
             exit 1
           fi
+      # 工具事件端到端（t106）：fake_sse --mode tool 先回 tool_calls，第二次请求回文本 + done，
+      # 客户端用真 DLL 跑完整链路，断言 tool_call → tool_result → delta → done 的顺序与配对。
+      #
+      # YUNONG_CORE_DLL **只在下面这条命令上设置**（step 级 env），不设 job 级、也不设到 flutter
+      # 其它命令上：全局设置会让 widget 测试被带着走真 FFI 而失败（lead-client 实测）。
+      # 本 job 与 Flutter job 是分开的，widget 测试那条链路永远看不到这个变量。
+      #
+      # t106 的测试若尚未合入 main，则只打警告并跳过本步（不阻塞主分支）；文件一出现就自动生效，
+      # 之后走完整断言：不许 skip、必须真跑、输出里必须出现 tool_call 与 tool_result。
+      - name: 工具事件端到端（t106，fake_sse --mode tool，禁止 skip）
+        working-directory: app
+        env:
+          YUNONG_CORE_DLL: ${{ github.workspace }}/target/debug/libyunong_core.so
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          files=(test/t106_*.dart)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::app/test/t106_*.dart 不存在（t106 尚未合入 main），跳过工具事件端到端；合入后本步自动生效"
+            exit 0
+          fi
+          echo "运行：${files[*]}"
+          if ! out=$(flutter test "${files[@]}" 2>&1); then
+            printf '%s\n' "$out" | tail -n 60
+            echo "::error::工具事件端到端失败（完整输出见上）"
+            exit 1
+          fi
+          printf '%s\n' "$out" | tail -n 20
+          # ① 不许 skip（未设 DLL 或 fake_sse 不再时它会静默跳过，那样等于没有护栏）
+          if printf '%s\n' "$out" | grep -Eq 'All tests skipped|⏭️'; then
+            echo "::error::工具事件用例被 skip 了：检查 YUNONG_CORE_DLL=$YUNONG_CORE_DLL 与 target/debug/examples/fake_sse"
+            exit 1
+          fi
+          # ② 必须真有通过行
+          if ! printf '%s\n' "$out" | grep -q '✅ Passing tests'; then
+            echo "::error::没有看到 ✅ Passing tests 分组（工具事件用例可能没执行）"
+            exit 1
+          fi
+          # ③ 工具事件确实出现：测试会把 wire JSON 打出来，两种事件名都要看到
+          for token in tool_call tool_result; do
+            if ! printf '%s\n' "$out" | grep -q "$token"; then
+              echo "::error::输出里没有出现 $token —— 工具事件链路没有真正跑通"
+              exit 1
+            fi
+          done
+          summary=$(printf '%s\n' "$out" | grep -E '[0-9]+ tests? passed' | tail -n 1)
+          if [ -z "$summary" ] || printf '%s' "$summary" | grep -q skipped; then
+            echo "::error::测试汇总缺失或含 skipped：${summary:-<empty>}"
+            exit 1
+          fi
+          passed=$(printf '%s' "$summary" | sed -E 's/.*[^0-9]([0-9]+) tests? passed.*/\1/')
+          if [ "${passed:-0}" -lt 1 ]; then
+            echo "::error::只跑了 ${passed:-0} 条工具事件用例（预期 ≥1）"
+            exit 1
+          fi
+          echo "工具事件端到端：${passed} 条用例真跑通过（非 skip）"
+
 
   docs:
     name: 文档（表格 / 相对链接）
