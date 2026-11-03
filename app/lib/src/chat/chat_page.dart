@@ -626,18 +626,30 @@ class ChatPageState extends State<ChatPage> {
               ],
             ),
           ),
+        // 顶部提示条：**颜色一律取主题 token**。
+        // 旧写法用 colorScheme.surfaceContainerHighest + tertiary，在深蓝玻璃（深色画布）上
+        // 会渲染成一块浅色底，和画布反色、非常突兀（owner 反馈的 P1）。
         if (!_searchStatus.available)
-          Container(
-            width: double.infinity,
-            color: theme.colorScheme.surfaceContainerHighest,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            child: Text(
-              _searchStatus.hint.isEmpty
-                  ? '未配置联网搜索，模型无法获取实时信息'
-                  : _searchStatus.hint,
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.tertiary),
-            ),
+          Builder(
+            builder: (BuildContext context) {
+              final YunongTokens t = context.tokens;
+              return Container(
+                width: double.infinity,
+                decoration: BoxDecoration(
+                  color: t.surfaceAlt,
+                  border: Border(
+                    bottom: BorderSide(color: t.hairline, width: t.borderWidth),
+                  ),
+                ),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                child: Text(
+                  _searchStatus.hint.isEmpty
+                      ? '未配置联网搜索，模型无法获取实时信息'
+                      : _searchStatus.hint,
+                  style: theme.textTheme.bodySmall?.copyWith(color: t.inkSoft),
+                ),
+              );
+            },
           ),
         if (_localPanelOpen)
           Container(
@@ -828,10 +840,9 @@ class _EmptyState extends StatelessWidget {
     final ThemeData theme = Theme.of(context);
     final YunongTokens t = context.tokens;
 
-    return Align(
-      alignment: Alignment.bottomCenter,
+    return Center(
       child: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(24, 16, 24, 10),
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 560),
           child: Column(
