@@ -251,6 +251,11 @@ jobs:
     needs: version-check
     permissions:
       contents: write
+    env:
+      # windows-latest 的 MSVC 14.51 已把 <experimental/coroutine> 变成硬错误（STL1011 / C2338），
+      # 而 flutter_inappwebview_windows 的插件工程仍在用 /await。这是微软给的抑制开关，
+      # 等插件升级后可以删掉；本地 VS 2022 不需要。
+      CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
     steps:
       - uses: actions/checkout@v7
         with:
