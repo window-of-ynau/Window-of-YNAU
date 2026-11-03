@@ -112,9 +112,14 @@ jobs:
             echo "::error::用例被 skip 了：检查 YUNONG_CORE_DLL=$YUNONG_CORE_DLL 与 target/debug/examples/fake_sse 是否存在"
             exit 1
           fi
-          # 锚定"确有 ✅ 的通过行"，而不是只看退出码
-          if ! printf '%s\n' "$out" | grep -F 't79_fake_sse_integration_test.dart' | grep -q '✅'; then
-            echo "::error::没有看到该用例的 ✅ 通过行（可能根本没执行）"
+          # 锚定"确有 ✅ 的通过行"，而不是只看退出码。
+          # 注意 reporter 的通过清单只打用例标题、不打文件路径（t93 踩过：按文件路径 grep 会误判）。
+          if ! printf '%s\n' "$out" | grep -q '✅ Passing tests'; then
+            echo "::error::没有看到 ✅ Passing tests 分组（用例可能没执行）"
+            exit 1
+          fi
+          if ! printf '%s\n' "$out" | grep -Eq '^✅ '; then
+            echo "::error::✅ Passing tests 分组里没有任何通过行"
             exit 1
           fi
           # 再卡一道下限：通过的条数 ≥ 1，且汇总行里不许出现 skipped
