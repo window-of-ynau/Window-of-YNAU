@@ -103,21 +103,22 @@ class ThemeController extends ChangeNotifier {
   ThemeController({
     SettingsStore? store,
     AppThemeId initialTheme = AppThemeId.minimalBlack,
-    ThemeMode initialMode = ThemeMode.system,
     GlassMode initialGlass = GlassMode.auto,
   })  : _store = store ?? MemorySettingsStore(),
         _themeId = initialTheme,
-        _themeMode = initialMode,
         _glassMode = initialGlass;
 
   final SettingsStore _store;
   AppThemeId _themeId;
-  ThemeMode _themeMode;
+
   GlassMode _glassMode;
 
   AppThemeId get themeId => _themeId;
 
-  ThemeMode get themeMode => _themeMode;
+  /// 明暗由主题决定（owner：A/C 本来就走浅色、B 本来就走深色，不再单设开关）：
+  /// A 极简黑白 / C 书本质感 → light；B 深蓝玻璃 → dark。
+  ThemeMode get themeMode =>
+      _themeId == AppThemeId.deepGlass ? ThemeMode.dark : ThemeMode.light;
 
   GlassMode get glassMode => _glassMode;
 
@@ -125,7 +126,7 @@ class ThemeController extends ChangeNotifier {
   Future<void> load() async {
     try {
       final String? id = await _store.get(SettingsKeys.themeId);
-      final String? mode = await _store.get(SettingsKeys.themeMode);
+
       bool changed = false;
       if (id != null) {
         final AppThemeId parsed = AppThemeId.fromStorage(id);
@@ -142,13 +143,7 @@ class ThemeController extends ChangeNotifier {
           changed = true;
         }
       }
-      if (mode != null) {
-        final ThemeMode parsed = _parseMode(mode);
-        if (parsed != _themeMode) {
-          _themeMode = parsed;
-          changed = true;
-        }
-      }
+
       if (changed) {
         notifyListeners();
       }
@@ -167,14 +162,6 @@ class ThemeController extends ChangeNotifier {
     await _persist(SettingsKeys.themeId, id.storageValue);
   }
 
-  Future<void> setThemeMode(ThemeMode mode) async {
-    if (mode == _themeMode) {
-      return;
-    }
-    _themeMode = mode;
-    notifyListeners();
-    await _persist(SettingsKeys.themeMode, _modeValue(mode));
-  }
 
   /// 玻璃强度（只有 B 主题有意义；A/C 下改这个不影响任何渲染）。
   Future<void> setGlassMode(GlassMode mode) async {
@@ -196,28 +183,6 @@ class ThemeController extends ChangeNotifier {
     } catch (error) {
       // 落盘失败不回滚：主题是体验偏好，闪回比存不上更难受。
       debugPrint('主题偏好保存失败：$error');
-    }
-  }
-
-  static String _modeValue(ThemeMode mode) {
-    switch (mode) {
-      case ThemeMode.light:
-        return 'light';
-      case ThemeMode.dark:
-        return 'dark';
-      case ThemeMode.system:
-        return 'system';
-    }
-  }
-
-  static ThemeMode _parseMode(String value) {
-    switch (value) {
-      case 'light':
-        return ThemeMode.light;
-      case 'dark':
-        return ThemeMode.dark;
-      default:
-        return ThemeMode.system;
     }
   }
 }

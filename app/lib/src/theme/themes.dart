@@ -188,48 +188,51 @@ YunongTokens _tokensB(Brightness brightness) {
 YunongTokens _tokensC(Brightness brightness) {
   final bool dark = brightness == Brightness.dark;
   return YunongTokens(
-    canvas: dark ? const Color(0xFF1A1611) : const Color(0xFFFAF6EF),
-    surface: dark ? const Color(0xFF241E17) : const Color(0xFFFFFDF8),
-    surfaceAlt: dark ? const Color(0xFF2E271E) : const Color(0xFFF5ECDD),
-    ink: dark ? const Color(0xFFF0E6D8) : const Color(0xFF2A2118),
-    inkSoft: dark ? const Color(0xFFB9A88E) : const Color(0xFF7A6349),
-    inkFaint: dark ? const Color(0xFF8A7A64) : const Color(0xFFA08A6D),
-    hairline: dark ? const Color(0xFF3A322A) : const Color(0xFFE8DDCA),
-    controlBorder: dark ? const Color(0xFF4A3F33) : const Color(0xFFDFD0B8),
-    focusRing: dark ? const Color(0xFFE0703F) : const Color(0xFFC2532A),
-    accent: dark ? const Color(0xFFE0703F) : const Color(0xFFC2532A),
-    // 深色下橘色偏亮，白字只有 3.2:1；改深墨色字（约 6:1）——亮底深字
+    // 纸色（Claude 公开参数 #faf9f5 / #f5f0e8 / #e8e0d2）
+    canvas: dark ? const Color(0xFF1A1611) : const Color(0xFFFAF9F5),
+    surface: dark ? const Color(0xFF241E17) : const Color(0xFFFFFEFC),
+    surfaceAlt: dark ? const Color(0xFF2E271E) : const Color(0xFFF5F0E8),
+    ink: dark ? const Color(0xFFF0E6D8) : const Color(0xFF141413),
+    inkSoft: dark ? const Color(0xFFB9A88E) : const Color(0xFF6C6A64),
+    inkFaint: dark ? const Color(0xFF8A7A64) : const Color(0xFF8E8B82),
+    hairline: dark ? const Color(0xFF3A322A) : const Color(0xFFE6DFD8),
+    controlBorder: dark ? const Color(0xFF4A3F33) : const Color(0xFFE6DFD8),
+    focusRing: dark ? const Color(0xFFDA7756) : const Color(0xFFA9583E),
+    // 强调色只做链接/选中/图标（白字 on #CC785C 仅 3.28:1，所以不做大面积填充）
+    accent: dark ? const Color(0xFFDA7756) : const Color(0xFFA9583E),
+    // 白字 on #DA7756 只有 3.11:1 → 深色下橙底用墨字（5.63:1）
     onAccent: dark ? const Color(0xFF1A1611) : const Color(0xFFFFFFFF),
-    accentWash: dark ? const Color(0x33E0703F) : const Color(0xFFF1E7D6),
+    accentWash: dark ? const Color(0x33DA7756) : const Color(0xFFF1E7DE),
+    // 主按钮：墨黑底 + 纸色字（18.43:1）
+    ctaBg: dark ? const Color(0xFFF0E6D8) : const Color(0xFF141413),
+    ctaFg: dark ? const Color(0xFF1A1611) : const Color(0xFFFAF9F5),
+    // 正文比标题浅一档：长文阅读 10.34:1，不刺眼
+    bodyText: dark ? const Color(0xFFD8CCBC) : const Color(0xFF3D3D3A),
+    // 珊瑚：只用于 3px 竖条等装饰，不承载文字
+    accentSoft: const Color(0xFFDA7756),
+    // 书页排版：助手消息无气泡、用户消息为页边批注
+    bookLayout: true,
     warnBg: dark ? _warnBgDark : _warnBgLight,
     warnFg: dark ? _warnFgDark : _warnFgLight,
     warnLine: dark ? _warnLineDark : _warnLineLight,
-    radiusS: 6,
-    radiusM: 8,
-    radiusL: 8,
+    // 8 控件 / 12 卡片 / 16 大卡
+    radiusS: 8,
+    radiusM: 12,
+    radiusL: 16,
     borderWidth: 1,
     displayFontFamily: 'Georgia',
     titleSize: 19,
-    bodySize: 14,
-    metaSize: 11,
-    bodyHeight: 1.9,
-    metaLetterSpacing: 0.7,
-    titleWeight: FontWeight.w600,
-    strongWeight: FontWeight.w700,
-    shadowPanel: <BoxShadow>[
-      BoxShadow(
-        color: dark ? const Color(0x40000000) : const Color(0x0F785A32),
-        blurRadius: 14,
-        offset: const Offset(0, 4),
-      ),
-    ],
-    shadowFloat: <BoxShadow>[
-      BoxShadow(
-        color: dark ? const Color(0x59000000) : const Color(0x14785A32),
-        blurRadius: 22,
-        offset: const Offset(0, 8),
-      ),
-    ],
+    bodySize: 15,
+    metaSize: 11.5,
+    // 中文需要比英文（1.55）更大的行距
+    bodyHeight: 1.85,
+    metaLetterSpacing: 0.8,
+    // 衬线只用 400 字重（加粗即失真）
+    titleWeight: FontWeight.w400,
+    strongWeight: FontWeight.w600,
+    // 零阴影：层次靠色块与留白
+    shadowPanel: const <BoxShadow>[],
+    shadowFloat: const <BoxShadow>[],
     texture: const TextureSpec(
       asset: 'assets/textures/paper_2px.png',
       opacity: 0.32,
@@ -240,7 +243,6 @@ YunongTokens _tokensC(Brightness brightness) {
     ease: Curves.easeOutCubic,
   );
 }
-
 /// 取某套主题在某亮度下的 token。
 YunongTokens tokensFor(AppThemeId id, Brightness brightness) {
   switch (id) {
@@ -303,8 +305,8 @@ ThemeData buildTheme(
     headlineSmall: scaled(base.textTheme.headlineSmall, t.titleSize + 2, t.titleWeight, 1.3),
     titleLarge: scaled(base.textTheme.titleLarge, t.titleSize, t.titleWeight, 1.3),
     titleMedium: scaled(base.textTheme.titleMedium, t.bodySize + 1, t.titleWeight, 1.35),
-    bodyLarge: scaled(base.textTheme.bodyLarge, t.bodySize + 1, FontWeight.w400, t.bodyHeight),
-    bodyMedium: scaled(base.textTheme.bodyMedium, t.bodySize, FontWeight.w400, t.bodyHeight),
+    bodyMedium: scaled(base.textTheme.bodyMedium, t.bodySize, FontWeight.w400, t.bodyHeight).copyWith(color: t.bodyText),
+    bodyLarge: scaled(base.textTheme.bodyLarge, t.bodySize + 1, FontWeight.w400, t.bodyHeight).copyWith(color: t.bodyText),
     bodySmall: scaled(base.textTheme.bodySmall, t.metaSize + 1, FontWeight.w400, 1.45),
     labelSmall: scaled(base.textTheme.labelSmall, t.metaSize, FontWeight.w700, 1.4)
         .copyWith(letterSpacing: t.metaLetterSpacing),
@@ -347,8 +349,8 @@ ThemeData buildTheme(
     ),
     filledButtonTheme: FilledButtonThemeData(
       style: FilledButton.styleFrom(
-        backgroundColor: t.accent,
-        foregroundColor: t.onAccent,
+        backgroundColor: t.ctaBg,
+        foregroundColor: t.ctaFg,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(t.radiusS)),
         minimumSize: const Size(0, 36),
         textStyle: text.labelLarge,

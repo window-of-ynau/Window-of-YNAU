@@ -18,6 +18,7 @@ import 'src/core/timetable_service.dart';
 import 'src/settings/settings_page.dart';
 import 'src/theme/theme_controller.dart';
 import 'src/theme/glass_panel.dart';
+import 'src/theme/paper_texture.dart';
 import 'src/theme/glass_performance.dart';
 import 'src/theme/themes.dart';
 import 'src/theme/yunong_tokens.dart';
@@ -109,22 +110,9 @@ class _YunongAppState extends State<YunongApp> {
               }
               final TextureSpec? texture = tokens.texture;
               if (texture != null) {
-                content = Stack(
-                  fit: StackFit.expand,
-                  children: <Widget>[
-                    IgnorePointer(
-                      child: Opacity(
-                        opacity: texture.opacity,
-                        child: Image.asset(
-                          texture.asset,
-                          repeat: ImageRepeat.repeat,
-                          fit: BoxFit.none,
-                        ),
-                      ),
-                    ),
-                    content,
-                  ],
-                );
+                // 纸纹：单次 drawRect 平铺（见 paper_texture.dart 顶部的事故记录）。
+                // 旧写法 Image.asset(repeat: …) 在 2560×1440 下是 57,600 次绘制/帧。
+                content = PaperTexture(spec: texture, child: content);
               }
               return content;
             },

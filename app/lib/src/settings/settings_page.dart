@@ -74,7 +74,6 @@ class SettingsPage extends StatelessWidget {
                       ],
                     ),
                   ),
-                  // 明暗不再单独开关：主题本身决定明暗（A/C 浅色、B 深色，t52 P1-3）
                   // 玻璃强度：只有 B（深蓝玻璃）有意义。A/C 下置灰并说明原因，
                   // 避免用户以为"选了没反应"。
                   _Row(
