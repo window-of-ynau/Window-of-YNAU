@@ -20,7 +20,7 @@ class _NoopChatBackend implements ChatBackend {
 
 /// 可切换“正常 / 抛异常”的密文后端（模拟 DPAPI 偶发失败、DB 忙等）。
 class _FlakySecrets implements SecretBackend {
-  _FlakySecrets({this.stored});
+  _FlakySecrets();
 
   String? stored;
   bool failGet = false;
