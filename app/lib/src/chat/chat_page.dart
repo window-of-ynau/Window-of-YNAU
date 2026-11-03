@@ -657,8 +657,51 @@ class _MessageBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final isUser = bubble.fromUser;
+    final ThemeData theme = Theme.of(context);
+    final YunongTokens t = context.tokens;
+    final bool isUser = bubble.fromUser;
+    final String text = bubble.text.isEmpty ? '…' : bubble.text;
+
+    // C（书本质感）走"书页"排版：助手回答是正文（无气泡、无背景），
+    // 用户提问是右上角的页边批注。其它主题保持聊天气泡。
+    if (t.bookLayout) {
+      if (isUser) {
+        return Align(
+          alignment: Alignment.centerRight,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 520),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: <Widget>[
+                Text(
+                  '你 · 提问',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: t.inkFaint,
+                    letterSpacing: 1.8,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  text,
+                  textAlign: TextAlign.right,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    fontFamily: t.displayFontFamily,
+                    fontStyle: FontStyle.italic,
+                    color: t.bodyText,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      }
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        child: Text(text, style: theme.textTheme.bodyMedium),
+      );
+    }
+
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -669,12 +712,9 @@ class _MessageBubble extends StatelessWidget {
           color: isUser
               ? theme.colorScheme.primaryContainer
               : theme.colorScheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(t.radiusS),
         ),
-        child: Text(
-          bubble.text.isEmpty ? '…' : bubble.text,
-          style: theme.textTheme.bodyMedium,
-        ),
+        child: Text(text, style: theme.textTheme.bodyMedium),
       ),
     );
   }

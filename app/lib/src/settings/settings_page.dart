@@ -74,47 +74,6 @@ class SettingsPage extends StatelessWidget {
                       ],
                     ),
                   ),
-                  _Row(
-                    icon: Icons.brightness_6_outlined,
-                    title: '明暗',
-                    subtitle: '跟随系统时，主题会各自使用浅色/深色两套 token',
-                    trailing: SegmentedButton<ThemeMode>(
-                      showSelectedIcon: false,
-                      // 用 token 着色：A（黑白）下选中段也是黑底白字，不引入 Material 的蓝色
-                      style: ButtonStyle(
-                        visualDensity: VisualDensity.compact,
-                        textStyle: WidgetStatePropertyAll<TextStyle>(
-                          Theme.of(context).textTheme.bodySmall ??
-                              const TextStyle(),
-                        ),
-                        foregroundColor: WidgetStateProperty.resolveWith(
-                            (Set<WidgetState> s) =>
-                                s.contains(WidgetState.selected)
-                                    ? t.onAccent
-                                    : t.inkSoft),
-                        backgroundColor: WidgetStateProperty.resolveWith(
-                            (Set<WidgetState> s) =>
-                                s.contains(WidgetState.selected)
-                                    ? t.accent
-                                    : t.surface),
-                        side: WidgetStatePropertyAll<BorderSide>(
-                          BorderSide(
-                              color: t.controlBorder, width: t.borderWidth),
-                        ),
-                      ),
-                      segments: const <ButtonSegment<ThemeMode>>[
-                        ButtonSegment<ThemeMode>(
-                            value: ThemeMode.system, label: Text('跟随系统')),
-                        ButtonSegment<ThemeMode>(
-                            value: ThemeMode.light, label: Text('浅色')),
-                        ButtonSegment<ThemeMode>(
-                            value: ThemeMode.dark, label: Text('深色')),
-                      ],
-                      selected: <ThemeMode>{controller.themeMode},
-                      onSelectionChanged: (Set<ThemeMode> value) =>
-                          controller.setThemeMode(value.first),
-                    ),
-                  ),
                   // 玻璃强度：只有 B（深蓝玻璃）有意义。A/C 下置灰并说明原因，
                   // 避免用户以为"选了没反应"。
                   _Row(

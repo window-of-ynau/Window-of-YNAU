@@ -16,6 +16,7 @@ import 'package:yunong/src/settings/settings_page.dart';
 import 'package:yunong/src/theme/theme_controller.dart';
 import 'package:yunong/src/theme/glass_panel.dart';
 import 'package:yunong/src/theme/glass_performance.dart';
+import 'package:yunong/src/theme/paper_texture.dart';
 import 'package:yunong/src/theme/themes.dart';
 import 'package:yunong/src/theme/yunong_tokens.dart';
 
@@ -125,8 +126,8 @@ void main() {
 
       final YunongTokens after =
           Theme.of(tester.element(find.byType(HomeShell))).extension<YunongTokens>()!;
-      expect(after.accent, const Color(0xFFC2532A), reason: 'C 主题的强调色应立刻生效');
-      expect(after.canvas, const Color(0xFFFAF6EF));
+      expect(after.accent, const Color(0xFFA9583E), reason: 'C 主题的强调色应立刻生效');
+      expect(after.canvas, const Color(0xFFFAF9F5));
       expect(identical(tester.element(find.byType(HomeShell)), shellBefore), isTrue,
           reason: '换主题不应重建 HomeShell（状态不能丢）');
       expect(find.byType(BackdropFilter), findsNothing);
@@ -167,7 +168,8 @@ void main() {
       expect(controller.themeId, AppThemeId.minimalBlack, reason: '构造时是默认值');
       await controller.load();
       expect(controller.themeId, AppThemeId.paperCoral);
-      expect(controller.themeMode, ThemeMode.dark);
+      // 明暗由主题决定：C 是浅色主题（不再有独立开关）
+      expect(controller.themeMode, ThemeMode.light);
     });
   });
 
@@ -303,6 +305,64 @@ void main() {
       final ThemeController restored = ThemeController(store: store);
       await restored.load();
       expect(restored.glassMode, GlassMode.liquid);
+    });
+  });
+
+  group('t53：C 主题性能与明暗收敛', () {
+    testWidgets('纸纹用单次绘制的 PaperTexture（不再有 Image + Opacity 平铺）',
+        (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(800, 600));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final ThemeController controller = ThemeController(initialTheme: AppThemeId.paperCoral);
+      await tester.pumpWidget(YunongApp(themeController: controller));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PaperTexture), findsOneWidget, reason: 'C 主题挂的是 shader 纸纹层');
+      // 旧写法是 Image.asset(repeat) + Opacity：那会在 2560×1440 下产生 57,600 次绘制/帧
+      expect(find.byType(Opacity), findsNothing, reason: '不允许整屏 Opacity（= saveLayer）');
+    });
+
+    testWidgets('A/B 主题不挂纸纹层', (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(800, 600));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      for (final AppThemeId id in <AppThemeId>[AppThemeId.minimalBlack, AppThemeId.deepGlass]) {
+        final ThemeController controller = ThemeController(initialTheme: id);
+        await tester.pumpWidget(YunongApp(themeController: controller));
+        await tester.pumpAndSettle();
+        expect(find.byType(PaperTexture), findsNothing, reason: '${id.label} 没有纸纹');
+      }
+    });
+
+    test('明暗由主题决定，不再有独立开关', () {
+      expect(ThemeController(initialTheme: AppThemeId.minimalBlack).themeMode, ThemeMode.light);
+      expect(ThemeController(initialTheme: AppThemeId.paperCoral).themeMode, ThemeMode.light);
+      expect(ThemeController(initialTheme: AppThemeId.deepGlass).themeMode, ThemeMode.dark);
+    });
+
+    testWidgets('设置页不再出现"明暗 / 跟随系统"选项', (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(900, 700));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final ThemeController controller = ThemeController();
+      await tester.pumpWidget(
+        MaterialApp(theme: controller.theme(Brightness.light), home: SettingsPage(controller: controller)),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('明暗'), findsNothing);
+      expect(find.text('跟随系统'), findsNothing);
+    });
+
+    testWidgets('C 主题的对话气泡改书页排版（用户为页边批注）', (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(900, 700));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final ThemeController controller = ThemeController(initialTheme: AppThemeId.paperCoral);
+      await tester.pumpWidget(YunongApp(themeController: controller));
+      await tester.pumpAndSettle();
+      // 书页排版下每条用户消息都有"你 · 提问"小标签（空对话时不出现，这里只断言不崩）
+      expect(find.byType(PaperTexture), findsOneWidget);
     });
   });
 }

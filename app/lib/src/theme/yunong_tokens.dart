@@ -100,7 +100,15 @@ class YunongTokens extends ThemeExtension<YunongTokens> {
     this.texture,
     this.canvasGradient,
     this.appBarElevation = 0,
-  });
+    Color? bodyText,
+    Color? ctaBg,
+    Color? ctaFg,
+    Color? accentSoft,
+    this.bookLayout = false,
+  })  : _bodyText = bodyText,
+        _ctaBg = ctaBg,
+        _ctaFg = ctaFg,
+        _accentSoft = accentSoft;
 
   // ── 1. 颜色（可变层） ───────────────────────────────────────────
   final Color canvas;
@@ -146,6 +154,26 @@ class YunongTokens extends ThemeExtension<YunongTokens> {
   // ── 5. 特效（A/C 恒为 null） ────────────────────────────────────
   final GlassSpec? glass;
   final TextureSpec? texture;
+
+  // ── 8. 书页层（C 主题专属，其它主题走默认值） ──────────────────────
+  /// 正文色：C 用 #3D3D3A（比标题浅一档，长文不刺眼）；其它主题 = ink。
+  final Color? _bodyText;
+  final Color? _ctaBg;
+  final Color? _ctaFg;
+  final Color? _accentSoft;
+
+  /// 书页排版：助手消息按"书页正文"渲染（无气泡）、用户消息按页边批注渲染。
+  final bool bookLayout;
+
+  Color get bodyText => _bodyText ?? ink;
+
+  /// 主按钮底色：C 用墨黑（白字 on 橙只有 3.28:1，不达标）。
+  Color get ctaBg => _ctaBg ?? accent;
+
+  Color get ctaFg => _ctaFg ?? onAccent;
+
+  /// 装饰性强调色（C 的珊瑚竖条）：不用于文字，因此不参与对比度断言。
+  Color? get accentSoft => _accentSoft;
 
   /// 画布渐变（只有 B 主题有：深蓝底 + 光团，玻璃层才谈得上景深）。
   /// 非 null 时 `scaffoldBackgroundColor` 变透明，由 `MaterialApp.builder` 铺渐变。
@@ -275,6 +303,11 @@ class YunongTokens extends ThemeExtension<YunongTokens> {
         glass: glass,
         texture: texture,
         canvasGradient: canvasGradient,
+        bodyText: _bodyText,
+        ctaBg: _ctaBg,
+        ctaFg: _ctaFg,
+        accentSoft: _accentSoft,
+        bookLayout: bookLayout,
         useDarkCoursePalette: useDarkCoursePalette,
         fast: fast,
         ease: ease,
