@@ -1,12 +1,16 @@
 // t85：对话设置纯搬迁到 `chat_settings_section.dart` 后的冒烟测试。
 // 只验证「弹窗还能打开、五个字段都在、保存不崩」——行为不变的最小证据。
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/src/chat/chat_page.dart';
 import 'package:yunong/src/chat/chat_settings_section.dart';
 import 'package:yunong/src/core/chat_service.dart';
 import 'package:yunong/src/core/secret_service.dart';
+import 'package:yunong/src/settings/settings_page.dart';
+import 'package:yunong/src/theme/theme_controller.dart';
 
 class _NoopChatBackend implements ChatBackend {
   @override
@@ -33,19 +37,31 @@ class _Secrets implements SecretBackend {
 }
 
 Future<void> _openSettings(WidgetTester tester) async {
+  // t89：对话页已无设置入口——走真实路径：设置页 →「对话设置」
+  final secrets = SecretService(backend: _Secrets(), dbPath: '/tmp/t85.db');
+  final shared = ChatSettingsController();
   await tester.pumpWidget(MaterialApp(
     home: Scaffold(
       body: ChatPage(
         service: ChatService(backend: _NoopChatBackend()),
-        secretService: SecretService(backend: _Secrets(), dbPath: '/tmp/t85.db'),
+        secretService: secrets,
+        chatSettings: shared,
         dbPath: '/tmp/t85.db',
       ),
     ),
   ));
   await tester.pumpAndSettle();
-  await tester.tap(find.byIcon(Icons.more_vert));
+
+  final NavigatorState navigator = tester.state<NavigatorState>(find.byType(Navigator));
+  unawaited(navigator.push(MaterialPageRoute<void>(
+    builder: (BuildContext context) => SettingsPage(
+      controller: ThemeController(store: MemorySettingsStore()),
+      chatSettings: shared,
+      secretService: secrets,
+    ),
+  )));
   await tester.pumpAndSettle();
-  await tester.tap(find.text('设置'));
+  await tester.tap(find.text('对话设置').first);
   await tester.pumpAndSettle();
 }
 
@@ -53,7 +69,7 @@ void main() {
   testWidgets('对话设置弹窗仍可从顶部菜单打开，且五个字段齐全', (WidgetTester tester) async {
     await _openSettings(tester);
 
-    expect(find.text('对话设置'), findsOneWidget);
+    expect(find.widgetWithText(AlertDialog, '对话设置'), findsOneWidget);
     // 五个字段：通道 / 模型 / 协议 / BYOK API Key / 套餐访问令牌
     expect(find.text('通道'), findsWidgets);
     expect(find.text('模型'), findsWidgets);
@@ -70,6 +86,6 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(tester.takeException(), isNull);
-    expect(find.text('对话设置'), findsNothing, reason: '保存后应关闭对话框');
+    expect(find.widgetWithText(AlertDialog, '对话设置'), findsNothing, reason: '保存后应关闭对话框');
   });
 }

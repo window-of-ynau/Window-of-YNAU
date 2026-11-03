@@ -26,7 +26,6 @@ class ChatTopBar extends StatelessWidget {
     required this.accountLabel,
     required this.onLocalSearch,
     required this.onMemory,
-    required this.onSettings,
     required this.onSignIn,
     required this.onSignOut,
     required this.onDiagnostics,
@@ -46,7 +45,6 @@ class ChatTopBar extends StatelessWidget {
 
   final VoidCallback onLocalSearch;
   final VoidCallback onMemory;
-  final VoidCallback onSettings;
   final VoidCallback onSignIn;
   final VoidCallback onSignOut;
 
@@ -77,6 +75,7 @@ class ChatTopBar extends StatelessWidget {
           const SizedBox(width: 4),
           // 状态：图标 + tooltip（不占横向空间，480px 也放得下）
           Tooltip(
+            key: const Key('chat-status-tooltip'),
             message: '$statusLabel\n搜索：$searchLabel\nKey：$keyLabel',
             child: Icon(
               keyDegraded ? Icons.warning_amber_outlined : Icons.info_outline,
@@ -94,8 +93,6 @@ class ChatTopBar extends StatelessWidget {
                   onLocalSearch();
                 case 'memory':
                   onMemory();
-                case 'settings':
-                  onSettings();
                 case 'signIn':
                   onSignIn();
                 case 'signOut':
@@ -109,7 +106,6 @@ class ChatTopBar extends StatelessWidget {
             itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
               const PopupMenuItem<String>(value: 'local', child: Text('搜索本地资料（不联网）')),
               const PopupMenuItem<String>(value: 'memory', child: Text('记忆')),
-              const PopupMenuItem<String>(value: 'settings', child: Text('设置')),
               const PopupMenuItem<String>(value: 'diagnostics', child: Text('对话诊断')),
               if (keyLabel.isNotEmpty)
                 const PopupMenuItem<String>(value: 'deleteKey', child: Text('删除已保存的 Key')),

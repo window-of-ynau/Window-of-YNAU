@@ -4,7 +4,6 @@
 // 消息列表与输入区拆成独立 widget，后续整体换主题不需要改逻辑。
 
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -500,28 +499,6 @@ class _ChatPageState extends State<ChatPage> {
   /// 轻量校验：请求一次 `/models`（OpenAI 兼容），8s 超时。
   ///
   /// 返回 null = 可用；否则返回可读错误（**不显示原始错误串**）。
-  static Future<String?> _validateByokKey(String apiKey) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
-    try {
-      final request = await client
-          .getUrl(Uri.parse('https://api.deepseek.com/models'))
-          .timeout(const Duration(seconds: 8));
-      request.headers.set('Authorization', 'Bearer $apiKey');
-      final response = await request.close().timeout(const Duration(seconds: 8));
-      await response.drain<void>();
-      if (response.statusCode == 200) {
-        return null;
-      }
-      if (response.statusCode == 401 || response.statusCode == 403) {
-        return 'Key 无效（上游返回 ${response.statusCode}）';
-      }
-      return '上游暂不可用（HTTP ${response.statusCode}），请稍后重试';
-    } on Object {
-      return '网络不可达，无法校验 Key（请检查网络后重试）';
-    } finally {
-      client.close(force: true);
-    }
-  }
 
   void _showError(String message) {
     if (!mounted) {
@@ -532,43 +509,6 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   /// 保存 Key：**先校验、再落盘、再回读**，任一失败都不假装成功。
-  Future<void> _saveKey(String apiKey) async {
-    final validator = widget.keyValidator ?? _validateByokKey;
-    final reason = await validator(apiKey);
-    if (reason != null) {
-      _showError(reason);
-      return;
-    }
-    try {
-      final saved = await _secrets.save(SecretService.byokKeyName, apiKey);
-      if (!saved.set) {
-        _showError('保存失败：安全存储没有确认写入');
-        return;
-      }
-      final status = await _secrets.status(SecretService.byokKeyName);
-      if (!status.set || status.masked.isEmpty) {
-        _showError('保存后回读失败：Key 没有真正落盘');
-        return;
-      }
-      if (mounted) {
-        setState(() {
-          _keyStatus = status;
-          _error = null;
-        });
-      }
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('已保存 · 掩码 ${status.masked} · 协议 ${_settings.protocol}'),
-          ),
-        );
-      }
-    } on SecretException catch (failure) {
-      _showError(failure.userHint);
-    } on Object {
-      _showError('保存失败：端侧核心不可用');
-    }
-  }
   /// 端侧数据**目录**（Rust `data_dir`）：由 `AppPaths.dataDirOf` 统一推导。
   String get _dataDir => AppPaths.dataDirOf(widget.dbPath);
 
@@ -583,40 +523,6 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  Future<void> _openSettings() async {
-    await _refreshKeyStatus();
-    if (!mounted) {
-      return;
-    }
-    final result = await showDialog<ChatSettings>(
-      context: context,
-      builder: (BuildContext context) => ChatSettingsSection(
-        settings: _settings,
-        searchLabel: _searchStatus.display,
-        searchHint: _searchStatus.available ? '' : _searchStatus.hint,
-        accountLabel: _auth.signedIn ? _auth.maskedEmail : '未登录',
-        signedIn: _auth.signedIn,
-        onSignIn: _signInCloud,
-        onSignOut: _signOutCloud,
-      ),
-    );
-    if (result != null && mounted) {
-      if (result.byokKey.isNotEmpty) {
-        // 明文只在这一行里出现，交给 _saveKey 后立刻清掉
-        final apiKey = result.byokKey;
-        result.byokKey = '';
-        await _saveKey(apiKey);
-        if (!mounted) {
-          return;
-        }
-      }      setState(() {
-        _settings.cloudToken = result.cloudToken;
-        _settings.model = result.model;
-        _settings.protocol = result.protocol;
-        _channel = result.channel;
-      });
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -639,7 +545,6 @@ class _ChatPageState extends State<ChatPage> {
           accountLabel: _auth.signedIn ? _auth.maskedEmail : '未登录',
           onLocalSearch: () => setState(() => _localPanelOpen = !_localPanelOpen),
           onMemory: () => unawaited(_openMemory()),
-          onSettings: () => unawaited(_openSettings()),
           onSignIn: () => unawaited(_signInCloud()),
           onSignOut: () => unawaited(_signOutCloud()),
           onDiagnostics: () => unawaited(_showDiagnostics()),
