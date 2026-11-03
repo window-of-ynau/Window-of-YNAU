@@ -14,6 +14,8 @@ import 'src/campus/timetable_page.dart';
 import 'src/core/app_paths.dart';
 import 'src/core/titlebar_service.dart';
 import 'src/chat/chat_settings_section.dart';
+import 'src/core/auth_service.dart';
+import 'src/core/secret_service.dart';
 import 'src/theme/file_settings_store.dart';
 import 'src/chat/chat_page.dart';
 import 'src/campus/webview_fetcher.dart';
@@ -149,6 +151,12 @@ class HomeShell extends StatefulWidget {
 }
 
 class _HomeShellState extends State<HomeShell> {
+  @override
+  void initState() {
+    super.initState();
+    _initSharedServices();
+  }
+
   int _selected = 0;
 
   @override
@@ -206,7 +214,7 @@ class _HomeShellState extends State<HomeShell> {
         ),
       ),
       body: destination == null
-          ? _ChatPane(chatSettings: _chatSettings)
+          ? _ChatPane(chatSettings: _chatSettings, secrets: _secrets, auth: _auth)
           : _CampusPane(entry: destination),
     );
   }
@@ -214,11 +222,31 @@ class _HomeShellState extends State<HomeShell> {
   /// 对话设置与设置页**共享**同一个状态源（t86：一处改，两处立即见）
   late final ChatSettingsController _chatSettings = ChatSettingsController();
 
+  /// 共享的服务实例（t89）：ChatPage 与 SettingsPage 用**同一份**，不是各自 new。
+  /// 构造失败不影响启动：降级为 null（设置页里账号/Key 显示为暂不可用）。
+  SecretService? _secrets;
+  AuthService? _auth;
+
+  void _initSharedServices() {
+    try {
+      _secrets = SecretService(dbPath: AppPaths.databasePath);
+      _auth = AuthService();
+    } on Object {
+      _secrets = null;
+      _auth = null;
+    }
+  }
+
   void _openSettings() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (BuildContext context) =>
-            SettingsPage(controller: widget.themeController, chatSettings: _chatSettings),
+            SettingsPage(
+              controller: widget.themeController,
+              chatSettings: _chatSettings,
+              authService: _auth,
+              secretService: _secrets,
+            ),
       ),
     );
   }
@@ -231,13 +259,20 @@ class _HomeShellState extends State<HomeShell> {
 
 /// 对话主区：真正的流式对话（`ChatPage`）。
 class _ChatPane extends StatelessWidget {
-  const _ChatPane({required this.chatSettings});
+  const _ChatPane({required this.chatSettings, this.secrets, this.auth});
 
   final ChatSettingsController chatSettings;
+  final SecretService? secrets;
+  final AuthService? auth;
 
   @override
   Widget build(BuildContext context) =>
-      ChatPage(dbPath: AppPaths.databasePath, chatSettings: chatSettings);
+      ChatPage(
+        dbPath: AppPaths.databasePath,
+        chatSettings: chatSettings,
+        secretService: secrets,
+        authService: auth,
+      );
 }
 
 /// 校务入口（后续替换为真实 WebView；Cookie 只留在本机，ADR-11）。
