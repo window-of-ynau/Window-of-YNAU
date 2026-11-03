@@ -186,8 +186,9 @@ bash scripts/docker-smoke.sh yunong-server:ci   # 或任意本地镜像 tag
 # 1. 确认 main 上 CI 全绿（rust / flutter / docs / migrations / pg / docker 六个 job）
 gh run list --branch main --limit 3
 
-# 2. 版本号对齐：tag vX.Y.Z 必须等于 Cargo.toml 的 [workspace.package].version
-#    （workflow 会校验，不一致直接红）app/pubspec.yaml 的版本前缀建议同步，不一致只 warning
+# 2. 版本号三处对齐：git tag vX.Y.Z == Cargo.toml 的 [workspace.package].version
+#    == app/pubspec.yaml 的 version 前缀。release workflow 的 version-check job 会硬校验，
+#    不一致直接红（安装包版本由 Cargo.toml 推导、APK 由 pubspec 推导，所以卡这里等于卡住四个产物）
 grep -A2 '\[workspace.package\]' Cargo.toml
 grep '^version:' app/pubspec.yaml
 
@@ -202,6 +203,62 @@ git push origin v0.1.0
 | 服务端镜像 | `ghcr.io/<owner>/yunong-server:vX.Y.Z` 与 `:latest` | 多阶段构建、非 root、只含二进制 + CA 证书；**冒烟通过后才推送** |
 | Android APK | Actions artifact `yunong-apk-vX.Y.Z` | 4 个签名 secret 齐备才出 release 包，否则降级 debug 并在日志里 `::warning::` |
 | APK 校验和 | 同一 artifact 里的 `SHA256SUMS` | 下载后 `sha256sum -c SHA256SUMS` 验证 |
+| **Windows 安装包** | `WindowOfYNAU-vX.Y.Z-setup.exe`（Actions artifact + Release asset） | Inno Setup 6 构建；安装 `yunong.exe` + `yunong_core.dll` + `flutter_windows.dll` + `data\`（DLL 必须与 exe 同目录） |
+
+### Windows 安装包（Inno Setup）
+
+选 **Inno Setup 6** 而不是 WiX：单文件 `.iss` + 一条 `ISCC` 命令就能进 CI（`choco install innosetup -y`），
+中文界面、开始菜单/可选桌面快捷方式、卸载程序都是声明式配置；而"卸载时保留用户数据并提示位置"
+需要写一小段 Pascal 回调，Inno 的 `CurUninstallStepChanged` 三行就够了，WiX 那边要额外自定义 Action。
+对本项目的桌面端规模，WiX 的 `.wxs/.wixproj` + Toolset 版本矩阵不划算。
+
+```bash
+# 本机打安装包（会先跑 scripts/build-windows-app.ps1 构建 exe + DLL）
+pwsh scripts/build-windows-installer.ps1 -Version 0.1.0
+# 产物：dist/WindowOfYNAU-0.1.0-setup.exe + dist/SHA256SUMS
+```
+
+- **未签名**：暂无代码签名证书。用户首次运行会看到 SmartScreen"Windows 已保护你的电脑"，
+  处理方式：点 **更多信息 → 仍要运行**（发布说明里也要写这句）。拿到证书后把 `signtool` 加进
+  `scripts/build-windows-installer.ps1` 的步骤 5 之前即可，`.iss` 不用改。
+- **用户数据不随卸载删除**：安装目录删干净，但 `%LOCALAPPDATA%\yunong`（SQLite 课表库、记忆/凭据的
+  DPAPI 密文、设置）保留；卸载完成页会弹出该路径。要彻底清除只能手动删目录——这是有意的，
+  卸载不该毁掉用户数据。
+- CI 里除了构建，还会做一次**从零安装验证**：静默装到临时目录 → 断言 `yunong.exe`、`yunong_core.dll`、
+  `flutter_windows.dll`、`data\` 都在 → 静默卸载 → 断言 `%LOCALAPPDATA%\yunong` 未被删。
+
+### Android 签名 APK
+
+签名材料**不进仓库**，走 GitHub Secrets（四个）：
+
+```bash
+# 一次性生成 upload keystore（口令自己定，别用示例值）
+keytool -genkeypair -v -keystore upload-keystore.jks -keyalg RSA -keysize 2048 \
+  -validity 10000 -alias upload -storetype JKS
+
+base64 -w0 upload-keystore.jks > keystore.b64   # Windows: certutil -encode 或 pwsh [Convert]::ToBase64String
+
+gh secret set KEYSTORE_BASE64   --body "$(cat keystore.b64)"
+gh secret set KEYSTORE_PASSWORD --body '<store password>'
+gh secret set KEY_ALIAS         --body 'upload'
+gh secret set KEY_PASSWORD      --body '<key password>'
+rm -f keystore.b64 upload-keystore.jks   # 本地别留副本
+```
+
+CI 在 `app/android/key.properties` 里还原（该文件已 gitignore）：有 `key.properties` → 真签名；
+没有 → 退回 debug 签名并打 `::warning::`（本地 `flutter run --release` 仍可用，但产物不可发布）。
+
+`targetSdk` 跟随 `flutter.targetSdkVersion`（当前 Flutter stable 版本对应值）；权限只看
+`app/android/app/src/main/AndroidManifest.xml`，本项目**不需要**存储写入权限（课表走 WebView 抓取 + 本地 SQLite），
+只需 `INTERNET`——Android 13+ 的分区存储/通知权限变化对我们无影响。
+
+### 干跑发布流水线
+
+```bash
+# 不推 GHCR、不打 Release，只验证四个 job 能跑通（含 Windows 安装包的装/卸闭环）
+gh workflow run release --ref main -f dry_run=true
+gh run watch <run-id>
+```
 
 **镜像先冒烟后推送**：构建只 load 到 runner 本地 → `scripts/docker-smoke.sh` 起容器探 `/healthz`、`/readyz`、检查二进制 ≥2MB 与 uid=10001 → 全过才 `docker push`。坏镜像不会进 GHCR，也不会顶掉 `:latest`。
 

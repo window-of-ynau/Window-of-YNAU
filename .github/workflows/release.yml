@@ -24,6 +24,31 @@ permissions:
   contents: read
 
 jobs:
+  # ── 版本号一致性 ───────────────────────────────────────────────────
+  # Cargo.toml / app/pubspec.yaml / git tag 三处必须同版本；安装包与 APK 的版本号都从
+  # 同一个来源推导（安装包由 ISCC /DMyAppVersion 注入，APK 由 pubspec 的 version 决定），
+  # 所以这里卡住就等于卡住了四个产物版本。
+  version-check:
+    name: 版本号一致性（tag / Cargo.toml / pubspec.yaml）
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: 校验三处版本一致
+        run: |
+          set -euo pipefail
+          cargo_version=$(awk -F'"' '/^\[workspace\.package\]/{f=1;next} f&&/^\[/{exit} f&&/^version[[:space:]]*=/{print $2;exit}' Cargo.toml)
+          pubspec_version=$(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)(\+[0-9]+)?.*/\1/p' app/pubspec.yaml | head -n 1)
+          echo "Cargo.toml=$cargo_version  pubspec.yaml=$pubspec_version  ref=$GITHUB_REF_NAME ($GITHUB_REF_TYPE)"
+          [ -n "$cargo_version" ] && [ -n "$pubspec_version" ] || { echo "::error::读不到版本号"; exit 1; }
+          [ "$cargo_version" = "$pubspec_version" ] || { echo "::error::Cargo.toml 与 pubspec.yaml 版本不一致"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            [ "$tag_version" = "$cargo_version" ] || { echo "::error::tag $GITHUB_REF_NAME 与 Cargo.toml $cargo_version 不一致"; exit 1; }
+          fi
+
   # ── 服务端镜像 → GHCR ──────────────────────────────────────────────
   server-image:
     name: 服务端镜像（GHCR）
@@ -136,8 +161,11 @@ jobs:
     name: Android APK
     # 干跑只验证镜像那一半（APK 与镜像发布无关、耗时 3~5 分钟）；标签发布时才出产物
     if: github.event_name == 'push'
+    needs: version-check
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: write
     env:
       KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
       KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -201,3 +229,86 @@ jobs:
             app/build/app/outputs/flutter-apk/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
+      # 打 tag 发布时把 APK 挂到 GitHub Release（artifact 只是 CI 内部留存，用户不下载）
+      - name: 上传 APK 到 Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app/build/app/outputs/flutter-apk/*.apk
+            app/build/app/outputs/flutter-apk/SHA256SUMS
+
+  # ── Windows 安装包（Inno Setup）──────────────────────────────────────
+  # 选 Inno Setup 而不是 WiX：单文件 .iss + 一条 ISCC 命令即可进 CI，中文界面/快捷方式/
+  # 卸载器都是声明式配置，卸载回调能写 Pascal（"保留用户数据并提示位置"用它实现）。
+  #
+  # 干跑（workflow_dispatch）也会构建安装包并做"静默安装 → 校验 DLL 齐全 → 静默卸载 →
+  # 确认用户数据未被删"的闭环，只是不上传 Release——这条链路只有真跑才可信。
+  windows-installer:
+    name: Windows 安装包（Inno Setup）
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs: version-check
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      # flutter_inappwebview 的 Windows 实现要 nuget 拉 nlohmann.json，缺了会 MSB3073
+      - name: 安装 nuget 与 Inno Setup 6
+        run: choco install nuget.commandline innosetup -y --no-progress
+      - name: 构建应用 + 安装包
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "version=$version"
+          pwsh scripts/build-windows-installer.ps1 -Version $version -OutputDir dist
+          Get-ChildItem dist | Format-Table Name,Length
+      # 端到端验证：静默装到临时目录 → 三个 DLL 与 data\ 都在 → 静默卸载 → 用户数据仍保留
+      - name: 从零安装验证（静默安装/卸载 + 用户数据保留）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = (Get-ChildItem dist -Filter "WindowOfYNAU-*-setup.exe" | Select-Object -First 1).FullName
+          $target = Join-Path $env:RUNNER_TEMP "ynau-install"
+          $sentinelDir = Join-Path $env:LOCALAPPDATA "yunong"
+          New-Item -ItemType Directory -Force -Path $sentinelDir | Out-Null
+          $sentinel = Join-Path $sentinelDir "ci-sentinel.txt"
+          "keep me" | Set-Content $sentinel
+
+          Start-Process -Wait -FilePath $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/DIR=$target")
+          foreach ($f in @("yunong.exe", "yunong_core.dll", "flutter_windows.dll")) {
+              $p = Join-Path $target $f
+              if (-not (Test-Path $p)) { throw "安装后缺少 $f（DLL 必须与 exe 同目录）" }
+              Write-Host ("OK {0} = {1:N1} MB" -f $f, ((Get-Item $p).Length / 1MB))
+          }
+          if (-not (Test-Path (Join-Path $target "data"))) { throw "安装后缺少 data\ 目录" }
+
+          $unins = Get-ChildItem $target -Filter "unins*.exe" | Select-Object -First 1
+          if (-not $unins) { throw "安装包没有卸载程序" }
+          Start-Process -Wait -FilePath $unins.FullName -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART")
+          if (-not (Test-Path $sentinel)) { throw "卸载把用户数据删了：必须保留 %LOCALAPPDATA%\yunong" }
+          Write-Host "卸载后用户数据仍保留：$sentinel"
+      - name: 上传安装包与校验和
+        uses: actions/upload-artifact@v7
+        with:
+          name: yunong-windows-setup-${{ github.ref_name }}
+          path: |
+            dist/*.exe
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+      - name: 上传安装包到 Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+            dist/SHA256SUMS
