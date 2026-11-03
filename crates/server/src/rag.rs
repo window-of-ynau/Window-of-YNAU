@@ -40,7 +40,8 @@ pub struct RagService {
     cache: Mutex<Option<CachedSalt>>,
     ttl: Duration,
     max_items_per_request: usize,
-    max_items_per_month: usize,
+    /// 单月单客户端可用的 **count 总和** 上限（R5-F1：不是条数）
+    max_items_per_month: u32,
     /// 配额计数：`(month, 客户端标识)` → 已累计条数。进程内、不落库（见 `check_quota`）。
     quota: Mutex<HashMap<(String, String), QuotaSlot>>,
 }
@@ -55,7 +56,8 @@ struct CachedSalt {
 
 #[derive(Debug, Clone)]
 struct QuotaSlot {
-    used: usize,
+    /// 本月已用（**count 总和**，不是条数——见 R5-F1）
+    used: u32,
     touched: Instant,
 }
 
@@ -66,8 +68,8 @@ pub enum RagError {
     BadMonth,
     /// 单次条数超限
     TooManyItems { limit: usize },
-    /// 单月累计超限
-    MonthlyQuota { limit: usize },
+    /// 单月累计超限（`limit` 是 **count 总和**，见 R5-F1）
+    MonthlyQuota { limit: u32 },
     /// 上报里有非法哈希
     BadHash,
     /// 没有数据库（无数据库模式不支持上报）
@@ -97,6 +99,10 @@ pub struct ReferralItem {
     pub count: u32,
 }
 
+/// 单个 `(month, hash)` 的聚合硬上限（R5-F1）：真实文档通常个位数，
+/// 10 万已远超"整个语料库被反复引用"的量级；到顶就截断，不允许无限增长。
+pub const REFERRAL_COUNT_CAP: i64 = 100_000;
+
 impl RagService {
     pub fn new(config: &Config, db: Option<PgPool>) -> Self {
         Self {
@@ -105,7 +111,7 @@ impl RagService {
             cache: Mutex::new(None),
             ttl: Duration::from_secs(config.rag_salt_ttl_secs),
             max_items_per_request: config.rag_max_items_per_request,
-            max_items_per_month: config.rag_max_items_per_month,
+            max_items_per_month: u32::try_from(config.rag_max_items_per_month).unwrap_or(u32::MAX),
             quota: Mutex::new(HashMap::new()),
         }
     }
@@ -117,6 +123,25 @@ impl RagService {
     /// `YYYY-MM` 的月份串（UTC）。
     pub fn month_of(now: OffsetDateTime) -> String {
         format!("{}-{:02}", now.year(), u8::from(now.month()))
+    }
+
+    /// 上一个自然月（`YYYY-MM`）。
+    ///
+    /// R5-F5：旧实现用 `month_expiry(now) - 1 DAY` 当月，那是**本月最后一天**，
+    /// 算出来的"上月"其实还是本月 ⇒ 跨月宽限从来没生效过（12-01 会真实触发）。
+    pub fn previous_month_of(now: OffsetDateTime) -> String {
+        let (year, month) = (now.year(), u8::from(now.month()));
+        let (previous_year, previous_month) = if month == 1 {
+            (year - 1, 12u8)
+        } else {
+            (year, month - 1)
+        };
+        format!("{previous_year}-{previous_month:02}")
+    }
+
+    /// 当前时刻的"上月"（给集成测试/运维用，免得测试里再引 `time`）。
+    pub fn previous_month_now() -> String {
+        Self::previous_month_of(OffsetDateTime::now_utc())
     }
 
     /// 下月 1 日 00:00 UTC——盐的失效时刻（也是"每月 1 日自动轮换"的实现：
@@ -250,39 +275,42 @@ impl RagService {
         if month == current {
             return Ok(());
         }
-        let previous = Self::month_of(Self::month_expiry(now) - time::Duration::DAY);
-        if month == previous {
+        // 正确的"上月"（跨年也对）：不能用 `month_expiry - 1 DAY`，那是本月最后一天
+        if month == Self::previous_month_of(now) {
             return Ok(());
         }
         Err(RagError::BadMonth)
     }
 
-    /// 配额闸（进程内，按 `(month, 客户端标识)` 累计）。
+    /// 配额**预检**（进程内，按 `(month, 客户端标识)` 累计 `sum(count)`）。
+    ///
+    /// R5-F1：旧实现按"条数"算配额 ⇒ 一次请求（200 条 × 单条 10000）就能给同一 hash
+    /// 加 2,000,000，真实文档通常个位数 ⇒ 一个账号一次请求即可霸榜。现在按 **count 总和**算。
     ///
     /// **为什么进程内**：ADR-19 要求上报体里没有 user_id，服务端也不该为了限额
     /// 去建立"账号 → 上报量"的持久化关联。进程内计数既能挡住单机放大，
     /// 又不留可回溯的痕迹；代价是重启清零、多实例不共享（1.0 单实例，可接受）。
-    pub fn check_quota(&self, month: &str, client: &str, items: usize) -> Result<(), RagError> {
-        if items > self.max_items_per_request {
-            return Err(RagError::TooManyItems {
-                limit: self.max_items_per_request,
+    pub fn check_quota(&self, month: &str, client: &str, amount: u32) -> Result<(), RagError> {
+        let mut map = self.lock_quota();
+        self.evict_if_needed(&mut map, month);
+        let used = map
+            .get(&(month.to_owned(), client.to_owned()))
+            .map(|slot| slot.used)
+            .unwrap_or(0);
+        if used.saturating_add(amount) > self.max_items_per_month {
+            return Err(RagError::MonthlyQuota {
+                limit: self.max_items_per_month,
             });
         }
+        Ok(())
+    }
+
+    /// 落库成功后记账（R5-F8）。
+    ///
+    /// 先落库、再扣配额：否则 DB 抖动期会出现"配额被扣、数据没落"，客户端被提前封月。
+    /// 代价是并发下可能略微超额（两个请求都通过预检），这是有意选择的宽松方向。
+    pub fn commit_quota(&self, month: &str, client: &str, amount: u32) {
         let mut map = self.lock_quota();
-        if map.len() > 4096 {
-            // 桶表有界：先清掉非本月的条目，再不行就按最久未用淘汰（参考 H1 的教训）
-            map.retain(|(slot_month, _), _| slot_month == month);
-            while map.len() > 4096 {
-                let Some(victim) = map
-                    .iter()
-                    .min_by_key(|(_, slot)| slot.touched)
-                    .map(|(key, _)| key.clone())
-                else {
-                    break;
-                };
-                map.remove(&victim);
-            }
-        }
         let slot = map
             .entry((month.to_owned(), client.to_owned()))
             .or_insert(QuotaSlot {
@@ -290,13 +318,36 @@ impl RagService {
                 touched: Instant::now(),
             });
         slot.touched = Instant::now();
-        if slot.used + items > self.max_items_per_month {
-            return Err(RagError::MonthlyQuota {
-                limit: self.max_items_per_month,
-            });
+        slot.used = slot.used.saturating_add(amount);
+    }
+
+    /// 只读：某客户端本月已用量（**count 总和**）。测试与排障用，不改变状态。
+    pub fn quota_used(&self, month: &str, client: &str) -> u32 {
+        self.lock_quota()
+            .get(&(month.to_owned(), client.to_owned()))
+            .map(|slot| slot.used)
+            .unwrap_or(0)
+    }
+
+    /// 桶表有界 + 淘汰（R5-F4）：**复用 limiter 的"跳过用满桶"策略**，
+    /// 否则攻击者用几千个不同 XFF 各发一条就能把 victim 已用满的桶挤掉、额度重置。
+    fn evict_if_needed(&self, map: &mut HashMap<(String, String), QuotaSlot>, month: &str) {
+        const MAX_QUOTA_ENTRIES: usize = 4096;
+        if map.len() <= MAX_QUOTA_ENTRIES {
+            return;
         }
-        slot.used += items;
-        Ok(())
+        // 先清掉非本月：跨月后旧月的计数本来就没有意义
+        map.retain(|(slot_month, _), _| slot_month == month);
+        while map.len() > MAX_QUOTA_ENTRIES {
+            let removed = crate::limiter::evict_oldest_unexhausted(
+                map,
+                |slot| slot.used >= self.max_items_per_month,
+                |slot| slot.touched,
+            );
+            if !removed {
+                break;
+            }
+        }
     }
 
     /// 聚合上报：累加 `rag_referrals`，同时把候选写进 `rag_candidates`（status=pending）。
@@ -312,27 +363,40 @@ impl RagService {
             .map_err(|error| RagError::Db(error.to_string()))?;
 
         for item in items {
-            sqlx::query(
+            // R5-F1：聚合值在**库侧**也封顶（`LEAST(...)`），多账号长期刷也不会顶到天文数字；
+            // 到顶后只记一条 warn（日志里只有 hash 前 8 位），不再无限增长。
+            let stored: i64 = sqlx::query_scalar(
                 "INSERT INTO rag_referrals (month, hash, count, first_seen, last_seen) \
                  VALUES ($1, $2, $3, now(), now()) \
                  ON CONFLICT (month, hash) DO UPDATE \
-                 SET count = rag_referrals.count + EXCLUDED.count, last_seen = now()",
+                 SET count = LEAST(rag_referrals.count + EXCLUDED.count, $4), last_seen = now() \
+                 RETURNING count",
             )
             .bind(month)
             .bind(&item.hash)
             .bind(i64::from(item.count))
-            .execute(&mut *tx)
+            .bind(REFERRAL_COUNT_CAP)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|error| RagError::Db(error.to_string()))?;
+            if stored >= REFERRAL_COUNT_CAP {
+                tracing::warn!(
+                    month = %month,
+                    hash_prefix = %crate::rag_fetch::hash_prefix(&item.hash),
+                    cap = REFERRAL_COUNT_CAP,
+                    "rag 聚合计数已达上限，本次增量被截断"
+                );
+            }
 
             sqlx::query(
                 "INSERT INTO rag_candidates (month, hash, count, status) VALUES ($1, $2, $3, 'pending') \
                  ON CONFLICT (month, hash) DO UPDATE \
-                 SET count = rag_candidates.count + EXCLUDED.count",
+                 SET count = LEAST(rag_candidates.count + EXCLUDED.count, $4)",
             )
             .bind(month)
             .bind(&item.hash)
             .bind(i64::from(item.count))
+            .bind(REFERRAL_COUNT_CAP)
             .execute(&mut *tx)
             .await
             .map_err(|error| RagError::Db(error.to_string()))?;
@@ -435,32 +499,93 @@ mod tests {
         let config = Config::for_tests();
         let service = RagService::new(&config, None);
         let month = "2026-11";
-        let limit = config.rag_max_items_per_month;
-        let per_request = config.rag_max_items_per_request;
-        // 单次有上限，所以分批发完整个月的额度
-        let mut left = limit;
-        while left > 0 {
-            let batch = left.min(per_request);
-            assert!(
-                service.check_quota(month, "device-a", batch).is_ok(),
-                "第 {batch} 批应通过"
-            );
-            left -= batch;
-        }
+        let limit = u32::try_from(config.rag_max_items_per_month).expect("测试配置");
+        let half = limit / 2;
+        // R5-F8：预检**不扣减**——连检两次同样的量都该通过
+        assert!(service.check_quota(month, "device-a", half).is_ok());
+        assert!(
+            service.check_quota(month, "device-a", half).is_ok(),
+            "预检不该扣减配额（R5-F8 的前提）"
+        );
+        // commit 之后正好到上限：仍可通过；再多 1 就拒
+        service.commit_quota(month, "device-a", half);
+        assert!(service.check_quota(month, "device-a", half).is_ok());
+        service.commit_quota(month, "device-a", half);
         assert_eq!(
             service.check_quota(month, "device-a", 1).unwrap_err(),
-            RagError::MonthlyQuota { limit }
+            RagError::MonthlyQuota { limit },
+            "累计到上限后再申请应被拒"
         );
-        // 另一个客户端不受影响（单次仍受 per-request 上限约束）
-        assert!(service.check_quota(month, "device-b", per_request).is_ok());
-        // 单次超限单独报错
+        // 另一个客户端不受影响
+        assert!(service.check_quota(month, "device-b", limit).is_ok());
+    }
+
+    /// R5-F5 的回归：上月必须是**上一个自然月**。
+    ///
+    /// 旧实现 `month_expiry(now) - 1 DAY` 得到的是**本月最后一天**（月份仍是本月），
+    /// 所以这个用例在旧实现下会红——这正是 security 指出的"测试绿得毫无意义"。
+    #[test]
+    fn previous_month_is_really_the_previous_month() {
+        let at = |year: i32, month: u8, day: u8| {
+            time::Date::from_calendar_date(year, time::Month::try_from(month).unwrap(), day)
+                .unwrap()
+                .midnight()
+                .assume_utc()
+        };
+        assert_eq!(RagService::month_of(at(2026, 11, 15)), "2026-11");
         assert_eq!(
+            RagService::previous_month_of(at(2026, 11, 15)),
+            "2026-10",
+            "11 月的上月是 10 月"
+        );
+        // 1 月要跨年
+        assert_eq!(RagService::previous_month_of(at(2026, 1, 1)), "2025-12");
+        assert_eq!(RagService::previous_month_of(at(2026, 1, 31)), "2025-12");
+        // 任何时刻的上月都不能等于本月（旧实现恒等于本月，必然违反）
+        let now = OffsetDateTime::now_utc();
+        assert_ne!(
+            RagService::previous_month_of(now),
+            RagService::month_of(now),
+            "上月必须与本月不同（旧实现恒相等）"
+        );
+        // check_month 要接受真正的上月
+        let config = Config::for_tests();
+        let service = RagService::new(&config, None);
+        assert!(
             service
-                .check_quota(month, "device-c", config.rag_max_items_per_request + 1)
-                .unwrap_err(),
-            RagError::TooManyItems {
-                limit: config.rag_max_items_per_request
-            }
+                .check_month(&RagService::previous_month_of(now))
+                .is_ok(),
+            "上月宽限必须生效（12-01 会真实触发）"
+        );
+    }
+
+    /// R5-F4 的回归：灌几千个新键也**不能**把 victim 已用满的配额桶挤掉。
+    #[test]
+    fn quota_eviction_does_not_reset_exhausted_buckets() {
+        let mut config = Config::for_tests();
+        config.rag_max_items_per_month = 100;
+        let service = RagService::new(&config, None);
+        let month = "2026-11";
+
+        // victim 用满
+        assert!(service.check_quota(month, "victim", 100).is_ok());
+        service.commit_quota(month, "victim", 100);
+        assert!(service.check_quota(month, "victim", 1).is_err());
+
+        // 用远超桶表上限（4096）的不同客户端灌表。
+        // 注意必须走 commit_quota：条目是在 commit 时才插入的（check 只读）。
+        for index in 0..4200 {
+            service.commit_quota(month, &format!("flood-{index}"), 1);
+        }
+
+        assert_eq!(
+            service.quota_used(month, "victim"),
+            100,
+            "victim 的已用量必须还在（淘汰跳过用满桶，R5-F4）"
+        );
+        assert!(
+            service.check_quota(month, "victim", 1).is_err(),
+            "victim 已用满的桶被淘汰了：攻击者灌新键就能重置配额（R5-F4）"
         );
     }
 

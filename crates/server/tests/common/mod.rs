@@ -104,10 +104,7 @@ impl TestDb {
         .await;
         // 迁移 0001 的第一句就是 CREATE EXTENSION vector：装在 public 一次，
         // 后面每个测试 schema 的迁移就只是一句无害的 no-op。
-        if let Err(error) = sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
-            .execute(&mut admin)
-            .await
-        {
+        if let Err(error) = sqlx::query("CREATE EXTENSION IF NOT EXISTS vector").execute(&mut admin).await {
             panic!(
                 "建 vector 扩展失败：{error}\n\
                  迁移 0001 需要 pgvector；请用带扩展的镜像：\n\

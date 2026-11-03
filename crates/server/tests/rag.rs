@@ -503,6 +503,282 @@ async fn pg_top_view_ranks_by_count() {
     db.finish().await;
 }
 
+/// R5-F1：配额按 **count 总和** 算，不按条数。
+///
+/// 在旧实现（按条数）下，第二条请求（1 条）会被放行 ⇒ 这个用例会红。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_quota_counts_sum_of_counts() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mut config = Config::for_tests();
+    config.rag_max_items_per_month = 5;
+    let app = RagApp::new(config, Some(db.pool.clone()));
+    let token = app.register("rag-sum-quota@ynau.edu.cn").await;
+    let month = current_month();
+
+    // 3 + 2 = 5：条数只有 2，但 sum(count) 正好用满
+    let (status, body) = app
+        .post_referrals(
+            &token,
+            json!({ "month": month, "items": [
+                { "hash": fake_hash("sum-a"), "count": 3 },
+                { "hash": fake_hash("sum-b"), "count": 2 }
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 再报 1 条（count=1）：按条数算会被放行，按 sum(count) 必须 429
+    let (status, body) = app
+        .post_referrals(
+            &token,
+            json!({ "month": month, "items": [
+                { "hash": fake_hash("sum-c"), "count": 1 }
+            ]}),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "配额必须按 count 总和算（R5-F1）：{body}"
+    );
+    db.finish().await;
+}
+
+/// security 复核缺失的 PG 断言 ①：`rag_referrals` 的 `sum(count)` 实值。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_sum_count_matches_reported_totals() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let app = RagApp::new(Config::for_tests(), Some(db.pool.clone()));
+    let token = app.register("rag-sum@ynau.edu.cn").await;
+    let month = current_month();
+    let hash = fake_hash("sum-value");
+
+    for count in [3u32, 4, 5] {
+        let (status, body) = app
+            .post_referrals(
+                &token,
+                json!({ "month": month, "items": [{ "hash": hash, "count": count }] }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    assert_eq!(
+        common::count(
+            &db.pool,
+            &format!(
+                "SELECT coalesce(sum(count), 0)::bigint FROM rag_referrals WHERE month = '{month}'"
+            )
+        )
+        .await,
+        12,
+        "3 + 4 + 5 = 12"
+    );
+    assert_eq!(
+        common::count(
+            &db.pool,
+            &format!("SELECT count FROM rag_referrals WHERE month = '{month}' AND hash = '{hash}'")
+        )
+        .await,
+        12
+    );
+    assert_eq!(
+        common::count(
+            &db.pool,
+            &format!(
+                "SELECT count FROM rag_candidates WHERE month = '{month}' AND hash = '{hash}'"
+            )
+        )
+        .await,
+        12,
+        "候选表与聚合表必须同步累加"
+    );
+    db.finish().await;
+}
+
+/// security 复核缺失的 PG 断言 ②：审计表 SQL 断言。
+///
+/// - 成功上报：`rag.referrals` + `allow` + `reason='accepted=N'`（N 是**条数**，不是 count 总和）；
+/// - 配额拒绝：`rag.referrals` + `deny` + reason 含 `monthly_quota_exceeded`；
+/// - 两种审计都**不含 hash**。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_audit_rows_distinguish_allow_and_deny() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mut config = Config::for_tests();
+    config.rag_max_items_per_month = 2;
+    let app = RagApp::new(config, Some(db.pool.clone()));
+    let token = app.register("rag-audit-sql@ynau.edu.cn").await;
+    let month = current_month();
+    let allowed = fake_hash("audit-allow");
+    let rejected = fake_hash("audit-deny");
+
+    // 1) 放行一次（2 条）
+    let (status, _) = app
+        .post_referrals(
+            &token,
+            json!({ "month": month, "items": [
+                { "hash": allowed, "count": 1 },
+                { "hash": fake_hash("audit-allow-2"), "count": 1 }
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 2) 用满配额后再报：拒绝
+    let (status, _) = app
+        .post_referrals(
+            &token,
+            json!({ "month": month, "items": [{ "hash": rejected, "count": 1 }] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    assert_eq!(
+        common::count(
+            &db.pool,
+            "SELECT count(*) FROM audit_logs WHERE action = 'rag.referrals' AND decision = 'allow'"
+        )
+        .await,
+        1,
+        "成功上报应有一条 allow 审计"
+    );
+    assert_eq!(
+        common::text_column(
+            &db.pool,
+            "SELECT reason FROM audit_logs WHERE action = 'rag.referrals' AND decision = 'allow' LIMIT 1"
+        )
+        .await
+        .as_deref(),
+        Some("accepted=2"),
+        "reason 里是**条数**（accepted=N）"
+    );
+    assert_eq!(
+        common::count(
+            &db.pool,
+            "SELECT count(*) FROM audit_logs WHERE action = 'rag.referrals' AND decision = 'deny' \
+             AND reason LIKE 'monthly_quota_exceeded%'"
+        )
+        .await,
+        1,
+        "配额拒绝也要留 deny 审计（便于解释为什么被限）"
+    );
+
+    // 两种审计都不含 hash
+    for hash in [allowed, rejected] {
+        assert_eq!(
+            common::count(
+                &db.pool,
+                &format!(
+                    "SELECT count(*) FROM audit_logs \
+                     WHERE coalesce(target,'') LIKE '%{hash}%' \
+                        OR coalesce(reason,'') LIKE '%{hash}%'"
+                )
+            )
+            .await,
+            0,
+            "审计里不允许出现 hash"
+        );
+    }
+    db.finish().await;
+}
+
+/// R5-F1：库侧封顶——即使有人长期刷，单个 `(month, hash)` 也不会超过 100_000。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_count_is_capped_at_hard_limit() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mut config = Config::for_tests();
+    // 让配额不挡路，只验库侧封顶
+    config.rag_max_items_per_month = 1_000_000;
+    let app = RagApp::new(config, Some(db.pool.clone()));
+    let token = app.register("rag-cap@ynau.edu.cn").await;
+    let month = current_month();
+    let hash = fake_hash("cap-me");
+
+    // 预置到 99_990（比上限少 10），再报 100 → 应被截断在 100_000
+    sqlx::query("INSERT INTO rag_referrals (month, hash, count) VALUES ($1, $2, 99990)")
+        .bind(&month)
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .expect("预置聚合行");
+    sqlx::query(
+        "INSERT INTO rag_candidates (month, hash, count, status) VALUES ($1, $2, 99990, 'pending')",
+    )
+    .bind(&month)
+    .bind(&hash)
+    .execute(&db.pool)
+    .await
+    .expect("预置候选行");
+
+    let (status, body) = app
+        .post_referrals(
+            &token,
+            json!({ "month": month, "items": [{ "hash": hash, "count": 100 }] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        common::count(
+            &db.pool,
+            &format!("SELECT count FROM rag_referrals WHERE month = '{month}' AND hash = '{hash}'")
+        )
+        .await,
+        100_000,
+        "聚合值必须被 LEAST(..., 100000) 截断"
+    );
+    assert_eq!(
+        common::count(
+            &db.pool,
+            &format!(
+                "SELECT count FROM rag_candidates WHERE month = '{month}' AND hash = '{hash}'"
+            )
+        )
+        .await,
+        100_000,
+        "候选表同样受上限约束"
+    );
+    db.finish().await;
+}
+
+/// R5-F5 端到端：**真正的上月**必须被接受（旧实现恒 422，这条会红）。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_previous_month_is_accepted() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let app = RagApp::new(Config::for_tests(), Some(db.pool.clone()));
+    let token = app.register("rag-prev-month@ynau.edu.cn").await;
+    let previous = yunong_server::rag::RagService::previous_month_now();
+    assert_ne!(previous, current_month(), "上月不能等于本月");
+
+    let (status, body) = app
+        .post_referrals(
+            &token,
+            json!({ "month": previous, "items": [{ "hash": fake_hash("prev-month"), "count": 1 }] }),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "上月宽限必须生效（旧实现恒 422，这条会红）：{body}"
+    );
+    db.finish().await;
+}
+
 /// 隐私边界：三张表里都**没有** `user_id` 列（ADR-19 决策 2）。
 #[tokio::test]
 #[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
