@@ -19,6 +19,7 @@ import '../core/memory_service.dart';
 import '../core/search_service.dart';
 import '../core/secret_service.dart';
 import '../memory/memory_page.dart';
+import '../core/build_info.dart';
 import 'chat_settings_section.dart';
 
 // `ChatSettings` 已随设置面板搬到 `chat_settings_section.dart`；这里 re-export，
@@ -409,7 +410,8 @@ class ChatPageState extends State<ChatPage> {
     final diag = _diagnostics;
     final keyLine =
         'key=`${_keyStatus.masked.isEmpty ? '未设置' : _keyStatus.masked} | protocol=`${_settings.protocol}'
-        ' | key_status_error=`${_keyStatusError ?? ''}';
+        ' | key_status_error=`${_keyStatusError ?? ''}'
+        ' | build=`${BuildInfo.label}';
     final text = keyLine + '\n' + (diag == null ? '还没有发起过对话' : diag.toClipboardText());
     if (!mounted) {
       return;

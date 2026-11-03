@@ -8,6 +8,7 @@
 import 'package:flutter/material.dart';
 
 import '../chat/chat_settings_section.dart';
+import '../core/build_info.dart';
 import '../core/auth_service.dart';
 import '../core/secret_service.dart';
 
@@ -199,7 +200,7 @@ class SettingsPage extends StatelessWidget {
                   _Row(
                     icon: Icons.info_outline,
                     title: '版本',
-                    subtitle: '云农之窗 $version',
+                    subtitle: '云农之窗 $version · ${BuildInfo.label}',
                     trailing: Text('检查更新', style: TextStyle(color: t.inkSoft)),
                   ),
                 ],
