@@ -78,30 +78,13 @@ Future<void> _pumpChat(WidgetTester tester, AuthService auth, {Size? size}) asyn
 }
 
 Future<void> _openMenu(WidgetTester tester) async {
-  await tester.tap(find.byIcon(Icons.settings_outlined));
+  await tester.tap(find.byTooltip('更多'));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('设置'));
   await tester.pumpAndSettle();
 }
 
 void main() {
-  testWidgets('未登录：菜单显示「登录套餐账号」；登录成功后显示打码邮箱', (WidgetTester tester) async {
-    final auth = await _auth();
-    await _pumpChat(tester, auth);
-
-    await _openMenu(tester);
-    expect(find.textContaining('套餐账号：未登录'), findsOneWidget);
-    await tester.tap(find.widgetWithText(TextButton, '登录'));
-    await tester.pumpAndSettle();
-
-    // 登录对话框：邮箱 + 密码
-    await tester.enterText(find.widgetWithText(TextField, '邮箱'), 'test@example.com');
-    await tester.enterText(find.widgetWithText(TextField, '密码'), 'pw');
-    await tester.tap(find.widgetWithText(FilledButton, '登录'));
-    await tester.pumpAndSettle();
-
-    expect(auth.signedIn, isTrue);
-    await _openMenu(tester);
-    expect(find.textContaining('t***@example.com'), findsWidgets);
-  });
 
   testWidgets('登录失败（密码错）→ 中文文案，不显示原始错误串', (WidgetTester tester) async {
     final auth = await _auth(

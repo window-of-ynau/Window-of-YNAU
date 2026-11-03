@@ -20,6 +20,7 @@ import '../core/memory_service.dart';
 import '../core/search_service.dart';
 import '../core/secret_service.dart';
 import '../memory/memory_page.dart';
+import 'chat_top_bar.dart';
 
 /// 会话设置（MVP：密钥只在内存里，进程退出即失效）。
 ///
@@ -568,71 +569,26 @@ class _ChatPageState extends State<ChatPage> {
     final theme = Theme.of(context);
     return Column(
       children: <Widget>[
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-          child: Row(
-            children: <Widget>[
-              SegmentedButton<String>(
-                segments: const <ButtonSegment<String>>[
-                  ButtonSegment<String>(value: 'byok', label: Text('BYOK 直连')),
-                  ButtonSegment<String>(value: 'cloud', label: Text('套餐通道')),
-                ],
-                selected: <String>{_channel},
-                onSelectionChanged: (Set<String> value) {
-                  setState(() => _channel = value.first);
-                  unawaited(_refreshSearchStatus());
-                },
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  _streaming
-                      ? '正在生成…'
-                      : (_channelState.ready ? '就绪' : _channelState.reason),
-                  style: theme.textTheme.bodySmall,
-                ),
-              ),
-              if (_promptTokens != null || _completionTokens != null)
-                Text(
-                  '用量 ${_promptTokens ?? '-'} / ${_completionTokens ?? '-'}',
-                  style: theme.textTheme.bodySmall,
-                ),
-              Flexible(
-                child: Text(
-                  '搜索 ${_searchStatus.display}' +
-                      (_channel == 'byok' ? ' · Key ${_keyStatus.display}' : ''),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.bodySmall,
-                ),
-              ),
-              if (_channel == 'byok')
-                Text('Key ${_keyStatus.display}',
-                    style: theme.textTheme.bodySmall),
-              if (_channel == 'byok' && _keyStatus.set)
-                IconButton(
-                  tooltip: '删除已保存的 Key',
-                  onPressed: _deleteKey,
-                  icon: const Icon(Icons.key_off_outlined, size: 18),
-                ),
-              IconButton(
-                tooltip: '搜索本地资料（只查本机，不联网）',
-                onPressed: () =>
-                    setState(() => _localPanelOpen = !_localPanelOpen),
-                icon: const Icon(Icons.manage_search, size: 20),
-              ),
-              IconButton(
-                tooltip: '记忆',
-                onPressed: _openMemory,
-                icon: const Icon(Icons.memory, size: 20),
-              ),
-              IconButton(
-                tooltip: '设置',
-                onPressed: _openSettings,
-                icon: const Icon(Icons.settings_outlined),
-              ),
-            ],
-          ),
+        ChatTopBar(
+          channel: _channel,
+          onChannelChanged: (String value) {
+            setState(() => _channel = value);
+            unawaited(_refreshSearchStatus());
+          },
+          statusLabel: _streaming
+              ? '正在生成…'
+              : (_channelState.ready ? '就绪' : _channelState.reason),
+          searchLabel: _searchStatus.display,
+          keyLabel: _keyStatus.display,
+          keyDegraded: _keyStatus.degraded,
+          signedIn: _auth.signedIn,
+          accountLabel: _auth.signedIn ? _auth.maskedEmail : '未登录',
+          onLocalSearch: () => setState(() => _localPanelOpen = !_localPanelOpen),
+          onMemory: () => unawaited(_openMemory()),
+          onSettings: () => unawaited(_openSettings()),
+          onSignIn: () => unawaited(_signInCloud()),
+          onSignOut: () => unawaited(_signOutCloud()),
+          onDeleteKey: _keyStatus.set ? () => unawaited(_deleteKey()) : null,
         ),
         if (_keyStatus.degraded)
           Padding(

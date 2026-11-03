@@ -7,6 +7,12 @@
 // - 错误按类型给中文文案，不显示原始错误串。
 
 import 'dart:convert';
+import 'dart:ffi';
+import 'dart:isolate';
+
+import 'package:ffi/ffi.dart';
+
+import 'ffi_bindings.dart';
 import 'dart:io';
 
 import 'secret_service.dart';
@@ -39,6 +45,21 @@ class MemoryTokenVault implements TokenVault {
 }
 
 
+/// 重启免登录：调用 Rust `yunong_auth_refresh_from_store(cloud_base_url, db_path)`。
+///
+/// 该 FFI 是**同步**的（connect 5s / total 10s），必须在后台 isolate 调用，
+/// 否则会卡住 UI 线程。
+abstract class AuthRefreshBackend {
+  /// 返回 `{ok, data:{access_token, rotated}}` 或 `{ok:false, code, message}`。
+  Future<Map<String, dynamic>> refreshFromStore();
+}
+
+/// symbol 不可用（旧包 / 非 Windows 平台）时抛这个，调用方降级为"需要重新登录"。
+class AuthRefreshUnavailable implements Exception {
+  const AuthRefreshUnavailable(this.reason);
+
+  final String reason;
+}
 /// 令牌对。
 class AuthTokens {
   const AuthTokens({required this.accessToken, required this.refreshToken});
@@ -70,10 +91,17 @@ class AuthException implements Exception {
 
 /// 端侧套餐通道会话。
 class AuthService {
-  AuthService({AuthApi? api, TokenVault? vault, SecretService? secrets, String? baseUrl})
+  AuthService({
+    AuthApi? api,
+    TokenVault? vault,
+    SecretService? secrets,
+    String? baseUrl,
+    AuthRefreshBackend? refreshBackend,
+  })
       : _api = api ?? HttpAuthApi(baseUrl: baseUrl ?? _defaultBaseUrl),
         _vault = vault ?? MemoryTokenVault(),
-        _secrets = secrets;
+        _secrets = secrets,
+        _refreshBackend = refreshBackend;
 
   static const String _accessKey = 'auth_access_token';
   static const String _refreshKey = 'auth_refresh_token';
@@ -87,6 +115,10 @@ class AuthService {
 
   final AuthApi _api;
   SecretService? _secrets;
+  final AuthRefreshBackend? _refreshBackend;
+
+  /// 最近一次失败原因（UI 用；NETWORK 时不应登出）。
+  String? lastIssue;
   final TokenVault _vault;
 
   String? _accessToken;
@@ -119,10 +151,20 @@ class AuthService {
     await _persist(tokens, email);
   }
 
-  /// 启动时恢复会话：读令牌 → 用 refresh 验一次（顺便换新）。
+  /// 启动时恢复会话：**优先** Rust `yunong_auth_refresh_from_store`（重启免登录），
+  /// 不可用时回退到 vault 里的 refresh token 走 HTTP。
+  ///
+  /// 分级语义（与 Rust 一致）：ok → 已登录；UNAUTHORIZED → 清本地、未登录；
+  /// NETWORK → **保留令牌**、仍视为已登录，只记提示。
   ///
   /// refresh 失败 = 会话已失效 → **清本地 + 未登录**（调用方据此提示重新登录）。
   Future<bool> restore() async {
+    // 1) 先试 Rust 免登录（symbol 缺失/非 Windows → 降级）
+    final rustResult = await _tryRefreshFromStore();
+    if (rustResult != null) {
+      return rustResult;
+    }
+    // 2) 回退：vault 里有 refresh token 就自己换新
     try {
       final access = await _read(_accessKey);
       final refresh = await _read(_refreshKey);
@@ -141,6 +183,51 @@ class AuthService {
     }
   }
 
+  /// 尝试 Rust 侧免登录。
+  ///
+  /// 返回 `null` = 不可用（降级到 vault 路径）；`true/false` = 明确结果。
+  Future<bool?> _tryRefreshFromStore() async {
+    final backend = _refreshBackend;
+    if (backend == null) {
+      return null;
+    }
+    try {
+      final json = await backend.refreshFromStore();
+      final code = json['code'] as String?;
+      if (json['ok'] == true) {
+        final data = json['data'];
+        final access = data is Map<String, dynamic> ? data['access_token'] as String? : null;
+        if (access != null && access.isNotEmpty) {
+          _accessToken = access;
+          // refresh token 由 Rust 侧轮换写回 DPAPI，Dart 不持有明文
+          _refreshToken ??= 'rust-managed';
+          await _vault.write(_accessKey, access);
+          lastIssue = null;
+          return true;
+        }
+        return false;
+      }
+      switch (code) {
+        case 'UNAUTHORIZED':
+          // Rust 已删除本地令牌 → 回未登录态
+          await _clearLocal();
+          lastIssue = '登录已失效，请重新登录';
+          return false;
+        case 'NETWORK':
+          // **保留令牌、不登出**：一次断网不该把用户踢下线
+          lastIssue = '网络不可用，稍后会自动重试';
+          return _accessToken != null || await _vault.read(_accessKey) != null;
+        default:
+          lastIssue = '登录状态未知，请重新登录';
+          return false;
+      }
+    } on AuthRefreshUnavailable {
+      // 旧包 / 非 Windows：免登录不可用，静默降级
+      return null;
+    } on Object {
+      return null;
+    }
+  }
   /// 主动刷新；失败会清本地并抛 [AuthException]（调用方显示"请重新登录"）。
   Future<void> refreshTokens() async {
     final refresh = _refreshToken;
@@ -330,5 +417,49 @@ class HttpAuthApi implements AuthApi {
       }
     }
     return null;
+  }
+}
+
+/// 真 FFI：`yunong_auth_refresh_from_store(cloud_base_url, db_path)`。
+///
+/// - 同步 FFI → 放 `Isolate.run` 里跑（连 5s / 总 10s 由 Rust 侧控制）；
+/// - 返回 JSON 信封；symbol 缺失（旧包）→ [AuthRefreshUnavailable]。
+class FfiAuthRefreshBackend implements AuthRefreshBackend {
+  FfiAuthRefreshBackend({this.baseUrl = '', this.dbPath = ''});
+
+  final String baseUrl;
+  final String dbPath;
+
+  @override
+  Future<Map<String, dynamic>> refreshFromStore() {
+    final url = baseUrl;
+    final db = dbPath;
+    return Isolate.run<Map<String, dynamic>>(() {
+      final library = CoreLibrary.openCoreLibrary();
+      final Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>) call;
+      try {
+        call = library.lookupFunction<Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>),
+            Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>)>('yunong_auth_refresh_from_store');
+      } on ArgumentError {
+        throw const AuthRefreshUnavailable('端侧核心没有 yunong_auth_refresh_from_store');
+      }
+      final free = library.lookupFunction<Void Function(Pointer<Utf8>), void Function(Pointer<Utf8>)>(
+          'yunong_free_string');
+      final p1 = url.toNativeUtf8();
+      final p2 = db.toNativeUtf8();
+      try {
+        final result = call(p1, p2);
+        if (result == nullptr) {
+          throw const AuthRefreshUnavailable('核心库没有返回结果');
+        }
+        final text = result.toDartString();
+        free(result);
+        final decoded = jsonDecode(text);
+        return decoded is Map<String, dynamic> ? decoded : <String, dynamic>{};
+      } finally {
+        calloc.free(p1);
+        calloc.free(p2);
+      }
+    });
   }
 }

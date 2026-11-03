@@ -72,7 +72,9 @@ Future<void> _pumpChat(
 }
 
 Future<void> _openSettingsAndSave(WidgetTester tester, String key) async {
-  await tester.tap(find.byIcon(Icons.settings_outlined));
+  await tester.tap(find.byIcon(Icons.more_vert));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('设置'));
   await tester.pumpAndSettle();
   final fields = find.byType(TextField);
   // 对话框里第 3 个输入框是 BYOK Key（前两个：模型、套餐令牌）
