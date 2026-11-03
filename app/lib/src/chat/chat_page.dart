@@ -123,9 +123,17 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void dispose() {
     _stream?.cancel();
+    widget.chatSettings?.removeListener(_onSharedSettingsChanged);
     _input.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _onSharedSettingsChanged() {
+    unawaited(_refreshKeyStatus());
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   void _scrollToBottom() {
@@ -312,7 +320,7 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _signInCloud() async {
     final result = await showDialog<({String email, String password})>(
       context: context,
-      builder: (BuildContext context) => const _CloudLoginDialog(),
+      builder: (BuildContext context) => const CloudLoginDialog(),
     );
     if (result == null || !mounted) {
       return;
@@ -928,63 +936,3 @@ class _MessageBubble extends StatelessWidget {
 /// 设置对话框：Key 输入框 `obscureText`，**不回显**已保存的值。
 
 /// 套餐账号登录对话框（邮箱 + 密码；密码不回显）。
-class _CloudLoginDialog extends StatefulWidget {
-  const _CloudLoginDialog();
-
-  @override
-  State<_CloudLoginDialog> createState() => _CloudLoginDialogState();
-}
-
-class _CloudLoginDialogState extends State<_CloudLoginDialog> {
-  final TextEditingController _email = TextEditingController();
-  final TextEditingController _password = TextEditingController();
-
-  @override
-  void dispose() {
-    _email.dispose();
-    _password.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      backgroundColor: Theme.of(context).colorScheme.surface,
-      surfaceTintColor: Colors.transparent,
-      scrollable: true,
-      title: const Text('登录套餐账号'),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          TextField(
-            controller: _email,
-            keyboardType: TextInputType.emailAddress,
-            decoration: const InputDecoration(labelText: '邮箱'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _password,
-            obscureText: true,
-            enableSuggestions: false,
-            autocorrect: false,
-            decoration: const InputDecoration(labelText: '密码'),
-          ),
-        ],
-      ),
-      actions: <Widget>[
-        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('取消')),
-        FilledButton(
-          onPressed: () {
-            final email = _email.text.trim();
-            final password = _password.text;
-            if (email.isEmpty || password.isEmpty) {
-              return;
-            }
-            Navigator.of(context).pop((email: email, password: password));
-          },
-          child: const Text('登录'),
-        ),
-      ],
-    );
-  }
-}

@@ -8,6 +8,8 @@
 import 'package:flutter/material.dart';
 
 import '../chat/chat_settings_section.dart';
+import '../core/auth_service.dart';
+import '../core/secret_service.dart';
 
 import '../theme/theme_controller.dart';
 import '../theme/glass_panel.dart';
@@ -16,12 +18,27 @@ import '../theme/yunong_tokens.dart';
 
 class SettingsPage extends StatelessWidget {
   const SettingsPage(
-      {super.key, required this.controller, this.chatSettings, this.version = '0.9.0（W2b）'});
+      {super.key,
+      required this.controller,
+      this.chatSettings,
+      this.authService,
+      this.secretService,
+      this.keyValidator,
+      this.onKeySaved,
+      this.version = '0.9.0（W2b）'});
 
   final ThemeController controller;
 
   /// 对话设置的共享状态源（与对话页同一实例）：本页改了对话页立即生效
   final ChatSettingsController? chatSettings;
+
+  /// 账号能力（t88 下沉）：给了它，设置页里的对话设置就能登录/退出套餐
+  final AuthService? authService;
+
+  /// Key 能力（t88 下沉）：给了它，保存 Key 的校验/保存/回读都在面板内完成
+  final SecretService? secretService;
+  final Future<String?> Function(String apiKey)? keyValidator;
+  final void Function(SecretStatus status)? onKeySaved;
   final String version;
 
   @override
@@ -51,7 +68,14 @@ class SettingsPage extends StatelessWidget {
                   title: '对话',
                   children: <Widget>[
                     InkWell(
-                      onTap: () => openChatSettingsDialog(context, chatSettings!),
+                      onTap: () => openChatSettingsDialog(
+                            context,
+                            chatSettings!,
+                            auth: authService,
+                            secrets: secretService,
+                            keyValidator: keyValidator,
+                            onKeySaved: onKeySaved,
+                          ),
                       child: const _Row(
                         icon: Icons.chat_bubble_outline,
                         title: '对话设置',
@@ -397,16 +421,43 @@ class _Row extends StatelessWidget {
 
 /// t86：从设置页打开对话设置（与对话页共享同一个 controller，保存即同步）。
 Future<void> openChatSettingsDialog(
-    BuildContext context, ChatSettingsController controller) async {
+  BuildContext context,
+  ChatSettingsController controller, {
+  AuthService? auth,
+  SecretService? secrets,
+  Future<String?> Function(String apiKey)? keyValidator,
+  void Function(SecretStatus status)? onKeySaved,
+}) async {
   final ChatSettings? result = await showDialog<ChatSettings>(
     context: context,
-    builder: (BuildContext context) => ChatSettingsSection(
+    builder: (BuildContext inner) => ChatSettingsSection(
       settings: controller.settings,
       searchLabel: '（在对话页查看）',
       searchHint: '',
+      // t88：账号与 Key 能力已下沉到面板，设置页只需注入服务
+      accountLabel: auth == null ? '未登录' : (auth.signedIn ? auth.maskedEmail : '未登录'),
+      signedIn: auth?.signedIn ?? false,
+      onSignIn: auth == null ? null : () => signInViaAuth(inner, auth),
+      onSignOut: auth == null ? null : auth.signOut,
+      secrets: secrets,
+      keyValidator: keyValidator,
+      onKeySaved: onKeySaved,
     ),
   );
   if (result != null) {
     controller.apply(result);
   }
+}
+
+/// 套餐登录（设置页内）：打开登录对话框 → 调 AuthService。
+Future<void> signInViaAuth(BuildContext context, AuthService auth) async {
+  final ({String email, String password})? result =
+      await showDialog<({String email, String password})>(
+    context: context,
+    builder: (BuildContext context) => const CloudLoginDialog(),
+  );
+  if (result == null) {
+    return;
+  }
+  await auth.signIn(email: result.email, password: result.password);
 }
