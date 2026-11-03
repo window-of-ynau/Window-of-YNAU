@@ -237,12 +237,14 @@ jobs:
       - name: 升级路径②（半成品旧索引 / 空表）
         run: |
           set -euo pipefail
-          P="psql -v ON_ERROR_STOP=1 -q -1"
+          # 注意：`-1` 只能加在 `-f`（整份迁移）上。`CREATE DATABASE` 不能在事务块里跑，
+          # 所以前缀本身不带 `-1`（t81 / M2 的真实教训，CI 上踩过一次）。
+          P="psql -v ON_ERROR_STOP=1 -q"
 
           echo "== ① 半成品库：旧版 0003 已经建过 ux_usage_turn_round"
           $P -c "CREATE DATABASE yunong_half"
-          $P -d yunong_half -f crates/server/migrations/0001_init.sql
-          $P -d yunong_half -f crates/server/migrations/0002_auth.sql
+          $P -d yunong_half -1 -f crates/server/migrations/0001_init.sql
+          $P -d yunong_half -1 -f crates/server/migrations/0002_auth.sql
           $P -d yunong_half <<'SQL'
           INSERT INTO users (email) VALUES ('half@example.com');
           INSERT INTO usage_samples (user_id, req_id, model, protocol, channel, round, tokens_in, tokens_out)
@@ -253,7 +255,7 @@ jobs:
           UPDATE usage_samples SET turn_id = req_id;
           CREATE UNIQUE INDEX ux_usage_turn_round ON usage_samples (turn_id, round);
           SQL
-          $P -d yunong_half -f crates/server/migrations/0003_usage_turn_estimated.sql
+          $P -d yunong_half -1 -f crates/server/migrations/0003_usage_turn_estimated.sql
           $P -d yunong_half <<'SQL'
           DO $$
           BEGIN
@@ -271,10 +273,10 @@ jobs:
 
           echo "== ② 空表库：usage_samples 一行数据都没有"
           $P -c "CREATE DATABASE yunong_empty"
-          $P -d yunong_empty -f crates/server/migrations/0001_init.sql
-          $P -d yunong_empty -f crates/server/migrations/0002_auth.sql
-          $P -d yunong_empty -f crates/server/migrations/0003_usage_turn_estimated.sql
-          $P -d yunong_empty -f crates/server/migrations/0004_audit_decisions.sql
+          $P -d yunong_empty -1 -f crates/server/migrations/0001_init.sql
+          $P -d yunong_empty -1 -f crates/server/migrations/0002_auth.sql
+          $P -d yunong_empty -1 -f crates/server/migrations/0003_usage_turn_estimated.sql
+          $P -d yunong_empty -1 -f crates/server/migrations/0004_audit_decisions.sql
 
           echo "半成品 / 空表升级 OK"
 
