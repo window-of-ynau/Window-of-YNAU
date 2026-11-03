@@ -1,0 +1,67 @@
+{
+  "salt": "2026-07-rag-salt",
+  "version": 1,
+  "note": "端侧与服务端共享的 RAG 规范向量（ADR-19：salt 公开，不需要保密）。服务端修改 canonical() 规则时必须同时更新本文件，否则端侧测试会红——这是刻意设计的漂移告警。",
+  "cases": [
+    {
+      "raw": "  https://Example.com/Paper/?utm_source=x&utm_medium=y#sec1 ",
+      "canonical": "https://example.com/paper",
+      "hash": "a17f4d27456618f6c2f22300205c84af5a1cc1e449885898746f0a3e494506e5"
+    },
+    {
+      "raw": "http://example.com/paper",
+      "canonical": "http://example.com/paper",
+      "hash": "bcab6218b7cc3a80939a9f927f9c32f66b480ea41aeaebaaec6476b241b87ab9"
+    },
+    {
+      "raw": "https://arxiv.org/abs/2401.01234v3",
+      "canonical": "2401.01234",
+      "hash": "0e11837ea129b6ed91621e815c8daf42be57b498839afa4b3a409b3962b16c17"
+    },
+    {
+      "raw": "arXiv:2401.01234",
+      "canonical": "2401.01234",
+      "hash": "0e11837ea129b6ed91621e815c8daf42be57b498839afa4b3a409b3962b16c17"
+    },
+    {
+      "raw": "https://doi.org/10.1145/1234567.890123",
+      "canonical": "10.1145/1234567.890123",
+      "hash": "9c3ef973a31ba534fe248c4fb60b0262f6d6533def36b0817b3974a887b84c5f"
+    },
+    {
+      "raw": "doi:10.1000/xyz",
+      "canonical": "10.1000/xyz",
+      "hash": "9e409b9877f81c09623319f00db44579ed8d579911dd1812e2a67a8328515ec9"
+    },
+    {
+      "raw": "https://example.com/a/b/",
+      "canonical": "https://example.com/a/b",
+      "hash": "f2e7fee175b84b6e172bd35f6ec91a7df5e6335822a773aa9051c73db51fcaf3"
+    },
+    {
+      "raw": "HTTPS://EXAMPLE.COM/UPPER",
+      "canonical": "https://example.com/upper",
+      "hash": "2becf4e035732a495e871323e9a25ed5495bfd97690c0ef82b82dde306b6e59d"
+    },
+    {
+      "raw": "https://example.com/x?utm_campaign=z",
+      "canonical": "https://example.com/x",
+      "hash": "f26ed5f001fed2275479c967127f2c254c6bdcd57b4075312244d08fa21b7f0a"
+    },
+    {
+      "raw": "https://arxiv.org/pdf/2312.99999v12",
+      "canonical": "2312.99999",
+      "hash": "fd3c87606ddd1808a30194f2fb15e71aff5854351b6fbbca8de5c50af3d8a03c"
+    },
+    {
+      "raw": "https://example.com/v2/notes",
+      "canonical": "https://example.com/v2/notes",
+      "hash": "e8a5dd27129afe4134aaeaeb3a22d685255c68cbf7321ab6e875514c68030347"
+    }
+  ],
+  "rejects": [
+    "",
+    "   ",
+    "https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ]
+}
