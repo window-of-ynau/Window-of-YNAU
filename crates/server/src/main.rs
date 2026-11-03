@@ -66,7 +66,12 @@ async fn main() -> anyhow::Result<()> {
         if let (Some(pool), Some(rag)) = (state.db.clone(), Some(state.rag.clone())) {
             let pipeline_config = yunong_server::rag_fetch::FetchConfig::from_config(&config);
             let timeout = std::time::Duration::from_secs(config.rag_fetch_timeout_secs);
-            match yunong_server::rag_fetch::HttpFetcher::new(timeout) {
+            // M3/M4：DOI 重定向白名单与正文字节上限都来自配置
+            match yunong_server::rag_fetch::HttpFetcher::new(
+                timeout,
+                config.rag_fetch_max_body_bytes,
+                config.rag_fetch_doi_allowed_hosts.clone(),
+            ) {
                 Ok(fetcher) => {
                     let pipeline =
                         std::sync::Arc::new(yunong_server::rag_fetch::FetchPipeline::new(

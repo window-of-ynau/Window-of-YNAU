@@ -1,11 +1,16 @@
 // t62 套餐通道 UI：菜单登录/登出、打码邮箱、错误文案、窄窗不溢出。
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/src/chat/chat_page.dart';
 import 'package:yunong/src/core/auth_service.dart';
 import 'package:yunong/src/core/chat_service.dart';
+import 'package:yunong/src/chat/chat_settings_section.dart';
 import 'package:yunong/src/core/secret_service.dart';
+import 'package:yunong/src/settings/settings_page.dart';
+import 'package:yunong/src/theme/theme_controller.dart';
 
 class FakeAuthApi implements AuthApi {
   FakeAuthApi({this.loginError});
@@ -57,6 +62,11 @@ class _NoopSecrets implements SecretBackend {
 Future<AuthService> _auth({AuthException? loginError}) async =>
     AuthService(api: FakeAuthApi(loginError: loginError), vault: MemoryTokenVault());
 
+// t89：对话页已无设置入口——走真实路径：设置页 →「对话设置」。
+late SecretService _secretsService;
+late ChatSettingsController _sharedSettings;
+late AuthService _authService;
+
 Future<void> _pumpChat(WidgetTester tester, AuthService auth, {Size? size}) async {
   if (size != null) {
     tester.view.physicalSize = size;
@@ -64,12 +74,16 @@ Future<void> _pumpChat(WidgetTester tester, AuthService auth, {Size? size}) asyn
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
   }
+  _authService = auth;
+  _secretsService = SecretService(backend: _NoopSecrets(), dbPath: '/tmp/t62.db');
+  _sharedSettings = ChatSettingsController();
   await tester.pumpWidget(MaterialApp(
     home: Scaffold(
       body: ChatPage(
         service: ChatService(backend: _NoopChatBackend()),
-        secretService: SecretService(backend: _NoopSecrets(), dbPath: '/tmp/t62.db'),
-        authService: auth,
+        secretService: _secretsService,
+        authService: _authService,
+        chatSettings: _sharedSettings,
         dbPath: '/tmp/t62.db',
       ),
     ),
@@ -78,9 +92,17 @@ Future<void> _pumpChat(WidgetTester tester, AuthService auth, {Size? size}) asyn
 }
 
 Future<void> _openMenu(WidgetTester tester) async {
-  await tester.tap(find.byTooltip('更多'));
+  final NavigatorState navigator = tester.state<NavigatorState>(find.byType(Navigator));
+  unawaited(navigator.push(MaterialPageRoute<void>(
+    builder: (BuildContext context) => SettingsPage(
+      controller: ThemeController(store: MemorySettingsStore()),
+      chatSettings: _sharedSettings,
+      authService: _authService,
+      secretService: _secretsService,
+    ),
+  )));
   await tester.pumpAndSettle();
-  await tester.tap(find.text('设置'));
+  await tester.tap(find.text('对话设置').first);
   await tester.pumpAndSettle();
 }
 

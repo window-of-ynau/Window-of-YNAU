@@ -308,7 +308,12 @@ impl RagService {
     /// 落库成功后记账（R5-F8）。
     ///
     /// 先落库、再扣配额：否则 DB 抖动期会出现"配额被扣、数据没落"，客户端被提前封月。
-    /// 代价是并发下可能略微超额（两个请求都通过预检），这是有意选择的宽松方向。
+    ///
+    /// **放大倍数的真实口径（t81 / M6 更正）**：预检与记账之间的窗口内，
+    /// N 个并发请求可以**同时**通过预检 ⇒ 最多超额 `N × 单次请求上限`，
+    /// 而不是之前注释里写的"略微"。这里的 N 由 `CONCURRENCY_LIMIT` 与客户端并发度共同决定，
+    /// 所以真正的收敛手段是 [`crate::limiter::AuthRoute::RagReport`] 的速率限制（每账号每分钟），
+    /// 配额只是"月度总量"的兜底。
     pub fn commit_quota(&self, month: &str, client: &str, amount: u32) {
         let mut map = self.lock_quota();
         let slot = map

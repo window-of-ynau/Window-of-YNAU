@@ -16,6 +16,7 @@ use yunong_shared::ErrorCode;
 use crate::accounting::{AuditEntry, RagLimit};
 use crate::api::{client_ip::ClientIp, envelope, error::AppError, request_id::ReqId};
 use crate::auth::Principal;
+use crate::limiter::AuthRoute;
 use crate::rag::{parse_hash, RagError, ReferralItem};
 use crate::state::AppState;
 
@@ -80,6 +81,15 @@ pub async fn referrals(
             &req_id.0,
         )
     })?;
+
+    // t81 / M6：**先限流**再解析业务字段。
+    //
+    // 这个端点之前完全无限流：一个账号可以无限次上报，配合"月配额按 sum(count)"之前的口径
+    // （按条数）能把某个 hash 顶到霸榜。键用 **user_id**（已鉴权、不可伪造），
+    // 不用 IP —— R5-F4 已经证明 XFF 在没开 trust_proxy 时是攻击者随便填的。
+    state
+        .limiter
+        .check_rate(AuthRoute::RagReport, &principal.user_id.to_string())?;
 
     // 月份：只允许当前月/上月（防止往未来月份无限写）
     state

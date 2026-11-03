@@ -47,7 +47,12 @@ use time::OffsetDateTime;
 use crate::config::Config;
 use crate::rag::{RagError, RagService};
 
-/// 单条标识的最大长度（规范化之前）。超过就是畸形输入。
+/// 单条标识的最大长度（规范化之前），按 **UTF-8 字节** 计。
+///
+/// ⚠️ 跨语言陷阱（t77 顺带查出来的）：Rust 的 `str::len()` 是 UTF-8 字节数，
+/// 而 Dart 的 `String.length` 是 **UTF-16 码元**数 —— 171 个汉字是 513 字节但只有 171 个码元。
+/// 端侧必须用 `utf8.encode(s).length` 来判这条上限，否则"171 个汉字"在两端会有不同结论。
+/// 向量文件里有一条 513 字节的拒绝用例来钉住这条。
 const MAX_IDENTIFIER_BYTES: usize = 512;
 
 /// 日志里允许出现的哈希前缀长度（**绝不打印完整哈希**）。
@@ -83,8 +88,22 @@ impl FetchError {
     }
 }
 
+/// 抓取结果（t81 / M4）：正文 + 归一化 Content-Type。
+///
+/// 为什么不再返回裸 `String`：没有 Content-Type 就无法判断"这是 HTML、Atom 还是 PDF"，
+/// 只能把原始字节当文本存进 `doc_text`；PDF 更是直接变成垃圾。类型判断放在抓取器里
+/// （它能看到响应头），清洗/落库判断放在 [`extract_text`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedDoc {
+    /// 归一化后的 MIME（小写、去掉 `; charset=…` 参数）
+    pub content_type: String,
+    /// 原始字节；**字节上限在抓取器里就卡住**（`FetchConfig::max_body_bytes`）
+    pub body: Vec<u8>,
+}
+
 /// 抓取器的盒子 future（不引入 `async-trait` 依赖）。
-pub type FetchFuture<'a> = Pin<Box<dyn Future<Output = Result<String, FetchError>> + Send + 'a>>;
+pub type FetchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<FetchedDoc, FetchError>> + Send + 'a>>;
 
 /// 抓取器抽象：真实实现走 HTTP，测试注入 mock（**CI 里不允许真的联网抓取**）。
 pub trait Fetcher: Send + Sync {
@@ -104,6 +123,12 @@ pub struct FetchConfig {
     pub retry_failed: bool,
     /// 同一轮内两次抓取之间的最小间隔（限速；arXiv 官方要求礼貌访问）
     pub min_interval: Duration,
+    /// `fetching` 占位的过期阈值（t81 / M1）：早于它才允许被回收
+    pub stale_after: Duration,
+    /// 正文字节上限（t81 / M4）
+    pub max_body_bytes: usize,
+    /// DOI 重定向白名单（t81 / M3）
+    pub doi_allowed_hosts: Vec<String>,
 }
 
 impl FetchConfig {
@@ -112,8 +137,12 @@ impl FetchConfig {
             top_n: config.rag_fetch_top_n.max(1),
             retries: config.rag_fetch_retries,
             backoff: Duration::from_millis(config.rag_fetch_backoff_ms),
-            retry_failed: false,
+            // M8：运维必须有手段重试失败项（旧实现把 false 写死在代码里）
+            retry_failed: config.rag_fetch_retry_failed,
             min_interval: Duration::from_millis(config.rag_fetch_min_interval_ms),
+            stale_after: Duration::from_secs(config.rag_fetch_stale_after_secs.max(1)),
+            max_body_bytes: config.rag_fetch_max_body_bytes.max(1),
+            doi_allowed_hosts: config.rag_fetch_doi_allowed_hosts.clone(),
         }
     }
 }
@@ -131,6 +160,17 @@ pub struct FetchReport {
     pub skipped: usize,
     /// 抢占失败：被别的 worker 拿走了 / 已经是终态
     pub contended: usize,
+}
+
+/// 落库结果（t81 / M5）：两步写必须能被区分，不能"看起来成功"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOutcome {
+    /// 事务提交成功
+    Stored,
+    /// `rag_known_docs` 里没有对应行 → 回滚（否则候选行会带一个**悬空** `doc_id`）
+    MissingKnownDoc,
+    /// 候选行已不是 `fetching`（别的 worker 回收/改掉了）→ 回滚
+    Contended,
 }
 
 #[derive(Debug)]
@@ -207,12 +247,19 @@ impl FetchPipeline {
         let month = self.rag.current_month();
         let salt = self.rag.salt().await?.salt;
 
-        // 崩溃恢复：单实例部署下，把"抢占后没来得及落结果"的 fetching 放回 pending。
+        // 崩溃恢复（t81 / M1）：**只回收超时未更新的 fetching**。
+        //
+        // 旧实现无条件 `UPDATE … WHERE status='fetching'`：多 worker 同时跑时，后启动的那个
+        // 会把前一个**正在抓**的占位抢回 pending，于是同一批候选被重复抓取、结果互相覆盖。
+        // 现在按 `claimed_at` 判过期；`claimed_at IS NULL`（老库升级前的历史行）视为最老、必回收。
+        let stale_secs = i64::try_from(self.config.stale_after.as_secs()).unwrap_or(i64::MAX);
         sqlx::query(
-            "UPDATE rag_candidates SET status = 'pending' \
-             WHERE month = $1 AND status = 'fetching'",
+            "UPDATE rag_candidates SET status = 'pending', claimed_at = NULL \
+             WHERE month = $1 AND status = 'fetching' \
+               AND (claimed_at IS NULL OR claimed_at < now() - make_interval(secs => $2))",
         )
         .bind(&month)
+        .bind(stale_secs as f64)
         .execute(&self.pool)
         .await?;
 
@@ -236,7 +283,7 @@ impl FetchPipeline {
             let hash: String = row.try_get("hash")?;
             // 抢占：只有把 pending/failed 改成 fetching 的 worker 才继续（多 worker 安全）
             let claimed = sqlx::query(
-                "UPDATE rag_candidates SET status = 'fetching', last_error = NULL \
+                "UPDATE rag_candidates SET status = 'fetching', last_error = NULL, claimed_at = now() \
                  WHERE month = $1 AND hash = $2 AND status IN ('pending', 'failed')",
             )
             .bind(&month)
@@ -253,7 +300,8 @@ impl FetchPipeline {
             let Some(target) = index.get(&hash) else {
                 // 反推不出来：诚实标 skipped，不要当成失败（否则会被反复重试）
                 sqlx::query(
-                    "UPDATE rag_candidates SET status = 'skipped', last_error = 'no_known_doc' \
+                    "UPDATE rag_candidates SET status = 'skipped', last_error = 'no_known_doc', \
+                         claimed_at = NULL \
                      WHERE month = $1 AND hash = $2",
                 )
                 .bind(&month)
@@ -272,40 +320,47 @@ impl FetchPipeline {
             let (attempts, last_error, fetched_text) = self.try_fetch(target).await;
             match fetched_text {
                 Some(text) => {
-                    sqlx::query(
-                        "UPDATE rag_known_docs SET fetched_at = now(), doc_text = $3 \
-                         WHERE month = $1 AND identifier = $2",
-                    )
-                    .bind(&month)
-                    .bind(&target.identifier)
-                    .bind(&text)
-                    .execute(&self.pool)
-                    .await?;
-                    sqlx::query(
-                        "UPDATE rag_candidates \
-                         SET status = 'fetched', attempts = $3, last_error = NULL, \
-                             fetched_at = now(), doc_id = $4 \
-                         WHERE month = $1 AND hash = $2",
-                    )
-                    .bind(&month)
-                    .bind(&hash)
-                    .bind(i32::try_from(attempts).unwrap_or(i32::MAX))
-                    .bind(&target.identifier)
-                    .execute(&self.pool)
-                    .await?;
-                    report.fetched += 1;
-                    tracing::info!(
-                        hash_prefix = %hash_prefix(&hash),
-                        source = %target.source,
-                        status = "fetched",
-                        bytes = text.len(),
-                        attempts,
-                        "rag fetch 成功"
-                    );
+                    // M5：两步写包进**同一个事务**并检查影响行数
+                    match self
+                        .store_fetch_result(&month, &hash, &target.identifier, &text, attempts)
+                        .await?
+                    {
+                        StoreOutcome::Stored => {
+                            report.fetched += 1;
+                            tracing::info!(
+                                hash_prefix = %hash_prefix(&hash),
+                                source = %target.source,
+                                status = "fetched",
+                                bytes = text.len(),
+                                attempts,
+                                "rag fetch 成功"
+                            );
+                        }
+                        StoreOutcome::MissingKnownDoc => {
+                            // 已知语料行在 join 之后被删了：宁可失败也不要写悬空 doc_id
+                            report.failed += 1;
+                            tracing::warn!(
+                                hash_prefix = %hash_prefix(&hash),
+                                source = %target.source,
+                                status = "failed",
+                                error = "known_doc_missing",
+                                "rag fetch：已知语料行已不存在，已回滚（不写悬空 doc_id）"
+                            );
+                        }
+                        StoreOutcome::Contended => {
+                            report.contended += 1;
+                            tracing::warn!(
+                                hash_prefix = %hash_prefix(&hash),
+                                status = "contended",
+                                "rag fetch：落库时候选行已不是 fetching（被别的 worker 回收？），已回滚"
+                            );
+                        }
+                    }
                 }
                 None => {
                     sqlx::query(
-                        "UPDATE rag_candidates SET status = 'failed', attempts = $3, last_error = $4 \
+                        "UPDATE rag_candidates SET status = 'failed', attempts = $3, last_error = $4, \
+                             claimed_at = NULL \
                          WHERE month = $1 AND hash = $2",
                     )
                     .bind(&month)
@@ -328,6 +383,57 @@ impl FetchPipeline {
         }
 
         Ok(report)
+    }
+
+    /// 落抓取结果（t81 / M5）：两步写**同一事务** + 检查 `rows_affected`。
+    ///
+    /// 旧实现是两次独立 `UPDATE` 且不查影响行数：如果 `rag_known_docs` 那行已被清理，
+    /// 候选行仍会被标成 `fetched` 并写入 `doc_id` —— 库里留下一个**悬空引用**，
+    /// 下游按 `doc_id` 反查正文时会拿到 NULL，且没有任何告警。
+    pub async fn store_fetch_result(
+        &self,
+        month: &str,
+        hash: &str,
+        identifier: &str,
+        text: &str,
+        attempts: u32,
+    ) -> Result<StoreOutcome, FetchPipelineError> {
+        let mut tx = self.pool.begin().await?;
+        let docs = sqlx::query(
+            "UPDATE rag_known_docs SET fetched_at = now(), doc_text = $3 \
+             WHERE month = $1 AND identifier = $2",
+        )
+        .bind(month)
+        .bind(identifier)
+        .bind(text)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if docs == 0 {
+            tx.rollback().await.ok();
+            return Ok(StoreOutcome::MissingKnownDoc);
+        }
+
+        let candidates = sqlx::query(
+            "UPDATE rag_candidates \
+             SET status = 'fetched', attempts = $3, last_error = NULL, \
+                 fetched_at = now(), doc_id = $4, claimed_at = NULL \
+             WHERE month = $1 AND hash = $2 AND status = 'fetching'",
+        )
+        .bind(month)
+        .bind(hash)
+        .bind(i32::try_from(attempts).unwrap_or(i32::MAX))
+        .bind(identifier)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if candidates != 1 {
+            tx.rollback().await.ok();
+            return Ok(StoreOutcome::Contended);
+        }
+
+        tx.commit().await?;
+        Ok(StoreOutcome::Stored)
     }
 
     /// 本月已知语料 → 瞬时哈希索引（只在内存里存在）。
@@ -360,7 +466,16 @@ impl FetchPipeline {
             attempts += 1;
             self.wait_for_slot().await;
             match self.fetcher.fetch(target).await {
-                Ok(text) => return (attempts, String::new(), Some(text)),
+                Ok(doc) => match extract_text(&doc.content_type, &doc.body) {
+                    Ok(text) => return (attempts, String::new(), Some(text)),
+                    Err(error) => {
+                        // 类型不支持 / 清洗后为空：**永久失败**，重试没有意义
+                        last_error = error.message;
+                        if !error.retryable {
+                            break;
+                        }
+                    }
+                },
                 Err(error) => {
                     last_error = error.message;
                     if !error.retryable {
@@ -396,7 +511,39 @@ fn truncate_error(message: &str) -> String {
     message.chars().take(200).collect()
 }
 
+/// **固定 ASCII 空白集合**（t77 的跨语言契约）。
+///
+/// 只有这 6 个字符会被裁掉；`U+FEFF`（BOM）、`U+00A0`（NBSP）、`U+2028` 等都**不裁**——
+/// 它们在不同语言的 `trim()` 里行为不一致（Dart 裁、Rust 不裁），正是 t77 的根因。
+const ASCII_WHITESPACE: [char; 6] = [' ', '\t', '\n', '\r', '\x0c', '\x0b'];
+
+/// 只裁 [`ASCII_WHITESPACE`] 里的字符（两端）。
+///
+/// 不能直接用 `str::trim()`：它是 Unicode White_Space 语义，但**不含** U+FEFF；
+/// 而 Dart 的 `String.trim()` **含** U+FEFF —— 两端就此分叉。
+fn trim_ascii_whitespace(raw: &str) -> &str {
+    raw.trim_matches(|ch: char| ASCII_WHITESPACE.contains(&ch))
+}
+
 /// 规范化标识（契约见模块文档）。返回 `None` 表示畸形输入（空 / 超长 / 归一后为空）。
+///
+/// # 规则是 **ASCII-only**，不是 Unicode 语义（t77）
+///
+/// 标识本来就是 URL / DOI / arXiv 这类 ASCII 文本，不需要 Unicode case folding。
+/// 用 Unicode 语义会**跨语言不一致**，实测两类：
+///
+/// - `İ`（U+0130）：Rust 的 `to_lowercase()` 走完整映射 → `i` + U+0307（2 个码点），
+///   Dart 的 `toLowerCase()` → 单个 `i` ⇒ 两端哈希不同；
+/// - U+FEFF（BOM）：Dart 的 `trim()` 把它当空白裁掉，Rust 的 `str::trim()` 不裁
+///   （BOM 不属于 Unicode White_Space）⇒ 粘贴带 BOM 的引用文本就会 0 命中。
+///
+/// 所以这里只做两件**逐字节确定**的事：
+/// 1. 裁**固定 ASCII 空白集合**（空格 / `\t` / `\n` / `\r` / `\x0c` / `\x0b`），
+///    其它任何字符（含 BOM、NBSP、U+2028）都**原样保留**；
+/// 2. 只把 ASCII `A–Z` 转小写（`to_ascii_lowercase`），非 ASCII 字符大小写**不动**；
+/// 3. 不做 NFC/NFKC 归一化、不做 Unicode case folding。
+///
+/// 端侧（Dart）必须实现同一套规则：`String.trim()` 是 Unicode 感知的，**不能直接用它**。
 ///
 /// # ⚠️ 改规则必须先改向量文件
 ///
@@ -411,11 +558,12 @@ fn truncate_error(message: &str) -> String {
 /// 守卫用例 `rag_vectors_match_implementation` 会比对文件与当前实现，改漏了 CI 直接红。
 /// 没有这道闸门时的后果是"服务端 join 永远 0 命中且不报错"——线上静默失效。
 pub fn canonical_identifier(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
+    let trimmed = trim_ascii_whitespace(raw);
     if trimmed.is_empty() || trimmed.len() > MAX_IDENTIFIER_BYTES {
         return None;
     }
-    let mut value = trimmed.to_lowercase();
+    // 只转 ASCII：非 ASCII（İ/Ü/П/全角…）一律原样保留，保证两端逐字节一致
+    let mut value = trimmed.to_ascii_lowercase();
     if let Some(index) = value.find('#') {
         value.truncate(index);
     }
@@ -549,23 +697,135 @@ pub fn previous_months(month: &str, count: u32) -> String {
     format!("{new_year}-{new_month:02}")
 }
 
+/// 落库正文的字符上限（t81 / M4）：200k 字符 ≈ 教科书一章，足够 RAG 用。
+pub const MAX_DOC_TEXT_CHARS: usize = 200_000;
+
+/// DOI 跟随重定向的最大跳数。
+const MAX_DOI_REDIRECTS: usize = 5;
+
+/// 允许落库的 Content-Type（t81 / M4）。
+///
+/// **PDF 不在白名单**：我们不解析 PDF，存字节进去只会让 `doc_text` 变成二进制垃圾；
+/// 判永久失败比"存进去看起来成功"诚实。
+fn is_supported_content_type(mime: &str) -> bool {
+    matches!(
+        mime,
+        "text/plain"
+            | "text/html"
+            | "application/xhtml+xml"
+            | "application/atom+xml"
+            | "application/xml"
+            | "text/xml"
+    )
+}
+
+/// 是不是私网/回环/链路本地地址（t81 / M3：重定向白名单之外的第二道闸）。
+///
+/// 白名单按域名匹配，但攻击者可以控制一个**白名单域名的子域**指向内网；
+/// 所以即使域名匹配，只要解析出来是字面量 IP 且属于私网段，也一律拒绝。
+fn is_private_host(host: &str) -> bool {
+    let lower = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return true;
+    }
+    match lower.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let segments = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (segments[0] & 0xfe00) == 0xfc00 // fc00::/7 唯一本地地址
+                || (segments[0] & 0xffc0) == 0xfe80 // fe80::/10 链路本地
+        }
+        Err(_) => false,
+    }
+}
+
+/// 重定向目标是否在白名单内（支持 `*.example.com` 通配）。
+///
+/// 纯函数，便于单测；网络路径上由 [`HttpFetcher`] 的 redirect policy 调用。
+pub fn is_allowed_doi_host(host: &str, allowed: &[String]) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || is_private_host(&host) {
+        return false;
+    }
+    allowed.iter().any(|pattern| {
+        let pattern = pattern.trim().to_ascii_lowercase();
+        if pattern.is_empty() {
+            return false;
+        }
+        match pattern.strip_prefix("*.") {
+            Some(suffix) => host == suffix || host.ends_with(&format!(".{suffix}")),
+            None => host == pattern,
+        }
+    })
+}
+
 /// 真实抓取器：按 `source` 分派 HTTP 请求。
 ///
 /// **默认不启用**（`RAG_FETCH_ENABLED=false`）：CI 与离线环境都不允许联网抓取。
+///
+/// # 为什么要两个 client（t81 / M3）
+///
+/// 这与上游模型 API 的 `Policy::none()`（M2 / SSRF 修复）**不冲突，是两套风险模型**：
+/// - 上游模型 API：地址是我们**自己配置**的，跟随重定向只是给攻击者一个"把我们带去内网"的机会，
+///   收益为零 → 一律不跟；
+/// - 抓取器：抓的是**外网公开资源**，doi.org 的 302 跳到出版商是它的正常工作方式，
+///   不跟等于 DOI 源 100% 不可用（旧实现的真实状态）。
+///
+/// 所以这里对 DOI 开"**有限 + 白名单**"的跟随：最多 5 跳、只允许 https、
+/// 目标域名必须在 `RAG_FETCH_DOI_ALLOWED_HOSTS` 内、且不能是私网/回环地址。
+/// arxiv / web 仍然完全不跟（URL 由标识直接构造，重定向没有正当理由）。
 pub struct HttpFetcher {
-    client: reqwest::Client,
+    /// arxiv / web：不跟随重定向
+    plain: reqwest::Client,
+    /// doi：白名单内的有限跟随
+    doi: reqwest::Client,
+    max_body_bytes: usize,
 }
 
 impl HttpFetcher {
-    pub fn new(timeout: Duration) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
+    pub fn new(
+        timeout: Duration,
+        max_body_bytes: usize,
+        doi_allowed_hosts: Vec<String>,
+    ) -> Result<Self, reqwest::Error> {
+        let user_agent = concat!("yunong-rag/", env!("CARGO_PKG_VERSION"));
+        let plain = reqwest::Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout)
             // 与上游网关同样不跟随重定向：避免被带去任意地址
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("yunong-rag/", env!("CARGO_PKG_VERSION")))
+            .user_agent(user_agent)
             .build()?;
-        Ok(Self { client })
+
+        let allowed = std::sync::Arc::new(doi_allowed_hosts);
+        let doi = reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(timeout)
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= MAX_DOI_REDIRECTS {
+                    return attempt.error("重定向次数过多");
+                }
+                if attempt.url().scheme() != "https" {
+                    return attempt.error("只允许 https 重定向");
+                }
+                let host = attempt.url().host_str().unwrap_or_default().to_owned();
+                if !is_allowed_doi_host(&host, &allowed) {
+                    return attempt.error(format!("重定向目标不在白名单：{host}"));
+                }
+                attempt.follow()
+            }))
+            .user_agent(user_agent)
+            .build()?;
+
+        Ok(Self {
+            plain,
+            doi,
+            max_body_bytes,
+        })
     }
 
     /// `source` + 规范化标识 → URL。未知来源直接判永久失败（不猜 URL）。
@@ -594,8 +854,12 @@ impl Fetcher for HttpFetcher {
                     target.source
                 )));
             };
-            let response = self
-                .client
+            let client = if target.source == "doi" {
+                &self.doi
+            } else {
+                &self.plain
+            };
+            let response = client
                 .get(&url)
                 .send()
                 .await
@@ -607,13 +871,169 @@ impl Fetcher for HttpFetcher {
             if !status.is_success() {
                 return Err(FetchError::retryable(format!("HTTP {status}")));
             }
+
+            // M4：类型不在白名单就判永久失败（重试也不会变）
+            let mime = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let mime = if mime.is_empty() {
+                "text/plain".to_owned()
+            } else {
+                mime
+            };
+            if !is_supported_content_type(&mime) {
+                return Err(FetchError::permanent(format!(
+                    "不支持的 Content-Type：{mime}（不落原始二进制）"
+                )));
+            }
+
+            // M4：先看 Content-Length，再在读完后再核一次（有的服务端不报长度）
+            if let Some(length) = response.content_length() {
+                if length > self.max_body_bytes as u64 {
+                    return Err(FetchError::permanent(format!(
+                        "正文过大：{length} 字节 > 上限 {}",
+                        self.max_body_bytes
+                    )));
+                }
+            }
             let body = response
                 .bytes()
                 .await
                 .map_err(|error| FetchError::retryable(format!("读响应失败：{error}")))?;
-            Ok(String::from_utf8_lossy(&body).into_owned())
+            if body.len() > self.max_body_bytes {
+                return Err(FetchError::permanent(format!(
+                    "正文过大：{} 字节 > 上限 {}",
+                    body.len(),
+                    self.max_body_bytes
+                )));
+            }
+            Ok(FetchedDoc {
+                content_type: mime,
+                body: body.to_vec(),
+            })
         })
     }
+}
+
+/// 把响应正文清洗成可落库的纯文本（t81 / M4）。
+///
+/// 这是**粗糙清洗**，正式清洗管线（去导航/去参考文献/分段）另排期；
+/// 现阶段的目标只有一个：**不要把原始 HTML/Atom 直接塞进 `doc_text`**。
+pub fn extract_text(content_type: &str, body: &[u8]) -> Result<String, FetchError> {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let raw = String::from_utf8_lossy(body);
+    let text = match mime.as_str() {
+        "" | "text/plain" => raw.into_owned(),
+        "text/html" | "application/xhtml+xml" => strip_markup(&raw, true),
+        "application/atom+xml" | "application/xml" | "text/xml" => strip_markup(&raw, false),
+        other => {
+            return Err(FetchError::permanent(format!(
+                "不支持的 Content-Type：{other}"
+            )))
+        }
+    };
+    let cleaned = collapse_whitespace(&text);
+    if cleaned.is_empty() {
+        return Err(FetchError::permanent("清洗后正文为空"));
+    }
+    Ok(cleaned.chars().take(MAX_DOC_TEXT_CHARS).collect())
+}
+
+/// 去标签 + 解实体（`strip_scripts` 时连 `<script>/<style>` 的内容一起丢掉）。
+fn strip_markup(raw: &str, strip_scripts: bool) -> String {
+    let mut out = String::with_capacity(raw.len() / 2);
+    let mut chars = raw.char_indices().peekable();
+    let mut in_script_until: Option<&'static str> = None;
+    while let Some((index, ch)) = chars.next() {
+        if in_script_until.is_some() {
+            if ch == '<' {
+                // 用**字节**切片比较：`&str[..n]` 会在非 ASCII 字符中间 panic
+                let rest = raw.as_bytes().get(index..).unwrap_or_default();
+                let closing = in_script_until.unwrap_or("</");
+                // 注意：`closing` 本身就带 `</`，所以比较长度就是 `closing.len()`
+                if rest
+                    .get(..closing.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(closing.as_bytes()))
+                {
+                    in_script_until = None;
+                    // 把收尾的 `>` 也吃掉，避免 `</script>` 的残渣混进正文
+                    for (_, inner) in chars.by_ref() {
+                        if inner == '>' {
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if ch == '<' {
+            let rest = raw.as_bytes().get(index..).unwrap_or_default();
+            if strip_scripts {
+                if rest
+                    .get(..7)
+                    .is_some_and(|head| head.eq_ignore_ascii_case(b"<script"))
+                {
+                    in_script_until = Some("</script");
+                } else if rest
+                    .get(..6)
+                    .is_some_and(|head| head.eq_ignore_ascii_case(b"<style"))
+                {
+                    in_script_until = Some("</style");
+                }
+            }
+            // 跳过整个标签
+            for (_, inner) in chars.by_ref() {
+                if inner == '>' {
+                    break;
+                }
+            }
+            out.push(' ');
+            continue;
+        }
+        out.push(ch);
+    }
+    decode_entities(&out)
+}
+
+/// 解常见 HTML 实体（够用即可，不做完整实体表）。
+fn decode_entities(raw: &str) -> String {
+    raw.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+/// 折叠空白：连续空白（含换行）压成一个空格，两端裁掉。
+fn collapse_whitespace(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+    }
+    out.trim_end().to_owned()
 }
 
 /// 本轮抓取的"人类可读"摘要（只含数量，不含标识）。
@@ -659,6 +1079,226 @@ mod tests {
             None
         );
         assert_eq!(canonical_identifier("#only-fragment"), None);
+    }
+
+    /// t77：ASCII 空白才裁，Unicode 空白与 BOM **原样保留**。
+    #[test]
+    fn ascii_only_trimming_keeps_bom_and_nbsp() {
+        // 6 个 ASCII 空白都被裁
+        for raw in [
+            "\thttps://example.com/a\n",
+            "\r\x0c\x0bhttps://example.com/a \t\n",
+        ] {
+            assert_eq!(
+                canonical_identifier(raw).as_deref(),
+                Some("https://example.com/a"),
+                "ASCII 空白应被裁：{raw:?}"
+            );
+        }
+        // BOM / NBSP / U+2028 不是 ASCII 空白 → 必须原样保留
+        for (raw, expected) in [
+            (
+                "\u{feff}https://example.com/z",
+                "\u{feff}https://example.com/z",
+            ),
+            (
+                "https://example.com/z\u{feff}",
+                "https://example.com/z\u{feff}",
+            ),
+            (
+                "\u{00a0}https://example.com/z",
+                "\u{00a0}https://example.com/z",
+            ),
+            (
+                "\u{2028}https://example.com/z",
+                "\u{2028}https://example.com/z",
+            ),
+        ] {
+            assert_eq!(
+                canonical_identifier(raw).as_deref(),
+                Some(expected),
+                "非 ASCII 空白不得被裁（Dart/Rust trim 语义不同，t77）：{raw:?}"
+            );
+        }
+        // 只有 ASCII 空白的输入 → 拒绝
+        assert_eq!(canonical_identifier(" \t\n\r\x0c\x0b "), None);
+        // 只有 BOM 的输入不是"空"（BOM 原样保留）
+        assert_eq!(
+            canonical_identifier("\u{feff}").as_deref(),
+            Some("\u{feff}")
+        );
+    }
+
+    /// t77：只做 ASCII 小写；非 ASCII 字符的大小写与组合形式**一律不动**。
+    #[test]
+    fn ascii_only_lowercasing_keeps_unicode_intact() {
+        let cases = [
+            // U+0130（İ）：Rust to_lowercase() 会产出 i + U+0307，Dart 产出 i —— 都不该发生
+            ("İSTANBUL-Üniversite", "İstanbul-Üniversite"),
+            // 拉丁扩展：Ü 保持大写
+            ("https://example.com/Über", "https://example.com/Über"),
+            // Cyrillic 保持大写
+            ("https://example.com/ПРИВЕТ", "https://example.com/ПРИВЕТ"),
+            // 全角字母不是 ASCII，不做小写
+            ("https://example.com/ＡＢＣ", "https://example.com/ＡＢＣ"),
+            // 组合符原样保留（不做 NFC）
+            (
+                "https://example.com/e\u{0301}",
+                "https://example.com/e\u{0301}",
+            ),
+            // emoji 原样
+            ("https://example.com/🚀", "https://example.com/🚀"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                canonical_identifier(raw).as_deref(),
+                Some(expected),
+                "ASCII-only 规则不对：{raw:?}"
+            );
+        }
+        // 关键：İ 的规范化结果里**不能**出现 U+0307（那是 to_lowercase 的产物）
+        let canonical = canonical_identifier("İSTANBUL").expect("能规范化");
+        assert!(
+            !canonical.contains('\u{0307}'),
+            "出现了 Unicode 分解产物（to_lowercase 的副作用）：{canonical:?}"
+        );
+    }
+
+    /// t77：长度上限按 **UTF-8 字节** 计（不是字符数，也不是 UTF-16 码元数）。
+    #[test]
+    fn identifier_limit_is_utf8_bytes() {
+        // 170 个汉字 = 510 字节 → 通过
+        assert!(canonical_identifier(&"论".repeat(170)).is_some());
+        // 171 个汉字 = 513 字节 → 拒绝（字符数只有 171，按字符算会误放行）
+        assert_eq!(canonical_identifier(&"论".repeat(171)), None);
+        // 512 个 ASCII 字符 = 512 字节 → 通过；513 → 拒绝
+        assert!(canonical_identifier(&"a".repeat(512)).is_some());
+        assert_eq!(canonical_identifier(&"a".repeat(513)), None);
+    }
+
+    /// t81 / M3：DOI 重定向白名单（纯函数，不联网）。
+    #[test]
+    fn doi_redirect_allowlist_is_strict() {
+        let allowed: Vec<String> = vec![
+            "doi.org".to_owned(),
+            "*.springer.com".to_owned(),
+            "ieeexplore.ieee.org".to_owned(),
+        ];
+        // 精确匹配 + 通配子域
+        assert!(is_allowed_doi_host("doi.org", &allowed));
+        assert!(is_allowed_doi_host("DOI.ORG", &allowed), "大小写不敏感");
+        assert!(is_allowed_doi_host("link.springer.com", &allowed));
+        assert!(
+            is_allowed_doi_host("springer.com", &allowed),
+            "通配也要匹配裸域"
+        );
+        assert!(is_allowed_doi_host("ieeexplore.ieee.org", &allowed));
+
+        // 不在白名单
+        assert!(!is_allowed_doi_host("evil.example.com", &allowed));
+        assert!(!is_allowed_doi_host("springer.com.evil.example", &allowed));
+        assert!(!is_allowed_doi_host("", &allowed));
+
+        // 私网/回环/链路本地：即使在白名单里也一律拒（白名单按域名匹配挡不住 IP 直连）
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "169.254.169.254",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+        ] {
+            assert!(
+                !is_allowed_doi_host(host, &allowed),
+                "私网/回环地址不允许跟随重定向：{host}"
+            );
+        }
+        // 白名单为空 → 谁都不跟（安全默认）
+        assert!(!is_allowed_doi_host("doi.org", &[]));
+    }
+
+    /// t81 / M4：Content-Type 白名单（PDF 不在里面）。
+    #[test]
+    fn content_type_allowlist_excludes_binary() {
+        for mime in [
+            "text/plain",
+            "text/html",
+            "application/xhtml+xml",
+            "application/atom+xml",
+            "application/xml",
+            "text/xml",
+        ] {
+            assert!(is_supported_content_type(mime), "应支持：{mime}");
+        }
+        for mime in ["application/pdf", "image/png", "application/octet-stream"] {
+            assert!(!is_supported_content_type(mime), "不该落库：{mime}");
+        }
+    }
+
+    /// t81 / M4：抓到的 HTML/Atom 必须先清洗成纯文本，**不能原样落库**。
+    #[test]
+    fn extract_text_strips_markup_and_scripts() {
+        let html = r#"<html><head><style>body{color:red}</style>
+<script>alert('x')</script></head>
+<body><h1>论文标题</h1><p>摘要 &amp; 结论 &lt;重要&gt;</p></body></html>"#
+            .as_bytes();
+        let text = extract_text("text/html; charset=utf-8", html).expect("能清洗");
+        assert!(text.contains("论文标题"), "{text}");
+        assert!(text.contains("摘要 & 结论 <重要>"), "实体要解开：{text}");
+        // 标签与脚本内容都不该出现
+        for forbidden in ["<html", "<p>", "alert(", "color:red", "<h1"] {
+            assert!(!text.contains(forbidden), "残留标记：{forbidden} / {text}");
+        }
+
+        // Atom（arxiv 的响应就是 atom+xml）
+        let atom = r#"<?xml version="1.0"?><feed><entry><title>标题</title>
+<summary>摘要正文</summary></entry></feed>"#
+            .as_bytes();
+        let text = extract_text("application/atom+xml", atom).expect("能清洗");
+        assert!(text.contains("摘要正文"), "{text}");
+        assert!(!text.contains("<summary>"), "{text}");
+
+        // 纯文本原样保留
+        assert_eq!(
+            extract_text("text/plain", "  纯文本  正文 ".as_bytes()).expect("能清洗"),
+            "纯文本 正文"
+        );
+    }
+
+    /// t81 / M4：不支持的类型 / 清洗后为空 → **永久失败**（重试没意义）。
+    #[test]
+    fn extract_text_rejects_unsupported_and_empty() {
+        let pdf = extract_text("application/pdf", b"%PDF-1.7 ...").expect_err("PDF 不该被接受");
+        assert!(!pdf.retryable, "类型不支持是永久失败：{pdf:?}");
+
+        let empty =
+            extract_text("text/html", b"<html><body>   </body></html>").expect_err("空正文");
+        assert!(!empty.retryable, "空正文是永久失败：{empty:?}");
+    }
+
+    /// t81 / M4：落库正文有字符上限（防止一篇文章把行撑爆）。
+    #[test]
+    fn extract_text_truncates_to_limit() {
+        let long = "字".repeat(MAX_DOC_TEXT_CHARS + 500);
+        let text = extract_text("text/plain", long.as_bytes()).expect("能清洗");
+        assert_eq!(text.chars().count(), MAX_DOC_TEXT_CHARS);
+    }
+
+    /// t81 / M8：`retry_failed` 必须能由配置打开（旧实现写死 false，运维无手段）。
+    #[test]
+    fn retry_failed_comes_from_config() {
+        let mut config = Config::for_tests();
+        assert!(
+            !FetchConfig::from_config(&config).retry_failed,
+            "默认不重试"
+        );
+        config.rag_fetch_retry_failed = true;
+        assert!(
+            FetchConfig::from_config(&config).retry_failed,
+            "RAG_FETCH_RETRY_FAILED=true 时本轮要纳入 failed"
+        );
     }
 
     #[test]
@@ -819,10 +1459,35 @@ mod rag_vectors_tests {
             "https://site1.example.com/v2",
             // v10 但没有前导数字：不该被当版本号
             "https://example.com/notes/v10",
+            // ——— t77：跨语言 Unicode 语料（规则：**非 ASCII 原样保留**）———
+            // U+0130（İ）：Rust 的 to_lowercase() 会产出 i + U+0307、Dart 的 toLowerCase() 产 i，
+            // 两端就此分叉；ASCII-only 规则下它必须原样保留
+            "İSTANBUL-Üniversite",
+            // U+FEFF（BOM）：Dart 的 trim() 会裁、Rust 的 trim() 不裁 —— 现在两端都不裁
+            "\u{feff}https://example.com/z",
+            "https://example.com/z\u{feff}",
+            // U+00A0（NBSP）：不是 ASCII 空白，不裁
+            "\u{00a0}https://example.com/nbsp\u{00a0}",
+            // U+2028（行分隔符）：同上
+            "\u{2028}https://example.com/ls",
+            // CJK 路径原样
+            "https://example.com/论文",
+            // 拉丁扩展：只做 ASCII 小写，Ü 保持大写
+            "https://example.com/Über",
+            // Cyrillic 保持大写
+            "https://example.com/ПРИВЕТ",
+            // 全角字母不是 ASCII，不做小写
+            "https://example.com/ＡＢＣ",
+            // 组合符：不做 NFC 归一化
+            "https://example.com/e\u{0301}",
+            // emoji 原样
+            "https://example.com/🚀",
+            // U+0130 在路径中间
+            "https://example.com/İstanbul/İ",
         ]
     }
 
-    fn rejected_inputs() -> Vec<&'static str> {
+    fn rejected_inputs() -> Vec<String> {
         vec![
             "",
             "   ",
@@ -831,7 +1496,15 @@ mod rag_vectors_tests {
             // 归一后为空
             "#only-fragment",
             "?only-query",
+            // t77：全是 ASCII 空白 → 裁完为空（注意：含 BOM 的输入**不**算空）
+            " \t\n\r\x0c\x0b ",
         ]
+        .into_iter()
+        .map(str::to_owned)
+        // t77：171 个汉字 = 513 UTF-8 **字节**（> 512）但只有 171 个 UTF-16 码元。
+        // 这条用例钉住"上限按字节算"；端侧若用 String.length 会算成 171 而误接受。
+        .chain(std::iter::once("论".repeat(171)))
+        .collect()
     }
 
     fn build_vectors() -> VectorsFile {
@@ -850,13 +1523,15 @@ mod rag_vectors_tests {
             .collect();
         VectorsFile {
             salt: VECTORS_SALT.to_owned(),
-            version: 1,
+            // t77：规则从"Unicode 语义"改为"ASCII-only"，属于**破坏性变更** → 版本号 +1。
+            // 端侧（Dart）必须同步实现 ASCII-only 规则，否则 join 永远 0 命中。
+            version: 2,
             note: "由 crates/server 的 canonical_identifier()/hash_identifier() 生成；\
                    端侧 Flutter 实现必须逐条对齐。改规则请重新生成：\
                    cargo test -p yunong-server rag_vectors -- --ignored"
                 .to_owned(),
             cases,
-            rejects: rejected_inputs().into_iter().map(str::to_owned).collect(),
+            rejects: rejected_inputs(),
         }
     }
 
@@ -944,7 +1619,7 @@ mod rag_vectors_tests {
         // 拒绝清单：实现确实返回 None
         for raw in rejected_inputs() {
             assert_eq!(
-                canonical_identifier(raw),
+                canonical_identifier(&raw),
                 None,
                 "这条应当被拒绝却通过了：{raw:?}"
             );

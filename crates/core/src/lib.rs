@@ -22,12 +22,14 @@ pub mod keystore;
 pub mod local_search;
 pub mod memory;
 pub mod memory_items;
+pub mod memory_ref;
 pub mod parse;
 pub mod protocols;
 pub mod schedule;
 pub mod search;
 pub mod secret;
 pub mod store;
+pub mod titlebar;
 pub mod tool_loop;
 pub mod tools;
 
@@ -78,6 +80,7 @@ pub mod prelude {
         compress_weeks, merge, MergedSchedule, SchedulePayload, WeekPayload,
     };
     pub use crate::store::{CourseStore, ImportOutcome, StoredCourse, TermRecord};
+    pub use crate::titlebar::{set_dark as set_titlebar_dark, TitlebarError, TitlebarReport};
     pub use crate::tool_loop::{run as run_tool_loop, LoopConfig, LoopEvent, LoopOutcome};
     pub use crate::tools::{ToolCall, ToolOutcome, ToolRegistry};
 }

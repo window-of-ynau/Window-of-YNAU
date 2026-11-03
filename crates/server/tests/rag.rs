@@ -526,6 +526,45 @@ async fn pg_top_view_ranks_by_count() {
     db.finish().await;
 }
 
+/// t81 / M6：`/rag/referrals` 必须有速率限制。
+///
+/// 旧实现这个端点**完全无限流**：只要令牌没被封，一个账号可以无限次上报，
+/// 配合早期的"按条数"配额口径能把某个 hash 顶到霸榜。
+/// 这里把 `RAG_REPORT_PER_MIN` 调成 1，第二次上报必须 429。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_referrals_are_rate_limited() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mut config = Config::for_tests();
+    config.rag_report_per_min = 1;
+    let app = RagApp::new(config, Some(db.pool.clone()));
+    let token = app.register("rag-rate-limit@ynau.edu.cn").await;
+    let month = current_month();
+
+    let (status, body) = app
+        .post_referrals(
+            &token,
+            json!({ "month": month, "items": [{ "hash": fake_hash("rl-1"), "count": 1 }] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "第一次应放行：{body}");
+
+    let (status, body) = app
+        .post_referrals(
+            &token,
+            json!({ "month": month, "items": [{ "hash": fake_hash("rl-2"), "count": 1 }] }),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "超过每分钟上限必须 429（旧实现完全没有限流）：{body}"
+    );
+    db.finish().await;
+}
+
 /// R5-F1：配额按 **count 总和** 算，不按条数。
 ///
 /// 在旧实现（按条数）下，第二条请求（1 条）会被放行 ⇒ 这个用例会红。

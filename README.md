@@ -1,5 +1,7 @@
 # 云农之窗（Yunong）
 
+**中文** | [English](README.en.md)
+
 [![CI](https://github.com/window-of-ynau/Window-of-YNAU/actions/workflows/ci.yml/badge.svg)](https://github.com/window-of-ynau/Window-of-YNAU/actions/workflows/ci.yml)
 
 面向云南农业大学学生的校务聚合客户端与 AI 助理。

@@ -4,7 +4,6 @@
 // 消息列表与输入区拆成独立 widget，后续整体换主题不需要改逻辑。
 
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -20,26 +19,17 @@ import '../core/memory_service.dart';
 import '../core/search_service.dart';
 import '../core/secret_service.dart';
 import '../memory/memory_page.dart';
+import 'chat_settings_section.dart';
+
+// `ChatSettings` 已随设置面板搬到 `chat_settings_section.dart`；这里 re-export，
+// 保持既有调用方/测试的 `import chat_page.dart` 不变（纯搬迁，行为不变）。
+export 'chat_settings_section.dart' show ChatSettings;
 import 'chat_top_bar.dart';
 
 /// 会话设置（MVP：密钥只在内存里，进程退出即失效）。
 ///
 /// 下一步（t34 之后）：接 Rust keystore 的 `yunong_set/get_secret`，
 /// 让 Key 落到系统安全存储、永不回显。本轮的 UI 已经按"不回显"设计。
-class ChatSettings {
-  String channel = 'byok';
-
-  /// 上游提供方（架构预留：加 OpenAI / 自建网关只需加枚举值）。
-  String providerId = 'deepseek';
-
-  /// 该提供方的 OpenAI 兼容 base url（BYOK 直连用）。
-  String baseUrl = 'https://api.deepseek.com';
-  String byokKey = '';
-  String cloudToken = '';
-  String model = 'deepseek-chat';
-  String protocol = 'openai_completions';
-}
-
 /// 一条气泡。
 class ChatBubble {
   ChatBubble({required this.fromUser, required this.text});
@@ -54,6 +44,7 @@ class ChatPage extends StatefulWidget {
     super.key,
     this.service,
     this.settings,
+    this.chatSettings,
     this.secretService,
     this.searchService,
     this.localSearchService,
@@ -65,6 +56,9 @@ class ChatPage extends StatefulWidget {
 
   final ChatService? service;
   final ChatSettings? settings;
+
+  /// 共享状态源（与设置页同一个实例）：设置页改完这里立即生效
+  final ChatSettingsController? chatSettings;
   final SecretService? secretService;
   final SearchService? searchService;
   final LocalSearchService? localSearchService;
@@ -78,15 +72,29 @@ class ChatPage extends StatefulWidget {
   final String dbPath;
 
   @override
-  State<ChatPage> createState() => _ChatPageState();
+  State<ChatPage> createState() => ChatPageState();
 }
 
-class _ChatPageState extends State<ChatPage> {
+/// 公开（而非 `_`）只为 `@visibleForTesting` 的 getter 能被测试读取。
+class ChatPageState extends State<ChatPage> {
   late final ChatService _service = widget.service ?? ChatService();
-  late final ChatSettings _settings = widget.settings ?? ChatSettings();
+  late final ChatSettings _settings =
+      widget.settings ?? widget.chatSettings?.settings ?? ChatSettings();
   late final SecretService _secrets =
       widget.secretService ?? SecretService(dbPath: widget.dbPath);
   SecretStatus _keyStatus = const SecretStatus(set: false, masked: '');
+  /// 最近一次「取 Key 状态」失败的原因（诊断可观测；为空 = 没失败过）。
+  String? _keyStatusError;
+
+  /// 测试用：当前 Key 状态文案（`未设置` / 打码串）。
+  ///
+  /// 不走 Tooltip 断言——前三次失败都是读错了 Tooltip（另一个控件或 offstage 文案）。
+  @visibleForTesting
+  String get keyStatusLabel => _keyStatus.display;
+
+  /// 测试用：最近一次取 Key 状态失败的原因（正常时应为空）。
+  @visibleForTesting
+  String? get keyStatusError => _keyStatusError;
   late final AuthService _auth = widget.authService ?? AuthService();
   late final SearchService _search =
       widget.searchService ?? SearchService(dbPath: widget.dbPath);
@@ -107,6 +115,8 @@ class _ChatPageState extends State<ChatPage> {
   ChatStream? _stream;
   bool _streaming = false;
   String? _error;
+  /// 首字慢的非致命提示（不取消流）
+  String? _slowHint;
 
   /// 最近一轮对话的诊断（3 秒无事件时显示横幅 + 可复制）。
   ChatDiagnostics? _diagnostics;
@@ -118,6 +128,8 @@ class _ChatPageState extends State<ChatPage> {
   void initState() {
     super.initState();
     _channel = _settings.channel;
+    // 共享设置源变化（例如在设置页保存了 Key）→ 立即刷新本页状态
+    widget.chatSettings?.addListener(_onSharedSettingsChanged);
     unawaited(_refreshKeyStatus());
     unawaited(_refreshSearchStatus());
   }
@@ -125,9 +137,17 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void dispose() {
     _stream?.cancel();
+    widget.chatSettings?.removeListener(_onSharedSettingsChanged);
     _input.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _onSharedSettingsChanged() {
+    unawaited(_refreshKeyStatus());
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   void _scrollToBottom() {
@@ -242,21 +262,24 @@ class _ChatPageState extends State<ChatPage> {
     // P0-1（t56）：失败必须可观测——内存诊断，不依赖 Release 看不了的日志
     _diagnostics = stream.diagnostics;
     var sawEvent = false;
-    final watchdog = Timer(const Duration(seconds: 3), () {
-      if (!mounted || sawEvent || !_streaming) {
+    // P0-1（t79）：**只提示，不取消**。DeepSeek/思考模型首个 token 常 >3s；
+    // 之前 3s 看门狗直接 cancel → handle=1、callback_registered=true、events=0、无错误，
+    // 正是 owner 看到的“默默被杀”。取消只由用户点「停止」触发。
+    final watchdog = Timer(const Duration(seconds: 5), () {
+      if (!mounted || sawEvent) {
         return;
       }
-      stream.cancel();
       setState(() {
-        _streaming = false;
-        _stream = null;
-        _error = stream.diagnostics.banner;
+        _slowHint = '流已启动，但 5 秒内还没收到任何数据（handle=${stream.diagnostics.handle}），仍在等待…';
       });
     });
     stream.events.listen(
       (ChatEvent event) {
         sawEvent = true;
         watchdog.cancel();
+        if (_slowHint != null) {
+          setState(() => _slowHint = null);
+        }
         if (!mounted) {
           return;
         }
@@ -311,7 +334,7 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _signInCloud() async {
     final result = await showDialog<({String email, String password})>(
       context: context,
-      builder: (BuildContext context) => const _CloudLoginDialog(),
+      builder: (BuildContext context) => const CloudLoginDialog(),
     );
     if (result == null || !mounted) {
       return;
@@ -371,7 +394,10 @@ class _ChatPageState extends State<ChatPage> {
   /// “收到几条 delta、第几条之后停止、是否收到 done/error”。
   Future<void> _showDiagnostics() async {
     final diag = _diagnostics;
-    final text = diag == null ? '还没有发起过对话' : diag.toClipboardText();
+    final keyLine =
+        'key=`${_keyStatus.masked.isEmpty ? '未设置' : _keyStatus.masked} | protocol=`${_settings.protocol}'
+        ' | key_status_error=`${_keyStatusError ?? ''}';
+    final text = keyLine + '\n' + (diag == null ? '还没有发起过对话' : diag.toClipboardText());
     if (!mounted) {
       return;
     }
@@ -478,39 +504,17 @@ class _ChatPageState extends State<ChatPage> {
       if (mounted) {
         setState(() => _error = failure.userHint);
       }
-    } on Object {
-      // 核心库不可用（例如 widget 测试环境没有 DLL）：保持“未设置”，不打扰用户
-      if (mounted) {
-        setState(() => _keyStatus = const SecretStatus(set: false, masked: ''));
-      }
+    } on Object catch (failure) {
+      // 读取失败**不再重置为“未设置”**（那会把用户的“已配置”抹掉、连带禁用发送），
+      // 保留上一次的已知状态，只把原因记录到诊断里。
+      _keyStatusError = '${failure.runtimeType}: $failure';
+      debugPrint('[chat] key status refresh failed: $_keyStatusError');
     }
   }
 
   /// 轻量校验：请求一次 `/models`（OpenAI 兼容），8s 超时。
   ///
   /// 返回 null = 可用；否则返回可读错误（**不显示原始错误串**）。
-  static Future<String?> _validateByokKey(String apiKey) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
-    try {
-      final request = await client
-          .getUrl(Uri.parse('https://api.deepseek.com/models'))
-          .timeout(const Duration(seconds: 8));
-      request.headers.set('Authorization', 'Bearer $apiKey');
-      final response = await request.close().timeout(const Duration(seconds: 8));
-      await response.drain<void>();
-      if (response.statusCode == 200) {
-        return null;
-      }
-      if (response.statusCode == 401 || response.statusCode == 403) {
-        return 'Key 无效（上游返回 ${response.statusCode}）';
-      }
-      return '上游暂不可用（HTTP ${response.statusCode}），请稍后重试';
-    } on Object {
-      return '网络不可达，无法校验 Key（请检查网络后重试）';
-    } finally {
-      client.close(force: true);
-    }
-  }
 
   void _showError(String message) {
     if (!mounted) {
@@ -521,41 +525,6 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   /// 保存 Key：**先校验、再落盘、再回读**，任一失败都不假装成功。
-  Future<void> _saveKey(String apiKey) async {
-    final validator = widget.keyValidator ?? _validateByokKey;
-    final reason = await validator(apiKey);
-    if (reason != null) {
-      _showError(reason);
-      return;
-    }
-    try {
-      final saved = await _secrets.save(SecretService.byokKeyName, apiKey);
-      if (!saved.set) {
-        _showError('保存失败：安全存储没有确认写入');
-        return;
-      }
-      final status = await _secrets.status(SecretService.byokKeyName);
-      if (!status.set || status.masked.isEmpty) {
-        _showError('保存后回读失败：Key 没有真正落盘');
-        return;
-      }
-      if (mounted) {
-        setState(() {
-          _keyStatus = status;
-          _error = null;
-        });
-      }
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('已保存 ${status.masked}')),
-        );
-      }
-    } on SecretException catch (failure) {
-      _showError(failure.userHint);
-    } on Object {
-      _showError('保存失败：端侧核心不可用');
-    }
-  }
   /// 端侧数据**目录**（Rust `data_dir`）：由 `AppPaths.dataDirOf` 统一推导。
   String get _dataDir => AppPaths.dataDirOf(widget.dbPath);
 
@@ -570,40 +539,6 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  Future<void> _openSettings() async {
-    await _refreshKeyStatus();
-    if (!mounted) {
-      return;
-    }
-    final result = await showDialog<ChatSettings>(
-      context: context,
-      builder: (BuildContext context) => _SettingsDialog(
-        settings: _settings,
-        searchLabel: _searchStatus.display,
-        searchHint: _searchStatus.available ? '' : _searchStatus.hint,
-        accountLabel: _auth.signedIn ? _auth.maskedEmail : '未登录',
-        signedIn: _auth.signedIn,
-        onSignIn: _signInCloud,
-        onSignOut: _signOutCloud,
-      ),
-    );
-    if (result != null && mounted) {
-      if (result.byokKey.isNotEmpty) {
-        // 明文只在这一行里出现，交给 _saveKey 后立刻清掉
-        final apiKey = result.byokKey;
-        result.byokKey = '';
-        await _saveKey(apiKey);
-        if (!mounted) {
-          return;
-        }
-      }      setState(() {
-        _settings.cloudToken = result.cloudToken;
-        _settings.model = result.model;
-        _settings.protocol = result.protocol;
-        _channel = result.channel;
-      });
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -626,7 +561,6 @@ class _ChatPageState extends State<ChatPage> {
           accountLabel: _auth.signedIn ? _auth.maskedEmail : '未登录',
           onLocalSearch: () => setState(() => _localPanelOpen = !_localPanelOpen),
           onMemory: () => unawaited(_openMemory()),
-          onSettings: () => unawaited(_openSettings()),
           onSignIn: () => unawaited(_signInCloud()),
           onSignOut: () => unawaited(_signOutCloud()),
           onDiagnostics: () => unawaited(_showDiagnostics()),
@@ -640,6 +574,11 @@ class _ChatPageState extends State<ChatPage> {
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.tertiary),
             ),
+          ),
+        if (_slowHint != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+            child: Text(_slowHint!, style: theme.textTheme.bodySmall),
           ),
         if (_error != null)
           Padding(
@@ -916,234 +855,5 @@ class _MessageBubble extends StatelessWidget {
 }
 
 /// 设置对话框：Key 输入框 `obscureText`，**不回显**已保存的值。
-class _SettingsDialog extends StatefulWidget {
-  const _SettingsDialog({
-    required this.settings,
-    required this.searchLabel,
-    required this.searchHint,
-    this.accountLabel = '',
-    this.signedIn = false,
-    this.onSignIn,
-    this.onSignOut,
-  });
-
-  final ChatSettings settings;
-  final String searchLabel;
-  final String searchHint;
-  final String accountLabel;
-  final bool signedIn;
-  final Future<void> Function()? onSignIn;
-  final Future<void> Function()? onSignOut;
-
-  @override
-  State<_SettingsDialog> createState() => _SettingsDialogState();
-}
-
-class _SettingsDialogState extends State<_SettingsDialog> {
-  late final TextEditingController _key =
-      TextEditingController(text: widget.settings.byokKey);
-  late final TextEditingController _token =
-      TextEditingController(text: widget.settings.cloudToken);
-  late final TextEditingController _model =
-      TextEditingController(text: widget.settings.model);
-  late String _protocol = widget.settings.protocol;
-  late String _channel = widget.settings.channel;
-
-  @override
-  void dispose() {
-    _key.dispose();
-    _token.dispose();
-    _model.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      // P0-2：任何主题都不透底——玻璃只用于外层装饰，表单必须实心可读
-      backgroundColor: Theme.of(context).colorScheme.surface,
-      surfaceTintColor: Colors.transparent,
-      scrollable: true,
-      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-      titlePadding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
-      contentPadding: const EdgeInsets.fromLTRB(24, 8, 24, 8),
-      actionsPadding: const EdgeInsets.fromLTRB(24, 8, 24, 16),
-      title: const Text('对话设置'),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            // 联网搜索来源：**诚实展示**（未配置时把提示也放进设置页）
-            Align(
-              alignment: Alignment.centerLeft,
-              child: Text('联网搜索：${widget.searchLabel}'),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: <Widget>[
-                Expanded(child: Text('套餐账号：${widget.accountLabel}')),
-                TextButton(
-                  onPressed: () async {
-                    if (widget.signedIn) {
-                      await widget.onSignOut?.call();
-                    } else {
-                      await widget.onSignIn?.call();
-                    }
-                  },
-                  child: Text(widget.signedIn ? '退出' : '登录'),
-                ),
-              ],
-            ),
-            if (widget.searchHint.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 4, bottom: 8),
-                child: Text(
-                  widget.searchHint,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              initialValue: _channel,
-              decoration: const InputDecoration(labelText: '通道'),
-              items: const <DropdownMenuItem<String>>[
-                DropdownMenuItem<String>(value: 'byok', child: Text('BYOK 直连')),
-                DropdownMenuItem<String>(value: 'cloud', child: Text('套餐通道')),
-              ],
-              onChanged: (String? value) =>
-                  setState(() => _channel = value ?? _channel),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _model,
-              decoration: const InputDecoration(labelText: '模型'),
-            ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              initialValue: _protocol,
-              decoration: const InputDecoration(labelText: '协议'),
-              items: const <DropdownMenuItem<String>>[
-                DropdownMenuItem<String>(
-                    value: 'openai_completions',
-                    child: Text('OpenAI Completions')),
-                DropdownMenuItem<String>(
-                    value: 'openai_responses', child: Text('OpenAI Responses')),
-                DropdownMenuItem<String>(
-                    value: 'anthropic_messages',
-                    child: Text('Anthropic Messages')),
-              ],
-              onChanged: (String? value) =>
-                  setState(() => _protocol = value ?? _protocol),
-            ),
-            const SizedBox(height: 20),
-            const Divider(height: 1),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _key,
-              obscureText: true,
-              enableSuggestions: false,
-              autocorrect: false,
-              decoration: const InputDecoration(
-                labelText: 'BYOK API Key',
-                hintText: 'sk-…',
-                helperText: '填到域名即可，带不带 /v1 都行；只保存在本机，不回显、不进日志',
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _token,
-              obscureText: true,
-              enableSuggestions: false,
-              autocorrect: false,
-              decoration: const InputDecoration(
-                labelText: '套餐访问令牌',
-                helperText: '套餐通道用；没有就留空',
-              ),
-            ),
-          ],
-        ),
-      ),
-      actions: <Widget>[
-        TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('取消')),
-        FilledButton(
-          onPressed: () {
-            widget.settings
-              ..channel = _channel
-              ..model = _model.text.trim().isEmpty
-                  ? 'deepseek-chat'
-                  : _model.text.trim()
-              ..protocol = _protocol
-              ..byokKey = _key.text.trim()
-              ..cloudToken = _token.text.trim();
-            Navigator.of(context).pop(widget.settings);
-          },
-          child: const Text('保存'),
-        ),
-      ],
-    );
-  }
-}
 
 /// 套餐账号登录对话框（邮箱 + 密码；密码不回显）。
-class _CloudLoginDialog extends StatefulWidget {
-  const _CloudLoginDialog();
-
-  @override
-  State<_CloudLoginDialog> createState() => _CloudLoginDialogState();
-}
-
-class _CloudLoginDialogState extends State<_CloudLoginDialog> {
-  final TextEditingController _email = TextEditingController();
-  final TextEditingController _password = TextEditingController();
-
-  @override
-  void dispose() {
-    _email.dispose();
-    _password.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      backgroundColor: Theme.of(context).colorScheme.surface,
-      surfaceTintColor: Colors.transparent,
-      scrollable: true,
-      title: const Text('登录套餐账号'),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          TextField(
-            controller: _email,
-            keyboardType: TextInputType.emailAddress,
-            decoration: const InputDecoration(labelText: '邮箱'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _password,
-            obscureText: true,
-            enableSuggestions: false,
-            autocorrect: false,
-            decoration: const InputDecoration(labelText: '密码'),
-          ),
-        ],
-      ),
-      actions: <Widget>[
-        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('取消')),
-        FilledButton(
-          onPressed: () {
-            final email = _email.text.trim();
-            final password = _password.text;
-            if (email.isEmpty || password.isEmpty) {
-              return;
-            }
-            Navigator.of(context).pop((email: email, password: password));
-          },
-          child: const Text('登录'),
-        ),
-      ],
-    );
-  }
-}

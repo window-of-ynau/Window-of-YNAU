@@ -51,6 +51,10 @@ done
 注意：
 
 - 顺序执行，别打乱；`CREATE EXTENSION vector` 需要超级用户，compose 里的 `POSTGRES_USER`（yunong）是超级用户，够用。
+- **`-1`（单事务）不能去掉**：迁移里有 `DROP CONSTRAINT → ADD CONSTRAINT` 这类顺序敏感的 DDL。
+  非单事务时，ADD 失败而 DROP 已提交，等于**把约束永久删掉**（RAG 的 `rag_candidates_status_check`
+  就踩过这个坑：库里存在 `status='fetching'` 的行时重跑会让约束丢失）。
+  加 `-1` 后每份迁移要么全生效、要么全回滚。
 - 重跑前确认 SQL 幂等（`IF NOT EXISTS` / 迁移记录表）；非幂等的迁移重复执行会报错，别用 `ON_ERROR_STOP=0` 硬吞。
 - 如果宿主机已经装了 `psql`，也可以直接连——但默认没发布 5432，需要临时在 compose 里映射或用 `docker compose exec`。映射之后就是常规写法：
 
@@ -61,6 +65,35 @@ done
 ```
 
 - 服务端若自带启动迁移，以它为准；当前按设计由部署方执行（服务端只管运行期查询）。
+
+## RAG 抓取 worker 的运维开关
+
+抓取默认**关闭**（`RAG_FETCH_ENABLED=false`）：CI 与离线环境都不允许联网抓取。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `RAG_FETCH_ENABLED` | `false` | 打开后每 6 小时跑一轮（只处理 `pending`） |
+| `RAG_FETCH_TOP_N` | `100` | 每轮按 `count` 取前 N 条 |
+| `RAG_FETCH_RETRIES` | `3` | 单条重试次数（总计 `retries+1` 次） |
+| `RAG_FETCH_MIN_INTERVAL_MS` | `1000` | 两次抓取之间的最小间隔（对 arXiv 礼貌访问） |
+| `RAG_FETCH_TIMEOUT_SECS` | `10` | 单次 HTTP 超时 |
+| `RAG_FETCH_STALE_AFTER_SECS` | `1800` | `fetching` 占位多久算"上个 worker 崩了"，可被下一轮回收 |
+| `RAG_FETCH_MAX_BODY_BYTES` | `2097152` | 正文字节上限；超过判失败（不落库） |
+| `RAG_FETCH_DOI_ALLOWED_HOSTS` | 见 `crates/server/src/config.rs` 的 `DEFAULT_DOI_HOSTS` | DOI 抓取允许跟随的重定向域名白名单 |
+| `RAG_FETCH_RETRY_FAILED` | `false` | **重试失败项**：设为 `true` 后本轮把 `status='failed'` 的候选也纳入 |
+| `RAG_REPORT_PER_MIN` | `30` | `/api/v1/rag/referrals` 每账号每分钟上限（0 = 关闭） |
+
+**怎么重试失败项**：把 `RAG_FETCH_RETRY_FAILED=true` 写进 `deploy/.env` 并重启 `server`，
+下一轮（或手动触发一轮）会把本月 `failed` 的候选重新抓一遍；**确认恢复后记得改回 `false`**，
+否则失败项会被无限重试（每 6 小时一轮）。
+
+**怎么看待 DOI 重定向**：`doi.org` 是 302 跳到出版商，不跟随则 DOI 源完全不可用。
+抓取器只在 `RAG_FETCH_DOI_ALLOWED_HOSTS` 白名单内跟随（最多 5 跳、只允许 https、拒绝私网地址）。
+这与上游模型 API 的"完全不跟随重定向"不冲突——那是我们自己配置的地址，这是抓外网公开资源，风险模型不同。
+
+**不上白名单的源**：`application/pdf` 等二进制内容直接判失败不落库（我们不解析 PDF）。
+正文按"去标签 + 解实体 + 折叠空白"粗清洗后写入 `rag_known_docs.doc_text`（上限 20 万字符），
+正式清洗管线（去导航/分节/引用解析）另排期。
 
 ## 冒烟验证
 

@@ -38,9 +38,20 @@ CREATE TABLE IF NOT EXISTS rag_referrals (
 COMMENT ON TABLE rag_referrals IS
     '匿名哈希的累计提及次数（ADR-19 决策 2/3）。无 user_id：服务端不保留"谁上传了哪条"。';
 
-ALTER TABLE rag_referrals DROP CONSTRAINT IF EXISTS rag_referrals_count_check;
-ALTER TABLE rag_referrals
-    ADD CONSTRAINT rag_referrals_count_check CHECK (count >= 0);
+-- t81 / M2：**永不 DROP**。旧写法在 `psql -f`（非单事务）下重跑时，
+-- DROP 先生效、ADD 再校验现有行失败 ⇒ 约束永久丢失（库里有 fetching 行就是这种局面）。
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'rag_referrals_count_check'
+          AND conrelid = 'rag_referrals'::regclass
+    ) THEN
+        ALTER TABLE rag_referrals
+            ADD CONSTRAINT rag_referrals_count_check CHECK (count >= 0);
+    END IF;
+END
+$$;
 
 -- 运维最常查"本月提到最多的前 N 条"：按 (month, count DESC) 建索引
 CREATE INDEX IF NOT EXISTS ix_rag_referrals_month_count
@@ -62,15 +73,40 @@ CREATE TABLE IF NOT EXISTS rag_candidates (
 COMMENT ON TABLE rag_candidates IS
     '抓取候选与结果（ADR-19 决策 3）。status: pending / fetched / failed / skipped。';
 
-ALTER TABLE rag_candidates DROP CONSTRAINT IF EXISTS rag_candidates_count_check;
-ALTER TABLE rag_candidates
-    ADD CONSTRAINT rag_candidates_count_check CHECK (count >= 0);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'rag_candidates_count_check'
+          AND conrelid = 'rag_candidates'::regclass
+    ) THEN
+        ALTER TABLE rag_candidates
+            ADD CONSTRAINT rag_candidates_count_check CHECK (count >= 0);
+    END IF;
+END
+$$;
 
--- 约束用"先删后加"：迁移可重入，且允许将来扩状态值时只改这一处
-ALTER TABLE rag_candidates DROP CONSTRAINT IF EXISTS rag_candidates_status_check;
-ALTER TABLE rag_candidates
-    ADD CONSTRAINT rag_candidates_status_check
-    CHECK (status IN ('pending', 'fetched', 'failed', 'skipped'));
+-- t81 / M2（最严重的一条）：**只在缺约束时 ADD，永不 DROP**。
+--
+-- 旧写法"先 DROP 再 ADD"在重跑时有两个坑：
+--   1. `psql -f` 非单事务：DROP 已生效、ADD 因**已存在的 fetching 行**失败 ⇒ 约束永久丢失，
+--      之后能插任意 `weird_status`，脏行还会让 0006 一起跑不过；
+--   2. 即使单事务回滚，也把"扩状态值"这件事和"重入"耦在一起，判断依据不可靠。
+--
+-- 这里只保证 4 值版本存在；把 `fetching` 加进来是 0006 的职责（它同样只在需要时重建）。
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'rag_candidates_status_check'
+          AND conrelid = 'rag_candidates'::regclass
+    ) THEN
+        ALTER TABLE rag_candidates
+            ADD CONSTRAINT rag_candidates_status_check
+            CHECK (status IN ('pending', 'fetched', 'failed', 'skipped'));
+    END IF;
+END
+$$;
 
 -- 抓取 worker 的取数路径：按 status + 热度
 CREATE INDEX IF NOT EXISTS ix_rag_candidates_status_count

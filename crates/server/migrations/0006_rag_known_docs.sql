@@ -51,10 +51,42 @@ CREATE INDEX IF NOT EXISTS ix_rag_known_docs_month
 ALTER TABLE rag_candidates ADD COLUMN IF NOT EXISTS attempts   INT  NOT NULL DEFAULT 0;
 ALTER TABLE rag_candidates ADD COLUMN IF NOT EXISTS last_error TEXT;
 
-ALTER TABLE rag_candidates DROP CONSTRAINT IF EXISTS rag_candidates_status_check;
-ALTER TABLE rag_candidates
-    ADD CONSTRAINT rag_candidates_status_check
-    CHECK (status IN ('pending', 'fetching', 'fetched', 'failed', 'skipped'));
+-- t81 / M2：**只在当前定义确实不含 fetching 时才重建**，其他情况一律不动。
+-- 这样重跑 0006 不会先失去约束；也不会把已经被 0005 之后的状态值卡住。
+DO $$
+DECLARE
+    definition TEXT;
+BEGIN
+    SELECT pg_get_constraintdef(oid) INTO definition
+    FROM pg_constraint
+    WHERE conname = 'rag_candidates_status_check'
+      AND conrelid = 'rag_candidates'::regclass;
+
+    IF definition IS NULL THEN
+        ALTER TABLE rag_candidates
+            ADD CONSTRAINT rag_candidates_status_check
+            CHECK (status IN ('pending', 'fetching', 'fetched', 'failed', 'skipped'));
+    ELSIF definition NOT LIKE '%fetching%' THEN
+        BEGIN
+            ALTER TABLE rag_candidates DROP CONSTRAINT rag_candidates_status_check;
+            ALTER TABLE rag_candidates
+                ADD CONSTRAINT rag_candidates_status_check
+                CHECK (status IN ('pending', 'fetching', 'fetched', 'failed', 'skipped'));
+        EXCEPTION WHEN check_violation THEN
+            -- 理论上到不了这里（fetching 本来就是 0006 加的）；真到了就保留旧约束并显式失败，
+            -- **绝不允许**"先丢约束再退出"。
+            RAISE EXCEPTION 'rag_candidates 里有非法 status 行，无法放宽约束（请先修数据）';
+        END;
+    END IF;
+END
+$$;
+
+-- t81 / M1：抢占时间戳。`run_once` 只能回收"超时未更新"的 fetching，
+-- 否则会清掉正在跑的 worker 的占位（多 worker 不安全）。
+ALTER TABLE rag_candidates ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+
+COMMENT ON COLUMN rag_candidates.claimed_at IS
+    '抢占时刻（M1）。只有 claimed_at 早于过期阈值的 fetching 才会被回收；NULL 视为最老，必被回收。';
 
 -- 抓取 worker 的取数路径：本月 pending / failed 按热度
 CREATE INDEX IF NOT EXISTS ix_rag_candidates_month_status_count

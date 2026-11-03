@@ -22,7 +22,10 @@ use yunong_shared::ErrorCode;
 
 use crate::api::error::AppError;
 
-/// 三条未鉴权路由的分类（限流键与阈值都按它取）。
+/// 限流路由的分类（限流键与阈值都按它取）。
+///
+/// 前三条是**未鉴权**端点（security 的 H1/R2 系列）；`RagReport` 是**已鉴权**的
+/// RAG 上报端点（t81 / M6：它之前**完全无限流**，一个账号可以无限刷 count 总和）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthRoute {
     /// 注册：建账号 + 一次哈希
@@ -31,6 +34,8 @@ pub enum AuthRoute {
     Login,
     /// 刷新：只有数据库读写，不哈希
     Refresh,
+    /// RAG 上报（已鉴权；键是用户 ID，不是 IP——IP 可被 XFF 伪造）
+    RagReport,
 }
 
 impl AuthRoute {
@@ -39,6 +44,7 @@ impl AuthRoute {
             Self::Register => "register",
             Self::Login => "login",
             Self::Refresh => "refresh",
+            Self::RagReport => "rag_referrals",
         }
     }
 
@@ -48,6 +54,7 @@ impl AuthRoute {
             Self::Register => "注册",
             Self::Login => "登录",
             Self::Refresh => "刷新",
+            Self::RagReport => "RAG 上报",
         }
     }
 }
@@ -122,6 +129,8 @@ pub struct AuthLimiter {
     login_per_min: u32,
     register_per_min: u32,
     refresh_per_min: u32,
+    /// RAG 上报的每分钟上限；0 = 关闭（t81 / M6）
+    rag_report_per_min: u32,
 }
 
 impl AuthLimiter {
@@ -138,7 +147,18 @@ impl AuthLimiter {
             login_per_min,
             register_per_min,
             refresh_per_min,
+            // 默认关闭：由 `with_rag_report_limit` 按配置打开（保持既有构造点不变）
+            rag_report_per_min: 0,
         }
+    }
+
+    /// 打开 RAG 上报端点的速率限制（t81 / M6）。
+    ///
+    /// 用独立入口而不是改 `new()` 的签名：`AuthLimiter::new` 有若干既有调用点
+    /// （含测试），加参数会让"少传一个就默认关闭"变成静默缺口。
+    pub fn with_rag_report_limit(mut self, per_min: u32) -> Self {
+        self.rag_report_per_min = per_min;
+        self
     }
 
     /// 该路由每分钟允许的次数；0 表示"不限次数"（并发闸仍然生效）。
@@ -147,6 +167,7 @@ impl AuthLimiter {
             AuthRoute::Register => self.register_per_min,
             AuthRoute::Login => self.login_per_min,
             AuthRoute::Refresh => self.refresh_per_min,
+            AuthRoute::RagReport => self.rag_report_per_min,
         }
     }
 

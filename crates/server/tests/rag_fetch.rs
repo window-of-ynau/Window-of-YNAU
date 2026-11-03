@@ -16,19 +16,28 @@ use yunong_server::config::Config;
 use yunong_server::rag::RagService;
 use yunong_server::rag_fetch::{
     self, canonical_identifier, current_month, hash_identifier, index_known_docs, prune_salts,
-    FetchConfig, FetchError, FetchFuture, FetchPipeline, FetchReport, FetchTarget, Fetcher,
+    FetchConfig, FetchError, FetchFuture, FetchPipeline, FetchReport, FetchTarget, FetchedDoc,
+    Fetcher, StoreOutcome,
 };
 
 // ===================== mock 抓取器 =====================
 
+/// 构造一个"纯文本"抓取结果（t81 / M4：抓取器返回 Content-Type + 字节）。
+fn doc(content_type: &str, body: &str) -> FetchedDoc {
+    FetchedDoc {
+        content_type: content_type.to_owned(),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
 /// 按脚本依次返回结果；脚本用完后一直返回成功。
 struct MockFetcher {
     calls: Mutex<Vec<FetchTarget>>,
-    script: Mutex<VecDeque<Result<String, FetchError>>>,
+    script: Mutex<VecDeque<Result<FetchedDoc, FetchError>>>,
 }
 
 impl MockFetcher {
-    fn new(script: Vec<Result<String, FetchError>>) -> Arc<Self> {
+    fn new(script: Vec<Result<FetchedDoc, FetchError>>) -> Arc<Self> {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
             script: Mutex::new(script.into()),
@@ -52,7 +61,7 @@ impl Fetcher for MockFetcher {
             .lock()
             .expect("锁")
             .pop_front()
-            .unwrap_or_else(|| Ok("mock-body".to_owned()));
+            .unwrap_or_else(|| Ok(doc("text/plain", "mock-body")));
         Box::pin(async move { outcome })
     }
 }
@@ -120,7 +129,10 @@ impl Fixture {
                 retries,
                 backoff: Duration::ZERO, // 测试不等退避
                 retry_failed: false,
-                min_interval: Duration::ZERO, // 测试不限速
+                min_interval: Duration::ZERO,            // 测试不限速
+                stale_after: Duration::from_secs(1_800), // M1：默认 30 分钟
+                max_body_bytes: 2 * 1024 * 1024,         // M4
+                doi_allowed_hosts: Vec::new(),           // 单测里不联网，白名单无所谓
             },
         )
     }
@@ -146,7 +158,7 @@ async fn join_hit_fetches_and_stores_text() {
     let hash = fx.index_doc("arXiv:2401.01234v3", "arxiv").await;
     fx.insert_candidate(&hash, 7).await;
 
-    let fetcher = MockFetcher::new(vec![Ok("论文摘要正文".to_owned())]);
+    let fetcher = MockFetcher::new(vec![Ok(doc("text/plain", "论文摘要正文"))]);
     let report: FetchReport = fx
         .pipeline(fetcher.clone(), 3)
         .await
@@ -326,7 +338,7 @@ async fn retry_then_success_marks_fetched() {
 
     let fetcher = MockFetcher::new(vec![
         Err(FetchError::retryable("timeout")),
-        Ok("第二次成功".to_owned()),
+        Ok(doc("text/plain", "第二次成功")),
     ]);
     let report = fx
         .pipeline(fetcher.clone(), 3)
@@ -364,7 +376,7 @@ async fn second_run_does_not_refetch_done_items() {
     let hash = fx.index_doc("2401.05678", "arxiv").await;
     fx.insert_candidate(&hash, 9).await;
 
-    let fetcher = MockFetcher::new(vec![Ok("正文".to_owned())]);
+    let fetcher = MockFetcher::new(vec![Ok(doc("text/plain", "正文"))]);
     let pipeline = fx.pipeline(fetcher.clone(), 3).await;
 
     let first = pipeline.run_once().await.expect("第一轮");
@@ -580,7 +592,7 @@ async fn stale_fetching_is_recovered() {
     .await
     .expect("插入残留 fetching");
 
-    let fetcher = MockFetcher::new(vec![Ok("恢复后的正文".to_owned())]);
+    let fetcher = MockFetcher::new(vec![Ok(doc("text/plain", "恢复后的正文"))]);
     let report = fx
         .pipeline(fetcher.clone(), 3)
         .await
@@ -592,6 +604,274 @@ async fn stale_fetching_is_recovered() {
         report.fetched, 1,
         "残留 fetching 应被恢复并抓取：{report:?}"
     );
+    assert_eq!(
+        candidate_status(&fx.pool(), &fx.month, &hash)
+            .await
+            .as_deref(),
+        Some("fetched")
+    );
+    fx.db.finish().await;
+}
+
+// ===================== t81 回归（M1 / M2 / M5 / M8） =====================
+
+/// t81 / M2：库里有 `fetching` 行时重跑 0005/0006 **不得丢 CHECK 约束**。
+///
+/// 旧的"先 DROP 再 ADD"在非单事务 `psql -f` 下会先丢掉约束、再因 fetching 行报错退出：
+/// 之后能插任意 `weird_status`。这个用例在旧实现下必然红（约束丢失 → 断言失败）。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_rag_migrations_are_safe_to_rerun_with_fetching_rows() {
+    let Some(fx) = Fixture::setup().await else {
+        return;
+    };
+    // 造一条 fetching 行（0006 之后合法）
+    sqlx::query(
+        "INSERT INTO rag_candidates (month, hash, count, status, claimed_at) \
+         VALUES ($1, 'fetching-row', 1, 'fetching', now())",
+    )
+    .bind(&fx.month)
+    .execute(&fx.pool())
+    .await
+    .expect("插入 fetching 行");
+
+    // 重跑 0005 与 0006（迁移文件本身，原样执行）
+    for name in ["0005_rag_referrals.sql", "0006_rag_known_docs.sql"] {
+        let sql = common::migration_sql(name);
+        sqlx::raw_sql(&sql)
+            .execute(&fx.pool())
+            .await
+            .unwrap_or_else(|error| panic!("{name} 必须能在有 fetching 行时重跑：{error}"));
+    }
+
+    // 约束必须仍在
+    assert_eq!(
+        common::count(
+            &fx.pool(),
+            "SELECT count(*) FROM pg_constraint \
+             WHERE conname = 'rag_candidates_status_check' \
+               AND conrelid = 'rag_candidates'::regclass"
+        )
+        .await,
+        1,
+        "重跑后 CHECK 约束丢了（旧实现会这样）"
+    );
+    // 非法状态必须被拒
+    let error = sqlx::query(
+        "INSERT INTO rag_candidates (month, hash, count, status) \
+         VALUES ($1, 'weird', 1, 'weird_status')",
+    )
+    .bind(&fx.month)
+    .execute(&fx.pool())
+    .await
+    .expect_err("weird_status 必须被 CHECK 拒绝");
+    assert!(
+        matches!(error, sqlx::Error::Database(_)),
+        "应是数据库约束错误：{error:?}"
+    );
+    // fetching 行本身还在（重跑没能把它"洗掉"）
+    assert_eq!(
+        candidate_status(&fx.pool(), &fx.month, "fetching-row")
+            .await
+            .as_deref(),
+        Some("fetching")
+    );
+    // claimed_at 列存在（M1）
+    assert_eq!(
+        common::count(
+            &fx.pool(),
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = 'rag_candidates' AND column_name = 'claimed_at'"
+        )
+        .await,
+        1
+    );
+    fx.db.finish().await;
+}
+
+/// t81 / M1：只回收**超时**的 fetching，正在跑的 worker 的占位不能被抢。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_stale_fetching_is_recovered_but_fresh_is_not() {
+    let Some(fx) = Fixture::setup().await else {
+        return;
+    };
+    let stale_hash = fx.index_doc("https://example.com/stale", "web").await;
+    let fresh_hash = fx.index_doc("https://example.com/fresh", "web").await;
+
+    // 两条都处于 fetching：一条 2 小时前抢占（视为崩溃残留），一条刚刚抢占（另一个 worker 正在跑）
+    for (hash, minutes_ago) in [(&stale_hash, 120i32), (&fresh_hash, 0i32)] {
+        sqlx::query(
+            "INSERT INTO rag_candidates (month, hash, count, status, claimed_at) \
+             VALUES ($1, $2, 5, 'fetching', now() - make_interval(mins => $3))",
+        )
+        .bind(&fx.month)
+        .bind(hash)
+        .bind(minutes_ago)
+        .execute(&fx.pool())
+        .await
+        .expect("插入 fetching");
+    }
+
+    let fetcher = MockFetcher::new(vec![Ok(doc("text/plain", "恢复后的正文"))]);
+    let report = fx
+        .pipeline(fetcher.clone(), 0)
+        .await
+        .run_once()
+        .await
+        .expect("跑一轮");
+
+    assert_eq!(report.processed, 1, "只该回收那条超时的：{report:?}");
+    assert_eq!(report.fetched, 1, "{report:?}");
+    assert_eq!(
+        candidate_status(&fx.pool(), &fx.month, &stale_hash)
+            .await
+            .as_deref(),
+        Some("fetched"),
+        "超时的应被回收并抓完"
+    );
+    assert_eq!(
+        candidate_status(&fx.pool(), &fx.month, &fresh_hash)
+            .await
+            .as_deref(),
+        Some("fetching"),
+        "另一 worker 正在跑的占位被抢了（M1 回归）"
+    );
+    fx.db.finish().await;
+}
+
+/// t81 / M5：`rag_known_docs` 行不存在时必须**回滚**，不能写悬空 doc_id。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_store_rolls_back_when_known_doc_missing() {
+    let Some(fx) = Fixture::setup().await else {
+        return;
+    };
+    let hash = fx.index_doc("https://example.com/gone", "web").await;
+    fx.insert_candidate(&hash, 1).await;
+    let updated = sqlx::query(
+        "UPDATE rag_candidates SET status = 'fetching', claimed_at = now() \
+         WHERE month = $1 AND hash = $2",
+    )
+    .bind(&fx.month)
+    .bind(&hash)
+    .execute(&fx.pool())
+    .await
+    .expect("置为 fetching")
+    .rows_affected();
+    assert_eq!(updated, 1, "候选行应存在并置为 fetching");
+    // 模拟"join 之后语料行被删"
+    sqlx::query("DELETE FROM rag_known_docs WHERE month = $1 AND identifier = $2")
+        .bind(&fx.month)
+        .bind("https://example.com/gone")
+        .execute(&fx.pool())
+        .await
+        .expect("删语料行");
+
+    let pipeline = fx.pipeline(MockFetcher::new(vec![]), 0).await;
+    let outcome = pipeline
+        .store_fetch_result(
+            &fx.month,
+            &hash,
+            "https://example.com/gone",
+            "不该落库的正文",
+            1,
+        )
+        .await
+        .expect("落库调用本身不该报错");
+
+    assert_eq!(outcome, StoreOutcome::MissingKnownDoc);
+    assert_eq!(
+        candidate_status(&fx.pool(), &fx.month, &hash)
+            .await
+            .as_deref(),
+        Some("fetching"),
+        "回滚后状态应保持 fetching（不是 fetched）"
+    );
+    // doc_id 必须是 NULL（`text_column` 只能取非空列，这里用 count 表达"为空"）
+    assert_eq!(
+        common::count(
+            &fx.pool(),
+            &format!(
+                "SELECT count(*) FROM rag_candidates \
+                 WHERE month = '{}' AND hash = '{}' AND doc_id IS NULL",
+                fx.month, hash
+            )
+        )
+        .await,
+        1,
+        "不能写悬空 doc_id"
+    );
+    fx.db.finish().await;
+}
+
+/// t81 / M5：候选行已经不是 fetching 时也要回滚（返回 Contended）。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_store_reports_contended() {
+    let Some(fx) = Fixture::setup().await else {
+        return;
+    };
+    let hash = fx.index_doc("https://example.com/race", "web").await;
+    fx.insert_candidate(&hash, 1).await; // 状态是 pending
+
+    let pipeline = fx.pipeline(MockFetcher::new(vec![]), 0).await;
+    let outcome = pipeline
+        .store_fetch_result(&fx.month, &hash, "https://example.com/race", "正文", 1)
+        .await
+        .expect("落库调用");
+    assert_eq!(outcome, StoreOutcome::Contended);
+    assert_eq!(
+        candidate_status(&fx.pool(), &fx.month, &hash)
+            .await
+            .as_deref(),
+        Some("pending")
+    );
+    fx.db.finish().await;
+}
+
+/// t81 / M8：`retry_failed = true` 时本轮必须纳入 failed 项（运维重试手段）。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_retry_failed_reprocesses_failed_candidates() {
+    let Some(fx) = Fixture::setup().await else {
+        return;
+    };
+    let hash = fx.index_doc("https://example.com/retry", "web").await;
+    sqlx::query(
+        "INSERT INTO rag_candidates (month, hash, count, status, attempts) \
+         VALUES ($1, $2, 3, 'failed', 3)",
+    )
+    .bind(&fx.month)
+    .bind(&hash)
+    .execute(&fx.pool())
+    .await
+    .expect("插入 failed");
+
+    // 默认（retry_failed=false）：不碰 failed
+    let pipeline = fx.pipeline(MockFetcher::new(vec![]), 0).await;
+    let report = pipeline.run_once().await.expect("跑一轮");
+    assert_eq!(report.processed, 0, "默认不该重试 failed：{report:?}");
+
+    // 打开开关：同一行应被重新抓
+    let rag = Arc::new(RagService::new(&Config::for_tests(), Some(fx.pool())));
+    let fetcher = MockFetcher::new(vec![Ok(doc("text/plain", "重试成功"))]);
+    let mut config = FetchConfig {
+        top_n: 50,
+        retries: 0,
+        backoff: Duration::ZERO,
+        retry_failed: true,
+        min_interval: Duration::ZERO,
+        stale_after: Duration::from_secs(1_800),
+        max_body_bytes: 2 * 1024 * 1024,
+        doi_allowed_hosts: Vec::new(),
+    };
+    config.retry_failed = true;
+    let pipeline = FetchPipeline::new(fx.pool(), rag, fetcher.clone(), config);
+    let report = pipeline.run_once().await.expect("跑一轮");
+    assert_eq!(report.processed, 1, "开关打开后应重试：{report:?}");
+    assert_eq!(report.fetched, 1, "{report:?}");
     assert_eq!(
         candidate_status(&fx.pool(), &fx.month, &hash)
             .await
