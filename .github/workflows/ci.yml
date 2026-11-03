@@ -284,6 +284,8 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunong_test
       # 用例靠这个开关区分"跳过"与"失败"：CI 里必须真跑，不允许静默跳过
       YUNONG_PG_TESTS_REQUIRED: "1"
+      # RAG 抓取在 CI 里必须关掉（不联网）；rag_fetch 的用例用 mock fetcher，仍能跑
+      RAG_FETCH_ENABLED: "false"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -338,6 +340,38 @@ jobs:
             echo "::error::只跑了 $passed 条用例（预期 ≥20）"
             exit 1
           fi
+      # RAG 的真实 SQL 用例（rag 19 条、rag_fetch 11 条）之前只在本地跑过——RAG 是安全敏感模块，
+      # 这是 CI 最大的盲区。沿用上面同一套防假绿断言，用函数避免复制粘贴：加套件只改下面的表格。
+      - name: cargo test（RAG / 抓取链路的 PostgreSQL 集成测试，含 #[ignore] 用例）
+        run: |
+          set -uo pipefail
+          run_suite() {
+            suite=$1
+            min=$2
+            if ! out=$(cargo test -p yunong-server --test "$suite" -- --include-ignored 2>&1); then
+              printf '%s\n' "$out" | tail -n 60
+              echo "::error::$suite 集成测试失败（完整输出见上）"
+              return 1
+            fi
+            printf '%s\n' "$out" | tail -n 25
+            # 防假绿（锚定整行）：只认 `0 failed; 0 ignored` 的汇总行，
+            # 不能用子串 "0 ignored"（"10 ignored" / "20 ignored" 里也含它）。
+            summary=$(printf '%s\n' "$out" | grep -E '^test result: ok\. [0-9]+ passed; 0 failed; 0 ignored' | tail -n 1)
+            if [ -z "$summary" ]; then
+              echo "::error::$suite 的 #[ignore] 用例没有真跑（检查 --include-ignored）"
+              return 1
+            fi
+            passed=$(printf '%s\n' "$summary" | sed -E 's/^test result: ok\. ([0-9]+) passed.*/\1/')
+            if [ "$passed" -lt "$min" ]; then
+              echo "::error::$suite 只跑了 $passed 条用例（预期 ≥$min）"
+              return 1
+            fi
+            echo "::notice::$suite 真跑了 $passed 条（下限 $min）"
+          }
+          fail=0
+          run_suite rag 19 || fail=1          # 7 条纯内存 + 12 条 #[ignore] 真 SQL
+          run_suite rag_fetch 11 || fail=1    # 11 条 #[ignore]，mock fetcher + 真库
+          exit "$fail"
 
   # 镜像构建 + 冒烟：本轮踩过"镜像里打包的是空壳二进制"——Dockerfile 的依赖缓存层带着
   # 空壳源码的 mtime，`COPY crates` 后 cargo 认为没变化、跳过重编，镜像里就装了个
@@ -347,8 +381,7 @@ jobs:
   #
   # 耗时：buildx 的 gha 缓存与 release.yml 共用（默认 scope=buildkit）。命中约 1~2 分钟，
   # 冷启（缓存被淘汰/首次）约 8~12 分钟，故 timeout 给到 25 分钟。
-  # 本 job 目前**不在**分支保护的必需检查里：先只提供信号，等它稳定跑绿若干次后，
-  # 再由维护者用 gh api 把「ci / 服务端镜像（build + /healthz 冒烟）」加进 required checks。
+  # 该 job 已是分支保护的必需检查（t46 加入）；改名=静默失效，改 name: 前先看 deploy/README。
   docker:
     name: 服务端镜像（build + /healthz 冒烟）
     runs-on: ubuntu-latest
