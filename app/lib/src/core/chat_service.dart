@@ -230,9 +230,54 @@ String describeChatError(String? code) => switch (code) {
       _ => '出错了，请稍后重试',
     };
 
+/// 一次对话的运行时诊断（**内存对象**，供界面读取；不打印日志）。
+///
+/// 记录六个关键节点：send 调用 / handle 返回值 / 回调注册 / 回调触发 / 事件累计 / 流结束。
+/// 任何异常都写进 [lastError]，**不静默吞掉**。**绝不包含 Key 明文**。
+class ChatDiagnostics {
+  bool sendCalled = false;
+  String channel = '';
+  String model = '';
+  String baseUrl = '';
+  String protocol = '';
+  int? handle;
+  bool callbackRegistered = false;
+  String? callbackError;
+  int eventsReceived = 0;
+  String? lastEventKind;
+  String? lastError;
+  DateTime? startedAt;
+  DateTime? finishedAt;
+
+  /// 界面横幅（3 秒无事件时显示）。
+  String get banner =>
+      '对话没有启动 · 通道=$channel · handle=${handle ?? "-"} · '
+      '回调注册=${callbackRegistered ? "成功" : "失败${callbackError == null ? "" : "($callbackError)"}"} · '
+      '已收到事件=$eventsReceived · 最后错误=${lastError ?? "无"}';
+
+  /// 复制给开发者的完整诊断（不含任何凭据）。
+  String toClipboardText() => <String>[
+        'send_called=$sendCalled',
+        'channel=$channel',
+        'model=$model',
+        'base_url=$baseUrl',
+        'protocol=$protocol',
+        'handle=${handle ?? "-"}',
+        'callback_registered=$callbackRegistered',
+        'callback_error=${callbackError ?? "-"}',
+        'events_received=$eventsReceived',
+        'last_event=${lastEventKind ?? "-"}',
+        'last_error=${lastError ?? "-"}',
+        'started_at=${startedAt?.toIso8601String() ?? "-"}',
+        'finished_at=${finishedAt?.toIso8601String() ?? "-"}',
+      ].join(' | ');
+}
 /// 一次对话的句柄（事件流 + 取消）。
 class ChatStream {
-  ChatStream._(this._events, this._handle, this._backend, this._onClose);
+  ChatStream._(this._events, this._handle, this._backend, this._onClose, this.diagnostics);
+
+  /// 本轮对话的诊断（界面失败横幅/复制按钮用）。
+  final ChatDiagnostics diagnostics;
 
   final Stream<ChatEvent> _events;
   final int _handle;
@@ -325,8 +370,14 @@ class ChatService {
 
   /// 发起一次流式对话。
   ChatStream send(ChatRequestDto request) {
+    final diag = ChatDiagnostics()
+      ..sendCalled = true
+      ..channel = request.channel.wire
+      ..model = request.model
+      ..baseUrl = request.baseUrl ?? '(空)'
+      ..protocol = request.protocol.wire
+      ..startedAt = DateTime.now();
     final controller = StreamController<ChatEvent>();
-    debugPrint("[chat][1] send channel=${request.channel.wire} model=${request.model} base_url=${request.baseUrl} secret_key=${request.secretKey}");
     void close() {
       if (!controller.isClosed) {
         unawaited(controller.close());
@@ -334,30 +385,59 @@ class ChatService {
     }
 
     var handle = 0;
-    handle = _backend.start(request.toJson(), (String chunkJson) {
-      final event = ChatEvent.fromJsonString(chunkJson);
-      debugPrint("[chat][5] event=${event.kind.name}");
-      if (!controller.isClosed) {
-        controller.add(event);
-      }
-      if (event.isTerminal) {
-        if (handle > 0) {
-          _backend.cancel(handle); // 不再消费上游
+    try {
+      handle = _backend.start(request.toJson(), (String chunkJson) {
+        final event = ChatEvent.fromJsonString(chunkJson);
+        diag.eventsReceived += 1;
+        diag.lastEventKind = event.kind.name;
+        if (event.kind == ChatEventKind.error) {
+          diag.lastError = event.errorCode ?? event.errorMessage ?? 'error';
         }
-        close();
-        return false;
+        if (!controller.isClosed) {
+          controller.add(event);
+        }
+        if (event.isTerminal) {
+          diag.finishedAt = DateTime.now();
+          if (handle > 0) {
+            _backend.cancel(handle);
+          }
+          close();
+          return false;
+        }
+        return true;
+      });
+      diag.callbackRegistered = handle > 0;
+    } on Object catch (err) {
+      diag.callbackRegistered = false;
+      diag.callbackError = err.runtimeType.toString();
+      // 不静默：任何异常都进诊断与 UI
+      diag.lastError = '${err.runtimeType}: $err';
+      diag.finishedAt = DateTime.now();
+      if (!controller.isClosed) {
+        controller.add(ChatEvent(
+          kind: ChatEventKind.error,
+          errorCode: 'INTERNAL',
+          errorMessage: diag.lastError,
+        ));
       }
-      return true;
-    });
+      close();
+      return ChatStream._(controller.stream, 0, _backend, close, diag);
+    } finally {
+      diag.handle = handle;
+    }
 
     if (handle <= 0) {
-      controller.add(const ChatEvent(
-        kind: ChatEventKind.error,
-        errorCode: 'INTERNAL',
-        errorMessage: '端侧核心未就绪',
-      ));
+      diag.lastError ??= 'yunong_chat_stream 返回 $handle（入口被拒）';
+      diag.finishedAt = DateTime.now();
+      if (!controller.isClosed) {
+        controller.add(const ChatEvent(
+          kind: ChatEventKind.error,
+          errorCode: 'INTERNAL',
+          errorMessage: '端侧核心未就绪',
+        ));
+      }
       close();
     }
-    return ChatStream._(controller.stream, handle, _backend, close);
+    return ChatStream._(controller.stream, handle, _backend, close, diag);
   }
 }
