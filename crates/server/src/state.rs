@@ -45,12 +45,15 @@ impl AppState {
             config.usage_sample_percent,
             config.sample_salt.clone(),
         ));
-        let limiter = Arc::new(AuthLimiter::new(
-            config.auth_hash_concurrency,
-            config.auth_login_per_min,
-            config.auth_register_per_min,
-            config.auth_refresh_per_min,
-        ));
+        let limiter = Arc::new(
+            AuthLimiter::new(
+                config.auth_hash_concurrency,
+                config.auth_login_per_min,
+                config.auth_register_per_min,
+                config.auth_refresh_per_min,
+            )
+            .with_rag_report_limit(config.rag_report_per_min),
+        );
         let rag = Arc::new(RagService::new(&config, db.clone()));
         let upstream = Arc::new(UpstreamClient::new(
             config.upstream.clone(),
