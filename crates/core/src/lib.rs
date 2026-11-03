@@ -22,6 +22,7 @@ pub mod keystore;
 pub mod local_search;
 pub mod memory;
 pub mod memory_items;
+pub mod memory_ref;
 pub mod parse;
 pub mod protocols;
 pub mod schedule;

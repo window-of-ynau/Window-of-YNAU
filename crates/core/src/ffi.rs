@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use crate::error::CoreError;
 use crate::local_search::{SearchDoc, SearchStore};
 use crate::memory_items::{MemoryDraft, MemoryItemStore, MemoryKind};
+use crate::memory_ref;
 use crate::parse::{ParseError, ParseReport};
 use crate::schedule::{merge, SchedulePayload};
 use crate::store::CourseStore;
@@ -610,6 +611,88 @@ pub unsafe extern "C" fn yunong_memory_list(
         };
         match store.list(kind, limit) {
             Ok(items) => ok_json(json!(items)),
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 按 `memory://<id>` 引用取回被压缩的原文（W8 阶段 2）。
+///
+/// 成功：`{"ok":true,"data":{"ref_id":12,"kind":"summary","title":"…","content":"原文","source":"compact"}}`
+/// 引用失效（被容量淘汰/手动删除）：`{"ok":true,"data":null}`
+///
+/// 引用失效**不算错误**：压缩摘要可能比记忆活得久，界面显示"原文已被清理"即可。
+///
+/// # Safety
+///
+/// `ref_id` 必须是有效的 NUL 结尾十进制字符串；`db_path` 同其它记忆接口。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_memory_expand(
+    ref_id: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (ref_id, db_path) = match (read_arg(ref_id, "ref_id"), read_arg(db_path, "db_path")) {
+            (Ok(ref_id), Ok(db_path)) => (ref_id, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        let id = match parse_optional_id(ref_id) {
+            Ok(Some(id)) => id,
+            Ok(None) => return err_json("BAD_INPUT", "ref_id 不能为空"),
+            Err(err) => return err_json("BAD_INPUT", err),
+        };
+        let store = match MemoryItemStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return input_error(err),
+        };
+        match memory_ref::expand(&store, id) {
+            Ok(Some(item)) => ok_json(json!(item)),
+            Ok(None) => ok_json(Value::Null),
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 在压缩摘要/已落库的原文里按关键词检索（W8 阶段 2）。
+///
+/// 返回：
+/// ```json
+/// {"ok":true,"data":{"hits":[{"ref_id":12,"title":"课表","snippet":"…带雨具和雨伞…","original":"周三记得带雨具和雨伞","truncated":false}]}}
+/// ```
+/// - 匹配规则：大小写不敏感的子串；`title` 命中也算；
+/// - 原文超过 2000 字时不内联（`truncated:true`、没有 `original`），用 `yunong_memory_expand` 再取；
+/// - `limit` 是十进制字符串，0 或空返回空列表。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_memory_search_refs(
+    query: *const c_char,
+    limit: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (query, limit, db_path) = match (
+            read_arg(query, "query"),
+            read_arg(limit, "limit"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(query), Ok(limit), Ok(db_path)) => (query, limit, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
+        };
+        let limit = match parse_list_limit(limit) {
+            Ok(limit) => limit,
+            Err(err) => return err_json("BAD_INPUT", err),
+        };
+        let store = match MemoryItemStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return input_error(err),
+        };
+        match memory_ref::search_refs(&store, query, limit) {
+            Ok(hits) => ok_json(json!({ "hits": hits })),
             Err(err) => input_error(err),
         }
     })
@@ -2012,8 +2095,108 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// owner 实测场景：**不填标题**、正文「雨伞是黑色的」，搜「雨伞」「黑色」都要能命中。
+    // ---------------------------------------------------------------------
+    // W8 阶段 2：memory:// 找回（expand / search_refs）
+    // ---------------------------------------------------------------------
+
+    fn call_memory_expand(ref_id: &str, db: &str) -> Value {
+        let ref_id = CString::new(ref_id).unwrap();
+        let db = CString::new(db).unwrap();
+        let raw = unsafe { yunong_memory_expand(ref_id.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null());
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn call_search_refs(query: &str, limit: &str, db: &str) -> Value {
+        let query = CString::new(query).unwrap();
+        let limit = CString::new(limit).unwrap();
+        let db = CString::new(db).unwrap();
+        let raw = unsafe { yunong_memory_search_refs(query.as_ptr(), limit.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null());
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// `memory://` 往返：落库后用 id 取回**逐字节一致**的原文。
     #[test]
+    fn memory_expand_returns_the_exact_original() {
+        let db = temp_db();
+        let content = "周三带雨具；宿舍楼 3 栋 502；课表第 3-4 节《数据库原理》";
+        let created = call_memory_upsert("summary", "会话存档", content, "compact", "", &db);
+        assert_eq!(created["ok"], true, "{created}");
+        let id = created["data"]["id"].as_i64().unwrap();
+
+        let expanded = call_memory_expand(&id.to_string(), &db);
+        assert_eq!(expanded["ok"], true, "{expanded}");
+        assert_eq!(expanded["data"]["ref_id"], id, "{expanded}");
+        assert_eq!(expanded["data"]["content"], content, "{expanded}");
+        assert_eq!(expanded["data"]["title"], "会话存档");
+        assert_eq!(expanded["data"]["source"], "compact");
+
+        // 引用失效：ok:true + data:null（不是错误，界面显示"原文已被清理"即可）
+        let gone = call_memory_expand("999999", &db);
+        assert_eq!(gone["ok"], true, "{gone}");
+        assert!(gone["data"].is_null(), "{gone}");
+        // 非法入参：明确报错，不崩
+        let bad = call_memory_expand("", &db);
+        assert_eq!(bad["ok"], false, "{bad}");
+        assert_eq!(bad["code"], "BAD_INPUT", "{bad}");
+    }
+
+    /// 在压缩摘要里按关键词检索，拿到 `{ref_id, snippet, original}`。
+    #[test]
+    fn memory_search_refs_finds_archived_summaries() {
+        let db = temp_db();
+        let created = call_memory_upsert(
+            "summary",
+            "会话存档",
+            "第 0 轮：帮我看下课表里周三有没有课，记得带雨具",
+            "compact",
+            "",
+            &db,
+        );
+        let id = created["data"]["id"].as_i64().unwrap();
+        call_memory_upsert("note", "", "买牛奶", "user", "", &db);
+
+        let hits = call_search_refs("雨具", "5", &db);
+        assert_eq!(hits["ok"], true, "{hits}");
+        let list = hits["data"]["hits"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "{hits}");
+        assert_eq!(list[0]["ref_id"], id);
+        assert!(list[0]["snippet"].as_str().unwrap().contains("雨具"));
+        assert!(list[0]["original"].as_str().unwrap().contains("课表"));
+        assert_eq!(list[0]["truncated"], false);
+
+        // 检索不到 / 空查询：空列表，不报错
+        assert_eq!(
+            call_search_refs("不存在", "5", &db)["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            call_search_refs("  ", "5", &db)["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        // limit 是十进制字符串：给 1 就最多 1 条
+        assert!(
+            call_search_refs("雨具", "1", &db)["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .len()
+                <= 1
+        );
+    }
+
+    #[test]
+    /// owner 实测场景：**不填标题**、正文「雨伞是黑色的」，搜「雨伞」「黑色」都要能命中。
     fn memory_upsert_is_searchable_even_without_title() {
         let db = temp_db();
         let created = call_memory_upsert("note", "", "雨伞是黑色的", "user", "", &db);
