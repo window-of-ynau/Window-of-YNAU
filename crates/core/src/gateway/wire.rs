@@ -10,8 +10,14 @@ use yunong_shared::Protocol;
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// 端点路径。`base_url` 允许带尾斜杠，也允许已经带了 `/v1`（不会重复拼）。
+///
+/// 第三种情况是**真实踩过的坑**：用户在设置页把厂商文档里的
+/// `https://api.deepseek.com/v1` 原样粘进来，若这里再拼 `/v1/chat/completions`，
+/// 请求会打到 `/v1/v1/chat/completions` → 上游 404。所以先把结尾的 `/v1`
+/// （以及 `/v1/`）去掉再拼；只认**整个路径段的** `/v1`，`/v1beta` 之类不动。
 pub(crate) fn endpoint(base_url: &str, protocol: Protocol) -> String {
     let base = base_url.trim_end_matches('/');
+    let base = base.strip_suffix("/v1").unwrap_or(base);
     let path = match protocol {
         Protocol::OpenaiCompletions => "/v1/chat/completions",
         Protocol::OpenaiResponses => "/v1/responses",
@@ -59,6 +65,43 @@ mod tests {
         assert_eq!(
             endpoint("https://api.example.com/", Protocol::OpenaiResponses),
             "https://api.example.com/v1/responses"
+        );
+    }
+
+    /// 用户把厂商文档里的 `…/v1` 原样粘进来时，不能再拼一次 `/v1`
+    /// （否则 `/v1/v1/chat/completions` → 上游 404）。
+    #[test]
+    fn base_already_ending_with_v1_does_not_double() {
+        for protocol in [
+            Protocol::OpenaiCompletions,
+            Protocol::OpenaiResponses,
+            Protocol::AnthropicMessages,
+        ] {
+            let with_v1 = endpoint("https://api.example.com/v1", protocol);
+            let plain = endpoint("https://api.example.com", protocol);
+            assert_eq!(with_v1, plain, "{protocol:?} 带 /v1 时不能重复拼");
+            assert!(!with_v1.contains("/v1/v1"), "{with_v1}");
+        }
+        // 尾斜杠 + /v1 也要吃掉
+        assert_eq!(
+            endpoint("https://api.example.com/v1/", Protocol::OpenaiCompletions),
+            "https://api.example.com/v1/chat/completions"
+        );
+        // 只有整个路径段是 /v1 才去重；/v1beta 这类保持原样（不强猜）
+        assert_eq!(
+            endpoint(
+                "https://proxy.example.com/v1beta",
+                Protocol::OpenaiCompletions
+            ),
+            "https://proxy.example.com/v1beta/v1/chat/completions"
+        );
+        // 带子路径的网关：只去尾部 /v1
+        assert_eq!(
+            endpoint(
+                "https://gw.example.com/openai/v1",
+                Protocol::OpenaiCompletions
+            ),
+            "https://gw.example.com/openai/v1/chat/completions"
         );
     }
 

@@ -815,8 +815,7 @@ pub unsafe extern "C" fn yunong_search_delete(
 
 /// 流式回调：`chunk_json` **只在本次回调期间有效**（Rust 分配、Rust 释放，Dart 侧绝不能 free）；
 /// 返回 `1` = 调用方要求取消（停止读取上游），`0` = 继续。
-pub type ChatChunkCallback =
-    unsafe extern "C" fn(chunk_json: *const c_char, user: *mut c_void);
+pub type ChatChunkCallback = unsafe extern "C" fn(chunk_json: *const c_char, user: *mut c_void);
 
 static CHAT_CANCEL: OnceLock<crate::chat_ffi::CancelRegistry> = OnceLock::new();
 
