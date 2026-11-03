@@ -722,12 +722,8 @@ class ChatPageState extends State<ChatPage> {
           ),
         Expanded(
           child: _bubbles.isEmpty
-              ? _EmptyState(
-                  onPick: (String text) {
-                    _input.text = text;
-                    _input.selection = TextSelection.collapsed(offset: text.length);
-                  },
-                )
+              ? _EmptyState(onPick: _fillInput)
+
               : ListView.builder(
                   controller: _scroll,
                   padding: const EdgeInsets.all(12),
@@ -738,6 +734,7 @@ class ChatPageState extends State<ChatPage> {
                   },
                 ),
         ),
+
         // B（深蓝玻璃）下输入条是一块玻璃：这是**全屏第二层也是最后一层** BackdropFilter。
         // A/C 没有玻璃 token，这里退回普通 Padding，不产生任何模糊。
         if (context.tokens.glass != null)
@@ -756,6 +753,14 @@ class ChatPageState extends State<ChatPage> {
           ),
       ],
     );
+  }
+
+  /// 把建议 chip 的文案填进输入框（不直接发送——用户还能改）。
+  void _fillInput(String text) {
+    setState(() {
+      _input.text = text;
+      _input.selection = TextSelection.collapsed(offset: text.length);
+    });
   }
 
   Widget _composer() {
@@ -795,10 +800,15 @@ class ChatPageState extends State<ChatPage> {
   }
 }
 
-/// 一条消息气泡（中性：用主题语义色，不写死颜色）。
-/// 空态编排（A/C 共用）：
-/// A 学 ChatGPT——居中问候 + 建议 chip + 状态行（"简约但不单调"的全部秘密）；
-/// C 学 Anthropic——overline 标签 + 38px 衬线大标题 + 深色引文块（明暗交替制造章节感）。
+/// 空态（三套主题**结构一致**：问候 + 一句副标题 + 建议 chip）。
+///
+/// 教训（t97）：这里曾经放过一个"深色引文块"金句，只存在于 C 主题。
+/// ① 三套主题结构不一致 → 它不是空态设计，而是某主题的独占装饰；
+/// ② 空态的任务是"让人知道能干什么"，不是展示金句；
+/// ③ 深色墨块视觉重量压过真正的引导（问候 + chip）。
+///
+/// 现在：**整簇贴着输入框锚定在下方**。删掉装饰后页面不空——重心落在
+/// "输入框 + 建议 chip"这两个要操作的对象上，中间的留白是有意的呼吸区。
 class _EmptyState extends StatelessWidget {
   const _EmptyState({required this.onPick});
 
@@ -808,41 +818,37 @@ class _EmptyState extends StatelessWidget {
     '第 8 周哪天最累？',
     '把课表导出成日历',
     '这门课的考核方式',
+    '这学期一共几门课？',
   ];
 
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
     final YunongTokens t = context.tokens;
-    final bool book = t.bookLayout;
 
-    return Center(
+    return Align(
+      alignment: Alignment.bottomCenter,
       child: SingleChildScrollView(
-        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+        padding: const EdgeInsets.fromLTRB(24, 16, 24, 10),
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 560),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.center,
             children: <Widget>[
-              if (book)
-                Text(
-                  '本地优先 · 数据不出电脑',
-                  style: theme.textTheme.labelSmall?.copyWith(color: t.inkSoft),
-                ),
-              if (book) const SizedBox(height: 14),
               Text(
                 '今天想从哪儿开始？',
                 textAlign: TextAlign.center,
                 style: theme.textTheme.displaySmall,
               ),
-              const SizedBox(height: 10),
+              const SizedBox(height: 8),
               Text(
                 '问点什么吧——课表、成绩、校园生活都行。',
                 textAlign: TextAlign.center,
                 style: theme.textTheme.bodyMedium?.copyWith(color: t.inkSoft),
               ),
-              const SizedBox(height: 22),
+              const SizedBox(height: 16),
+              // 用 chip 的数量与排布补密度（而不是加装饰）；窄窗自动换行
               Wrap(
                 alignment: WrapAlignment.center,
                 spacing: 8,
@@ -852,47 +858,6 @@ class _EmptyState extends StatelessWidget {
                     _SuggestionChip(label: text, onTap: () => onPick(text)),
                 ],
               ),
-              if (book) ...<Widget>[
-                const SizedBox(height: 26),
-                // 深色引文块：Anthropic 的"章节"靠明暗交替，不靠装饰
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.fromLTRB(22, 18, 22, 18),
-                  decoration: BoxDecoration(
-                    color: t.ink,
-                    borderRadius: BorderRadius.circular(t.radiusL),
-                  ),
-                  child: Text(
-                    '选课不是"选更重要的那门"，而是"选损失更小的那门"。',
-                    // 不覆盖字体/字重：直接继承 titleMedium（主题已配好衬线 + 中文回退）
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      color: t.canvas,
-                      height: 1.5,
-                    ),
-                  ),
-                ),
-              ],
-              if (!book) ...<Widget>[
-                const SizedBox(height: 20),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: <Widget>[
-                    Container(
-                      width: 6,
-                      height: 6,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF10A37F),
-                        borderRadius: BorderRadius.circular(3),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      '课表已同步 · 数据只在这台电脑上',
-                      style: theme.textTheme.bodySmall?.copyWith(color: t.inkSoft),
-                    ),
-                  ],
-                ),
-              ],
             ],
           ),
         ),
@@ -900,7 +865,6 @@ class _EmptyState extends StatelessWidget {
     );
   }
 }
-
 /// 建议 chip：环形阴影（不占布局）而不是边框。
 class _SuggestionChip extends StatelessWidget {
   const _SuggestionChip({required this.label, required this.onTap});
