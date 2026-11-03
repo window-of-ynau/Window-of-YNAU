@@ -971,6 +971,45 @@ mod tests {
         assert_eq!(events.last().unwrap()["type"], "done");
     }
 
+    /// t109 回归：**空结果**与**有结果**两条工具路径都必须收到 `done`。
+    ///
+    /// 之前的用例只覆盖了"工具有返回"，而真实事故恰恰是"工具有返回 ⇒ 流不结束"。
+    /// 这条用例把两条路径并排跑一遍，任何一条丢 `done` 都会红。
+    #[test]
+    fn both_empty_and_non_empty_tool_results_end_with_done() {
+        for (label, content) in [
+            ("空结果", ""),
+            ("有结果", "「雨伞」找到 1 条本地记忆：\n- 雨伞是黑色的"),
+        ] {
+            let server = ScriptedServer::start(vec![
+                tool_round("echo", "call_done", "{\"query\":\"雨伞\"}"),
+                final_round("好"),
+            ]);
+            let mut registry = crate::tools::ToolRegistry::new();
+            let payload = content.to_owned();
+            registry.register("echo", move |_args| Ok(payload.clone()));
+            let chunks = run_collect(byok_config(&server.base_url(), Some(2_000)), registry);
+            let events = parse_all(&chunks);
+
+            let results = results_of(&events);
+            assert_eq!(results.len(), 1, "{label}：{chunks:#?}");
+            assert_eq!(results[0]["ok"], true, "{label}：{results:?}");
+            assert_eq!(
+                events
+                    .last()
+                    .map(|event| event["type"].as_str().unwrap_or_default()),
+                Some("done"),
+                "{label}：最后一条必须是 done（工具事件之后流必须收尾）：{chunks:#?}"
+            );
+            assert!(
+                events.iter().any(|event| event["type"] == "delta"),
+                "{label}：第二轮文本应作为 delta 到达"
+            );
+            // 配对
+            assert_eq!(calls_of(&events).len(), results.len(), "{label}");
+        }
+    }
+
     /// 工具失败：`ok:false` + 可读原因 + code。
     #[test]
     fn tool_failure_carries_a_code() {

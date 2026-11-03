@@ -18,10 +18,13 @@
 //!
 //! `--mode tool` 是**工具事件的长期护栏**：客户端（真 DLL）或 Rust 探针把它当上游，
 //! 就能看到一条真实的 `tool_call` → `tool_result` → `delta` → `done` 流。
-//! 第一/第二次请求靠**进程内计数**区分（同一条客户端连接会分两次发请求：
-//! 第一次拿 tool_calls，工具在端侧执行后第二次把结果回传，上游这时才说人话）。
 //!
-//! 第二轮请求的 body 里会带 `role:"tool"` 的结果——`fake_sse` 只打日志、不校验。
+//! **轮次按请求体判定，不用计数器**：body 里出现 `"role":"tool"`（工具结果回填）
+//! 就回"第二轮文本"，否则回"第一轮 tool_calls"。
+//!
+//! 这条规则是 t109 换来的教训：早先用进程级 `AtomicUsize` 数请求次数，
+//! 同一个 mock 进程被两个测试连续使用时计数会漂移，第二个测试直接拿到"文本"响应
+//! （实测 12 帧、`tool_call=0`）。无状态判定对重试、并发、连续测试都稳。
 //!
 //! 参数：
 //! - `--port <u16>`：监听端口（默认 8765，只绑 127.0.0.1）
@@ -57,8 +60,6 @@ struct Config {
     mode: Mode,
     delay: Duration,
     text: String,
-    /// 进程内请求计数（`--mode tool` 靠它区分"第一轮要工具"与"第二轮给文本"）
-    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -89,7 +90,6 @@ fn parse_args() -> Config {
         mode: Mode::Ok,
         delay: Duration::from_millis(120),
         text: "你好，我是云农之窗".to_owned(),
-        requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -161,7 +161,7 @@ async fn handle(mut stream: TcpStream, config: Config) -> std::io::Result<()> {
                 body.len(),
                 String::from_utf8_lossy(&body)
             );
-            return respond(stream, config).await;
+            return respond(stream, config, &body).await;
         }
         if read >= buffer.len() {
             return Ok(());
@@ -190,7 +190,11 @@ fn parse_content_length(head: &str) -> usize {
     0
 }
 
-async fn respond(mut stream: TcpStream, config: Config) -> std::io::Result<()> {
+async fn respond(
+    mut stream: TcpStream,
+    config: Config,
+    request_body: &[u8],
+) -> std::io::Result<()> {
     match config.mode {
         Mode::Error => {
             let body = r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"fake_sse: 限流（模拟）","retry_after":2}}"#;
@@ -213,10 +217,16 @@ async fn respond(mut stream: TcpStream, config: Config) -> std::io::Result<()> {
             stream.flush().await
         }
         Mode::Tool | Mode::ToolFail => {
-            let round = config
-                .requests
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if round == 0 {
+            // **按请求体判定轮次，不用全局计数器**：
+            // 客户端把工具结果回填时，body 里一定有 `"role":"tool"`；没有就是"第一轮"。
+            //
+            // 早先用 `AtomicUsize` 数请求次数，结果同一个 fake_sse 进程被两个测试连续使用时
+            // 计数会漂移：第 2 个测试的"第一轮"拿到的是"第二轮文本"，整条工具路径直接测不到
+            //（实测：第 2 次运行 12 帧、tool_call=0）。按 body 判定是**无状态**的，重试/并发都稳。
+            let body_text = String::from_utf8_lossy(request_body);
+            let has_tool_result =
+                body_text.contains("\"role\":\"tool\"") || body_text.contains("\"role\": \"tool\"");
+            if !has_tool_result {
                 // 第一轮：让模型"要求调用工具"（OpenAI Completions 的流式 tool_calls 形状）
                 stream
                     .write_all(
@@ -254,6 +264,7 @@ async fn respond(mut stream: TcpStream, config: Config) -> std::io::Result<()> {
                 write_sse(&mut stream, &format!("data: {finish}\n\n")).await?;
                 write_sse(&mut stream, "data: [DONE]\n\n").await?;
                 stream.flush().await?;
+                let _ = stream.shutdown().await;
                 println!(
                     "[fake_sse] 第 1 轮：已发出 tool_calls（call_1 / memory_search / {:?}）",
                     config.mode
@@ -261,7 +272,7 @@ async fn respond(mut stream: TcpStream, config: Config) -> std::io::Result<()> {
                 Ok(())
             } else {
                 // 第二轮（工具结果已回传）：正常说人话
-                println!("[fake_sse] 第 {} 轮：工具结果已回传，返回文本", round + 1);
+                println!("[fake_sse] 第 2 轮（body 里有 tool 结果）：返回文本");
                 stream_text(stream, &config, &config.text).await
             }
         }
