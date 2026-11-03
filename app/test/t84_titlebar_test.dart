@@ -1,11 +1,9 @@
 // t84：标题栏跟随主题（FFI 接线）。
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/main.dart';
 import 'package:yunong/src/core/titlebar_service.dart';
 import 'package:yunong/src/theme/theme_controller.dart';
-import 'package:yunong/src/theme/file_settings_store.dart';
 
 class _RecordingTitleBar implements TitleBarBackend {
   _RecordingTitleBar({this.code = ''});

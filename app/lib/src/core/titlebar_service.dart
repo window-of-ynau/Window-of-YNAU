@@ -31,19 +31,30 @@ abstract class TitleBarBackend {
 
 /// 真 FFI 实现。
 class FfiTitleBarBackend implements TitleBarBackend {
-  FfiTitleBarBackend() : _lib = CoreLibrary.openCoreLibrary();
+  FfiTitleBarBackend() {
+    // 打不开核心库（例如纯 widget 测试环境）也算 UNSUPPORTED，绝不抛到启动流程
+    try {
+      _lib = CoreLibrary.openCoreLibrary();
+    } on Object {
+      _lib = null;
+    }
+  }
 
-  final DynamicLibrary _lib;
+  late final DynamicLibrary? _lib;
 
   @override
   Future<String> setDark(bool dark) async {
     try {
+      final DynamicLibrary? lib = _lib;
+      if (lib == null) {
+        return 'UNSUPPORTED';
+      }
       final Pointer<Utf8> Function(int) setDarkFn;
       final void Function(Pointer<Utf8>) freeFn;
       try {
-        setDarkFn = _lib.lookupFunction<Pointer<Utf8> Function(Int32), Pointer<Utf8> Function(int)>(
+        setDarkFn = lib.lookupFunction<Pointer<Utf8> Function(Int32), Pointer<Utf8> Function(int)>(
             'yunong_set_titlebar_dark');
-        freeFn = _lib.lookupFunction<Void Function(Pointer<Utf8>), void Function(Pointer<Utf8>)>(
+        freeFn = lib.lookupFunction<Void Function(Pointer<Utf8>), void Function(Pointer<Utf8>)>(
             'yunong_free_string');
       } on ArgumentError {
         return 'UNSUPPORTED';
