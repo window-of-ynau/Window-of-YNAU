@@ -184,6 +184,10 @@ class CampusWebViewPage extends StatefulWidget {
 
 class _CampusWebViewPageState extends State<CampusWebViewPage> {
   InAppWebViewController? _controller;
+
+  /// t98：Dart 主动拉取 `window.__yunongState` 的轮询（不依赖 JS→Dart 桥）。
+  Timer? _statePull;
+  int _consumedStateEvents = 0;
   WebViewEnvironment? _environment;
 
   /// 门户接口模式下：20s 内没捕获到课表请求就明确报错（绝不静默挂起）。
@@ -230,10 +234,58 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     });
   }
 
+  /// t98：主路径——Dart 每 400ms 拉一次 `window.__yunongState`，把新事件喂给同一个 bridge。
+  ///
+  /// 为什么换架构：诊断显示 Dart→JS 完全可用（候选/hook/XHR 都能拿到），
+  /// 但 JS→Dart 的 `flutter_inappwebview` 桥在该环境里始终不注入；与其继续修桥，不如反向拉取。
+  void _startStatePull() {
+    _statePull?.cancel();
+    _statePull = Timer.periodic(const Duration(milliseconds: 400), (_) async {
+      final Object? raw = await _controller?.evaluateJavascript(
+        source: 'JSON.stringify(window.__yunongState || null)',
+      );
+      if (raw is! String || raw.isEmpty || raw == 'null') {
+        return;
+      }
+      Object? decoded;
+      try {
+        decoded = jsonDecode(raw);
+      } on FormatException {
+        return;
+      }
+      if (decoded is! Map<String, dynamic>) {
+        return;
+      }
+      _bridge.pullCount += 1;
+      final Object? updatedAt = decoded['updatedAt'];
+      if (updatedAt is num) {
+        _bridge.lastStateAgeSeconds =
+            ((DateTime.now().millisecondsSinceEpoch - updatedAt.toInt()) / 1000).round();
+      }
+      final Object? events = decoded['events'];
+      if (events is List) {
+        for (var i = _consumedStateEvents; i < events.length; i++) {
+          final Object? event = events[i];
+          if (event is Map<String, dynamic>) {
+            _bridge.handle(event);
+            _bridge.stateEventsConsumed += 1;
+          }
+        }
+        _consumedStateEvents = events.length;
+      }
+    });
+  }
+
+  void _stopStatePull() {
+    _statePull?.cancel();
+    _statePull = null;
+  }
+
   @override
   void dispose() {
     _stopProgressWatchdog();
     _stopGrabLoop();
+    _stopStatePull();
     super.dispose();
   }
 
@@ -489,6 +541,8 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                         _progress.enterStage('waiting_card', DateTime.now());
                         _markProgress();
                         _startProgressWatchdog();
+                        // t98：主路径——Dart 主动拉取状态（不依赖 JS→Dart 桥）
+                        _startStatePull();
                       }
                       final term = widget.term;
                       if (term != null && term.isNotEmpty) {

@@ -39,7 +39,12 @@ class CampusBridge {
   final void Function(ScheduleApiResult result)? onScheduleApi;
 
   /// Dart 侧收到的 schedule_api 消息数（用于和脚本侧探测计数对照）。
-  int scheduleApiCount = 0;
+  int scheduleApiCount = 0;  /// t98：Dart 主动拉取 `window.__yunongState` 的统计（诊断用）。  int pullCount = 0;  int lastStateAgeSeconds = -1;  int stateEventsConsumed = 0;
+
+  /// t98：Dart 主动拉取 `window.__yunongState` 的统计（诊断用）。
+  int pullCount = 0;
+  int lastStateAgeSeconds = -1;
+  int stateEventsConsumed = 0;
 
   /// 阶段变化：`login`（等用户登录，**不抓取**）/ `capture`（登录完成，开始抓）
   final void Function(String stage, Map<String, dynamic>? diagnostics)? onStageChange;
@@ -83,7 +88,7 @@ class CampusBridge {
         _fail(FetchException(
           code: 'CAPTURE_TIMEOUT',
           userHint: '请在页面里打开「课表」卡片，或切换一次周次后重试',
-          message: _formatDiagnostics(message['diagnostics'], dartScheduleApiCount: scheduleApiCount),
+          message: _formatDiagnostics(          message['diagnostics'],          dartScheduleApiCount: scheduleApiCount,          pullCount: pullCount,          stateAgeSeconds: lastStateAgeSeconds,          stateEventsConsumed: stateEventsConsumed,        ),
         ));
         return true;
 
@@ -91,7 +96,7 @@ class CampusBridge {
         _fail(FetchException(
           code: 'PORTAL_PAGE',
           userHint: '当前是门户页，需要先打开「课表」卡片',
-          message: _formatDiagnostics(message['diagnostics'], dartScheduleApiCount: scheduleApiCount),
+          message: _formatDiagnostics(          message['diagnostics'],          dartScheduleApiCount: scheduleApiCount,          pullCount: pullCount,          stateAgeSeconds: lastStateAgeSeconds,          stateEventsConsumed: stateEventsConsumed,        ),
         ));
         return true;
       case 'stage':
@@ -219,7 +224,7 @@ String classifyWebViewError(String? description, {String? type}) {
 }
 
 /// 把脚本带回的诊断信息压成一行（给人看，**不含任何凭据**）。
-String _formatDiagnostics(Object? raw, {int dartScheduleApiCount = 0}) {
+String _formatDiagnostics(  Object? raw, {  int dartScheduleApiCount = 0,  int pullCount = 0,  int stateAgeSeconds = -1,  int stateEventsConsumed = 0,}) {
   if (raw is! Map) {
     return '';
   }
@@ -268,6 +273,7 @@ String _formatDiagnostics(Object? raw, {int dartScheduleApiCount = 0}) {
       ? scriptProbes.toInt()
       : (raw['probeResults'] is List ? (raw['probeResults'] as List).length : 0);
   parts.add('桥接 脚本探测$scriptProbeCount 次 / Dart收到 $dartScheduleApiCount 条');
+    parts.add('拉取 $pullCount 次 / 最后状态 age=${stateAgeSeconds}s / 已消费 $stateEventsConsumed 条');
   final probeResults = raw['probeResults'];
   if (probeResults is List && probeResults.isNotEmpty) {
     final tried = probeResults.take(12).map((dynamic item) => '[$item]').join(' ');

@@ -629,7 +629,11 @@ class ChatPageState extends State<ChatPage> {
         if (!_searchStatus.available)
           Container(
             width: double.infinity,
-            color: theme.colorScheme.surfaceContainerHighest,
+            // t98：提示底色必须跟随主题画布（深色主题下不再出现浅色条）
+            color: Color.alphaBlend(
+              theme.colorScheme.tertiary.withValues(alpha: 0.12),
+              theme.colorScheme.surface,
+            ),
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             child: Text(
               _searchStatus.hint.isEmpty

@@ -572,10 +572,25 @@ const String kPortalScheduleScript = r'''
   // t94：注入脚本可能早于 flutter_inappwebview 的 polyfill（AT_DOCUMENT_START），
   // 此时 `window.flutter_inappwebview` 还不存在——**旧实现在这里静默 return false，消息直接丢了**，
   // 于是诊断出现“脚本探测 1 次 / Dart 收到 0 条”。现在改为排队 + 定时/加载后补发。
+  // t98：**主路径改为 Dart 主动拉取**。本脚本只把要上报的东西挂到
+  // `window.__yunongState.events`，由 Dart 用 `evaluateJavascript('JSON.stringify(window.__yunongState)')`
+  // 轮询取走（Dart→JS 已被证明可用；JS→Dart 的 bridge 在某些环境里始终不注入）。
+  window.__yunongState = window.__yunongState || { events: [], updatedAt: 0, diag: DIAG };
   var PENDING = [];
   var BRIDGE = { queued: 0, flushed: 0, dropped: 0 };
   DIAG.bridgeQueued = 0;
   function post(payload) {
+    // 主路径：写进可被 Dart 拉取的状态（不依赖桥）
+    try {
+      var st = window.__yunongState;
+      if (st) {
+        st.events.push(payload);
+        if (st.events.length > 60) { st.events.shift(); }
+        st.updatedAt = Date.now();
+        st.diag = DIAG;
+      }
+    } catch (e) {}
+    // 兜底：桥可用时仍照旧推送（失败入队，不再静默丢弃）
     try {
       if (!window.flutter_inappwebview) {
         PENDING.push(payload); DIAG.bridgeQueued += 1; BRIDGE.queued += 1;
