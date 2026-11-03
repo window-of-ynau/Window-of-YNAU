@@ -1,12 +1,17 @@
 {
   "salt": "2026-07-rag-salt",
   "version": 1,
-  "note": "端侧与服务端共享的 RAG 规范向量（ADR-19：salt 公开，不需要保密）。服务端修改 canonical() 规则时必须同时更新本文件，否则端侧测试会红——这是刻意设计的漂移告警。",
+  "note": "由 crates/server 的 canonical_identifier()/hash_identifier() 生成；端侧 Flutter 实现必须逐条对齐。改规则请重新生成：cargo test -p yunong-server rag_vectors -- --ignored",
   "cases": [
     {
-      "raw": "  https://Example.com/Paper/?utm_source=x&utm_medium=y#sec1 ",
-      "canonical": "https://example.com/paper",
-      "hash": "a17f4d27456618f6c2f22300205c84af5a1cc1e449885898746f0a3e494506e5"
+      "raw": "https://example.com/article?utm_source=wechat&utm_medium=social#comments",
+      "canonical": "https://example.com/article",
+      "hash": "f50a52905e3232736c5f208af471bb78369ba95fd8631f6ce993ce62ecab6fb4"
+    },
+    {
+      "raw": "https://Example.COM/Path/To/Paper/",
+      "canonical": "https://example.com/path/to/paper",
+      "hash": "8c5d779814195bf82e0f944e651f927fb4784fcc2f6634af239dd1cb9ccb875c"
     },
     {
       "raw": "http://example.com/paper",
@@ -19,49 +24,91 @@
       "hash": "0e11837ea129b6ed91621e815c8daf42be57b498839afa4b3a409b3962b16c17"
     },
     {
-      "raw": "arXiv:2401.01234",
+      "raw": "https://arxiv.org/pdf/2401.01234v12",
       "canonical": "2401.01234",
       "hash": "0e11837ea129b6ed91621e815c8daf42be57b498839afa4b3a409b3962b16c17"
     },
     {
-      "raw": "https://doi.org/10.1145/1234567.890123",
-      "canonical": "10.1145/1234567.890123",
-      "hash": "9c3ef973a31ba534fe248c4fb60b0262f6d6533def36b0817b3974a887b84c5f"
+      "raw": "arxiv:2401.01234v2",
+      "canonical": "2401.01234",
+      "hash": "0e11837ea129b6ed91621e815c8daf42be57b498839afa4b3a409b3962b16c17"
     },
     {
-      "raw": "doi:10.1000/xyz",
-      "canonical": "10.1000/xyz",
-      "hash": "9e409b9877f81c09623319f00db44579ed8d579911dd1812e2a67a8328515ec9"
+      "raw": "doi:10.1145/1234567.7654321",
+      "canonical": "10.1145/1234567.7654321",
+      "hash": "ab43a19e4915f12c401f517fd11b84fea38056a11847f3891dd3a5c7bbebeaaf"
     },
     {
-      "raw": "https://example.com/a/b/",
+      "raw": "https://doi.org/10.1145/1234567.7654321",
+      "canonical": "10.1145/1234567.7654321",
+      "hash": "ab43a19e4915f12c401f517fd11b84fea38056a11847f3891dd3a5c7bbebeaaf"
+    },
+    {
+      "raw": "http://doi.org/10.1000/ABC",
+      "canonical": "10.1000/abc",
+      "hash": "f02ad2a9241beec9e780fa240438e28bcb92ea3697c2dd17b11d86cc491b0ca3"
+    },
+    {
+      "raw": "https://example.com/v2/docs",
+      "canonical": "https://example.com/v2/docs",
+      "hash": "1c2a6f3400b0f9d090ed35bb1da01fe91950cc91abde3546df69826f7f5c55b5"
+    },
+    {
+      "raw": "https://example.com/doc#section-2",
+      "canonical": "https://example.com/doc",
+      "hash": "5d333a9da8e04bd5199465f5d3e2483dab85b62c322b8400b9bf63ddb150d533"
+    },
+    {
+      "raw": "https://example.com/a/b///",
       "canonical": "https://example.com/a/b",
       "hash": "f2e7fee175b84b6e172bd35f6ec91a7df5e6335822a773aa9051c73db51fcaf3"
     },
     {
-      "raw": "HTTPS://EXAMPLE.COM/UPPER",
-      "canonical": "https://example.com/upper",
-      "hash": "2becf4e035732a495e871323e9a25ed5495bfd97690c0ef82b82dde306b6e59d"
+      "raw": "   https://example.com/spaced   ",
+      "canonical": "https://example.com/spaced",
+      "hash": "ef30ee0f0ee724f9d6cce7a5525003b59f570852f6bf89cd9fcc436be750aa27"
     },
     {
-      "raw": "https://example.com/x?utm_campaign=z",
-      "canonical": "https://example.com/x",
-      "hash": "f26ed5f001fed2275479c967127f2c254c6bdcd57b4075312244d08fa21b7f0a"
+      "raw": "HTTPS://ARXIV.ORG/ABS/2401.01234V3",
+      "canonical": "2401.01234",
+      "hash": "0e11837ea129b6ed91621e815c8daf42be57b498839afa4b3a409b3962b16c17"
     },
     {
-      "raw": "https://arxiv.org/pdf/2312.99999v12",
-      "canonical": "2312.99999",
-      "hash": "fd3c87606ddd1808a30194f2fb15e71aff5854351b6fbbca8de5c50af3d8a03c"
+      "raw": "https://example.com/doc?v=2#top",
+      "canonical": "https://example.com/doc",
+      "hash": "5d333a9da8e04bd5199465f5d3e2483dab85b62c322b8400b9bf63ddb150d533"
     },
     {
-      "raw": "https://example.com/v2/notes",
-      "canonical": "https://example.com/v2/notes",
-      "hash": "e8a5dd27129afe4134aaeaeb3a22d685255c68cbf7321ab6e875514c68030347"
+      "raw": "https://site1.example.com/v2/",
+      "canonical": "https://site1.example.com/v2",
+      "hash": "9b5a14574766fb69cce876cc7d6ed6f5efd3dac7e1756a8a4665b40d00e8e253"
+    },
+    {
+      "raw": "10.1000/xyz123v2",
+      "canonical": "10.1000/xyz123",
+      "hash": "87b6422f089bac9669d51d8919f6235ee098c9270a5dcae530b96fd35c4250ff"
+    },
+    {
+      "raw": "https://example.com/2024/12/article",
+      "canonical": "https://example.com/2024/12/article",
+      "hash": "975410328794712e7cb32ca488554b1301ff8d3b8606a38f20ba35460ec75551"
+    },
+    {
+      "raw": "https://site1.example.com/v2",
+      "canonical": "https://site1.example.com",
+      "hash": "a20bef2012e924d36ed19c39c5b2f0d282f9ee0d039d222257f842eec3751ada"
+    },
+    {
+      "raw": "https://example.com/notes/v10",
+      "canonical": "https://example.com/notes/v10",
+      "hash": "75477904faaa0a4df187adb73213bf86498f63b127bf007607e829a66940423b"
     }
   ],
   "rejects": [
     "",
     "   ",
-    "https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    "doi:",
+    "#only-fragment",
+    "?only-query"
   ]
 }
