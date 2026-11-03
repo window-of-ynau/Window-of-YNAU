@@ -188,6 +188,9 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
   /// t98：Dart 主动拉取 `window.__yunongState` 的轮询（不依赖 JS→Dart 桥）。
   Timer? _statePull;
   int _consumedStateEvents = 0;
+
+  /// t100：JS 侧文档会话 id；变化说明发生了导航/文档重建，必须重置消费游标。
+  String? _lastSessionId;
   WebViewEnvironment? _environment;
 
   /// 门户接口模式下：20s 内没捕获到课表请求就明确报错（绝不静默挂起）。
@@ -262,7 +265,22 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
         _bridge.lastStateAgeSeconds =
             ((DateTime.now().millisecondsSinceEpoch - updatedAt.toInt()) / 1000).round();
       }
+      // t100：导航到新文档后 `window.__yunongState` 从 0 开始，而 Dart 游标仍停在旧值 →
+      // 新事件全被当作"已消费"跳过。表现正是 owner 报的"首次登录必失败、重试才好"。
+      // 判据：JS 侧 sessionId 变化（新文档）**或** events 变短（被重置）→ 游标归零。
+      final Object? sessionId = decoded['sessionId'];
       final Object? events = decoded['events'];
+      if (events is List) {
+        _consumedStateEvents = nextConsumedCursor(
+          consumed: _consumedStateEvents,
+          eventCount: events.length,
+          sessionId: sessionId is String ? sessionId : null,
+          lastSessionId: _lastSessionId,
+        );
+      }
+      if (sessionId is String) {
+        _lastSessionId = sessionId;
+      }
       if (events is List) {
         for (var i = _consumedStateEvents; i < events.length; i++) {
           final Object? event = events[i];
@@ -468,13 +486,16 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-          _stage == 'login'
-              ? '请先在页面里完成登录（登录成功后会自动抓取，不需要再点按钮）'
-              : _probe.hint,
-          style: theme.textTheme.bodySmall,
-        ),
+                          _stage == 'login'
+                              ? '请先在页面里完成登录（登录成功后会自动抓取，不需要再点按钮）'
+                              : _probe.hint,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: theme.colorScheme.onSurface,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
                       ),
-                      OutlinedButton(
+                      FilledButton(
                         onPressed: () async {
                           // 门户模式先走接口（__yunongGrab）；旧正方页面才走 DOM（__yunongGrabDom）
                           await _controller?.evaluateJavascript(
@@ -594,4 +615,27 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
       ),
     );
   }
+}
+
+/// t100：导航/文档重建后消费游标必须归零。
+///
+/// 触发条件（任一）：
+/// - `sessionId` 变化：JS 侧新文档会生成新 id；
+/// - `eventCount < consumed`：JS 侧 events 变短，说明被重置。
+///
+/// 为什么需要它：SSO 登录页 → 服务门户是**换文档**，`window.__yunongState` 从 0 开始，
+/// 而 Dart 游标停在旧值 → 新事件全被跳过 → 首次登录必失败、重试（不再导航）才好。
+int nextConsumedCursor({
+  required int consumed,
+  required int eventCount,
+  String? sessionId,
+  String? lastSessionId,
+}) {
+  if (sessionId != null && sessionId != lastSessionId) {
+    return 0;
+  }
+  if (eventCount < consumed) {
+    return 0;
+  }
+  return consumed;
 }

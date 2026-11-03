@@ -575,7 +575,11 @@ const String kPortalScheduleScript = r'''
   // t98：**主路径改为 Dart 主动拉取**。本脚本只把要上报的东西挂到
   // `window.__yunongState.events`，由 Dart 用 `evaluateJavascript('JSON.stringify(window.__yunongState)')`
   // 轮询取走（Dart→JS 已被证明可用；JS→Dart 的 bridge 在某些环境里始终不注入）。
-  window.__yunongState = window.__yunongState || { events: [], updatedAt: 0, diag: DIAG };
+  window.__yunongState = window.__yunongState || {
+    events: [], updatedAt: 0, diag: DIAG,
+    // t100：文档级会话 id —— 导航后新文档会生成新 id，Dart 据此重置消费游标
+    sessionId: Math.random().toString(36).slice(2) + '-' + Date.now().toString(36)
+  };
   var PENDING = [];
   var BRIDGE = { queued: 0, flushed: 0, dropped: 0 };
   DIAG.bridgeQueued = 0;
