@@ -523,6 +523,46 @@ async fn retention_prunes_old_months_and_salts() {
     db.finish().await;
 }
 
+/// 迁移可重入：0006 连跑两次不应报错（老库升级 / 重入场景）。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_migration_0006_is_idempotent() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let sql = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations/0006_rag_known_docs.sql"
+    ))
+    .expect("读迁移文件");
+    // 多语句必须用 raw_sql（预编译协议一次只能一条）
+    for attempt in 0..2 {
+        sqlx::raw_sql(&sql)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(|error| panic!("第 {} 次重入 0006 失败：{error}", attempt + 1));
+    }
+    // 重入后结构仍正确：known_docs 仍然没有 hash 列、candidates 的 CHECK 仍含 fetching
+    assert_eq!(
+        common::count(
+            &db.pool,
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = 'rag_known_docs' AND column_name = 'hash'"
+        )
+        .await,
+        0
+    );
+    let invalid = sqlx::query(
+        "INSERT INTO rag_candidates (month, hash, count, status) \
+         VALUES ('2026-11', 'deadbeef', 1, 'bogus')",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(invalid.is_err(), "非法 status 应被 CHECK 拒绝");
+    db.finish().await;
+}
+
 /// 崩溃恢复：残留的 `fetching` 本轮开头会被放回 `pending` 并重新处理。
 #[tokio::test]
 #[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
