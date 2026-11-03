@@ -21,7 +21,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 
-import 'package:flutter/foundation.dart';
 
 import 'package:ffi/ffi.dart';
 
@@ -250,9 +249,9 @@ class ChatDiagnostics {
   int lastDeltaLength = 0;
   String mergedText = '';
   String? lastError;
-  DateTime? startedAt;
+  /// 终态时间（done/error/cancel）；为空说明流从未进入终态
   DateTime? finishedAt;
-
+  DateTime? startedAt;
   /// 界面横幅（3 秒无事件时显示）。
   String get banner =>
       '对话没有启动 · 通道=$channel · handle=${handle ?? "-"} · '
@@ -308,6 +307,11 @@ abstract class ChatBackend {
 }
 
 /// 真 FFI 后端：`NativeCallable.listener` + `yunong_chat_stream/cancel`。
+///
+/// **投递顺序（t79 根因）**：Rust 在 `yunong_chat_stream` 里 spawn 线程后可能**立刻** emit，
+/// 若等函数返回后再登记 sink，首批帧会找不到接收者而丢失（表现为 events=0、无错误）。
+/// 因此这里改成：先自己分配 `streamId` → **先登记** sink → 把 `streamId` 当 `user` 指针传给 Rust
+/// → Rust 原样回传（`ffi.rs` 的 `ChatCallback::emit`）→ 回调按 `user` 找 sink。
 class FfiChatBackend implements ChatBackend {
   FfiChatBackend() : _lib = CoreLibrary.openCoreLibrary() {
     _stream = _lib.lookupFunction<_StreamNative, _StreamDart>('yunong_chat_stream');
@@ -318,30 +322,35 @@ class FfiChatBackend implements ChatBackend {
   late final _StreamDart _stream;
   late final _CancelDart _cancelFn;
 
-  /// 每个流一个 listener（端口 id 通过 `user` 传给 Rust）。
-  final Map<int, ({NativeCallable<_ChunkCbNative> callable, void Function(String) onChunk})>
-      _sinks = <int, ({NativeCallable<_ChunkCbNative> callable, void Function(String) onChunk})>{};
+  int _nextStreamId = 1;
+  final Map<int, _ChatSink> _sinks = <int, _ChatSink>{};
+  final Map<int, int> _handleToStreamId = <int, int>{};
+
+  /// 回调**实际触发**次数（诊断用：区分“回调没来”与“回调来了但被丢”）。
+  int framesFired = 0;
 
   @override
   int start(String requestJson, bool Function(String chunkJson) onChunk) {
-    // Rust 侧从任意线程回调 → 必须用 listener（端口投递）而不是 isLeaf/sync
+    final streamId = _nextStreamId++;
     final callable = NativeCallable<_ChunkCbNative>.listener(
       (Pointer<Utf8> chunkJson, Pointer<Void> user) {
-        // 字符串只在回调期间有效：立刻拷成 Dart String
-        onChunk(chunkJson.toDartString());
-        debugPrint("[chat][4] callback fired");
+        framesFired += 1;
+        final sink = _sinks[user.address];
+        final text = chunkJson.toDartString();
+        (sink?.onChunk ?? onChunk)(text);
       },
     );
+    // **先登记再调用**（见类文档）
+    _sinks[streamId] = _ChatSink(callable: callable, onChunk: onChunk);
+
     final request = requestJson.toNativeUtf8();
     final dbPath = ''.toNativeUtf8();
     try {
-      // 用自己的指针当 user：只做标识，不跨 isolate 解引用
-      final handle = _stream(request, dbPath, callable.nativeFunction, Pointer.fromAddress(0));
-      debugPrint("[chat][2] yunong_chat_stream handle=$handle");
+      final handle = _stream(request, dbPath, callable.nativeFunction, Pointer<Void>.fromAddress(streamId));
       if (handle > 0) {
-        _sinks[handle] = (callable: callable, onChunk: onChunk);
+        _handleToStreamId[handle] = streamId;
       } else {
-        callable.close();
+        _sinks.remove(streamId)?.callable.close();
       }
       return handle;
     } finally {
@@ -353,8 +362,18 @@ class FfiChatBackend implements ChatBackend {
   @override
   void cancel(int handle) {
     _cancelFn(handle);
-    _sinks.remove(handle)?.callable.close();
+    final streamId = _handleToStreamId.remove(handle);
+    if (streamId != null) {
+      _sinks.remove(streamId)?.callable.close();
+    }
   }
+}
+
+class _ChatSink {
+  _ChatSink({required this.callable, required this.onChunk});
+
+  final NativeCallable<_ChunkCbNative> callable;
+  final void Function(String) onChunk;
 }
 
 // listener 只能返回 void（取消走 yunong_chat_cancel，而不是回调返回值）
