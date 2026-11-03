@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 import 'src/campus/campus_entries.dart';
 import 'src/campus/timetable_page.dart';
 import 'src/core/app_paths.dart';
+import 'src/theme/file_settings_store.dart';
 import 'src/chat/chat_page.dart';
 import 'src/campus/webview_fetcher.dart';
 import 'src/core/timetable_service.dart';
@@ -36,7 +37,7 @@ void main() {
 class YunongApp extends StatefulWidget {
   const YunongApp({super.key, this.themeController});
 
-  /// 测试可注入；生产为 null（现造一个，内存兜底存储）。
+  /// 测试可注入；生产为 null（现造一个，**文件持久化**存储）。
   final ThemeController? themeController;
 
   @override
@@ -45,7 +46,7 @@ class YunongApp extends StatefulWidget {
 
 class _YunongAppState extends State<YunongApp> {
   late final ThemeController _controller =
-      widget.themeController ?? ThemeController();
+      widget.themeController ?? ThemeController(store: FileSettingsStore());
 
   /// 玻璃帧率闸门：**只在 B（深蓝玻璃）主题下挂载**，A/C 完全不启动。
   final GlassGovernor _glass = GlassGovernor();

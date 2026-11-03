@@ -365,6 +365,37 @@ class _ChatPageState extends State<ChatPage> {
       const SnackBar(content: Text('已退出套餐账号')),
     );
   }
+  /// 对话诊断（始终可达）：显示最近一轮的观测数据并支持复制。
+  ///
+  /// P0-1 观测口径：`delta_count` / `last_delta_len` / `merged_chars` 能直接回答
+  /// “收到几条 delta、第几条之后停止、是否收到 done/error”。
+  Future<void> _showDiagnostics() async {
+    final diag = _diagnostics;
+    final text = diag == null ? '还没有发起过对话' : diag.toClipboardText();
+    if (!mounted) {
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: const Text('对话诊断'),
+        scrollable: true,
+        content: SelectableText(text, style: const TextStyle(fontSize: 12)),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: text));
+              if (context.mounted) {
+                Navigator.of(context).pop();
+              }
+            },
+            child: const Text('复制诊断'),
+          ),
+          FilledButton(onPressed: () => Navigator.of(context).pop(), child: const Text('关闭')),
+        ],
+      ),
+    );
+  }
   /// 查询搜索来源：未配置时 UI **必须**常驻提示（禁止静默降级）。
   /// 本地资料检索：结果**只来自本机**（与联网搜索区分，不混淆）。
   Future<void> _runLocalSearch() async {
@@ -598,6 +629,7 @@ class _ChatPageState extends State<ChatPage> {
           onSettings: () => unawaited(_openSettings()),
           onSignIn: () => unawaited(_signInCloud()),
           onSignOut: () => unawaited(_signOutCloud()),
+          onDiagnostics: () => unawaited(_showDiagnostics()),
           onDeleteKey: _keyStatus.set ? () => unawaited(_deleteKey()) : null,
         ),
         if (_keyStatus.degraded)

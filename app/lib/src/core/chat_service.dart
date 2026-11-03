@@ -245,6 +245,10 @@ class ChatDiagnostics {
   String? callbackError;
   int eventsReceived = 0;
   String? lastEventKind;
+  /// P0-1 观测：收到多少条 delta、最后一条 delta 的文本长度（判断"只出几个字就停"）
+  int deltaCount = 0;
+  int lastDeltaLength = 0;
+  String mergedText = '';
   String? lastError;
   DateTime? startedAt;
   DateTime? finishedAt;
@@ -390,6 +394,11 @@ class ChatService {
         final event = ChatEvent.fromJsonString(chunkJson);
         diag.eventsReceived += 1;
         diag.lastEventKind = event.kind.name;
+        if (event.kind == ChatEventKind.delta) {
+          diag.deltaCount += 1;
+          diag.lastDeltaLength = (event.text ?? '').length;
+          diag.mergedText += event.text ?? '';
+        }
         if (event.kind == ChatEventKind.error) {
           diag.lastError = event.errorCode ?? event.errorMessage ?? 'error';
         }

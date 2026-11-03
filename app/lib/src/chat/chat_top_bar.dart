@@ -29,6 +29,7 @@ class ChatTopBar extends StatelessWidget {
     required this.onSettings,
     required this.onSignIn,
     required this.onSignOut,
+    required this.onDiagnostics,
     this.onDeleteKey,
   });
 
@@ -48,6 +49,9 @@ class ChatTopBar extends StatelessWidget {
   final VoidCallback onSettings;
   final VoidCallback onSignIn;
   final VoidCallback onSignOut;
+
+  /// 对话诊断（**始终可达**：不是只在失败时出现）
+  final VoidCallback onDiagnostics;
   final VoidCallback? onDeleteKey;
 
   @override
@@ -96,6 +100,8 @@ class ChatTopBar extends StatelessWidget {
                   onSignIn();
                 case 'signOut':
                   onSignOut();
+                case 'diagnostics':
+                  onDiagnostics();
                 case 'deleteKey':
                   onDeleteKey?.call();
               }
@@ -104,6 +110,7 @@ class ChatTopBar extends StatelessWidget {
               const PopupMenuItem<String>(value: 'local', child: Text('搜索本地资料（不联网）')),
               const PopupMenuItem<String>(value: 'memory', child: Text('记忆')),
               const PopupMenuItem<String>(value: 'settings', child: Text('设置')),
+              const PopupMenuItem<String>(value: 'diagnostics', child: Text('对话诊断')),
               if (keyLabel.isNotEmpty)
                 const PopupMenuItem<String>(value: 'deleteKey', child: Text('删除已保存的 Key')),
               const PopupMenuDivider(),
