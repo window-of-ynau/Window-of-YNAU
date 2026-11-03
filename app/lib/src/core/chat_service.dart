@@ -21,6 +21,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 
+import 'package:flutter/foundation.dart';
+
 import 'package:ffi/ffi.dart';
 
 import 'ffi_bindings.dart';
@@ -278,6 +280,7 @@ class FfiChatBackend implements ChatBackend {
       (Pointer<Utf8> chunkJson, Pointer<Void> user) {
         // 字符串只在回调期间有效：立刻拷成 Dart String
         onChunk(chunkJson.toDartString());
+        debugPrint("[chat][4] callback fired");
       },
     );
     final request = requestJson.toNativeUtf8();
@@ -285,6 +288,7 @@ class FfiChatBackend implements ChatBackend {
     try {
       // 用自己的指针当 user：只做标识，不跨 isolate 解引用
       final handle = _stream(request, dbPath, callable.nativeFunction, Pointer.fromAddress(0));
+      debugPrint("[chat][2] yunong_chat_stream handle=$handle");
       if (handle > 0) {
         _sinks[handle] = (callable: callable, onChunk: onChunk);
       } else {
@@ -322,6 +326,7 @@ class ChatService {
   /// 发起一次流式对话。
   ChatStream send(ChatRequestDto request) {
     final controller = StreamController<ChatEvent>();
+    debugPrint("[chat][1] send channel=${request.channel.wire} model=${request.model} base_url=${request.baseUrl} secret_key=${request.secretKey}");
     void close() {
       if (!controller.isClosed) {
         unawaited(controller.close());
@@ -331,6 +336,7 @@ class ChatService {
     var handle = 0;
     handle = _backend.start(request.toJson(), (String chunkJson) {
       final event = ChatEvent.fromJsonString(chunkJson);
+      debugPrint("[chat][5] event=${event.kind.name}");
       if (!controller.isClosed) {
         controller.add(event);
       }

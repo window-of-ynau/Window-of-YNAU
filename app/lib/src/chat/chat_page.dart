@@ -25,6 +25,12 @@ import '../memory/memory_page.dart';
 /// 让 Key 落到系统安全存储、永不回显。本轮的 UI 已经按"不回显"设计。
 class ChatSettings {
   String channel = 'byok';
+
+  /// 上游提供方（架构预留：加 OpenAI / 自建网关只需加枚举值）。
+  String providerId = 'deepseek';
+
+  /// 该提供方的 OpenAI 兼容 base url（BYOK 直连用）。
+  String baseUrl = 'https://api.deepseek.com';
   String byokKey = '';
   String cloudToken = '';
   String model = 'deepseek-chat';
@@ -200,6 +206,7 @@ class _ChatPageState extends State<ChatPage> {
       ),
       messages: history,
       // BYOK：只传 key 名，明文由 Rust 从安全存储取（Dart 不见明文）
+      baseUrl: _settings.baseUrl,
       secretKey: _channel == 'byok' ? SecretService.byokKeyName : null,
       dataDir: widget.dbPath,
       cloudToken: _settings.cloudToken,
@@ -828,6 +835,9 @@ class _SettingsDialogState extends State<_SettingsDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
+      // P0-2：任何主题都不透底——玻璃只用于外层装饰，表单必须实心可读
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      surfaceTintColor: Colors.transparent,
       title: const Text('对话设置'),
       content: SingleChildScrollView(
         child: Column(
