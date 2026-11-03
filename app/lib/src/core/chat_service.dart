@@ -97,8 +97,10 @@ class ChatRequestDto {
   /// 应用数据目录（Rust 用它定位 secret store）
   final String? dataDir;
 
-  /// t104：**目录**路径（不是 .db 文件）。给了它 Rust 才启用内置工具
-  /// （`memory_search` / `timetable_query`）；不给则行为与旧版一致。
+  /// 内置工具开关：给了它 Rust 才启用 `memory_search` / `timetable_query`；不给则行为与旧版一致。
+  ///
+  /// **实测（t106）：这是数据库文件路径，不是目录。**传目录会得到
+  /// `SQLITE_CANTOPEN: unable to open database file`（曾按“目录”理解踩过一次）。
   final String? dbPath;
 
   /// 套餐通道的访问令牌

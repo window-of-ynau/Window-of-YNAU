@@ -11,20 +11,22 @@ import 'package:yunong/src/core/app_paths.dart';
 import 'package:yunong/src/core/chat_service.dart';
 
 void main() {
-  group('db_path：必须是目录（给文件路径会让 Rust 把库当目录用）', () {
-    test('请求 JSON 里的 db_path 是目录，不是 .db 文件', () {
+  // t106 实测修正：Rust 把 db_path 当**数据库文件**打开（传目录会 SQLITE_CANTOPEN）。
+  group('db_path：启用内置工具的数据库文件路径', () {
+    test('请求 JSON 里的 db_path 是 .db 文件路径（实测形态）', () {
       final String dbFile = '${Directory.systemTemp.path}/t104/app.db';
       final String dataDir = AppPaths.dataDirOf(dbFile);
+      expect(dataDir, isNot(contains('app.db')));
       final ChatRequestDto request = ChatRequestDto(
         channel: ChatChannel.byok,
         model: 'deepseek-chat',
         messages: <ChatTurn>[ChatTurn.user('你好')],
-        dbPath: dataDir,
+        dbPath: dbFile,
       );
       final String json = request.toJson();
       expect(json, contains('"db_path"'));
       expect(json, contains(dataDir.replaceAll('\\', '\\\\')));
-      expect(json.contains('app.db'), isFalse, reason: 'db_path 不能是 .db 文件');
+      expect(json.contains('app.db'), isTrue, reason: '实测：db_path 必须是数据库文件');
     });
 
     test('不传 db_path → 行为与旧版一致（不启用工具）', () {
