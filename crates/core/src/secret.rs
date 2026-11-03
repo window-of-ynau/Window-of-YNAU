@@ -638,6 +638,7 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+    #[cfg(windows)]
     #[test]
     fn dpapi_roundtrip_on_windows() {
         let base = temp_base();

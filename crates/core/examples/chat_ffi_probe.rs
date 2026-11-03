@@ -4,16 +4,19 @@
 //!
 //! 起一个手写的假上游（`std::net::TcpListener`，零依赖），返回固定 SSE 流，然后
 //! 用 `extern "C" fn` 回调把每条 chunk 打印出来，最后统计：
-//! 回调次数、首条/末条、是否收到 `done`、`yunong_chat_stream` 返回的 handle。
+//! 回调次数、首条/末条、是否收到 `done`、`yunong_chat_stream` 返回的 handle，
+//! 以及 **上游实际发出多少帧 vs 回调收到多少帧**（排查"说到一半就不说了"）。
 //!
 //! ```text
 //! cargo run -p yunong-core --example chat_ffi_probe
 //! cargo run -p yunong-core --example chat_ffi_probe -- --cancel-after 3
 //! cargo run -p yunong-core --example chat_ffi_probe -- --bad-url
+//! cargo run -p yunong-core --example chat_ffi_probe -- --frames 50 --interval-ms 50
+//! cargo run -p yunong-core --example chat_ffi_probe -- --frames 50 --interval-ms 50 --split
 //! ```
 //!
-//! 退出码：`0` = 符合预期；`2` = 超时没收到 `done`；`3` = 一条 chunk 都没收到；
-//! `4` = 期望收到错误 chunk 却收不到（错误路径断了）。
+//! 退出码：`0` = 符合预期；`2` = 超时/没收齐；`3` = 一条 chunk 都没收到；
+//! `4` = 期望收到错误 chunk 却收不到；`5` = 上游发了 N 帧但回调只收到 M 帧（提前断流）。
 
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
@@ -31,6 +34,8 @@ use yunong_core::ffi::{yunong_chat_cancel, yunong_chat_stream};
 struct Sink {
     chunks: Mutex<Vec<String>>,
     count: AtomicUsize,
+    /// 收到的 `delta` 条数（和上游发的帧数对账）
+    deltas: AtomicUsize,
     /// `>0` 时收到第 N 条后主动取消（验证取消路径）
     cancel_after: usize,
     handle: AtomicI64,
@@ -42,6 +47,7 @@ impl Sink {
         Self {
             chunks: Mutex::new(Vec::new()),
             count: AtomicUsize::new(0),
+            deltas: AtomicUsize::new(0),
             cancel_after,
             handle: AtomicI64::new(0),
             cancel_sent: AtomicBool::new(false),
@@ -83,7 +89,10 @@ unsafe extern "C" fn on_chunk(json: *const std::os::raw::c_char, user: *mut std:
         return;
     };
     let n = sink.count.fetch_add(1, Ordering::SeqCst) + 1;
-    println!("[probe] chunk #{n:<3} {}", brief(&text, 180));
+    if chunk_type(&text).as_deref() == Some("delta") {
+        sink.deltas.fetch_add(1, Ordering::SeqCst);
+    }
+    println!("[probe] chunk #{n:<3} {}", brief(&text, 160));
     if let Ok(mut chunks) = sink.chunks.lock() {
         chunks.push(text);
     }
@@ -108,11 +117,14 @@ fn chunk_type(chunk: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// 取 `delta.text`（文本增量）用于展示。
-fn delta_text(chunk: &str) -> Option<String> {
+/// 从 chunk JSON 里取增量文本或错误信息（展示用）。
+fn chunk_body(chunk: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(chunk).ok()?;
+    if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+        return Some(text.to_owned());
+    }
     value
-        .get("text")
+        .get("message")
         .and_then(|v| v.as_str())
         .map(str::to_owned)
 }
@@ -131,21 +143,69 @@ fn brief(text: &str, max: usize) -> String {
 // 假上游：手写 HTTP + SSE（零依赖，只用 std::net）
 // ---------------------------------------------------------------------------
 
-/// 上游收到的请求行（诊断 `base_url` 用）。
-fn start_fake_sse() -> (u16, Arc<Mutex<Option<String>>>, thread::JoinHandle<()>) {
+/// 假上游的行为参数（对应命令行开关）。
+#[derive(Clone, Copy)]
+struct UpstreamSpec {
+    frames: usize,
+    interval: Duration,
+    /// 每帧拆成两次 write（模拟"帧被 TCP 切开"）
+    split: bool,
+    /// 用 CRLF 收尾而不是 LF
+    crlf: bool,
+    /// 不发 `data: [DONE]`，直接关连接
+    no_done: bool,
+}
+
+struct UpstreamStats {
+    /// 上游**成功写出去**的 delta 帧数
+    deltas_sent: AtomicUsize,
+    finish_sent: AtomicBool,
+}
+
+impl UpstreamStats {
+    fn new() -> Self {
+        Self {
+            deltas_sent: AtomicUsize::new(0),
+            finish_sent: AtomicBool::new(false),
+        }
+    }
+}
+
+/// 起好的假上游（端口 + 观测点）。
+struct FakeUpstream {
+    port: u16,
+    /// 上游收到的请求行（诊断 `base_url` 用）
+    seen: Arc<Mutex<Option<String>>>,
+    stats: Arc<UpstreamStats>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn start_fake_sse(spec: UpstreamSpec) -> FakeUpstream {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("绑定假上游端口失败");
     let port = listener.local_addr().expect("取端口失败").port();
     let seen = Arc::new(Mutex::new(None));
+    let stats = Arc::new(UpstreamStats::new());
     let seen_in_thread = Arc::clone(&seen);
+    let stats_in_thread = Arc::clone(&stats);
     let handle = thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            serve_sse(stream, &seen_in_thread);
+            serve_sse(stream, &seen_in_thread, &stats_in_thread, spec);
         }
     });
-    (port, seen, handle)
+    FakeUpstream {
+        port,
+        seen,
+        stats,
+        handle,
+    }
 }
 
-fn serve_sse(mut stream: TcpStream, seen: &Arc<Mutex<Option<String>>>) {
+fn serve_sse(
+    mut stream: TcpStream,
+    seen: &Arc<Mutex<Option<String>>>,
+    stats: &Arc<UpstreamStats>,
+    spec: UpstreamSpec,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 2048];
@@ -175,8 +235,9 @@ fn serve_sse(mut stream: TcpStream, seen: &Arc<Mutex<Option<String>>>) {
         return;
     }
 
-    // 逐字 delta（OpenAI Completions 的形状，与本仓库 fake_sse 一致）
-    for text in ["你", "好", "，", "探", "针"] {
+    let sep = if spec.crlf { "\r\n\r\n" } else { "\n\n" };
+    for index in 0..spec.frames {
+        let text = format!("字{index}");
         let payload = serde_json::json!({
             "id": "chatcmpl-probe",
             "object": "chat.completion.chunk",
@@ -188,10 +249,26 @@ fn serve_sse(mut stream: TcpStream, seen: &Arc<Mutex<Option<String>>>) {
                 "finish_reason": serde_json::Value::Null
             }]
         });
-        if write_sse(&mut stream, &format!("data: {payload}\n\n")).is_err() {
+        let frame = format!("data: {payload}{sep}");
+        let wrote = if spec.split {
+            // 拆成两次写：先把前半截发出去，睡一会儿再发剩下的（模拟 TCP 切开一帧）
+            let (head_part, tail_part) = frame.split_at(frame.len() / 2);
+            stream.write_all(head_part.as_bytes()).is_ok() && stream.flush().is_ok() && {
+                thread::sleep(spec.interval / 2);
+                stream.write_all(tail_part.as_bytes()).is_ok()
+            }
+        } else {
+            stream.write_all(frame.as_bytes()).is_ok()
+        };
+        if !wrote {
+            // 对面不再读了（取消）：上游侧也停，并记录已发多少
             return;
         }
-        thread::sleep(Duration::from_millis(20));
+        let _ = stream.flush();
+        stats.deltas_sent.fetch_add(1, Ordering::SeqCst);
+        if index + 1 < spec.frames {
+            thread::sleep(spec.interval);
+        }
     }
 
     // 结束帧 + usage
@@ -201,16 +278,22 @@ fn serve_sse(mut stream: TcpStream, seen: &Arc<Mutex<Option<String>>>) {
         "created": 1,
         "model": "gpt-probe",
         "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
-        "usage": { "prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12 }
+        "usage": {
+            "prompt_tokens": 7,
+            "completion_tokens": spec.frames,
+            "total_tokens": 7 + spec.frames
+        }
     });
-    let _ = write_sse(&mut stream, &format!("data: {finish}\n\n"));
-    let _ = write_sse(&mut stream, "data: [DONE]\n\n");
+    if stream
+        .write_all(format!("data: {finish}{sep}").as_bytes())
+        .is_ok()
+    {
+        stats.finish_sent.store(true, Ordering::SeqCst);
+    }
+    if !spec.no_done {
+        let _ = stream.write_all(format!("data: [DONE]{sep}").as_bytes());
+    }
     let _ = stream.flush();
-}
-
-fn write_sse(stream: &mut TcpStream, text: &str) -> std::io::Result<()> {
-    stream.write_all(text.as_bytes())?;
-    stream.flush()
 }
 
 fn find_headers_end(buffer: &[u8]) -> Option<usize> {
@@ -241,6 +324,11 @@ struct Args {
     cancel_after: usize,
     bad_url: bool,
     timeout_ms: u64,
+    frames: usize,
+    interval_ms: u64,
+    split: bool,
+    crlf: bool,
+    no_done: bool,
 }
 
 fn parse_args() -> Args {
@@ -248,6 +336,11 @@ fn parse_args() -> Args {
         cancel_after: 0,
         bad_url: false,
         timeout_ms: 10_000,
+        frames: 5,
+        interval_ms: 20,
+        split: false,
+        crlf: false,
+        no_done: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -258,7 +351,22 @@ fn parse_args() -> Args {
                     .and_then(|v| v.parse().ok())
                     .expect("--cancel-after 需要一个数字");
             }
+            "--frames" => {
+                args.frames = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--frames 需要一个数字");
+            }
+            "--interval-ms" => {
+                args.interval_ms = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--interval-ms 需要一个数字");
+            }
             "--bad-url" => args.bad_url = true,
+            "--split" => args.split = true,
+            "--crlf" => args.crlf = true,
+            "--no-done" => args.no_done = true,
             "--timeout-ms" => {
                 args.timeout_ms = iter
                     .next()
@@ -276,14 +384,44 @@ fn main() {
     println!("=== C ABI 探针：yunong_chat_stream ===");
 
     // 1) 假上游（--bad-url 时故意指向一个没人监听的端口）
-    let (port, seen, upstream) = if args.bad_url {
+    let upstream = if args.bad_url {
         println!("模式: --bad-url（指向未监听的端口，验证错误能否回调到 UI）");
-        (1_u16, Arc::new(Mutex::new(None)), thread::spawn(|| {}))
+        FakeUpstream {
+            port: 1,
+            seen: Arc::new(Mutex::new(None)),
+            stats: Arc::new(UpstreamStats::new()),
+            handle: thread::spawn(|| {}),
+        }
     } else {
-        let (port, seen, handle) = start_fake_sse();
-        println!("假上游: http://127.0.0.1:{port}/v1（SSE：5 条逐字 delta + usage + [DONE]）");
-        (port, seen, handle)
+        let spec = UpstreamSpec {
+            frames: args.frames,
+            interval: Duration::from_millis(args.interval_ms),
+            split: args.split,
+            crlf: args.crlf,
+            no_done: args.no_done,
+        };
+        let upstream = start_fake_sse(spec);
+        println!(
+            "假上游: http://127.0.0.1:{}/v1（{} 帧 delta，间隔 {} ms{}{}）",
+            upstream.port,
+            args.frames,
+            args.interval_ms,
+            if args.split {
+                "，每帧拆两次写"
+            } else {
+                ""
+            },
+            if args.no_done {
+                "，不发 [DONE] 直接关连接"
+            } else {
+                "，随后 usage + [DONE]"
+            }
+        );
+        upstream
     };
+    let port = upstream.port;
+    let seen = Arc::clone(&upstream.seen);
+    let stats = Arc::clone(&upstream.stats);
 
     // 2) 组装 Dart 侧会传的 request JSON（字段与 ChatRunConfig 一致）
     let request = serde_json::json!({
@@ -320,8 +458,6 @@ fn main() {
         let settled = if expect_error {
             sink.has_error()
         } else if args.cancel_after > 0 {
-            // 取消后不该再有 done：取消一旦发出、且已到第 N 条，就算 settled
-            // （取消是"停止读取"，之后不会再有 chunk，所以不能等第 N+1 条）
             sink.cancel_sent.load(Ordering::SeqCst) && count >= args.cancel_after
         } else {
             sink.has_done() || sink.has_error()
@@ -331,8 +467,7 @@ fn main() {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    // 取消路径：取消后**不该再有任何 chunk**。上面按"收到第 N 条"就已经 settle 了，
-    // 这里再等一小段确认真的静默（而不是刚好卡在两次 chunk 之间）。
+    // 取消路径：确认之后真的静默（不该再有新 chunk）
     if args.cancel_after > 0 && sink.cancel_sent.load(Ordering::SeqCst) {
         let quiet_from = sink.count.load(Ordering::SeqCst);
         let quiet_deadline = Instant::now() + Duration::from_millis(300);
@@ -345,18 +480,20 @@ fn main() {
         }
     }
     let elapsed = started.elapsed();
-    // 取消/错误路径下流可能还在收尾，给一点时间让后面的 chunk 落进来（用于观察是否真的停）
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(100));
 
     // 5) 汇总
     let chunks = sink.snapshot();
     let count = chunks.len();
+    let deltas = sink.deltas.load(Ordering::SeqCst);
+    let sent = stats.deltas_sent.load(Ordering::SeqCst);
+    let finish_sent = stats.finish_sent.load(Ordering::SeqCst);
     let first = chunks.first().map(|c| brief(c, 120)).unwrap_or_default();
     let last = chunks.last().map(|c| brief(c, 120)).unwrap_or_default();
     let done = sink.has_done();
     let errored = sink.has_error();
     let types: Vec<String> = chunks.iter().filter_map(|c| chunk_type(c)).collect();
-    let text: String = chunks.iter().filter_map(|c| delta_text(c)).collect();
+    let text: String = chunks.iter().filter_map(|c| chunk_body(c)).collect();
     if let Some(seen) = seen.lock().ok().and_then(|slot| slot.clone()) {
         println!("[probe] 上游收到的请求行: {seen}");
     }
@@ -364,6 +501,8 @@ fn main() {
     println!("=== 汇总 ===");
     println!("handle            = {handle}");
     println!("回调次数          = {count}");
+    println!("上游发出 delta    = {sent} 帧（结束帧已发：{finish_sent}）");
+    println!("回调收到 delta    = {deltas} 帧");
     println!("chunk 类型序列    = {types:?}");
     println!("拼出的文本        = {text:?}");
     println!("首条              = {first}");
@@ -372,7 +511,7 @@ fn main() {
     println!("收到 error        = {errored}");
     println!("耗时              = {} ms", elapsed.as_millis());
 
-    let _ = upstream.join();
+    let _ = upstream.handle.join();
 
     // 6) 判定
     if count == 0 {
@@ -381,10 +520,10 @@ fn main() {
     }
     if expect_error {
         if errored {
-            println!("\n✅ 结论：错误路径也走回调（UI 能收到 Chunk::Error，不会只是转圈）");
+            println!("\n✅ 结论：错误路径也走回调（UI 能收到 Chunk::Error）");
             return;
         }
-        eprintln!("\n❌ 结论：期望收到 error chunk，但没收到 → 错误被吞了（UI 会一直转圈）");
+        eprintln!("\n❌ 结论：期望收到 error chunk，但没收到 → 错误被吞了");
         std::process::exit(4);
     }
     if args.cancel_after > 0 {
@@ -398,8 +537,17 @@ fn main() {
         );
         return;
     }
-    if done && count > 0 {
-        println!("\n✅ 结论：**C ABI + 回调通**——chunk 能到，done 能到（问题不在 Rust 侧）");
+    if deltas < sent {
+        eprintln!(
+            "\n❌ 结论：**提前断流**——上游发出 {sent} 帧，回调只收到 {deltas} 帧（差 {}）",
+            sent - deltas
+        );
+        std::process::exit(5);
+    }
+    if done && deltas == sent {
+        println!(
+            "\n✅ 结论：**C ABI + 回调通**——上游 {sent} 帧全到，done 也到（Rust 侧无提前断流）"
+        );
         return;
     }
     eprintln!("\n❌ 结论：收到 {count} 条但没等到 done → 流没走完（超时或上游卡住）");

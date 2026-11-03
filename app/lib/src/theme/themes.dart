@@ -268,6 +268,12 @@ ThemeData buildTheme(
     t = t.withGlass(glassMode == GlassMode.off ? null : glassSpecFor(glassMode, t.glass!));
   }
   final ThemeData base = ThemeData(brightness: brightness, useMaterial3: true);
+  // P1-4：**所有** 对话框统一实心背景（玻璃只用于外层装饰；表单/正文必须可读）
+  final DialogThemeData solidDialog = DialogThemeData(
+    backgroundColor: t.canvas,
+    surfaceTintColor: Colors.transparent,
+    barrierColor: Colors.black54,
+  );
   final ColorScheme scheme = ColorScheme.fromSeed(
     seedColor: t.accent,
     brightness: brightness,
@@ -407,5 +413,8 @@ ThemeData buildTheme(
       behavior: SnackBarBehavior.floating,
     ),
     progressIndicatorTheme: ProgressIndicatorThemeData(color: t.accent),
+    // P1-4：全局对话框实心背景（记忆页/设置页/登录框等所有 showDialog 自动生效）
+    dialogTheme: solidDialog,
+    bottomSheetTheme: BottomSheetThemeData(backgroundColor: t.canvas, surfaceTintColor: Colors.transparent),
   );
 }

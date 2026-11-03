@@ -46,13 +46,55 @@ const List<String> _prefixes = <String>[
   'arxiv:',
 ];
 
+/// ASCII 空白集合：空格 / `\t` / `\n` / `\r` / `\x0c` / `\x0b`。
+///
+/// **不能用 `String.trim()`**：它按 Unicode 空白裁剪（包含 BOM `\uFEFF`），
+/// 与服务端 `str::trim()` 的语义不同 → 同一输入两端算出不同哈希。
+bool _isAsciiSpace(int codeUnit) =>
+    codeUnit == 0x20 || codeUnit == 0x09 || codeUnit == 0x0a || codeUnit == 0x0d || codeUnit == 0x0c || codeUnit == 0x0b;
+
+/// 只裁 ASCII 空白（首尾）。
+String _trimAscii(String value) {
+  var start = 0;
+  var end = value.length;
+  while (start < end && _isAsciiSpace(value.codeUnitAt(start))) {
+    start++;
+  }
+  while (end > start && _isAsciiSpace(value.codeUnitAt(end - 1))) {
+    end--;
+  }
+  return value.substring(start, end);
+}
+
+/// 只把 ASCII `A–Z` 转小写，其它码点**原样保留**。
+///
+/// **不能用 `toLowerCase()`**：它做 Unicode 大小写映射（例如 `İ` U+0130 → `i` + U+0307，
+/// 或某些字符映射成单字符），与服务端 `to_ascii_lowercase` 语义不同 → 哈希分叉。
+String _toLowerAscii(String value) {
+  final units = value.codeUnits;
+  final out = <int>[];
+  for (final unit in units) {
+    if (unit >= 0x41 && unit <= 0x5a) {
+      out.add(unit + 0x20);
+    } else {
+      out.add(unit);
+    }
+  }
+  return String.fromCharCodes(out);
+}
 /// 规范化标识；非法/空 → null。
+///
+/// **规则（与 Rust 服务端逐字节一致，标识是 ASCII 语义）**：
+/// - 只裁 **ASCII 空白**（见 [_isAsciiSpace]），**不**用 `String.trim()`（会裁 BOM 等 Unicode 空白）；
+/// - 只把 **ASCII A–Z** 转小写，**不**用 `toLowerCase()`（会做 Unicode 大小写映射）；
+/// - 其余字符（含 Unicode、BOM、组合字符）**原样保留**，不做 NFC 归一化。
+/// 违反任一条都会与服务端算出不同哈希，而 join 失败是**静默**的（0 命中、无报错）。
 String? canonicalIdentifier(String raw) {
-  var value = raw.trim();
+  var value = _trimAscii(raw);
   if (value.isEmpty || utf8.encode(value).length > maxIdentifierBytes) {
     return null;
   }
-  value = value.toLowerCase();
+  value = _toLowerAscii(value);
   final hash = value.indexOf('#');
   if (hash >= 0) {
     value = value.substring(0, hash);
