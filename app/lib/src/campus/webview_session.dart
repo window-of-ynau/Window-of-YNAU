@@ -76,14 +76,32 @@ const String kCampusProbeScript = r'''
   if (window.__yunongProbeReady) { return; }
   window.__yunongProbeReady = true;
 
+  // t94：注入脚本可能早于 flutter_inappwebview polyfill（AT_DOCUMENT_START），
+  // 旧实现此时静默 return false → 消息丢失（诊断表现为“脚本探测 N 次 / Dart 收到 0 条”）。
+  // 现在排队 + 定时/加载后补发。
+  var PENDING = [];
   function bridge(payload) {
     try {
-      if (!window.flutter_inappwebview) { return false; }
+      if (!window.flutter_inappwebview) { PENDING.push(payload); return false; }
       // 白名单：只回传登录态与课表 HTML；不读、不回传 Cookie / 表单值 / 完整 URL
       window.flutter_inappwebview.callHandler('yunongBridge', JSON.stringify(payload));
       return true;
-    } catch (e) { return false; }
+    } catch (e) { PENDING.push(payload); return false; }
   }
+
+  function flushPendingBridge() {
+    if (!PENDING.length || !window.flutter_inappwebview) { return; }
+    var items = PENDING; PENDING = [];
+    for (var i = 0; i < items.length; i++) {
+      try { window.flutter_inappwebview.callHandler('yunongBridge', JSON.stringify(items[i])); }
+      catch (e) { PENDING.push(items[i]); }
+    }
+  }
+  try {
+    setInterval(flushPendingBridge, 200);
+    window.addEventListener('load', flushPendingBridge);
+    document.addEventListener('DOMContentLoaded', flushPendingBridge);
+  } catch (e) {}
 
   function has(selector) {
     try { return !!document.querySelector(selector); } catch (e) { return false; }

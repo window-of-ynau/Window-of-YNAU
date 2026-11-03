@@ -217,9 +217,17 @@ class _HomeShellState extends State<HomeShell> {
           ],
         ),
       ),
-      body: destination == null
-          ? _ChatPane(chatSettings: _chatSettings, secrets: _secrets, auth: _auth)
-          : _CampusPane(entry: destination),
+      // t94：用 IndexedStack 保留各栏状态——切到课表再切回来，对话（消息 + 输入草稿）不能丢。
+      body: IndexedStack(
+        index: destination == null ? 0 : 1,
+        children: <Widget>[
+          _ChatPane(chatSettings: _chatSettings, secrets: _secrets, auth: _auth),
+          if (destination == null)
+            const SizedBox.shrink()
+          else
+            _CampusPane(entry: destination),
+        ],
+      ),
     );
   }
 
