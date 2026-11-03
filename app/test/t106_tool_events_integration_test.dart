@@ -11,6 +11,7 @@
 //   {"type":"delta",...} → {"type":"done","finish":"stop"}
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -50,7 +51,6 @@ Future<List<String>> _runOnce({
   required int port,
   required String mode,
   required String dbDir,
-  bool allowMissingDone = false,
 }) async {
   final process = await Process.start(
     _findFakeSse()!.absolute.path,
@@ -58,6 +58,9 @@ Future<List<String>> _runOnce({
   );
   _spawned.add(File('${process.pid}'));
   addTearDown(process.kill);
+  final List<String> serverLog = <String>[];
+  process.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen(serverLog.add);
+  process.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen(serverLog.add);
   await Future<void>.delayed(const Duration(milliseconds: 400));
 
   final request = ChatRequestDto(
@@ -81,16 +84,14 @@ Future<List<String>> _runOnce({
     return true;
   });
   expect(handle, greaterThan(0));
+  // t110：假上游轮次漂移已修（按请求体判定），这里改回**硬断言**：done 必须存在。
   try {
     await done.future.timeout(const Duration(seconds: 30));
   } on TimeoutException {
-    // t107 观测：种了记忆（搜到 2 条）后，真实流在首个 delta 后停住、不发 done。
-    // 这是 Rust 侧待查问题；本测试不掩盖（打印告警），但继续校验顺序/配对/终态。
-    if (!allowMissingDone) {
-      rethrow;
-    }
+    // t110：把假上游 stdout 贴出来，区分“第二轮没发出”还是“第二轮响应没解析完”
     // ignore: avoid_print
-    print('T106_WARN: 30s 内没有 done，已收到 ${raw.length} 帧（已知问题，见任务报告）');
+    print('T110_FAKE_SSE_LOG:\n${serverLog.join('\n')}');
+    rethrow;
   }
   backend.cancel(handle);
   return raw;
@@ -118,7 +119,7 @@ void main() {
     await memory.save(kind: MemoryKind.note, title: '雨伞', content: '雨伞是黑色的');
 
     final List<String> raw =
-        await _runOnce(port: 18801, mode: 'tool', dbDir: dbFile, allowMissingDone: true);
+        await _runOnce(port: 18801, mode: 'tool', dbDir: dbFile);
     // 原始事件（供报告引用）
     // ignore: avoid_print
     print('T106_RAW_TOOL_EVENTS=${raw.join('\n')}');
@@ -153,6 +154,12 @@ void main() {
       expect(result.toolSummary, isNotNull);
       expect(result.toolSummary!, contains('找到'), reason: '实际 summary=' + result.toolSummary!);
       expect(result.toolSummary!, isNot(contains('没搜到')));
+
+      // t110：帧数量级 + done 硬断言（有结果路径约 14 帧）
+      final int deltaCount = events.where((ChatEvent e) => e.kind == ChatEventKind.delta).length;
+      expect(events.length, greaterThanOrEqualTo(10), reason: '总帧数过少，可能第二轮没跑');
+      expect(deltaCount, greaterThanOrEqualTo(5), reason: 'delta 过少，可能响应没解析完');
+      expect(events.any((ChatEvent e) => e.kind == ChatEventKind.done), isTrue, reason: '必须有 done');
     }
 
     // 流尾 done：当前 Rust 在“搜到内容”路径上会停住不发 done（已在上面 T106_WARN 打印）。
@@ -186,6 +193,27 @@ void main() {
     final String text = toolFailureText(result.errorCode, fallback: result.toolSummary);
     expect(text, contains('参数'));
     expect(text.contains('BAD_ARGS'), isFalse);
+  }, timeout: const Timeout(Duration(minutes: 2)));
+
+  test('空结果路径（不种记忆）也要有 done', () async {
+    if (fakeSse == null || dll == null || envDll.isEmpty) {
+      markTestSkipped('需要 YUNONG_CORE_DLL 与 fake_sse 产物');
+      return;
+    }
+    final Directory dbDir = Directory.systemTemp.createTempSync('t110-empty');
+    addTearDown(() => dbDir.deleteSync(recursive: true));
+
+    final List<String> raw = await _runOnce(
+      port: 18821,
+      mode: 'tool',
+      dbDir: '${dbDir.path}/yunong.db',
+    );
+    final List<ChatEvent> events = raw.map(ChatEvent.fromJsonString).toList();
+    final ChatEvent result = events.firstWhere((ChatEvent e) => e.kind == ChatEventKind.toolResult);
+    expect(result.toolOk, isTrue);
+    expect(result.toolSummary, contains('没搜到'), reason: '空库应走“没搜到”路径');
+    expect(events.any((ChatEvent e) => e.kind == ChatEventKind.done), isTrue,
+        reason: '空结果路径也必须有 done');
   }, timeout: const Timeout(Duration(minutes: 2)));
 }
 
