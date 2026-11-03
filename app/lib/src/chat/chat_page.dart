@@ -13,12 +13,14 @@ import '../theme/glass_panel.dart';
 import '../theme/yunong_tokens.dart';
 
 import '../core/app_paths.dart';
+import '../core/auth_service.dart';
 import '../core/chat_service.dart';
 import '../core/local_search_service.dart';
 import '../core/memory_service.dart';
 import '../core/search_service.dart';
 import '../core/secret_service.dart';
 import '../memory/memory_page.dart';
+import 'chat_top_bar.dart';
 
 /// 会话设置（MVP：密钥只在内存里，进程退出即失效）。
 ///
@@ -57,6 +59,7 @@ class ChatPage extends StatefulWidget {
     this.localSearchService,
     this.memoryService,
     this.keyValidator,
+    this.authService,
     this.dbPath = '',
   });
 
@@ -70,6 +73,8 @@ class ChatPage extends StatefulWidget {
   /// 保存前的 Key 轻校验（默认真的请求上游 `/models`；测试可注入）。
   /// 返回 null = 可用；否则返回可读错误文案。
   final Future<String?> Function(String apiKey)? keyValidator;
+
+  final AuthService? authService;
   final String dbPath;
 
   @override
@@ -82,6 +87,7 @@ class _ChatPageState extends State<ChatPage> {
   late final SecretService _secrets =
       widget.secretService ?? SecretService(dbPath: widget.dbPath);
   SecretStatus _keyStatus = const SecretStatus(set: false, masked: '');
+  late final AuthService _auth = widget.authService ?? AuthService();
   late final SearchService _search =
       widget.searchService ?? SearchService(dbPath: widget.dbPath);
   SearchStatus _searchStatus = const SearchStatus.unknown();
@@ -144,10 +150,10 @@ class _ChatPageState extends State<ChatPage> {
       return (ready: false, reason: '未设置 API Key：点右上角设置填入', code: 'MISSING_API_KEY');
     }
     if (_channel == 'cloud') {
-      if (_settings.cloudToken.isNotEmpty) {
+      if (_auth.signedIn || _settings.cloudToken.isNotEmpty) {
         return (ready: true, reason: '', code: '');
       }
-      return (ready: false, reason: '套餐未登录：请先在设置里填写访问令牌', code: 'MISSING_ACCESS_TOKEN');
+      return (ready: false, reason: '请先登录套餐账号', code: 'NOT_SIGNED_IN');
     }
     return (ready: false, reason: '未选择对话通道', code: 'NO_CHANNEL');
   }
@@ -299,6 +305,63 @@ class _ChatPageState extends State<ChatPage> {
     });
   }
 
+  Future<void> _signInCloud() async {
+    final result = await showDialog<({String email, String password})>(
+      context: context,
+      builder: (BuildContext context) => const _CloudLoginDialog(),
+    );
+    if (result == null || !mounted) {
+      return;
+    }
+    try {
+      await _auth.signIn(email: result.email, password: result.password);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _channel = 'cloud';
+        _error = null;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已登录套餐账号 ${_auth.maskedEmail}')),
+      );
+    } on AuthException catch (failure) {
+      _showError(failure.userHint);
+    } on Object {
+      _showError('登录失败，请稍后重试');
+    }
+  }
+
+  Future<void> _signOutCloud() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        backgroundColor: Theme.of(context).colorScheme.surface,
+        surfaceTintColor: Colors.transparent,
+        title: const Text('退出套餐账号？'),
+        content: Text('将退出 ${_auth.maskedEmail}，本机令牌会被清除。'),
+        actions: <Widget>[
+          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.of(context).pop(true), child: const Text('退出')),
+        ],
+      ),
+    );
+    if (confirmed != true) {
+      return;
+    }
+    await _auth.signOut();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      if (_channel == 'cloud') {
+        _channel = 'byok';
+      }
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已退出套餐账号')),
+    );
+  }
   /// 查询搜索来源：未配置时 UI **必须**常驻提示（禁止静默降级）。
   /// 本地资料检索：结果**只来自本机**（与联网搜索区分，不混淆）。
   Future<void> _runLocalSearch() async {
@@ -477,6 +540,10 @@ class _ChatPageState extends State<ChatPage> {
         settings: _settings,
         searchLabel: _searchStatus.display,
         searchHint: _searchStatus.available ? '' : _searchStatus.hint,
+        accountLabel: _auth.signedIn ? _auth.maskedEmail : '未登录',
+        signedIn: _auth.signedIn,
+        onSignIn: _signInCloud,
+        onSignOut: _signOutCloud,
       ),
     );
     if (result != null && mounted) {
@@ -502,64 +569,26 @@ class _ChatPageState extends State<ChatPage> {
     final theme = Theme.of(context);
     return Column(
       children: <Widget>[
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-          child: Row(
-            children: <Widget>[
-              SegmentedButton<String>(
-                segments: const <ButtonSegment<String>>[
-                  ButtonSegment<String>(value: 'byok', label: Text('BYOK 直连')),
-                  ButtonSegment<String>(value: 'cloud', label: Text('套餐通道')),
-                ],
-                selected: <String>{_channel},
-                onSelectionChanged: (Set<String> value) {
-                  setState(() => _channel = value.first);
-                  unawaited(_refreshSearchStatus());
-                },
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  _streaming
-                      ? '正在生成…'
-                      : (_channelState.ready ? '就绪' : _channelState.reason),
-                  style: theme.textTheme.bodySmall,
-                ),
-              ),
-              if (_promptTokens != null || _completionTokens != null)
-                Text(
-                  '用量 ${_promptTokens ?? '-'} / ${_completionTokens ?? '-'}',
-                  style: theme.textTheme.bodySmall,
-                ),
-              Text('搜索 ${_searchStatus.display}',
-                  style: theme.textTheme.bodySmall),
-              if (_channel == 'byok')
-                Text('Key ${_keyStatus.display}',
-                    style: theme.textTheme.bodySmall),
-              if (_channel == 'byok' && _keyStatus.set)
-                IconButton(
-                  tooltip: '删除已保存的 Key',
-                  onPressed: _deleteKey,
-                  icon: const Icon(Icons.key_off_outlined, size: 18),
-                ),
-              IconButton(
-                tooltip: '搜索本地资料（只查本机，不联网）',
-                onPressed: () =>
-                    setState(() => _localPanelOpen = !_localPanelOpen),
-                icon: const Icon(Icons.manage_search, size: 20),
-              ),
-              IconButton(
-                tooltip: '记忆',
-                onPressed: _openMemory,
-                icon: const Icon(Icons.memory, size: 20),
-              ),
-              IconButton(
-                tooltip: '设置',
-                onPressed: _openSettings,
-                icon: const Icon(Icons.settings_outlined),
-              ),
-            ],
-          ),
+        ChatTopBar(
+          channel: _channel,
+          onChannelChanged: (String value) {
+            setState(() => _channel = value);
+            unawaited(_refreshSearchStatus());
+          },
+          statusLabel: _streaming
+              ? '正在生成…'
+              : (_channelState.ready ? '就绪' : _channelState.reason),
+          searchLabel: _searchStatus.display,
+          keyLabel: _keyStatus.display,
+          keyDegraded: _keyStatus.degraded,
+          signedIn: _auth.signedIn,
+          accountLabel: _auth.signedIn ? _auth.maskedEmail : '未登录',
+          onLocalSearch: () => setState(() => _localPanelOpen = !_localPanelOpen),
+          onMemory: () => unawaited(_openMemory()),
+          onSettings: () => unawaited(_openSettings()),
+          onSignIn: () => unawaited(_signInCloud()),
+          onSignOut: () => unawaited(_signOutCloud()),
+          onDeleteKey: _keyStatus.set ? () => unawaited(_deleteKey()) : null,
         ),
         if (_keyStatus.degraded)
           Padding(
@@ -834,14 +863,23 @@ class _MessageBubble extends StatelessWidget {
 
 /// 设置对话框：Key 输入框 `obscureText`，**不回显**已保存的值。
 class _SettingsDialog extends StatefulWidget {
-  const _SettingsDialog(
-      {required this.settings,
-      required this.searchLabel,
-      required this.searchHint});
+  const _SettingsDialog({
+    required this.settings,
+    required this.searchLabel,
+    required this.searchHint,
+    this.accountLabel = '',
+    this.signedIn = false,
+    this.onSignIn,
+    this.onSignOut,
+  });
 
   final ChatSettings settings;
   final String searchLabel;
   final String searchHint;
+  final String accountLabel;
+  final bool signedIn;
+  final Future<void> Function()? onSignIn;
+  final Future<void> Function()? onSignOut;
 
   @override
   State<_SettingsDialog> createState() => _SettingsDialogState();
@@ -885,6 +923,22 @@ class _SettingsDialogState extends State<_SettingsDialog> {
             Align(
               alignment: Alignment.centerLeft,
               child: Text('联网搜索：${widget.searchLabel}'),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: <Widget>[
+                Expanded(child: Text('套餐账号：${widget.accountLabel}')),
+                TextButton(
+                  onPressed: () async {
+                    if (widget.signedIn) {
+                      await widget.onSignOut?.call();
+                    } else {
+                      await widget.onSignIn?.call();
+                    }
+                  },
+                  child: Text(widget.signedIn ? '退出' : '登录'),
+                ),
+              ],
             ),
             if (widget.searchHint.isNotEmpty)
               Padding(
@@ -972,6 +1026,68 @@ class _SettingsDialogState extends State<_SettingsDialog> {
             Navigator.of(context).pop(widget.settings);
           },
           child: const Text('保存'),
+        ),
+      ],
+    );
+  }
+}
+
+/// 套餐账号登录对话框（邮箱 + 密码；密码不回显）。
+class _CloudLoginDialog extends StatefulWidget {
+  const _CloudLoginDialog();
+
+  @override
+  State<_CloudLoginDialog> createState() => _CloudLoginDialogState();
+}
+
+class _CloudLoginDialogState extends State<_CloudLoginDialog> {
+  final TextEditingController _email = TextEditingController();
+  final TextEditingController _password = TextEditingController();
+
+  @override
+  void dispose() {
+    _email.dispose();
+    _password.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      surfaceTintColor: Colors.transparent,
+      scrollable: true,
+      title: const Text('登录套餐账号'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          TextField(
+            controller: _email,
+            keyboardType: TextInputType.emailAddress,
+            decoration: const InputDecoration(labelText: '邮箱'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _password,
+            obscureText: true,
+            enableSuggestions: false,
+            autocorrect: false,
+            decoration: const InputDecoration(labelText: '密码'),
+          ),
+        ],
+      ),
+      actions: <Widget>[
+        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('取消')),
+        FilledButton(
+          onPressed: () {
+            final email = _email.text.trim();
+            final password = _password.text;
+            if (email.isEmpty || password.isEmpty) {
+              return;
+            }
+            Navigator.of(context).pop((email: email, password: password));
+          },
+          child: const Text('登录'),
         ),
       ],
     );

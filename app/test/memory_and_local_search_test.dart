@@ -202,7 +202,9 @@ void main() {
       ));
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byIcon(Icons.manage_search));
+      await tester.tap(find.byIcon(Icons.more_vert));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('搜索本地资料（不联网）'));
       await tester.pumpAndSettle();
       expect(find.textContaining('本地资料（只查这台设备，不联网）'), findsOneWidget);
 
@@ -231,7 +233,9 @@ void main() {
         ),
       ));
       await tester.pumpAndSettle();
-      await tester.tap(find.byIcon(Icons.manage_search));
+      await tester.tap(find.byIcon(Icons.more_vert));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('搜索本地资料（不联网）'));
       await tester.pumpAndSettle();
       await tester.enterText(find.widgetWithText(TextField, '搜索本机记忆/资料…'), '不存在的词');
       await tester.tap(find.text('搜索'));
@@ -254,7 +258,9 @@ void main() {
         ),
       ));
       await tester.pumpAndSettle();
-      await tester.tap(find.byIcon(Icons.manage_search));
+      await tester.tap(find.byIcon(Icons.more_vert));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('搜索本地资料（不联网）'));
       await tester.pumpAndSettle();
       await tester.enterText(find.widgetWithText(TextField, '搜索本机记忆/资料…'), 'x');
       await tester.tap(find.text('搜索'));

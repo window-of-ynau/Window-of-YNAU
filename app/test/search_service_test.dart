@@ -108,7 +108,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.textContaining('未配置联网搜索'), findsOneWidget);
-      expect(find.textContaining('搜索 未配置'), findsOneWidget);
+      // 顶栏已改为图标 + tooltip；用 Tooltip 文案断言搜索来源可见\n      expect(find.byTooltip(RegExp('搜索：未配置')), findsOneWidget);
       // 不谎称已搜索
       expect(find.textContaining('已搜索'), findsNothing);
     });
@@ -127,7 +127,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // 默认协议是 openai_completions → 我方代理；切到 Responses 才是内置
-      expect(find.textContaining('搜索 我方代理'), findsOneWidget);
+      expect(find.byTooltip(RegExp('搜索：我方代理')), findsOneWidget);
       expect(find.textContaining('未配置联网搜索'), findsNothing);
     });
   });
