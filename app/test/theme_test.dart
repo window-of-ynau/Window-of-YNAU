@@ -127,7 +127,7 @@ void main() {
       final YunongTokens after =
           Theme.of(tester.element(find.byType(HomeShell))).extension<YunongTokens>()!;
       expect(after.accent, const Color(0xFFA9583E), reason: 'C 主题的强调色应立刻生效');
-      expect(after.canvas, const Color(0xFFFAF9F5));
+      expect(after.canvas, const Color(0xFFF5F4ED));
       expect(identical(tester.element(find.byType(HomeShell)), shellBefore), isTrue,
           reason: '换主题不应重建 HomeShell（状态不能丢）');
       expect(find.byType(BackdropFilter), findsNothing);
@@ -363,6 +363,53 @@ void main() {
       await tester.pumpAndSettle();
       // 书页排版下每条用户消息都有"你 · 提问"小标签（空对话时不出现，这里只断言不崩）
       expect(find.byType(PaperTexture), findsOneWidget);
+    });
+  });
+
+  group('t76：13 级字阶 / 环形阴影 / 空态编排', () {
+    test('A 与 C 的字阶是同一套 13 级结构，但 display 级不同', () {
+      final TextTheme a = buildTheme(AppThemeId.minimalBlack, Brightness.light).textTheme;
+      final TextTheme c = buildTheme(AppThemeId.paperCoral, Brightness.light).textTheme;
+      // 13 级都应有值
+      final List<double?> sizes = <double?>[
+        a.displayLarge?.fontSize, a.displayMedium?.fontSize, a.displaySmall?.fontSize,
+        a.headlineLarge?.fontSize, a.headlineMedium?.fontSize, a.headlineSmall?.fontSize,
+        a.titleLarge?.fontSize, a.titleMedium?.fontSize, a.titleSmall?.fontSize,
+        a.bodyLarge?.fontSize, a.bodyMedium?.fontSize, a.bodySmall?.fontSize,
+        a.labelSmall?.fontSize,
+      ];
+      expect(sizes.every((double? s) => s != null && s > 0), isTrue, reason: '$sizes');
+      expect(a.displaySmall!.fontSize, 30);
+      expect(c.displaySmall!.fontSize, 38, reason: 'C 的 display 更大（38 vs 15.5 正文）');
+      expect(c.displaySmall!.fontSize! / c.bodyMedium!.fontSize!, greaterThan(2.2));
+    });
+
+    testWidgets('A 主题空态有问候语 + 建议 chip + 状态行', (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1100, 760));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final ThemeController controller = ThemeController();
+      await tester.pumpWidget(YunongApp(themeController: controller));
+      await tester.pumpAndSettle();
+      expect(find.text('今天想从哪儿开始？'), findsOneWidget);
+      expect(find.text('第 8 周哪天最累？'), findsOneWidget);
+      expect(find.textContaining('课表已同步'), findsOneWidget);
+    });
+
+    testWidgets('C 主题空态有 overline + 深色引文块', (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1100, 760));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final ThemeController controller = ThemeController(initialTheme: AppThemeId.paperCoral);
+      await tester.pumpWidget(YunongApp(themeController: controller));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('本地优先'), findsOneWidget);
+      expect(find.textContaining('选损失更小的那门'), findsOneWidget);
+    });
+
+    test('环形阴影是 spreadRadius=1 / blurRadius=0（不是 Border）', () {
+      final List<BoxShadow> ring = ringShadow(const Color(0xFFE6DFD8));
+      expect(ring, hasLength(1));
+      expect(ring.first.spreadRadius, 1);
+      expect(ring.first.blurRadius, 0);
     });
   });
 }

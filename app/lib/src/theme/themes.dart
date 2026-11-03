@@ -51,6 +51,8 @@ YunongTokens _tokensA(Brightness brightness) {
     metaSize: 11,
     bodyHeight: 1.72,
     metaLetterSpacing: 0.8,
+    displaySize: 30,
+    overlineSize: 10,
     titleWeight: FontWeight.w600,
     strongWeight: FontWeight.w700,
     // A 的"层级"靠线与字重，不靠投影
@@ -189,9 +191,10 @@ YunongTokens _tokensC(Brightness brightness) {
   final bool dark = brightness == Brightness.dark;
   return YunongTokens(
     // 纸色（Claude 公开参数 #faf9f5 / #f5f0e8 / #e8e0d2）
-    canvas: dark ? const Color(0xFF1A1611) : const Color(0xFFFAF9F5),
-    surface: dark ? const Color(0xFF241E17) : const Color(0xFFFFFEFC),
-    surfaceAlt: dark ? const Color(0xFF2E271E) : const Color(0xFFF5F0E8),
+    // 羊皮纸画布：比卡片暗一档，卡片才会浮在纸上
+    canvas: dark ? const Color(0xFF1A1611) : const Color(0xFFF5F4ED),
+    surface: dark ? const Color(0xFF241E17) : const Color(0xFFFAF9F5),
+    surfaceAlt: dark ? const Color(0xFF2E271E) : const Color(0xFFEFEEE4),
     ink: dark ? const Color(0xFFF0E6D8) : const Color(0xFF141413),
     inkSoft: dark ? const Color(0xFFB9A88E) : const Color(0xFF6C6A64),
     inkFaint: dark ? const Color(0xFF8A7A64) : const Color(0xFF8E8B82),
@@ -225,10 +228,13 @@ YunongTokens _tokensC(Brightness brightness) {
     bodySize: 15,
     metaSize: 11.5,
     // 中文需要比英文（1.55）更大的行距
-    bodyHeight: 1.85,
+    // Anthropic 用 1.60（之前 1.85 太松，读起来散）
+    bodyHeight: 1.6,
     metaLetterSpacing: 0.8,
-    // 衬线只用 400 字重（加粗即失真）
-    titleWeight: FontWeight.w400,
+    displaySize: 38,
+    overlineSize: 10,
+    // 衬线固定 500（Anthropic 的单字重是刻意的；400 偏软）
+    titleWeight: FontWeight.w500,
     strongWeight: FontWeight.w600,
     // 零阴影：层次靠色块与留白
     shadowPanel: const <BoxShadow>[],
@@ -306,23 +312,44 @@ ThemeData buildTheme(
     );
   }
 
+  // 13 级字阶（10 → 64）：display / h1 / h2 / h3 / title / bodyL / body / bodyS / label / overline / caption / micro / displayLarge
+  // 之前只有 4~5 级，是"单调"的结构原因——层级少，页面就只能靠留白，而留白一多就是空。
   final TextTheme text = base.textTheme.copyWith(
-    displaySmall: scaled(base.textTheme.displaySmall, t.titleSize + 8, t.titleWeight, 1.25),
-    headlineSmall: scaled(base.textTheme.headlineSmall, t.titleSize + 2, t.titleWeight, 1.3),
-    titleLarge: scaled(base.textTheme.titleLarge, t.titleSize, t.titleWeight, 1.3),
+    displayLarge: scaled(base.textTheme.displayLarge, 64, t.titleWeight, 1.05),
+    displayMedium: scaled(base.textTheme.displayMedium, 52, t.titleWeight, 1.1),
+    displaySmall: scaled(base.textTheme.displaySmall, t.displaySize, t.titleWeight, 1.16),
+    headlineLarge: scaled(base.textTheme.headlineLarge, t.titleSize + 9, t.titleWeight, 1.2),
+    headlineMedium: scaled(base.textTheme.headlineMedium, t.titleSize + 4, t.titleWeight, 1.25),
+    headlineSmall: scaled(base.textTheme.headlineSmall, t.titleSize, t.titleWeight, 1.28),
+    titleLarge: scaled(base.textTheme.titleLarge, t.bodySize + 3, t.titleWeight, 1.32),
     titleMedium: scaled(base.textTheme.titleMedium, t.bodySize + 1, t.titleWeight, 1.35),
-    bodyMedium: scaled(base.textTheme.bodyMedium, t.bodySize, FontWeight.w400, t.bodyHeight).copyWith(color: t.bodyText),
+    titleSmall: scaled(base.textTheme.titleSmall, t.bodySize, t.strongWeight, 1.4),
     bodyLarge: scaled(base.textTheme.bodyLarge, t.bodySize + 1, FontWeight.w400, t.bodyHeight).copyWith(color: t.bodyText),
-    bodySmall: scaled(base.textTheme.bodySmall, t.metaSize + 1, FontWeight.w400, 1.45),
-    labelSmall: scaled(base.textTheme.labelSmall, t.metaSize, FontWeight.w700, 1.4)
-        .copyWith(letterSpacing: t.metaLetterSpacing),
+    bodyMedium: scaled(base.textTheme.bodyMedium, t.bodySize, FontWeight.w400, t.bodyHeight).copyWith(color: t.bodyText),
+    bodySmall: scaled(base.textTheme.bodySmall, t.metaSize + 1, FontWeight.w400, 1.5),
     labelLarge: scaled(base.textTheme.labelLarge, t.bodySize - 1, t.strongWeight, 1.2),
-  ).apply(
+    labelMedium: scaled(base.textTheme.labelMedium, t.metaSize, FontWeight.w500, 1.3),
+    labelSmall: scaled(base.textTheme.labelSmall, t.overlineSize, FontWeight.w600, 1.3)
+        .copyWith(letterSpacing: t.metaLetterSpacing),  ).apply(bodyColor: t.ink, displayColor: t.ink);
+
+  // **衬线只给标题层**（display/headline/title），正文与控件保持无衬线。
+  // 之前对整个 textTheme apply(serif) 会把正文也变成宋体——那是"书卷气"变成"老气"的原因。
+  final TextTheme serifText = text.apply(
     fontFamily: t.displayFontFamily,
     fontFamilyFallback: serifFallback,
-    bodyColor: t.ink,
-    displayColor: t.ink,
   );
+  final TextTheme finalText = t.displayFontFamily == null
+      ? text
+      : text.copyWith(
+          displayLarge: serifText.displayLarge,
+          displayMedium: serifText.displayMedium,
+          displaySmall: serifText.displaySmall,
+          headlineLarge: serifText.headlineLarge,
+          headlineMedium: serifText.headlineMedium,
+          headlineSmall: serifText.headlineSmall,
+          titleLarge: serifText.titleLarge,
+          titleMedium: serifText.titleMedium,
+        );
 
   return base.copyWith(
     colorScheme: scheme,
@@ -331,8 +358,8 @@ ThemeData buildTheme(
     canvasColor: t.canvas,
     cardColor: t.surface,
     dividerColor: t.hairline,
-    textTheme: text,
-    primaryTextTheme: text,
+    textTheme: finalText,
+    primaryTextTheme: finalText,
     extensions: <ThemeExtension<dynamic>>[t],
     appBarTheme: AppBarTheme(
       backgroundColor: t.glass == null ? t.canvas : t.surface,
@@ -340,7 +367,7 @@ ThemeData buildTheme(
       elevation: t.appBarElevation,
       scrolledUnderElevation: 0,
       centerTitle: false,
-      titleTextStyle: text.titleLarge,
+      titleTextStyle: finalText.titleLarge,
       iconTheme: IconThemeData(color: t.ink),
     ),
     drawerTheme: DrawerThemeData(backgroundColor: t.canvas, surfaceTintColor: t.surface),
@@ -359,7 +386,7 @@ ThemeData buildTheme(
         foregroundColor: t.ctaFg,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(t.radiusS)),
         minimumSize: const Size(0, 36),
-        textStyle: text.labelLarge,
+        textStyle: finalText.labelLarge,
       ),
     ),
     outlinedButtonTheme: OutlinedButtonThemeData(
@@ -368,14 +395,14 @@ ThemeData buildTheme(
         side: BorderSide(color: t.controlBorder, width: t.borderWidth),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(t.radiusS)),
         minimumSize: const Size(0, 36),
-        textStyle: text.labelLarge,
+        textStyle: finalText.labelLarge,
       ),
     ),
     textButtonTheme: TextButtonThemeData(
       style: TextButton.styleFrom(
         foregroundColor: t.ink,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(t.radiusS)),
-        textStyle: text.labelLarge,
+        textStyle: finalText.labelLarge,
       ),
     ),
     switchTheme: SwitchThemeData(

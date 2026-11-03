@@ -188,23 +188,27 @@ class _HomeShellState extends State<HomeShell> {
         ],
       ),
       drawer: Drawer(
+        // 分组侧栏（t76 视觉新增）：上组「功能」、下组「校园 · N」。
+        // 只改分组标签与密度；「设置」入口仍统一走 AppBar 的齿轮（不回退 main 的统一入口）。
         child: ListView(
+          padding: const EdgeInsets.only(top: 8, bottom: 12),
           children: <Widget>[
-            const DrawerHeader(
-              child: Align(
-                alignment: Alignment.bottomLeft,
-                child: Text('云农之窗', style: TextStyle(fontSize: 22)),
-              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 20, 18, 8),
+              child: Text('云农之窗', style: Theme.of(context).textTheme.headlineSmall),
             ),
+            const _DrawerSectionLabel(text: '功能'),
             ListTile(
+              dense: true,
               leading: const Icon(Icons.chat_bubble_outline),
               title: const Text('对话'),
               selected: _selected == 0,
               onTap: () => _select(0),
             ),
-            const Divider(),
+            _DrawerSectionLabel(text: '校园 · ${entries.length}'),
             for (var i = 0; i < entries.length; i++)
               ListTile(
+                dense: true,
                 leading: const Icon(Icons.school_outlined),
                 title: Text(entries[i].label),
                 selected: _selected == i + 1,
@@ -324,6 +328,25 @@ class _EntryPlaceholder extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// 抽屉里的分组小标题（overline 层：10px + 字距）。
+class _DrawerSectionLabel extends StatelessWidget {
+  const _DrawerSectionLabel({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final YunongTokens t = context.tokens;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(18, 14, 18, 4),
+      child: Text(
+        text,
+        style: Theme.of(context).textTheme.labelSmall?.copyWith(color: t.inkSoft),
       ),
     );
   }

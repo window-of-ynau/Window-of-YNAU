@@ -104,11 +104,15 @@ class YunongTokens extends ThemeExtension<YunongTokens> {
     Color? ctaBg,
     Color? ctaFg,
     Color? accentSoft,
+    double? displaySize,
+    double? overlineSize,
     this.bookLayout = false,
   })  : _bodyText = bodyText,
         _ctaBg = ctaBg,
         _ctaFg = ctaFg,
-        _accentSoft = accentSoft;
+        _accentSoft = accentSoft,
+        _displaySize = displaySize,
+        _overlineSize = overlineSize;
 
   // ── 1. 颜色（可变层） ───────────────────────────────────────────
   final Color canvas;
@@ -161,6 +165,16 @@ class YunongTokens extends ThemeExtension<YunongTokens> {
   final Color? _ctaBg;
   final Color? _ctaFg;
   final Color? _accentSoft;
+
+  /// 13 级字阶的顶部两级（其余由 titleSize/bodySize/metaSize 派生）。
+  /// display：A 用 30、C 用 38（大标题 vs 正文 15.5 = 2.45×，这是"书页"的对比来源）。
+  final double? _displaySize;
+
+  /// overline（10px + 0.5 字距）——Anthropic 的"过线标签"层。
+  final double? _overlineSize;
+
+  double get displaySize => _displaySize ?? titleSize + 12;
+  double get overlineSize => _overlineSize ?? 10;
 
   /// 书页排版：助手消息按"书页正文"渲染（无气泡）、用户消息按页边批注渲染。
   final bool bookLayout;
@@ -307,6 +321,8 @@ class YunongTokens extends ThemeExtension<YunongTokens> {
         ctaBg: _ctaBg,
         ctaFg: _ctaFg,
         accentSoft: _accentSoft,
+        displaySize: _displaySize,
+        overlineSize: _overlineSize,
         bookLayout: bookLayout,
         useDarkCoursePalette: useDarkCoursePalette,
         fast: fast,
@@ -360,6 +376,16 @@ class YunongTokens extends ThemeExtension<YunongTokens> {
     );
   }
 }
+
+/// 环形阴影：Anthropic 的   0 0 1px。
+///
+/// 选了 BoxShadow(spreadRadius: 1, blurRadius: 0) 而不是 Border，原因：
+/// ① 边框会占布局（影响内边距与 1px 抖动），阴影不占；
+/// ② 阴影天然跟随 orderRadius，圆角处不会出现边框"啃角"；
+/// ③ 换主题时只换颜色，不动布局。
+List<BoxShadow> ringShadow(Color color, {double width = 1}) => <BoxShadow>[
+      BoxShadow(color: color, spreadRadius: width, blurRadius: 0),
+    ];
 
 /// 取当前主题的 token。所有页面都通过它取视觉参数。
 ///
