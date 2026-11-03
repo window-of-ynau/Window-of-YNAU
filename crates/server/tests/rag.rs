@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -101,6 +101,22 @@ fn json_req(method: &str, uri: &str, body: Value, token: Option<&str>) -> Reques
 /// 64 位小写十六进制的假哈希（内容无所谓，只要格式合法）。
 fn fake_hash(seed: &str) -> String {
     sha256_hex(seed)
+}
+
+/// 轮询直到某条 `count(*)` 查询达到期望值（最多 5s）。
+///
+/// 为什么必须轮询：审计是**异步写**（`record_audit_detached` 里 `tokio::spawn`），
+/// HTTP 响应返回时那一行可能还没落库。本地常常抢在写之前跑完、CI 上却会输掉竞速
+/// （PR #39 的 pg job 就是这样红的）。固定 `sleep` 只是把竞态窗口挪小，不能消除。
+async fn wait_for_count(pool: &sqlx::PgPool, sql: &str, expected: i64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if common::count(pool, sql).await >= expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "5s 内没等到异步写入落库：{sql}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn current_month() -> String {
@@ -421,7 +437,14 @@ async fn pg_audit_records_counts_but_never_the_hash() {
         .await;
     assert_eq!(status, StatusCode::OK);
 
-    // 有一条 rag.referrals 审计，且 reason 里只有 accepted=N
+    // 有一条 rag.referrals 审计，且 reason 里只有 accepted=N。
+    // 审计是异步写 → 先轮询等它落库（不能直接断言，也不能 sleep 固定时长）。
+    wait_for_count(
+        &db.pool,
+        "SELECT count(*) FROM audit_logs WHERE action = 'rag.referrals' AND decision = 'allow'",
+        1,
+    )
+    .await;
     assert_eq!(
         common::count(
             &db.pool,
@@ -429,7 +452,7 @@ async fn pg_audit_records_counts_but_never_the_hash() {
         )
         .await,
         1,
-        "应留一条 allow 审计"
+        "只应留一条 allow 审计（多了说明重复写）"
     );
     assert_eq!(
         common::text_column(
@@ -642,6 +665,19 @@ async fn pg_audit_rows_distinguish_allow_and_deny() {
         .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 
+    // 审计异步写：allow 与 deny 各等一次落库（顺序不保证）
+    wait_for_count(
+        &db.pool,
+        "SELECT count(*) FROM audit_logs WHERE action = 'rag.referrals' AND decision = 'allow'",
+        1,
+    )
+    .await;
+    wait_for_count(
+        &db.pool,
+        "SELECT count(*) FROM audit_logs WHERE action = 'rag.referrals' AND decision = 'deny'",
+        1,
+    )
+    .await;
     assert_eq!(
         common::count(
             &db.pool,
@@ -852,6 +888,4 @@ async fn pg_migration_0005_is_idempotent() {
     assert!(rejected.is_err(), "非法 status 应被 CHECK 约束拒绝");
 
     db.finish().await;
-    // 防未使用告警（Duration 在部分平台上没用到）
-    let _ = Duration::from_millis(0);
 }
