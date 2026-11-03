@@ -47,6 +47,11 @@ pub struct SecretStatus {
     pub masked: String,
     /// true = 本次只存在内存里（重启失效）
     pub degraded: bool,
+    /// true = **本地有密文但解不开**（R4-F3）：文件损坏 / DPAPI 换了用户上下文。
+    ///
+    /// 与 `set` 并存（`set: true, broken: true`）：语义是"记录在，但用不了"，
+    /// UI 该提示"本地凭据已损坏，请重新填写"，而不是显示一句矛盾的"未设置"。
+    pub broken: bool,
     pub reason: Option<String>,
 }
 
@@ -56,6 +61,7 @@ impl SecretStatus {
             set: false,
             masked: String::new(),
             degraded,
+            broken: false,
             reason,
         }
     }
@@ -131,6 +137,7 @@ impl KeyStore for MemoryKeyStore {
             set: true,
             masked: mask_secret(value),
             degraded: true,
+            broken: false,
             reason: self.reason.clone(),
         })
     }
@@ -145,6 +152,7 @@ impl KeyStore for MemoryKeyStore {
                 set: true,
                 masked: mask_secret(value),
                 degraded: true,
+                broken: false,
                 reason: self.reason.clone(),
             }),
             None => Ok(SecretStatus::unset(true, self.reason.clone())),
@@ -227,6 +235,16 @@ impl DpapiKeyStore {
         self.dir.join(format!("{key}.bin"))
     }
 
+    /// 试探密文能不能解开（**只用结果，不碰明文**：解出来的字节立刻丢弃）。
+    ///
+    /// 两种情况都算"坏"：密文文件不存在（meta 变孤儿）、DPAPI 解不开（换过用户上下文/文件损坏）。
+    fn ciphertext_is_readable(&self, key: &str) -> bool {
+        match std::fs::read(self.bin_path(key)) {
+            Ok(ciphertext) => dpapi::unprotect(&ciphertext).is_ok(),
+            Err(_) => false,
+        }
+    }
+
     fn meta_path(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{key}.json"))
     }
@@ -289,6 +307,7 @@ impl KeyStore for DpapiKeyStore {
             set: true,
             masked: mask_secret(value),
             degraded: false,
+            broken: false,
             reason: None,
         })
     }
@@ -297,7 +316,8 @@ impl KeyStore for DpapiKeyStore {
         if !valid_key(key) {
             return Err(SecretError::InvalidKey(key.to_owned()));
         }
-        // 只读元数据：不需要解密，也就没有明文泄漏面
+        // 元数据本身不解密（没有明文面）；但**要不要说"可用"**必须试探一次密文（R4-F3）：
+        // 只看 meta 会出现 "status 说 set=true / get_secret 说 set=false" 的自相矛盾。
         let meta = std::fs::read_to_string(self.meta_path(key)).ok();
         let memory = self.fallback.status(key)?;
         match meta {
@@ -311,10 +331,12 @@ impl KeyStore for DpapiKeyStore {
                             .map(str::to_owned)
                     })
                     .unwrap_or_default();
+                let set = !masked.is_empty();
                 Ok(SecretStatus {
-                    set: !masked.is_empty(),
+                    set,
                     masked,
                     degraded: false,
+                    broken: set && !self.ciphertext_is_readable(key),
                     reason: None,
                 })
             }
@@ -579,6 +601,43 @@ mod tests {
     }
 
     #[cfg(windows)]
+    /// R4-F3：密文损坏时 `status()` 必须说"有记录但解不开"（`set:true` + `broken:true`），
+    /// 而不是和 `load_raw` 给出互相矛盾的结论。
+    #[cfg(windows)]
+    #[test]
+    fn corrupt_ciphertext_reports_broken_not_just_set() {
+        let base =
+            std::env::temp_dir().join(format!("yunong-secret-broken-{}", uuid::Uuid::new_v4()));
+        let store = crate::secret::default_store(&base);
+        store
+            .set("byok_api_key", "sk-test-0123456789abcdef")
+            .unwrap();
+
+        // 好密文：set 且不 broken
+        let status = store.status("byok_api_key").unwrap();
+        assert!(status.set, "{status:?}");
+        assert!(!status.broken, "正常的凭据不该报 broken：{status:?}");
+
+        // 密文写坏：DPAPI 解不开
+        let bin = base.join("secrets").join("byok_api_key.bin");
+        std::fs::write(&bin, b"not-a-dpapi-blob").unwrap();
+        let status = store.status("byok_api_key").unwrap();
+        assert!(status.set, "记录还在，set 不该变 false");
+        assert!(status.broken, "解不开必须报 broken：{status:?}");
+        assert!(!status.masked.is_empty(), "掩码仍可用于展示");
+        // 明文确实取不出来（损坏时 `load_raw` 是 Err，不是 Ok(None)）
+        assert!(
+            store.load_raw("byok_api_key").is_err(),
+            "损坏的密文不该解出明文"
+        );
+
+        // 密文文件被删（meta 变孤儿）同样算坏
+        std::fs::remove_file(&bin).unwrap();
+        let status = store.status("byok_api_key").unwrap();
+        assert!(status.set && status.broken, "{status:?}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
     #[test]
     fn dpapi_roundtrip_on_windows() {
         let base = temp_base();

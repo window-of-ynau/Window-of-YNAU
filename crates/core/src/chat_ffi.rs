@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::Deserialize;
-use yunong_shared::{ChatMessage, ChatRequest, Chunk, ErrorCode, Protocol};
+use yunong_shared::{ChatMessage, ChatRequest, Chunk, ErrorCode, FinishReason, Protocol};
 
 use crate::gateway::ModelGateway;
 
@@ -303,7 +303,21 @@ pub fn run_stream(
     };
 
     match outcome {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // R5-F7：用户取消后必须补一帧终态，否则客户端停在"加载中"看不到结束。
+            //
+            // 语义说明（契约里没有 `finish: cancelled`，加它要动 shared，本次不加）：
+            // 补的是 `done(finish=stop)`——表示**本条流已结束**，不代表"模型正常说完"。
+            // 客户端自己发起的取消，它知道这是取消；这一帧只是让它能收尾。
+            if cancelled {
+                let terminal = serde_json::to_string(&Chunk::Done {
+                    finish: FinishReason::Stop,
+                })
+                .unwrap_or_else(|_| error_chunk_json(ErrorCode::Internal, "序列化失败"));
+                let _ = callback.call(terminal);
+            }
+            Ok(())
+        }
         Err(err) => {
             let (code, message) = map_core_error(err);
             let _ = callback.call(error_chunk_json(code, message));
@@ -349,6 +363,68 @@ mod tests {
             "messages": [{ "role": "user", "content": "你好" }]
         })
         .to_string()
+    }
+
+    /// R5-F7：取消之后必须补一帧终态（`done`），客户端才能离开"加载中"。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_emits_a_terminal_done_frame() {
+        fn delta(text: &str) -> String {
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "id": "c1",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "deepseek-chat",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": text },
+                        "finish_reason": serde_json::Value::Null
+                    }]
+                })
+            )
+        }
+        let server = crate::gateway::fake_server::FakeServer::start(
+            200,
+            "text/event-stream",
+            Vec::new(),
+            vec![
+                crate::gateway::fake_server::Step::Write(delta("你")),
+                crate::gateway::fake_server::Step::Write(delta("好")),
+                crate::gateway::fake_server::Step::Write("data: [DONE]\n\n".to_owned()),
+                crate::gateway::fake_server::Step::Close,
+            ],
+        )
+        .await;
+        let mut config = ChatRunConfig::parse(&byok_json("sk-test")).unwrap();
+        config.base_url = Some(server.base_url());
+
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&chunks);
+        // `run_stream` 自建 runtime，放到阻塞线程里跑
+        tokio::task::spawn_blocking(move || {
+            run_stream(config, move |json| {
+                let mut guard = sink.lock().unwrap();
+                guard.push(json);
+                // 收到第 1 条（meta）就取消：模拟用户点了"停止"
+                guard.len() > 1
+            })
+            .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let chunks = chunks.lock().unwrap().clone();
+        assert!(!chunks.is_empty(), "至少要有 meta");
+        let last: serde_json::Value =
+            serde_json::from_str(chunks.last().expect("取消后应有终帧")).unwrap();
+        assert_eq!(
+            last["type"], "done",
+            "取消后最后一条必须是终帧，实际：{last}"
+        );
+        assert_eq!(last["finish"], "stop");
+        // 取消之前的 chunk 照常到达
+        assert!(chunks.len() >= 2, "{chunks:?}");
     }
 
     #[test]
