@@ -20,26 +20,17 @@ import '../core/memory_service.dart';
 import '../core/search_service.dart';
 import '../core/secret_service.dart';
 import '../memory/memory_page.dart';
+import 'chat_settings_section.dart';
+
+// `ChatSettings` 已随设置面板搬到 `chat_settings_section.dart`；这里 re-export，
+// 保持既有调用方/测试的 `import chat_page.dart` 不变（纯搬迁，行为不变）。
+export 'chat_settings_section.dart' show ChatSettings;
 import 'chat_top_bar.dart';
 
 /// 会话设置（MVP：密钥只在内存里，进程退出即失效）。
 ///
 /// 下一步（t34 之后）：接 Rust keystore 的 `yunong_set/get_secret`，
 /// 让 Key 落到系统安全存储、永不回显。本轮的 UI 已经按"不回显"设计。
-class ChatSettings {
-  String channel = 'byok';
-
-  /// 上游提供方（架构预留：加 OpenAI / 自建网关只需加枚举值）。
-  String providerId = 'deepseek';
-
-  /// 该提供方的 OpenAI 兼容 base url（BYOK 直连用）。
-  String baseUrl = 'https://api.deepseek.com';
-  String byokKey = '';
-  String cloudToken = '';
-  String model = 'deepseek-chat';
-  String protocol = 'openai_completions';
-}
-
 /// 一条气泡。
 class ChatBubble {
   ChatBubble({required this.fromUser, required this.text});
@@ -586,7 +577,7 @@ class _ChatPageState extends State<ChatPage> {
     }
     final result = await showDialog<ChatSettings>(
       context: context,
-      builder: (BuildContext context) => _SettingsDialog(
+      builder: (BuildContext context) => ChatSettingsSection(
         settings: _settings,
         searchLabel: _searchStatus.display,
         searchHint: _searchStatus.available ? '' : _searchStatus.hint,
@@ -930,175 +921,6 @@ class _MessageBubble extends StatelessWidget {
 }
 
 /// 设置对话框：Key 输入框 `obscureText`，**不回显**已保存的值。
-class _SettingsDialog extends StatefulWidget {
-  const _SettingsDialog({
-    required this.settings,
-    required this.searchLabel,
-    required this.searchHint,
-    this.accountLabel = '',
-    this.signedIn = false,
-    this.onSignIn,
-    this.onSignOut,
-  });
-
-  final ChatSettings settings;
-  final String searchLabel;
-  final String searchHint;
-  final String accountLabel;
-  final bool signedIn;
-  final Future<void> Function()? onSignIn;
-  final Future<void> Function()? onSignOut;
-
-  @override
-  State<_SettingsDialog> createState() => _SettingsDialogState();
-}
-
-class _SettingsDialogState extends State<_SettingsDialog> {
-  late final TextEditingController _key =
-      TextEditingController(text: widget.settings.byokKey);
-  late final TextEditingController _token =
-      TextEditingController(text: widget.settings.cloudToken);
-  late final TextEditingController _model =
-      TextEditingController(text: widget.settings.model);
-  late String _protocol = widget.settings.protocol;
-  late String _channel = widget.settings.channel;
-
-  @override
-  void dispose() {
-    _key.dispose();
-    _token.dispose();
-    _model.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      // P0-2：任何主题都不透底——玻璃只用于外层装饰，表单必须实心可读
-      backgroundColor: Theme.of(context).colorScheme.surface,
-      surfaceTintColor: Colors.transparent,
-      scrollable: true,
-      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-      titlePadding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
-      contentPadding: const EdgeInsets.fromLTRB(24, 8, 24, 8),
-      actionsPadding: const EdgeInsets.fromLTRB(24, 8, 24, 16),
-      title: const Text('对话设置'),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            // 联网搜索来源：**诚实展示**（未配置时把提示也放进设置页）
-            Align(
-              alignment: Alignment.centerLeft,
-              child: Text('联网搜索：${widget.searchLabel}'),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: <Widget>[
-                Expanded(child: Text('套餐账号：${widget.accountLabel}')),
-                TextButton(
-                  onPressed: () async {
-                    if (widget.signedIn) {
-                      await widget.onSignOut?.call();
-                    } else {
-                      await widget.onSignIn?.call();
-                    }
-                  },
-                  child: Text(widget.signedIn ? '退出' : '登录'),
-                ),
-              ],
-            ),
-            if (widget.searchHint.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 4, bottom: 8),
-                child: Text(
-                  widget.searchHint,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              initialValue: _channel,
-              decoration: const InputDecoration(labelText: '通道'),
-              items: const <DropdownMenuItem<String>>[
-                DropdownMenuItem<String>(value: 'byok', child: Text('BYOK 直连')),
-                DropdownMenuItem<String>(value: 'cloud', child: Text('套餐通道')),
-              ],
-              onChanged: (String? value) =>
-                  setState(() => _channel = value ?? _channel),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _model,
-              decoration: const InputDecoration(labelText: '模型'),
-            ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              initialValue: _protocol,
-              decoration: const InputDecoration(labelText: '协议'),
-              items: const <DropdownMenuItem<String>>[
-                DropdownMenuItem<String>(
-                    value: 'openai_completions',
-                    child: Text('OpenAI Completions')),
-                DropdownMenuItem<String>(
-                    value: 'openai_responses', child: Text('OpenAI Responses')),
-                DropdownMenuItem<String>(
-                    value: 'anthropic_messages',
-                    child: Text('Anthropic Messages')),
-              ],
-              onChanged: (String? value) =>
-                  setState(() => _protocol = value ?? _protocol),
-            ),
-            const SizedBox(height: 20),
-            const Divider(height: 1),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _key,
-              obscureText: true,
-              enableSuggestions: false,
-              autocorrect: false,
-              decoration: const InputDecoration(
-                labelText: 'BYOK API Key',
-                hintText: 'sk-…',
-                helperText: '填到域名即可，带不带 /v1 都行；只保存在本机，不回显、不进日志',
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _token,
-              obscureText: true,
-              enableSuggestions: false,
-              autocorrect: false,
-              decoration: const InputDecoration(
-                labelText: '套餐访问令牌',
-                helperText: '套餐通道用；没有就留空',
-              ),
-            ),
-          ],
-        ),
-      ),
-      actions: <Widget>[
-        TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('取消')),
-        FilledButton(
-          onPressed: () {
-            widget.settings
-              ..channel = _channel
-              ..model = _model.text.trim().isEmpty
-                  ? 'deepseek-chat'
-                  : _model.text.trim()
-              ..protocol = _protocol
-              ..byokKey = _key.text.trim()
-              ..cloudToken = _token.text.trim();
-            Navigator.of(context).pop(widget.settings);
-          },
-          child: const Text('保存'),
-        ),
-      ],
-    );
-  }
-}
 
 /// 套餐账号登录对话框（邮箱 + 密码；密码不回显）。
 class _CloudLoginDialog extends StatefulWidget {
