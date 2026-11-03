@@ -8,7 +8,7 @@
 import 'package:flutter/material.dart';
 
 /// 工具调用状态。
-enum ToolCallStatus { running, ok, failed }
+enum ToolCallStatus { running, ok, failed, cancelled }
 
 /// 工具调用卡片。
 class ToolCallCard extends StatefulWidget {
@@ -58,8 +58,12 @@ class _ToolCallCardState extends State<ToolCallCard> {
     final ColorScheme scheme = theme.colorScheme;
     final bool failed = widget.status == ToolCallStatus.failed;
     final bool running = widget.status == ToolCallStatus.running;
+    // t104：取消 ≠ 失败——用户主动停止，用中性色而不是红色错误
+    final bool cancelled = widget.status == ToolCallStatus.cancelled;
 
-    final Color statusColor = failed ? scheme.error : (running ? scheme.primary : scheme.onSurfaceVariant);
+    final Color statusColor = failed
+        ? scheme.error
+        : (running ? scheme.primary : scheme.onSurfaceVariant);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Material(
@@ -94,22 +98,24 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       ),
                     ),
                     Text(
-                      failed
-                          ? '失败'
-                          : running
-                              ? '进行中…'
-                              : (widget.summary ?? '已完成'),
+                      cancelled
+                          ? '已取消'
+                          : failed
+                              ? '失败'
+                              : running
+                                  ? '进行中…'
+                                  : (widget.summary ?? '已完成'),
                       style: theme.textTheme.bodySmall?.copyWith(color: statusColor),
                     ),
                     Icon(_expanded ? Icons.expand_less : Icons.expand_more, size: 18, color: scheme.onSurfaceVariant),
                   ],
                 ),
-                if (failed && widget.errorText != null)
+                if ((failed || cancelled) && widget.errorText != null)
                   Padding(
                     padding: const EdgeInsets.only(top: 4, left: 24),
                     child: Text(
                       widget.errorText!,
-                      style: theme.textTheme.bodySmall?.copyWith(color: scheme.error),
+                      style: theme.textTheme.bodySmall?.copyWith(color: failed ? scheme.error : scheme.onSurfaceVariant),
                     ),
                   ),
                 if (_expanded && widget.args != null && widget.args!.isNotEmpty)
@@ -142,5 +148,28 @@ class _ToolCallCardState extends State<ToolCallCard> {
       return '';
     }
     return '(${match.group(1)}=${match.group(2)})';
+  }
+}
+
+/// 工具失败码 → 中文可读文案（t104）。
+///
+/// Rust 侧会返回 `TIMEOUT / BAD_ARGS / NOT_ALLOWED / CANCELLED / ROUND_LIMIT / TOOL_ERROR`；
+/// **不要把英文码直接显示给用户**。`CANCELLED` 单独文案（用户主动停止，不是失败）。
+String toolFailureText(String? code, {String? fallback}) {
+  switch (code) {
+    case 'TIMEOUT':
+      return '工具执行超时，已放弃本次结果';
+    case 'BAD_ARGS':
+      return '工具参数不合法，本次调用未执行';
+    case 'NOT_ALLOWED':
+      return '该工具未获授权，已拒绝调用';
+    case 'CANCELLED':
+      return '已取消（你点了停止）';
+    case 'ROUND_LIMIT':
+      return '本轮工具调用次数已达上限';
+    case 'TOOL_ERROR':
+      return '工具执行出错';
+    default:
+      return fallback ?? '工具调用失败';
   }
 }

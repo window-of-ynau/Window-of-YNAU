@@ -74,6 +74,7 @@ class ChatRequestDto {
     this.apiKey,
     this.secretKey,
     this.dataDir,
+    this.dbPath,
     this.cloudToken,
     this.baseUrl,
     this.cloudBaseUrl,
@@ -96,6 +97,10 @@ class ChatRequestDto {
   /// 应用数据目录（Rust 用它定位 secret store）
   final String? dataDir;
 
+  /// t104：**目录**路径（不是 .db 文件）。给了它 Rust 才启用内置工具
+  /// （`memory_search` / `timetable_query`）；不给则行为与旧版一致。
+  final String? dbPath;
+
   /// 套餐通道的访问令牌
   final String? cloudToken;
   final String? baseUrl;
@@ -111,6 +116,8 @@ class ChatRequestDto {
         'messages': messages.map((ChatTurn turn) => turn.toJson()).toList(),
         if (secretKey != null && secretKey!.isNotEmpty) 'secret_key': secretKey,
         if (dataDir != null && dataDir!.isNotEmpty) 'data_dir': dataDir,
+    // 注意：必须是目录（传 .db 文件路径会让 Rust 把它当目录用）
+    if (dbPath != null && dbPath!.isNotEmpty) 'db_path': dbPath,
         // 仅测试/命令行用；App 正常路径不会带明文
         if (apiKey != null && apiKey!.isNotEmpty) 'api_key': apiKey,
         if (cloudToken != null && cloudToken!.isNotEmpty) 'cloud_token': cloudToken,
