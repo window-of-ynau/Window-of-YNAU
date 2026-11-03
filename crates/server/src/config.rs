@@ -82,6 +82,24 @@ pub struct Config {
     pub rag_fetch_timeout_secs: u64,
     /// 同一轮内两次抓取之间的最小间隔（毫秒）——限速，对 arXiv 这类要求礼貌访问的源必要
     pub rag_fetch_min_interval_ms: u64,
+    /// 是否把上次 `failed` 的候选也纳入本轮（t81 / M8）。
+    ///
+    /// 默认 **false**：默认只跑 pending，保证"失败不会被无限重试"；
+    /// 但运维必须**有手段**重试（旧实现只有代码里一个 `retry_failed: false` 字面量）。
+    pub rag_fetch_retry_failed: bool,
+    /// `fetching` 占位的过期阈值（秒，t81 / M1）。
+    ///
+    /// 只有 `claimed_at` 早于这个阈值的行才会被下一轮回收；正在跑的 worker 的占位不会被抢。
+    pub rag_fetch_stale_after_secs: u64,
+    /// 抓取正文的字节上限（t81 / M4）。超过直接判永久失败，不落库。
+    pub rag_fetch_max_body_bytes: usize,
+    /// DOI 抓取允许跟随的重定向目标域名白名单（t81 / M3）。
+    ///
+    /// doi.org 是 302 跳到出版商；不跟重定向 ⇒ DOI 源 100% 失败。
+    /// 但也不能无条件跟（会被带去任意地址），所以只在白名单域名内跟。
+    pub rag_fetch_doi_allowed_hosts: Vec<String>,
+    /// `/api/v1/rag/referrals` 的每分钟上报次数上限（t81 / M6）。0 = 关闭。
+    pub rag_report_per_min: u32,
     /// `rag_known_docs` 保留月数（0 = 不清理）。与盐的保留期**分开配置**：
     /// "语料保留多久"和"盐保留多久"是两类不同决策。
     pub rag_known_docs_retention_months: u32,
@@ -136,6 +154,11 @@ impl Config {
             rag_fetch_backoff_ms: env_parse("RAG_FETCH_BACKOFF_MS", 200),
             rag_fetch_timeout_secs: env_parse("RAG_FETCH_TIMEOUT_SECS", 10),
             rag_fetch_min_interval_ms: env_parse("RAG_FETCH_MIN_INTERVAL_MS", 1_000),
+            rag_fetch_retry_failed: env_flag("RAG_FETCH_RETRY_FAILED"),
+            rag_fetch_stale_after_secs: env_parse("RAG_FETCH_STALE_AFTER_SECS", 1_800),
+            rag_fetch_max_body_bytes: env_parse("RAG_FETCH_MAX_BODY_BYTES", 2 * 1024 * 1024),
+            rag_fetch_doi_allowed_hosts: env_list("RAG_FETCH_DOI_ALLOWED_HOSTS", DEFAULT_DOI_HOSTS),
+            rag_report_per_min: env_parse("RAG_REPORT_PER_MIN", 30),
             rag_known_docs_retention_months: env_parse("RAG_KNOWN_DOCS_RETENTION_MONTHS", 3),
             rag_salts_retention_months: env_parse("RAG_SALTS_RETENTION_MONTHS", 3),
             trust_proxy: env::var("YUNONG_TRUST_PROXY")
@@ -188,6 +211,14 @@ impl Config {
             rag_fetch_backoff_ms: 0,
             rag_fetch_timeout_secs: 10,
             rag_fetch_min_interval_ms: 0, // 测试里不限速（否则用例会变慢）
+            rag_fetch_retry_failed: false,
+            rag_fetch_stale_after_secs: 1_800,
+            rag_fetch_max_body_bytes: 2 * 1024 * 1024,
+            rag_fetch_doi_allowed_hosts: DEFAULT_DOI_HOSTS
+                .iter()
+                .map(|host| (*host).to_owned())
+                .collect(),
+            rag_report_per_min: 1_000, // 测试默认不挡路；需要断言限流的用例自己调小
 
             rag_known_docs_retention_months: 3,
             rag_salts_retention_months: 3,
@@ -285,6 +316,52 @@ pub fn validate_sample_salt(salt: &str) -> Result<(), String> {
         return Err("小写十六进制串不足 64 字符（建议 `openssl rand -hex 32`）".to_owned());
     }
     Ok(())
+}
+
+/// DOI 抓取允许跟随的重定向目标（t81 / M3 的默认白名单）。
+///
+/// 为什么不无条件跟随：重定向目标由上游响应决定，等于把"我们去访问哪个地址"交给对方；
+/// 不跟随则 doi.org（302 跳到出版商）**整源不可用**。折中是：只在已知出版商域名内跟，
+/// 且永远拒绝私网/回环/链路本地地址。
+pub const DEFAULT_DOI_HOSTS: &[&str] = &[
+    "doi.org",
+    "www.doi.org",
+    "dx.doi.org",
+    "link.springer.com",
+    "www.sciencedirect.com",
+    "ieeexplore.ieee.org",
+    "dl.acm.org",
+    "onlinelibrary.wiley.com",
+    "www.nature.com",
+    "www.tandfonline.com",
+    "www.mdpi.com",
+    "pubs.acs.org",
+    "academic.oup.com",
+    "journals.plos.org",
+    "www.pnas.org",
+    "www.frontiersin.org",
+    "www.biorxiv.org",
+    "www.cambridge.org",
+];
+
+/// 从环境读一个逗号分隔的列表（空值/缺失 → 默认值）。
+fn env_list(key: &str, default: &[&str]) -> Vec<String> {
+    match env::var(key) {
+        Ok(raw) => {
+            let parsed: Vec<String> = raw
+                .split(',')
+                .map(|item| item.trim().to_ascii_lowercase())
+                .filter(|item| !item.is_empty())
+                .collect();
+            if parsed.is_empty() {
+                tracing::warn!(key, "列表配置为空，回退到默认值");
+                default.iter().map(|item| (*item).to_owned()).collect()
+            } else {
+                parsed
+            }
+        }
+        Err(_) => default.iter().map(|item| (*item).to_owned()).collect(),
+    }
 }
 
 /// 把 `AUTH_HASH_CONCURRENCY` 夹到允许区间（security 报告加固建议 1）。

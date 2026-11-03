@@ -200,6 +200,17 @@ pub fn sha256_hex(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
+/// 读一个迁移文件的全文（与 [`TestDb::setup`] 用同一个目录）。
+///
+/// 测试里需要"重放迁移"时走这个入口，而不是 `include_str!`：
+/// 本地无 pgvector 时会用一份去掉 `vector` 类型的临时迁移目录，
+/// 用编译期路径会把本地测试直接卡在 `CREATE EXTENSION vector` 上。
+#[allow(dead_code)]
+pub fn migration_sql(name: &str) -> String {
+    let path = std::path::Path::new(MIGRATIONS_DIR).join(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("读 {path:?} 失败：{error}"))
+}
+
 /// 只查一个 `bigint` 的 `SELECT`（用例里都是 count）。
 pub async fn count(pool: &PgPool, sql: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(sql)

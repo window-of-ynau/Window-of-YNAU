@@ -104,7 +104,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # runner 自带 psql；ON_ERROR_STOP=1 保证任一条失败即整体失败
+      # runner 自带 psql；ON_ERROR_STOP=1 保证任一条失败即整体失败。
+      # `-1`（单事务）是硬要求（t81 / M2）：迁移里有 "DROP CONSTRAINT → ADD CONSTRAINT" 这类
+      # 顺序敏感的 DDL，非单事务下 ADD 失败时 DROP 已经提交 ⇒ 约束永久丢失且退出码非 0，
+      # 下次重跑会更糟。加上 `-1` 后任意一条失败整份回滚，库要么全旧要么全新。
       - name: 按文件名顺序执行 crates/server/migrations/*.sql
         run: |
           set -euo pipefail
@@ -115,8 +118,8 @@ jobs:
             exit 0
           fi
           while IFS= read -r f; do
-            echo "==> psql -f $f"
-            psql -v ON_ERROR_STOP=1 -q -f "$f"
+            echo "==> psql -1 -f $f"
+            psql -v ON_ERROR_STOP=1 -q -1 -f "$f"
           done < <(printf '%s\n' "${files[@]}" | sort)
 
       # 上面那步只证明"全新库能把迁移落下去"。线上不会每次重建库：0003 改过唯一键、
@@ -128,7 +131,7 @@ jobs:
           set -euo pipefail
           db=yunong_upgrade
           psql -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE $db"
-          mig() { psql -v ON_ERROR_STOP=1 -q -d "$db" -f "$1"; }
+          mig() { psql -v ON_ERROR_STOP=1 -q -1 -d "$db" -f "$1"; }
 
           echo "== 老库：只跑 0001 + 0002"
           mig crates/server/migrations/0001_init.sql
@@ -206,6 +209,25 @@ jobs:
 
           echo "== 可重入：全部迁移再跑一遍也必须成功"
           for f in crates/server/migrations/*.sql; do mig "$f"; done
+
+          # t81 / M2：RAG 的 CHECK 约束**重跑后必须仍在**（旧写法会永久丢掉它）。
+          psql -v ON_ERROR_STOP=1 -q -1 -d "$db" <<'SQL'
+          DO $$
+          DECLARE n int;
+          BEGIN
+            SELECT count(*) INTO n FROM pg_constraint
+             WHERE conname = 'rag_candidates_status_check'
+               AND conrelid = 'rag_candidates'::regclass;
+            IF n <> 1 THEN RAISE EXCEPTION '重跑后丢了 rag_candidates_status_check'; END IF;
+
+            BEGIN
+              INSERT INTO rag_candidates (month, hash, status)
+                  VALUES ('2026-11', 'deadbeef', 'weird_status');
+              RAISE EXCEPTION '重跑后 CHECK 失效：weird_status 被接受';
+            EXCEPTION WHEN check_violation THEN NULL;
+            END;
+          END $$;
+          SQL
           echo "升级路径 OK"
 
       # 0003 的注释承诺"已经把旧索引建出来的库也能重放"（半成品库），另外"空表升级"
@@ -215,12 +237,14 @@ jobs:
       - name: 升级路径②（半成品旧索引 / 空表）
         run: |
           set -euo pipefail
+          # 注意：`-1` 只能加在 `-f`（整份迁移）上。`CREATE DATABASE` 不能在事务块里跑，
+          # 所以前缀本身不带 `-1`（t81 / M2 的真实教训，CI 上踩过一次）。
           P="psql -v ON_ERROR_STOP=1 -q"
 
           echo "== ① 半成品库：旧版 0003 已经建过 ux_usage_turn_round"
           $P -c "CREATE DATABASE yunong_half"
-          $P -d yunong_half -f crates/server/migrations/0001_init.sql
-          $P -d yunong_half -f crates/server/migrations/0002_auth.sql
+          $P -d yunong_half -1 -f crates/server/migrations/0001_init.sql
+          $P -d yunong_half -1 -f crates/server/migrations/0002_auth.sql
           $P -d yunong_half <<'SQL'
           INSERT INTO users (email) VALUES ('half@example.com');
           INSERT INTO usage_samples (user_id, req_id, model, protocol, channel, round, tokens_in, tokens_out)
@@ -231,7 +255,7 @@ jobs:
           UPDATE usage_samples SET turn_id = req_id;
           CREATE UNIQUE INDEX ux_usage_turn_round ON usage_samples (turn_id, round);
           SQL
-          $P -d yunong_half -f crates/server/migrations/0003_usage_turn_estimated.sql
+          $P -d yunong_half -1 -f crates/server/migrations/0003_usage_turn_estimated.sql
           $P -d yunong_half <<'SQL'
           DO $$
           BEGIN
@@ -249,10 +273,10 @@ jobs:
 
           echo "== ② 空表库：usage_samples 一行数据都没有"
           $P -c "CREATE DATABASE yunong_empty"
-          $P -d yunong_empty -f crates/server/migrations/0001_init.sql
-          $P -d yunong_empty -f crates/server/migrations/0002_auth.sql
-          $P -d yunong_empty -f crates/server/migrations/0003_usage_turn_estimated.sql
-          $P -d yunong_empty -f crates/server/migrations/0004_audit_decisions.sql
+          $P -d yunong_empty -1 -f crates/server/migrations/0001_init.sql
+          $P -d yunong_empty -1 -f crates/server/migrations/0002_auth.sql
+          $P -d yunong_empty -1 -f crates/server/migrations/0003_usage_turn_estimated.sql
+          $P -d yunong_empty -1 -f crates/server/migrations/0004_audit_decisions.sql
 
           echo "半成品 / 空表升级 OK"
 
