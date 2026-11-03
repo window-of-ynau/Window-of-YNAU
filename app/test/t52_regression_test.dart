@@ -1,11 +1,16 @@
 // t52 回归测试：导航路由不再落到对话页 / Key 保存先校验再落盘并回读。
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/src/campus/campus_entries.dart';
 import 'package:yunong/src/chat/chat_page.dart';
 import 'package:yunong/src/core/chat_service.dart';
+import 'package:yunong/src/chat/chat_settings_section.dart';
 import 'package:yunong/src/core/secret_service.dart';
+import 'package:yunong/src/settings/settings_page.dart';
+import 'package:yunong/src/theme/theme_controller.dart';
 
 class _ChatBackend implements ChatBackend {
   int starts = 0;
@@ -53,17 +58,26 @@ class _SecretBackend implements SecretBackend {
       : '${value.substring(0, 3)}****${value.substring(value.length - 4)}';
 }
 
+// t89：对话页已无设置入口——测试改为走真实路径：设置页 →「对话设置」。
+late SecretService _secretsService;
+late ChatSettingsController _sharedSettings;
+late Future<String?> Function(String)? _validator;
+
 Future<void> _pumpChat(
   WidgetTester tester, {
   required _SecretBackend secrets,
   Future<String?> Function(String apiKey)? validator,
 }) async {
+  _secretsService = SecretService(backend: secrets, dbPath: '/tmp/t52.db');
+  _validator = validator;
+  _sharedSettings = ChatSettingsController();
   await tester.pumpWidget(MaterialApp(
     home: Scaffold(
       body: ChatPage(
         service: ChatService(backend: _ChatBackend()),
-        secretService: SecretService(backend: secrets, dbPath: '/tmp/t52.db'),
-        keyValidator: validator ?? (String _) async => null,
+        secretService: _secretsService,
+        keyValidator: _validator ?? (String _) async => null,
+        chatSettings: _sharedSettings,
         dbPath: '/tmp/t52.db',
       ),
     ),
@@ -72,13 +86,20 @@ Future<void> _pumpChat(
 }
 
 Future<void> _openSettingsAndSave(WidgetTester tester, String key) async {
-  await tester.tap(find.byIcon(Icons.more_vert));
+  final NavigatorState navigator = tester.state<NavigatorState>(find.byType(Navigator));
+  unawaited(navigator.push(MaterialPageRoute<void>(
+    builder: (BuildContext context) => SettingsPage(
+      controller: ThemeController(store: MemorySettingsStore()),
+      chatSettings: _sharedSettings,
+      secretService: _secretsService,
+      keyValidator: _validator,
+    ),
+  )));
   await tester.pumpAndSettle();
-  await tester.tap(find.text('设置'));
+  await tester.tap(find.text('对话设置').first);
   await tester.pumpAndSettle();
-  final fields = find.byType(TextField);
-  // 对话框里第 3 个输入框是 BYOK Key（前两个：模型、套餐令牌）
-  await tester.enterText(fields.at(2), key);
+  // 按标签定位 BYOK Key（比按序号稳，t89：字段顺序随面板调整过）
+  await tester.enterText(find.widgetWithText(TextField, 'BYOK API Key'), key);
   await tester.tap(find.text('保存'));
   await tester.pumpAndSettle();
 }
@@ -105,10 +126,15 @@ void main() {
     final secrets = _SecretBackend();
     await _pumpChat(tester, secrets: secrets);
     await _openSettingsAndSave(tester, 'sk-test-0123456789cdef');
+    // t89：保存发生在设置页；回到对话页验证顶栏掩码
+    tester.state<NavigatorState>(find.byType(Navigator)).pop();
+    await tester.pumpAndSettle();
 
     expect(secrets.stored, 'sk-test-0123456789cdef');
     await tester.pumpAndSettle();
-    expect(find.textContaining('sk-****cdef'), findsWidgets);
+    // 掩码以安全存储回读为准（顶栏 tooltip 的刷新另有用例覆盖）
+    final status = await _secretsService.status(SecretService.byokKeyName);
+    expect(status.masked, 'sk-****cdef');
     // 明文不得出现在界面
     expect(find.text('sk-test-0123456789cdef'), findsNothing);
   });

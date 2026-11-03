@@ -459,5 +459,12 @@ Future<void> signInViaAuth(BuildContext context, AuthService auth) async {
   if (result == null) {
     return;
   }
-  await auth.signIn(email: result.email, password: result.password);
+  try {
+    await auth.signIn(email: result.email, password: result.password);
+  } on AuthException catch (failure) {
+    // 与对话页一致：中文文案，不显示原始错误串
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(failure.userHint)));
+    }
+  }
 }
