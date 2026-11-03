@@ -100,6 +100,9 @@ class _ChatPageState extends State<ChatPage> {
   ChatStream? _stream;
   bool _streaming = false;
   String? _error;
+
+  /// 最近一轮对话的诊断（3 秒无事件时显示横幅 + 可复制）。
+  ChatDiagnostics? _diagnostics;
   int? _promptTokens;
   int? _completionTokens;
   String _channel = 'byok';
@@ -224,8 +227,10 @@ class _ChatPageState extends State<ChatPage> {
     }
     _stream = stream;
     // 无事件兜底：Rust 回调 ABI 不匹配时事件永远不来，界面就会停在占位三点。
+    // P0-1（t56）：失败必须可观测——内存诊断，不依赖 Release 看不了的日志
+    _diagnostics = stream.diagnostics;
     var sawEvent = false;
-    final watchdog = Timer(const Duration(seconds: 15), () {
+    final watchdog = Timer(const Duration(seconds: 3), () {
       if (!mounted || sawEvent || !_streaming) {
         return;
       }
@@ -233,7 +238,7 @@ class _ChatPageState extends State<ChatPage> {
       setState(() {
         _streaming = false;
         _stream = null;
-        _error = '端侧核心没有返回任何事件（可能是回调 ABI 不匹配，见报告）';
+        _error = stream.diagnostics.banner;
       });
     });
     stream.events.listen(
@@ -562,10 +567,32 @@ class _ChatPageState extends State<ChatPage> {
         if (_error != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            child: Text(
-              _error!,
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.error),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Expanded(
+                  child: Text(
+                    _error!,
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: theme.colorScheme.error),
+                  ),
+                ),
+                if (_diagnostics != null)
+                  TextButton.icon(
+                    onPressed: () async {
+                      await Clipboard.setData(
+                        ClipboardData(text: _diagnostics!.toClipboardText()),
+                      );
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('诊断已复制，可直接粘贴给开发者')),
+                        );
+                      }
+                    },
+                    icon: const Icon(Icons.copy, size: 16),
+                    label: const Text('复制诊断'),
+                  ),
+              ],
             ),
           ),
         if (!_searchStatus.available)
@@ -838,6 +865,11 @@ class _SettingsDialogState extends State<_SettingsDialog> {
       // P0-2：任何主题都不透底——玻璃只用于外层装饰，表单必须实心可读
       backgroundColor: Theme.of(context).colorScheme.surface,
       surfaceTintColor: Colors.transparent,
+      scrollable: true,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+      titlePadding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
+      contentPadding: const EdgeInsets.fromLTRB(24, 8, 24, 8),
+      actionsPadding: const EdgeInsets.fromLTRB(24, 8, 24, 16),
       title: const Text('对话设置'),
       content: SingleChildScrollView(
         child: Column(
@@ -856,6 +888,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ),
+            const SizedBox(height: 12),
             DropdownButtonFormField<String>(
               initialValue: _channel,
               decoration: const InputDecoration(labelText: '通道'),
@@ -866,10 +899,12 @@ class _SettingsDialogState extends State<_SettingsDialog> {
               onChanged: (String? value) =>
                   setState(() => _channel = value ?? _channel),
             ),
+            const SizedBox(height: 12),
             TextField(
               controller: _model,
               decoration: const InputDecoration(labelText: '模型'),
             ),
+            const SizedBox(height: 12),
             DropdownButtonFormField<String>(
               initialValue: _protocol,
               decoration: const InputDecoration(labelText: '协议'),
@@ -886,6 +921,9 @@ class _SettingsDialogState extends State<_SettingsDialog> {
               onChanged: (String? value) =>
                   setState(() => _protocol = value ?? _protocol),
             ),
+            const SizedBox(height: 20),
+            const Divider(height: 1),
+            const SizedBox(height: 16),
             TextField(
               controller: _key,
               obscureText: true,
@@ -897,6 +935,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                 helperText: '只保存在本机；不会显示在界面上，也不进日志',
               ),
             ),
+            const SizedBox(height: 12),
             TextField(
               controller: _token,
               obscureText: true,
