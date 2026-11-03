@@ -768,7 +768,12 @@ pub unsafe extern "C" fn yunong_search_upsert(
             content,
         };
         match store.upsert(&doc) {
-            Ok(terms) => ok_json(json!({ "id": id, "terms": terms })),
+            // `evicted` 只在索引到容量上限、按 updated_at 淘汰了最旧文档时才非 0（R5-F3）
+            Ok(outcome) => ok_json(json!({
+                "id": id,
+                "terms": outcome.terms,
+                "evicted": outcome.evicted,
+            })),
             Err(err) => input_error(err),
         }
     })
@@ -813,8 +818,14 @@ pub unsafe extern "C" fn yunong_search_delete(
 // 流式对话（W7 P0）：回调式 FFI
 // ---------------------------------------------------------------------------
 
-/// 流式回调：`chunk_json` **只在本次回调期间有效**（Rust 分配、Rust 释放，Dart 侧绝不能 free）；
-/// 返回 `1` = 调用方要求取消（停止读取上游），`0` = 继续。
+/// 流式回调：`chunk_json` **只在本次回调期间有效**（Rust 分配、Rust 释放，Dart 侧绝不能 free）。
+///
+/// **返回类型是 `void`**（R5-F6：早期版本让回调返回 `1/0` 表示取消，现在不是了）：
+/// 回调里**不能**通过返回值取消流。要取消请拿 `yunong_chat_stream` 返回的 handle
+/// 调 [`yunong_chat_cancel`]（可以在回调里调，也可以从别的线程调）。
+///
+/// 取消之后仍会再收到**一帧终态** `{"type":"done","finish":"stop"}`（R5-F7）：
+/// 它表示"本条流已结束"，不代表模型正常说完——客户端据此收尾即可。
 pub type ChatChunkCallback = unsafe extern "C" fn(chunk_json: *const c_char, user: *mut c_void);
 
 static CHAT_CANCEL: OnceLock<crate::chat_ffi::CancelRegistry> = OnceLock::new();
@@ -955,6 +966,8 @@ fn secret_status_json(status: crate::secret::SecretStatus) -> Value {
         "set": status.set,
         "masked": status.masked,
         "degraded": status.degraded,
+        // R4-F3：`set:true, broken:true` = 本地有密文但解不开，UI 该提示"请重新填写"
+        "broken": status.broken,
         "reason": status.reason,
     }))
 }
@@ -1992,6 +2005,11 @@ mod tests {
             "{clamped}"
         );
 
+        // R5-F2：超长 query 走 BAD_INPUT（上限 512 字符）
+        let too_long = "数".repeat(crate::local_search::MAX_QUERY_CHARS + 1);
+        let over = call_search_local(&too_long, "", &db);
+        assert_eq!(over["code"], "BAD_INPUT", "{over}");
+
         // doc_id 必须是正整数；kind 只接受 note/summary/fact
         assert_eq!(
             call_search_upsert("memory:1", "note", "标题", "正文", &db)["code"],
@@ -2172,6 +2190,41 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("cloud_base_url"));
+    }
+
+    /// R4-F3：密文损坏时 `get_secret` 的 JSON 必须带 `broken:true`（与 `set:true` 并存），
+    /// 这样 UI 能提示"本地凭据已损坏，请重新填写"，而不是显示矛盾的"未设置"。
+    #[cfg(windows)]
+    #[test]
+    fn get_secret_reports_broken_ciphertext_via_ffi() {
+        let dir = std::env::temp_dir().join(format!("yunong-ffi-broken-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("timetable.db").to_string_lossy().into_owned();
+        // 先正常存一条
+        let store = secret_store_for(&db_path);
+        store
+            .set("byok_api_key", "sk-test-0123456789abcdef")
+            .unwrap();
+        // 再把它写坏
+        let bin = dir.join("secrets").join("byok_api_key.bin");
+        std::fs::write(&bin, b"not-a-dpapi-blob").unwrap();
+
+        let key = CString::new("byok_api_key").unwrap();
+        let db = CString::new(db_path.clone()).unwrap();
+        let raw = unsafe { yunong_get_secret(key.as_ptr(), db.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["ok"], true, "{value}");
+        assert_eq!(value["data"]["set"], true, "{value}");
+        assert_eq!(value["data"]["broken"], true, "{value}");
+        assert!(!value["data"]["masked"].as_str().unwrap().is_empty());
+        // 明文绝不出现在返回里
+        assert!(
+            !text.contains("sk-test-0123456789abcdef"),
+            "泄漏明文：{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 平台差异（与 secret 用例同一条规则）：非 Windows 没有系统安全存储，

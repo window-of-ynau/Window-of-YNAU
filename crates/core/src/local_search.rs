@@ -64,7 +64,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
@@ -82,6 +82,22 @@ pub const MAX_SEARCH_LIMIT: usize = 100;
 
 /// 单篇文档的字节上限：再大就该先分块再入库，否则一次导入能把倒排表撑爆。
 pub const MAX_DOC_BYTES: usize = 256 * 1024;
+
+/// 单次查询的字符上限（R5-F2）。
+///
+/// 分词与倒排扫描都是**线性**的：实测 339 KB 的 query 在 debug 构建里要 200–305 ms，
+/// 足够让移动端掉帧。512 字符已经远超正常查询（一句话），超限直接 `BAD_INPUT`——
+/// 而且判断在**进入分词之前**，先 `take` 再比，别为超长串白算一遍。
+pub const MAX_QUERY_CHARS: usize = 512;
+
+/// 索引文档数上限（R5-F3）。与 `memory_items` 的容量策略一致：超了按 `updated_at` 淘汰最旧。
+pub const MAX_INDEXED_DOCS: usize = 5_000;
+
+/// 索引总量上限（R5-F3，按倒排近似字节算：每个 term 占 `term.len() + 24`）。
+///
+/// 64 MB 是"端侧本地私文档"能接受的上限：按实测 6 KB/篇（115 汉字）能放 1 万篇；
+/// 满额 256 KiB 的长文档则先撞这条上限。
+pub const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
 
 /// 分数保留的小数位（FFI 契约要求 4 位）。
 const SCORE_DECIMALS: f64 = 10_000.0;
@@ -130,7 +146,8 @@ CREATE TABLE IF NOT EXISTS search_docs (
   title TEXT,
   content TEXT NOT NULL,
   length INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  index_bytes INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS search_postings (
   term TEXT NOT NULL,
@@ -144,9 +161,35 @@ CREATE TABLE IF NOT EXISTS search_postings (
 const INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_search_docs_updated ON search_docs(updated_at DESC);";
 
+/// 容量上限（测试里可以调小，不用插 5000 篇）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchLimits {
+    pub docs: usize,
+    pub bytes: usize,
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            docs: MAX_INDEXED_DOCS,
+            bytes: MAX_INDEX_BYTES,
+        }
+    }
+}
+
+/// 一次 `upsert` 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpsertOutcome {
+    /// 这篇文档的倒排行数（不同 term 数）
+    pub terms: usize,
+    /// 为了腾容量淘汰掉的最旧文档数（正常是 0）
+    pub evicted: usize,
+}
+
 /// 本地 BM25 索引（SQLite 持久化）。
 pub struct SearchStore {
     conn: Connection,
+    limits: SearchLimits,
 }
 
 impl SearchStore {
@@ -173,6 +216,17 @@ impl SearchStore {
         )
     }
 
+    /// 调小容量上限（测试用；生产用默认值）。
+    pub fn with_limits(mut self, limits: SearchLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// 当前容量上限。
+    pub fn limits(&self) -> SearchLimits {
+        self.limits
+    }
+
     fn from_connection(conn: Connection) -> CoreResult<Self> {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.execute_batch(TABLE_SQL)
@@ -180,13 +234,26 @@ impl SearchStore {
         if let Err(err) = conn.execute_batch(INDEX_SQL) {
             eprintln!("[yunong-core] search_docs 索引创建失败（老库结构不完整？）：{err}");
         }
-        Ok(Self { conn })
+        // 老库没有 `index_bytes` 列（R5-F3 之前的库）：补一列，补不上只警告。
+        // 补上之后老文档该列是 0，容量统计会低估——但总数上限仍然生效，不会失控。
+        if let Err(err) = conn.execute_batch(
+            "ALTER TABLE search_docs ADD COLUMN index_bytes INTEGER NOT NULL DEFAULT 0;",
+        ) {
+            let text = err.to_string();
+            if !text.contains("duplicate column name") {
+                eprintln!("[yunong-core] search_docs 补 index_bytes 列失败：{err}");
+            }
+        }
+        Ok(Self {
+            conn,
+            limits: SearchLimits::default(),
+        })
     }
 
     /// 写一篇文档：删旧倒排 → 重建该文档的倒排 → 覆盖文档行。**只动这一篇**。
     ///
     /// 返回写入的倒排行数（= 不同 term 数），便于测试与容量观测。
-    pub fn upsert(&mut self, doc: &SearchDoc<'_>) -> CoreResult<usize> {
+    pub fn upsert(&mut self, doc: &SearchDoc<'_>) -> CoreResult<UpsertOutcome> {
         if doc.id <= 0 {
             return Err(CoreError::Invalid("文档 id 必须是正整数".into()));
         }
@@ -215,6 +282,9 @@ impl SearchStore {
         for token in &tokens {
             *freq.entry(token.as_str()).or_insert(0) += 1;
         }
+        // 倒排写进库之后大约占多少字节（term + doc_id + freq + B-tree 分摊，取 24 字节/行）
+        let index_bytes: usize = freq.keys().map(|term| term.len() + 24).sum();
+        let terms = freq.len();
 
         let tx = self
             .conn
@@ -235,24 +305,67 @@ impl SearchStore {
             }
         }
         tx.execute(
-            "INSERT INTO search_docs (id, kind, title, content, length, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO search_docs (id, kind, title, content, length, updated_at, index_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                kind = excluded.kind, title = excluded.title, content = excluded.content,
-               length = excluded.length, updated_at = excluded.updated_at",
+               length = excluded.length, updated_at = excluded.updated_at,
+               index_bytes = excluded.index_bytes",
             params![
                 doc.id,
                 kind,
                 doc.title,
                 doc.content,
                 length as i64,
-                now_ms()
+                now_ms(),
+                index_bytes as i64
             ],
         )
         .map_err(|err| CoreError::Storage(format!("写文档失败：{err}")))?;
         tx.commit()
             .map_err(|err| CoreError::Storage(format!("提交事务失败：{err}")))?;
-        Ok(freq.len())
+        // 容量兜底（R5-F3）：写完之后再判，保证"刚写进来的这条"不会被自己的容量策略吃掉
+        let evicted = self.enforce_limits(doc.id)?;
+        Ok(UpsertOutcome { terms, evicted })
+    }
+
+    /// 超限就按 `updated_at` 淘汰最旧，直到回到上限以内（永不淘汰 `keep`）。
+    ///
+    /// 与 `memory_items` 的容量策略一致：先保"用户刚存的"，再淘汰最旧的。
+    fn enforce_limits(&mut self, keep: i64) -> CoreResult<usize> {
+        let mut evicted = 0_usize;
+        loop {
+            let (docs, bytes): (i64, i64) = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(index_bytes), 0) FROM search_docs",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|err| CoreError::Storage(format!("统计索引规模失败：{err}")))?;
+            let within_docs = (docs.max(0) as usize) <= self.limits.docs;
+            let within_bytes = (bytes.max(0) as usize) <= self.limits.bytes;
+            if within_docs && within_bytes {
+                return Ok(evicted);
+            }
+            let victim: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM search_docs WHERE id != ?1 ORDER BY updated_at ASC, id ASC LIMIT 1",
+                    params![keep],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| CoreError::Storage(format!("挑淘汰对象失败：{err}")))?;
+            match victim {
+                Some(id) => {
+                    self.delete(id)?;
+                    evicted += 1;
+                }
+                // 只剩刚写的那条还超限（单篇就超过总量上限）：不再淘汰，交给调用方处理
+                None => return Ok(evicted),
+            }
+        }
     }
 
     /// 删一篇文档（倒排 + 文档行），返回实际删除的文档行数（0 = 本来没有）。
@@ -277,7 +390,7 @@ impl SearchStore {
     /// 把一条本地记忆（`memory_items`）编进索引：id 就是 `memory_items.id`，kind 原样。
     ///
     /// 记忆写入/更新/删除后调这个即可保持索引同步（增量，不重建）。
-    pub fn index_memory_item(&mut self, item: &MemoryItem) -> CoreResult<usize> {
+    pub fn index_memory_item(&mut self, item: &MemoryItem) -> CoreResult<UpsertOutcome> {
         // kind 只允许三种记忆类型；库里万一有脏值就当 note 处理（不阻断索引）
         let kind = MemoryKind::parse(&item.kind).unwrap_or(MemoryKind::Note);
         self.upsert(&SearchDoc {
@@ -346,6 +459,14 @@ impl SearchStore {
     /// - `limit` 必须在 `1..=MAX_SEARCH_LIMIT`（FFI 侧把超限夹到 100）；
     /// - 命中词只出现在标题时也会返回，snippet 退化成正文开头。
     pub fn search(&self, query: &str, limit: usize) -> CoreResult<Vec<SearchResult>> {
+        // R5-F2：长度上限必须在**分词之前**判。只数到上限+1 个字符就停，
+        // 不为 300 KB 的串白算一遍（`.chars().count()` 会整串扫）。
+        if query.chars().take(MAX_QUERY_CHARS + 1).count() > MAX_QUERY_CHARS {
+            return Err(CoreError::Invalid(format!(
+                "查询太长：超过 {MAX_QUERY_CHARS} 个字符（实际 ≥{}）",
+                MAX_QUERY_CHARS + 1
+            )));
+        }
         if limit == 0 {
             return Err(CoreError::Invalid("limit 必须是正整数".into()));
         }
@@ -514,7 +635,13 @@ mod tests {
         SearchStore::open_in_memory().unwrap()
     }
 
-    fn add(store: &mut SearchStore, id: i64, kind: &str, title: &str, content: &str) -> usize {
+    fn add(
+        store: &mut SearchStore,
+        id: i64,
+        kind: &str,
+        title: &str,
+        content: &str,
+    ) -> UpsertOutcome {
         let doc = SearchDoc {
             id,
             kind,
@@ -749,6 +876,104 @@ mod tests {
         assert!(matches!(error, CoreError::Invalid(_)), "{error:?}");
     }
 
+    // ------------------------------------------------------------------
+    // 容量上限（R5-F2 / R5-F3）
+    // ------------------------------------------------------------------
+
+    /// R5-F2：超过 512 字符的 query 直接拒绝，且**在分词之前**就停。
+    #[test]
+    fn query_longer_than_cap_is_rejected_before_tokenizing() {
+        let mut store = store();
+        add(&mut store, 1, "note", "笔记", "高等数学笔记");
+
+        // 正好 512 字符：允许（会命中很多次，但不会被拒）
+        let at_cap = "数学".repeat(MAX_QUERY_CHARS / 2);
+        assert_eq!(at_cap.chars().count(), MAX_QUERY_CHARS);
+        assert!(store.search(&at_cap, 5).is_ok(), "512 字符应当放行");
+
+        // 513 字符：拒绝
+        let over = "数".repeat(MAX_QUERY_CHARS + 1);
+        let error = store.search(&over, 5).unwrap_err();
+        assert!(matches!(error, CoreError::Invalid(_)), "{error:?}");
+        assert!(error.to_string().contains("查询太长"), "{error}");
+
+        // 339 KB（security 实测的那个量级）：必须立刻拒绝，不能先分词
+        let huge = "数".repeat(339 * 1024 / 3);
+        let started = std::time::Instant::now();
+        let error = store.search(&huge, 5).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(matches!(error, CoreError::Invalid(_)), "{error:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(5),
+            "拒绝超长 query 花了 {elapsed:?}，说明没有在分词前拦住"
+        );
+    }
+
+    /// R5-F3：文档数超限 → 按 `updated_at` 淘汰最旧，并在结果里报 `evicted`。
+    #[test]
+    fn index_evicts_oldest_when_doc_cap_is_exceeded() {
+        let mut store = store().with_limits(SearchLimits {
+            docs: 3,
+            bytes: usize::MAX,
+        });
+        for id in 1..=3 {
+            add(&mut store, id, "note", "笔记", "高等数学");
+        }
+        assert_eq!(store.len().unwrap(), 3);
+
+        let outcome = add(&mut store, 4, "note", "笔记", "线性代数");
+        assert_eq!(outcome.evicted, 1, "超限该淘汰 1 篇");
+        assert_eq!(store.len().unwrap(), 3, "淘汰后回到上限");
+        assert!(
+            store
+                .search("数学", 5)
+                .unwrap()
+                .iter()
+                .all(|hit| hit.id != 1),
+            "淘汰的是最旧的（id=1）"
+        );
+        assert_eq!(
+            ids(&store.search("线性代数", 5).unwrap()),
+            vec![4],
+            "新写的不受影响"
+        );
+    }
+
+    /// R5-F3：索引字节超限也淘汰（不只看篇数）。
+    #[test]
+    fn index_evicts_oldest_when_byte_cap_is_exceeded() {
+        let mut store = store().with_limits(SearchLimits {
+            docs: usize::MAX,
+            bytes: 400,
+        });
+        // 每篇 8 个汉字 → 7 个 bigram → 7 ×（6+24）= 210 字节
+        let first = add(&mut store, 1, "note", "", "高等数学线性代数");
+        assert_eq!(first.evicted, 0);
+        // 第二篇把总量顶到 420 > 400 → 淘汰最旧的（不是刚写的）
+        let second = add(&mut store, 2, "note", "", "概率论与数理统计");
+        assert_eq!(second.evicted, 1);
+        assert_eq!(store.len().unwrap(), 1);
+        assert_eq!(
+            ids(&store.search("概率", 5).unwrap()),
+            vec![2],
+            "刚写的一定还在"
+        );
+    }
+
+    /// 更新已有文档不该触发淘汰（总数没变）。
+    #[test]
+    fn updating_existing_doc_does_not_evict() {
+        let mut store = store().with_limits(SearchLimits {
+            docs: 2,
+            bytes: usize::MAX,
+        });
+        add(&mut store, 1, "note", "笔记", "高等数学");
+        add(&mut store, 2, "note", "笔记", "线性代数");
+        let outcome = add(&mut store, 1, "note", "笔记", "高等数学 第二版");
+        assert_eq!(outcome.evicted, 0);
+        assert_eq!(store.len().unwrap(), 2);
+    }
+
     #[test]
     fn invalid_document_input() {
         let mut store = store();
@@ -888,7 +1113,7 @@ mod tests {
             title: None,
             content: "",
         };
-        assert_eq!(store.upsert(&doc).unwrap(), 0);
+        assert_eq!(store.upsert(&doc).unwrap().terms, 0);
         assert_eq!(store.len().unwrap(), 1);
         assert!(store.search("任意", 5).unwrap().is_empty());
         assert_eq!(store.stats().unwrap().avg_len, 0.0);
