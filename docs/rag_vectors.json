@@ -1,0 +1,114 @@
+{
+  "salt": "2026-07-rag-salt",
+  "version": 1,
+  "note": "由 crates/server 的 canonical_identifier()/hash_identifier() 生成；端侧 Flutter 实现必须逐条对齐。改规则请重新生成：cargo test -p yunong-server rag_vectors -- --ignored",
+  "cases": [
+    {
+      "raw": "https://example.com/article?utm_source=wechat&utm_medium=social#comments",
+      "canonical": "https://example.com/article",
+      "hash": "f50a52905e3232736c5f208af471bb78369ba95fd8631f6ce993ce62ecab6fb4"
+    },
+    {
+      "raw": "https://Example.COM/Path/To/Paper/",
+      "canonical": "https://example.com/path/to/paper",
+      "hash": "8c5d779814195bf82e0f944e651f927fb4784fcc2f6634af239dd1cb9ccb875c"
+    },
+    {
+      "raw": "http://example.com/paper",
+      "canonical": "http://example.com/paper",
+      "hash": "bcab6218b7cc3a80939a9f927f9c32f66b480ea41aeaebaaec6476b241b87ab9"
+    },
+    {
+      "raw": "https://arxiv.org/abs/2401.01234v3",
+      "canonical": "2401.01234",
+      "hash": "0e11837ea129b6ed91621e815c8daf42be57b498839afa4b3a409b3962b16c17"
+    },
+    {
+      "raw": "https://arxiv.org/pdf/2401.01234v12",
+      "canonical": "2401.01234",
+      "hash": "0e11837ea129b6ed91621e815c8daf42be57b498839afa4b3a409b3962b16c17"
+    },
+    {
+      "raw": "arxiv:2401.01234v2",
+      "canonical": "2401.01234",
+      "hash": "0e11837ea129b6ed91621e815c8daf42be57b498839afa4b3a409b3962b16c17"
+    },
+    {
+      "raw": "doi:10.1145/1234567.7654321",
+      "canonical": "10.1145/1234567.7654321",
+      "hash": "ab43a19e4915f12c401f517fd11b84fea38056a11847f3891dd3a5c7bbebeaaf"
+    },
+    {
+      "raw": "https://doi.org/10.1145/1234567.7654321",
+      "canonical": "10.1145/1234567.7654321",
+      "hash": "ab43a19e4915f12c401f517fd11b84fea38056a11847f3891dd3a5c7bbebeaaf"
+    },
+    {
+      "raw": "http://doi.org/10.1000/ABC",
+      "canonical": "10.1000/abc",
+      "hash": "f02ad2a9241beec9e780fa240438e28bcb92ea3697c2dd17b11d86cc491b0ca3"
+    },
+    {
+      "raw": "https://example.com/v2/docs",
+      "canonical": "https://example.com/v2/docs",
+      "hash": "1c2a6f3400b0f9d090ed35bb1da01fe91950cc91abde3546df69826f7f5c55b5"
+    },
+    {
+      "raw": "https://example.com/doc#section-2",
+      "canonical": "https://example.com/doc",
+      "hash": "5d333a9da8e04bd5199465f5d3e2483dab85b62c322b8400b9bf63ddb150d533"
+    },
+    {
+      "raw": "https://example.com/a/b///",
+      "canonical": "https://example.com/a/b",
+      "hash": "f2e7fee175b84b6e172bd35f6ec91a7df5e6335822a773aa9051c73db51fcaf3"
+    },
+    {
+      "raw": "   https://example.com/spaced   ",
+      "canonical": "https://example.com/spaced",
+      "hash": "ef30ee0f0ee724f9d6cce7a5525003b59f570852f6bf89cd9fcc436be750aa27"
+    },
+    {
+      "raw": "HTTPS://ARXIV.ORG/ABS/2401.01234V3",
+      "canonical": "2401.01234",
+      "hash": "0e11837ea129b6ed91621e815c8daf42be57b498839afa4b3a409b3962b16c17"
+    },
+    {
+      "raw": "https://example.com/doc?v=2#top",
+      "canonical": "https://example.com/doc",
+      "hash": "5d333a9da8e04bd5199465f5d3e2483dab85b62c322b8400b9bf63ddb150d533"
+    },
+    {
+      "raw": "https://site1.example.com/v2/",
+      "canonical": "https://site1.example.com/v2",
+      "hash": "9b5a14574766fb69cce876cc7d6ed6f5efd3dac7e1756a8a4665b40d00e8e253"
+    },
+    {
+      "raw": "10.1000/xyz123v2",
+      "canonical": "10.1000/xyz123",
+      "hash": "87b6422f089bac9669d51d8919f6235ee098c9270a5dcae530b96fd35c4250ff"
+    },
+    {
+      "raw": "https://example.com/2024/12/article",
+      "canonical": "https://example.com/2024/12/article",
+      "hash": "975410328794712e7cb32ca488554b1301ff8d3b8606a38f20ba35460ec75551"
+    },
+    {
+      "raw": "https://site1.example.com/v2",
+      "canonical": "https://site1.example.com",
+      "hash": "a20bef2012e924d36ed19c39c5b2f0d282f9ee0d039d222257f842eec3751ada"
+    },
+    {
+      "raw": "https://example.com/notes/v10",
+      "canonical": "https://example.com/notes/v10",
+      "hash": "75477904faaa0a4df187adb73213bf86498f63b127bf007607e829a66940423b"
+    }
+  ],
+  "rejects": [
+    "",
+    "   ",
+    "doi:",
+    "#only-fragment",
+    "?only-query"
+  ]
+}

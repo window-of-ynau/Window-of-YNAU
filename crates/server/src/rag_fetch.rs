@@ -397,6 +397,19 @@ fn truncate_error(message: &str) -> String {
 }
 
 /// 规范化标识（契约见模块文档）。返回 `None` 表示畸形输入（空 / 超长 / 归一后为空）。
+///
+/// # ⚠️ 改规则必须先改向量文件
+///
+/// 端侧（Flutter）有一份**逐字节等价**的实现，两边靠 `docs/rag_vectors.json` 对齐。
+/// 任何对本函数（或 [`hash_identifier`]）的行为修改，都必须**同一次提交**里重新生成
+/// 这份向量文件，否则：
+///
+/// ```text
+/// cargo test -p yunong-server rag_vectors -- --ignored   # 重新生成
+/// ```
+///
+/// 守卫用例 `rag_vectors_match_implementation` 会比对文件与当前实现，改漏了 CI 直接红。
+/// 没有这道闸门时的后果是"服务端 join 永远 0 命中且不报错"——线上静默失效。
 pub fn canonical_identifier(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > MAX_IDENTIFIER_BYTES {
@@ -714,5 +727,235 @@ mod tests {
         let text = summarize(&report);
         assert!(text.contains("fetched=1"));
         assert!(!text.contains("user"), "摘要里不该出现用户概念");
+    }
+}
+
+/// **跨语言 RAG 向量的事实源**（端侧 Flutter 的 `canonical()` / `hashIdentifier()` 与这里对齐）。
+///
+/// 生成：`cargo test -p yunong-server rag_vectors -- --ignored`
+/// 守卫：`cargo test -p yunong-server rag_vectors`（CI 跑的就是这条）
+#[cfg(test)]
+mod rag_vectors_tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    /// 固定测试盐（**不要随机**：向量文件必须是确定性的）。
+    ///
+    /// 注意它和线上"按月轮换的盐"无关：这里只需要两端用同一串来算同一个哈希。
+    const VECTORS_SALT: &str = "2026-07-rag-salt";
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct VectorsFile {
+        salt: String,
+        version: u32,
+        /// 给两个团队看的说明（程序不读）
+        note: String,
+        /// 能被规范化的用例
+        cases: Vec<VectorCase>,
+        /// 必须被拒绝的原始输入（`canonical_identifier` 返回 `None`）
+        rejects: Vec<String>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct VectorCase {
+        raw: String,
+        canonical: String,
+        /// 64 位小写十六进制
+        hash: String,
+    }
+
+    /// 仓库根（`crates/server` 往上两级）。
+    fn repo_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn vectors_path() -> std::path::PathBuf {
+        repo_root().join("docs/rag_vectors.json")
+    }
+
+    /// 覆盖契约里每一条规则（含边界）。
+    fn accepted_inputs() -> Vec<&'static str> {
+        vec![
+            // utm_* + fragment
+            "https://example.com/article?utm_source=wechat&utm_medium=social#comments",
+            // 大小写 + 尾斜杠
+            "https://Example.COM/Path/To/Paper/",
+            // http:// 保持（**不**归一成 https）
+            "http://example.com/paper",
+            // arXiv abs + 版本号
+            "https://arxiv.org/abs/2401.01234v3",
+            // arXiv pdf + 两位版本号（v12）
+            "https://arxiv.org/pdf/2401.01234v12",
+            // arxiv: 前缀
+            "arxiv:2401.01234v2",
+            // doi: 前缀
+            "doi:10.1145/1234567.7654321",
+            // doi.org URL
+            "https://doi.org/10.1145/1234567.7654321",
+            // http 版 doi.org + 大小写
+            "http://doi.org/10.1000/ABC",
+            // /v2/ 属于路径，**不该**被当版本号裁掉
+            "https://example.com/v2/docs",
+            // 只砍 fragment
+            "https://example.com/doc#section-2",
+            // 多重尾斜杠
+            "https://example.com/a/b///",
+            // 前后空白
+            "   https://example.com/spaced   ",
+            // 全大写 arXiv
+            "HTTPS://ARXIV.ORG/ABS/2401.01234V3",
+            // query 与 fragment 同时存在
+            "https://example.com/doc?v=2#top",
+            // 带数字的域名 + /v2/：记录**当前**行为（数字在前，会被当版本号），
+            // 将来若要修这条规则，守卫会红，提醒同步两端
+            "https://site1.example.com/v2/",
+            // 裸 DOI 带版本后缀
+            "10.1000/xyz123v2",
+            // 路径里带数字（不该被当版本号）
+            "https://example.com/2024/12/article",
+            // 没有尾斜杠的 /v2：当前实现会把它当**版本号**裁掉（"v 前出现过数字"这条规则的副作用，
+            // 因为域名里的 site1 含数字）。记录现状是为了让两端行为一致；
+            // 将来要修这条规则，守卫会红，提醒同步端侧与本文档。
+            "https://site1.example.com/v2",
+            // v10 但没有前导数字：不该被当版本号
+            "https://example.com/notes/v10",
+        ]
+    }
+
+    fn rejected_inputs() -> Vec<&'static str> {
+        vec![
+            "",
+            "   ",
+            // 只有前缀，归一后为空
+            "doi:",
+            // 归一后为空
+            "#only-fragment",
+            "?only-query",
+        ]
+    }
+
+    fn build_vectors() -> VectorsFile {
+        let cases = accepted_inputs()
+            .into_iter()
+            .map(|raw| {
+                let canonical = canonical_identifier(raw)
+                    .unwrap_or_else(|| panic!("这条用例不该被拒绝：{raw}"));
+                let hash = hash_identifier(VECTORS_SALT, &canonical);
+                VectorCase {
+                    raw: raw.to_owned(),
+                    canonical,
+                    hash,
+                }
+            })
+            .collect();
+        VectorsFile {
+            salt: VECTORS_SALT.to_owned(),
+            version: 1,
+            note: "由 crates/server 的 canonical_identifier()/hash_identifier() 生成；\
+                   端侧 Flutter 实现必须逐条对齐。改规则请重新生成：\
+                   cargo test -p yunong-server rag_vectors -- --ignored"
+                .to_owned(),
+            cases,
+            rejects: rejected_inputs().into_iter().map(str::to_owned).collect(),
+        }
+    }
+
+    /// 生成器（默认 ignore，避免每次跑测试都写文件）。
+    #[test]
+    #[ignore = "生成器：cargo test -p yunong-server rag_vectors -- --ignored"]
+    fn generate_rag_vectors() {
+        let vectors = build_vectors();
+        let text = serde_json::to_string_pretty(&vectors).expect("序列化失败");
+        let path = vectors_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("建 docs 目录失败");
+        }
+        std::fs::write(&path, format!("{text}\n")).expect("写向量文件失败");
+        println!(
+            "已生成 {}（{} 条用例 + {} 条拒绝）",
+            path.display(),
+            vectors.cases.len(),
+            vectors.rejects.len()
+        );
+    }
+
+    /// 守卫：文件必须与当前实现**逐条一致**（服务端改规则忘了同步 → CI 红）。
+    #[test]
+    fn rag_vectors_match_implementation() {
+        let path = vectors_path();
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "读不到 {}：{err}（首次请先跑 generate_rag_vectors 生成）",
+                path.display()
+            )
+        });
+        let actual: VectorsFile = serde_json::from_str(&text).expect("向量文件不是合法 JSON");
+        let expected = build_vectors();
+        assert_eq!(actual.salt, expected.salt, "盐对不上：端侧会整片 join 失败");
+        assert_eq!(actual.version, expected.version, "向量文件版本对不上");
+        assert_eq!(
+            actual.cases.len(),
+            expected.cases.len(),
+            "用例条数对不上（{} vs {}）",
+            actual.cases.len(),
+            expected.cases.len()
+        );
+        for (got, want) in actual.cases.iter().zip(expected.cases.iter()) {
+            assert_eq!(got.raw, want.raw);
+            assert_eq!(
+                got.canonical, want.canonical,
+                "规范化结果变了：{:?} → 文件里是 {:?}，实现给出 {:?}。\
+                 若这是**有意**改规则，请重新生成 docs/rag_vectors.json 并通知端侧",
+                got.raw, got.canonical, want.canonical
+            );
+            assert_eq!(got.hash, want.hash, "哈希变了：{:?}", got.raw);
+        }
+        assert_eq!(
+            actual.rejects, expected.rejects,
+            "拒绝清单对不上（畸形输入的行为变了）"
+        );
+    }
+
+    /// 哈希必须是 64 位小写十六进制——之前踩过"少一个 hex 字符 → 永远 0 命中"的坑。
+    #[test]
+    fn every_hash_is_64_lowercase_hex() {
+        let vectors = build_vectors();
+        assert!(
+            vectors.cases.len() >= 15,
+            "用例太少：{}（至少要 15 条）",
+            vectors.cases.len()
+        );
+        for case in &vectors.cases {
+            assert_eq!(
+                case.hash.len(),
+                64,
+                "哈希长度是 {}，不是 64：{:?}",
+                case.hash.len(),
+                case.raw
+            );
+            assert!(
+                case.hash
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "哈希含非小写 hex：{}",
+                case.hash
+            );
+        }
+        // 拒绝清单：实现确实返回 None
+        for raw in rejected_inputs() {
+            assert_eq!(
+                canonical_identifier(raw),
+                None,
+                "这条应当被拒绝却通过了：{raw:?}"
+            );
+        }
+    }
+
+    /// 不同盐必须给出不同哈希（salt 参与计算，不是形参摆设）。
+    #[test]
+    fn vectors_are_salt_specific() {
+        let vectors = build_vectors();
+        let other = hash_identifier("2026-08-rag-salt", &vectors.cases[0].canonical);
+        assert_ne!(other, vectors.cases[0].hash);
     }
 }
