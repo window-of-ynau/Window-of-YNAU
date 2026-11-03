@@ -291,8 +291,9 @@ ThemeData buildTheme(
     surface: t.canvas,
     onSurface: t.ink,
     onSurfaceVariant: t.inkSoft,
-    surfaceContainerHighest: t.surfaceAlt,
-    surfaceContainerHigh: t.surfaceAlt,
+    // t100：浮层/工具栏底色必须从画布派生，保证与 onSurface 的对比度（深色主题不再出现浅色条）
+    surfaceContainerHighest: Color.alphaBlend(t.ink.withValues(alpha: 0.08), t.canvas),
+    surfaceContainerHigh: Color.alphaBlend(t.ink.withValues(alpha: 0.06), t.canvas),
     outline: t.controlBorder,
     outlineVariant: t.hairline,
     error: brightness == Brightness.dark ? const Color(0xFFFFB4AB) : const Color(0xFFBA1A1A),
