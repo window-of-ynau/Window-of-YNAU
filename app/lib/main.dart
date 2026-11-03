@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 
 import 'src/campus/campus_entries.dart';
 import 'src/campus/timetable_page.dart';
+import 'src/core/app_paths.dart';
 import 'src/chat/chat_page.dart';
 import 'src/campus/webview_fetcher.dart';
 import 'src/core/timetable_service.dart';
@@ -91,7 +92,10 @@ class _YunongAppState extends State<YunongApp> {
             navigatorKey: WebViewSchoolFetcher.navigatorKey,
             theme: _controller.theme(Brightness.light),
             darkTheme: _controller.theme(Brightness.dark),
-            themeMode: _controller.themeMode,
+            // P1-3：不再单独选明暗；主题自身决定（B 深蓝玻璃=深色，A/C=浅色）
+      themeMode: _controller.themeId == AppThemeId.deepGlass
+          ? ThemeMode.dark
+          : ThemeMode.light,
             // 画布背景：B 的深蓝渐变、C 的纸纹都铺在这里（Scaffold 对这些主题透明），
             // 这样所有路由（设置页、课表页）都叠在同一层背景上，切页不会"闪白"。
             builder: (BuildContext context, Widget? child) {
@@ -225,7 +229,7 @@ class _ChatPane extends StatelessWidget {
   const _ChatPane();
 
   @override
-  Widget build(BuildContext context) => const ChatPage();
+  Widget build(BuildContext context) => ChatPage(dbPath: AppPaths.databasePath);
 }
 
 /// 校务入口（后续替换为真实 WebView；Cookie 只留在本机，ADR-11）。
@@ -246,8 +250,19 @@ class _CampusPane extends StatelessWidget {
     if (entry == CampusEntry.timetable) {
       return TimetablePage(service: _service, fetcher: _fetcher);
     }
-    return const ChatPage();
-    // ignore: dead_code
+    // t52 P0-2：其余入口显示**自己的占位页**（带 URL），绝不能落到对话页
+    return _EntryPlaceholder(entry: entry);
+  }
+}
+
+/// 校务入口占位页（WebView 接入前的兜底；**绝不显示对话页**）。
+class _EntryPlaceholder extends StatelessWidget {
+  const _EntryPlaceholder({required this.entry});
+
+  final CampusEntry entry;
+
+  @override
+  Widget build(BuildContext context) {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
@@ -261,9 +276,8 @@ class _CampusPane extends StatelessWidget {
             SelectableText(entry.url, style: const TextStyle(fontSize: 12)),
             const SizedBox(height: 16),
             const Text(
-              'W2 将在此内嵌 WebView：登录一次、Cookie 留本机、免二次登录',
+              '该入口暂为占位页（后续在此内嵌 WebView）',
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
         ),
