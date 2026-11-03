@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use yunong_core::ffi::{yunong_chat_cancel, yunong_chat_stream};
+use yunong_core::ffi::{yunong_chat_cancel, yunong_chat_stream, yunong_free_string};
 
 /// 回调里累积的状态。
 ///
@@ -36,6 +36,9 @@ struct Sink {
     count: AtomicUsize,
     /// 收到的 `delta` 条数（和上游发的帧数对账）
     deltas: AtomicUsize,
+    /// 泄漏模式用：不打印每条 chunk
+    quiet: bool,
+
     /// `>0` 时收到第 N 条后主动取消（验证取消路径）
     cancel_after: usize,
     handle: AtomicI64,
@@ -48,6 +51,7 @@ impl Sink {
             chunks: Mutex::new(Vec::new()),
             count: AtomicUsize::new(0),
             deltas: AtomicUsize::new(0),
+            quiet: false,
             cancel_after,
             handle: AtomicI64::new(0),
             cancel_sent: AtomicBool::new(false),
@@ -92,10 +96,14 @@ unsafe extern "C" fn on_chunk(json: *const std::os::raw::c_char, user: *mut std:
     if chunk_type(&text).as_deref() == Some("delta") {
         sink.deltas.fetch_add(1, Ordering::SeqCst);
     }
-    println!("[probe] chunk #{n:<3} {}", brief(&text, 160));
+    if !sink.quiet {
+        println!("[probe] chunk #{n:<3} {}", brief(&text, 160));
+    }
     if let Ok(mut chunks) = sink.chunks.lock() {
         chunks.push(text);
     }
+    // T82 契约：chunk_json 的所有权已转移给我们，拷完必须释放（等价于 Dart 侧 yunong_free_string）
+    unsafe { yunong_free_string(json as *mut std::os::raw::c_char) };
 
     // 取消路径：收到第 N 条后调 `yunong_chat_cancel`，观察后续是否停下
     if sink.cancel_after > 0
@@ -154,6 +162,8 @@ struct UpstreamSpec {
     crlf: bool,
     /// 不发 `data: [DONE]`，直接关连接
     no_done: bool,
+    /// 每帧 delta 额外填充多少字节（泄漏测试用；0 = 只发 `字{i}`）
+    payload_bytes: usize,
 }
 
 struct UpstreamStats {
@@ -237,7 +247,11 @@ fn serve_sse(
 
     let sep = if spec.crlf { "\r\n\r\n" } else { "\n\n" };
     for index in 0..spec.frames {
-        let text = format!("字{index}");
+        let text = if spec.payload_bytes == 0 {
+            format!("字{index}")
+        } else {
+            format!("字{index}{}", "x".repeat(spec.payload_bytes))
+        };
         let payload = serde_json::json!({
             "id": "chatcmpl-probe",
             "object": "chat.completion.chunk",
@@ -329,6 +343,8 @@ struct Args {
     split: bool,
     crlf: bool,
     no_done: bool,
+    /// `--leak N`：跑 N 次完整流做泄漏检查（0 = 不跑）
+    leak_rounds: usize,
 }
 
 fn parse_args() -> Args {
@@ -341,6 +357,7 @@ fn parse_args() -> Args {
         split: false,
         crlf: false,
         no_done: false,
+        leak_rounds: 0,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -367,6 +384,12 @@ fn parse_args() -> Args {
             "--split" => args.split = true,
             "--crlf" => args.crlf = true,
             "--no-done" => args.no_done = true,
+            "--leak" => {
+                args.leak_rounds = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--leak 需要一个数字");
+            }
             "--timeout-ms" => {
                 args.timeout_ms = iter
                     .next()
@@ -381,6 +404,10 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
+    if args.leak_rounds > 0 {
+        run_leak(args.leak_rounds);
+        return;
+    }
     println!("=== C ABI 探针：yunong_chat_stream ===");
 
     // 1) 假上游（--bad-url 时故意指向一个没人监听的端口）
@@ -399,6 +426,7 @@ fn main() {
             split: args.split,
             crlf: args.crlf,
             no_done: args.no_done,
+            payload_bytes: 0,
         };
         let upstream = start_fake_sse(spec);
         println!(
@@ -552,4 +580,144 @@ fn main() {
     }
     eprintln!("\n❌ 结论：收到 {count} 条但没等到 done → 流没走完（超时或上游卡住）");
     std::process::exit(2);
+}
+
+// ---------------------------------------------------------------------------
+// 泄漏检查：跑 N 次完整流（含回调释放），RSS 不应线性增长
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[repr(C)]
+struct ProcessMemoryCounters {
+    cb: u32,
+    page_fault_count: u32,
+    peak_working_set_size: usize,
+    working_set_size: usize,
+    quota_peak_paged_pool_usage: usize,
+    quota_paged_pool_usage: usize,
+    quota_peak_non_paged_pool_usage: usize,
+    quota_non_paged_pool_usage: usize,
+    pagefile_usage: usize,
+    peak_pagefile_usage: usize,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> *mut std::os::raw::c_void;
+    fn K32GetProcessMemoryInfo(
+        process: *mut std::os::raw::c_void,
+        counters: *mut ProcessMemoryCounters,
+        size: u32,
+    ) -> i32;
+}
+
+/// 当前进程的常驻内存（字节）；非 Windows 返回 None。
+#[cfg(windows)]
+fn rss_bytes() -> Option<u64> {
+    let mut counters = ProcessMemoryCounters {
+        cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+        page_fault_count: 0,
+        peak_working_set_size: 0,
+        working_set_size: 0,
+        quota_peak_paged_pool_usage: 0,
+        quota_paged_pool_usage: 0,
+        quota_peak_non_paged_pool_usage: 0,
+        quota_non_paged_pool_usage: 0,
+        pagefile_usage: 0,
+        peak_pagefile_usage: 0,
+    };
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<ProcessMemoryCounters>() as u32,
+        )
+    };
+    (ok != 0).then_some(counters.working_set_size as u64)
+}
+
+#[cfg(not(windows))]
+fn rss_bytes() -> Option<u64> {
+    None
+}
+
+fn total_rss() -> Option<u64> {
+    rss_bytes()
+}
+
+/// 跑 `rounds` 次完整流；每次回调都按契约释放指针。若哪里漏了 free，RSS 会跟着涨。
+fn run_leak(rounds: usize) {
+    println!("=== 泄漏检查：{rounds} 次完整流（每帧 8 KiB，回调内释放）===");
+    let before = total_rss();
+    let mut chunks_total = 0_usize;
+    for round in 0..rounds {
+        let spec = UpstreamSpec {
+            frames: 8,
+            interval: Duration::from_millis(1),
+            split: false,
+            crlf: false,
+            no_done: false,
+            payload_bytes: 8192,
+        };
+        let upstream = start_fake_sse(spec);
+        let port = upstream.port;
+        let request = serde_json::json!({
+            "channel": "byok",
+            "protocol": "openai_completions",
+            "model": "gpt-probe",
+            "base_url": format!("http://127.0.0.1:{port}/v1"),
+            "api_key": "sk-probe-not-a-real-key",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let request = CString::new(serde_json::to_string(&request).unwrap()).unwrap();
+        let db_path = CString::new("").unwrap();
+        let mut sink = Sink::new(0);
+        sink.quiet = true;
+        let sink = Arc::new(sink);
+        let user = Arc::as_ptr(&sink) as *mut std::os::raw::c_void;
+        let handle =
+            unsafe { yunong_chat_stream(request.as_ptr(), db_path.as_ptr(), Some(on_chunk), user) };
+        if handle <= 0 {
+            eprintln!("第 {round} 轮 yunong_chat_stream 返回 0（入参被拒）");
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !sink.has_done() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let _ = upstream.handle.join();
+        chunks_total += sink.count.load(Ordering::SeqCst);
+        if (round + 1) % 50 == 0 {
+            let now = total_rss();
+            println!(
+                "  第 {:>3} 轮：累计 {} 帧，RSS = {}",
+                round + 1,
+                chunks_total,
+                now.map(|bytes| format!("{:.1} MiB", bytes as f64 / 1048576.0))
+                    .unwrap_or_else(|| "n/a".to_owned())
+            );
+        }
+    }
+    let after = total_rss();
+    println!(
+        "总计 {} 帧；RSS {} → {}（差 {}）",
+        chunks_total,
+        before
+            .map(|b| format!("{:.1} MiB", b as f64 / 1048576.0))
+            .unwrap_or_else(|| "n/a".to_owned()),
+        after
+            .map(|b| format!("{:.1} MiB", b as f64 / 1048576.0))
+            .unwrap_or_else(|| "n/a".to_owned()),
+        match (before, after) {
+            (Some(b), Some(a)) => format!("{:+.1} MiB", (a as f64 - b as f64) / 1048576.0),
+            _ => "n/a".to_owned(),
+        }
+    );
+    if chunks_total / rounds.max(1) < 5 {
+        eprintln!(
+            "⚠️ 每轮平均帧数偏低（{}），泄漏结论仅供参考",
+            chunks_total / rounds.max(1)
+        );
+    }
 }

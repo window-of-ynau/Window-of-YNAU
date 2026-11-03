@@ -874,14 +874,28 @@ pub unsafe extern "C" fn yunong_search_delete(
 // 流式对话（W7 P0）：回调式 FFI
 // ---------------------------------------------------------------------------
 
-/// 流式回调：`chunk_json` **只在本次回调期间有效**（Rust 分配、Rust 释放，Dart 侧绝不能 free）。
+/// 流式回调。
 ///
-/// **返回类型是 `void`**（R5-F6：早期版本让回调返回 `1/0` 表示取消，现在不是了）：
-/// 回调里**不能**通过返回值取消流。要取消请拿 `yunong_chat_stream` 返回的 handle
-/// 调 [`yunong_chat_cancel`]（可以在回调里调，也可以从别的线程调）。
+/// # ⚠️ `chunk_json` 的所有权**转移给调用方**（T82 契约）
 ///
-/// 取消之后仍会再收到**一帧终态** `{"type":"done","finish":"stop"}`（R5-F7）：
-/// 它表示"本条流已结束"，不代表模型正常说完——客户端据此收尾即可。
+/// 这块内存由 Rust `CString::into_raw` 分配，**调用方读完必须调 [`yunong_free_string`] 释放**：
+/// ```c
+/// void on_chunk(const char* json, void* user) {
+///     /* 1. 拷出内容（UTF-8 → 你的字符串类型） */
+///     /* 2. 立刻：yunong_free_string((char*)json);  <-- 不调就是内存泄漏 */
+/// }
+/// ```
+/// **不释放 = 泄漏；释放后再读 = UB。**
+///
+/// 为什么必须这样：`NativeCallable.listener` 是**异步投递**（经 Dart 端口），
+/// 回调函数返回时数据还没被读；Rust 若在返回时 drop，Dart 读到的就是已释放内存
+/// （现象：`FormatException: Missing extension byte` 或内容乱掉）。
+///
+/// # 返回类型是 `void`
+///
+/// 回调里**不能**通过返回值取消流（`listener` 只能返回 void，寄存器内容未定义）。
+/// 要取消请拿 [`yunong_chat_stream`] 返回的 handle 调 [`yunong_chat_cancel`]。
+/// 取消之后仍会再收到**一帧终态** `{"type":"done","finish":"stop"}`。
 pub type ChatChunkCallback = unsafe extern "C" fn(chunk_json: *const c_char, user: *mut c_void);
 
 static CHAT_CANCEL: OnceLock<crate::chat_ffi::CancelRegistry> = OnceLock::new();
@@ -903,16 +917,33 @@ struct ChatCallback {
 unsafe impl Send for ChatCallback {}
 
 impl ChatCallback {
+    /// 投递一条 chunk。返回 `false` 表示**无法投递**（含 NUL 的非法 JSON），调用方应停止。
+    ///
+    /// # 所有权：**必须 `into_raw` 移交给调用方**
+    ///
+    /// `NativeCallable.listener` 是**异步投递**：它只是把指针塞进 Dart 端口就返回，
+    /// Dart 那边稍后才真正读取。所以**绝不能用 `c.as_ptr()`** —— 函数一返回 `c` 就被 drop，
+    /// Dart 读到的是已释放内存（表现为 `FormatException: Missing extension byte`，
+    /// 或者更糟：读到别人刚写进去的数据）。
+    ///
+    /// 契约：
+    /// - 所有权随回调**转移给调用方**；
+    /// - 调用方拷出内容（UTF-8 → Dart String）后**必须**调 [`yunong_free_string`] 释放；
+    /// - 不释放 = 内存泄漏；释放后再读 = UB。
+    ///
+    /// # 取消
+    ///
+    /// 回调是 `void`（`NativeCallable.listener` 只能返回 void，返回值寄存器内容未定义），
+    /// 所以这里恒返回 `true`。要取消请用 [`yunong_chat_cancel`]，由 registry 判定。
     fn emit(&self, json: &str) -> bool {
-        // 回调是 void：Dart 的 `NativeCallable.listener` 只能返回 void，
-        // 返回寄存器内容未定义，若当成"非 0 即取消"会把每个 chunk 都判成取消，
-        // 流立刻结束、done 永远不来。取消只由 `yunong_chat_cancel` 的 registry 判定。
         match CString::new(json) {
             Ok(c) => {
-                unsafe { (self.on_chunk)(c.as_ptr(), self.user) };
+                // 所有权移交：这块内存活到调用方调 `yunong_free_string`
+                let ptr = c.into_raw();
+                unsafe { (self.on_chunk)(ptr, self.user) };
                 true
             }
-            // 含 NUL 的非法 JSON：无法安全投递，按终止处理
+            // 含 NUL 的非法 JSON：无法安全投递，按终止处理（不分配、不泄漏）
             Err(_) => false,
         }
     }
@@ -922,6 +953,12 @@ impl ChatCallback {
 /// 流内的错误也以 `Chunk::Error` 回调，**不会**用返回值/异常表达。
 ///
 /// 返回 `0` 表示入参无效（空指针 / 空 JSON）；此时不会启动线程。
+///
+/// # 首帧与所有权（T80 / T82）
+///
+/// - 流启动后**立刻**发一条 `{"type":"meta",…}`（不等上游）：收到它就证明回调通了；
+/// - 回调收到的 `chunk_json` **所有权归调用方**，读完必须 `yunong_free_string`（见 [`ChatChunkCallback`]）；
+/// - `user` 原样回传（Dart 用它当 sink 的键，不要指望 handle 的时序）。
 ///
 /// # Safety
 ///
@@ -2664,12 +2701,15 @@ mod tests {
     // 流式对话 FFI（W7 P0）
     // ---------------------------------------------------------------------
 
+    /// 测试用回调：立刻拷出内容，然后**按契约释放**（T82：所有权在回调方）。
     extern "C" fn collect_chunk(chunk_json: *const c_char, user: *mut c_void) {
         let sink = unsafe { &mut *(user as *mut Vec<String>) };
         let text = unsafe { CStr::from_ptr(chunk_json) }
             .to_str()
             .unwrap()
             .to_owned();
+        // 所有权已转移给我们：拷完就还回去（等价于 Dart 侧调 yunong_free_string）
+        drop(unsafe { CString::from_raw(chunk_json as *mut c_char) });
         sink.push(text);
     }
 
@@ -2766,6 +2806,8 @@ mod tests {
         let text = unsafe { CStr::from_ptr(json) }
             .to_string_lossy()
             .into_owned();
+        // T82 契约：回调方拥有所有权，拷完必须释放
+        drop(unsafe { CString::from_raw(json as *mut c_char) });
         let kind = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
             value
                 .get("type")
@@ -2803,6 +2845,65 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // T82：回调指针的所有权转移（模拟 Dart 异步投递的"延迟读取"）
+    // ---------------------------------------------------------------------
+
+    /// 只把指针**存起来**，不读、不释放——模拟 `NativeCallable.listener` 的异步投递。
+    static DELAYED_PTRS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn delay_cb(json: *const c_char, _user: *mut std::os::raw::c_void) {
+        DELAYED_PTRS.lock().unwrap().push(json as usize);
+    }
+
+    /// 回调返回之后，指针指向的内容**必须仍然有效**。
+    ///
+    /// 这正是 T82 的回归测试：修复前 `emit` 用 `c.as_ptr()`，回调一返回 `CString` 就被 drop，
+    /// 这里延迟读取要么读到乱码、要么直接崩溃/`FormatException`（Dart 侧的
+    /// `Missing extension byte` 就是这么来的）。
+    #[test]
+    fn chunk_pointer_stays_valid_after_callback_returns() {
+        DELAYED_PTRS.lock().unwrap().clear();
+        let request = byok_request_with_dead_upstream();
+        let db = CString::new("").unwrap();
+        let handle = unsafe {
+            yunong_chat_stream(
+                request.as_ptr(),
+                db.as_ptr(),
+                Some(delay_cb),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(handle > 0);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while DELAYED_PTRS.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "等回调超时（只存了 {} 个指针）",
+                DELAYED_PTRS.lock().unwrap().len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // 给"流已经收尾"留点时间，确保不是刚写就被读到
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let pointers = DELAYED_PTRS.lock().unwrap().clone();
+        let mut kinds = Vec::new();
+        for ptr in pointers {
+            let text = unsafe { CStr::from_ptr(ptr as *const c_char) }
+                .to_str()
+                .unwrap_or_else(|err| panic!("延迟读到的不是合法 UTF-8：{err}"))
+                .to_owned();
+            let value: Value = serde_json::from_str(&text)
+                .unwrap_or_else(|err| panic!("延迟读到的不是 JSON（{err}）：{text:?}"));
+            kinds.push(value["type"].as_str().unwrap_or_default().to_owned());
+            // 读完按契约释放（否则就是泄漏）
+            drop(unsafe { CString::from_raw(ptr as *mut c_char) });
+        }
+        assert_eq!(kinds, vec!["meta", "error"], "延迟读到的帧序列：{kinds:?}");
     }
 
     /// `user` 原样透传 + 首帧即 meta + 竞态测量（一个测试里顺序做，避免并行测试互相踩静态量）。

@@ -5,6 +5,13 @@
 //! `gateway` 是纯 Rust 的流式 trait，Dart 侧要"边生成边显示"，必须走**回调**而不是
 //! "调用→返回 JSON"。FFI 函数本体在 `ffi.rs`，这里放可单测的逻辑：
 //! - [`ChatRunConfig`]：Dart 传的 JSON 配置（通道 / 协议 / 模型 / Key / 消息）；
+//! # ⚠️ 回调的所有权（T82，最容易踩的一条）
+//!
+//! 每条 chunk 的 JSON 由 Rust `CString::into_raw` 分配，**所有权随回调转给调用方**：
+//! 调用方读完必须 `yunong_free_string(ptr)`。原因见 `ffi::ChatChunkCallback`：
+//! `NativeCallable.listener` 是**异步投递**，回调返回时数据还没被读，Rust 若在返回时释放
+//! 就是悬垂指针（现象：Dart 侧 `FormatException: Missing extension byte`）。
+//!
 //! - [`run_stream`]：搭运行时、选通道、把 Chunk 交给回调；流中的错误**以 `Chunk::Error` 输出**
 //!   （不是异常、不是 FFI 返回值），这样 Dart 侧永远只有一条流；
 //! - [`CancelRegistry`]：`yunong_chat_cancel(handle)` 的取消登记表。
