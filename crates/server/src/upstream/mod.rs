@@ -562,6 +562,7 @@ mod tests {
             max_output_tokens: 128,
             stream: true,
             estimated_input_tokens: 12,
+            tool_choice: None,
         }
     }
 

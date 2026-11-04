@@ -36,6 +36,7 @@ fn request(protocol: Protocol) -> ChatRequest {
         max_output_tokens: 128,
         stream: true,
         estimated_input_tokens: 32,
+        tool_choice: None,
     }
 }
 

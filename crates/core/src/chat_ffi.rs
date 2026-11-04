@@ -169,6 +169,13 @@ impl ChatRunConfig {
             max_output_tokens: self.max_output_tokens.unwrap_or(1024),
             stream: true,
             estimated_input_tokens: 0,
+            // t128：把客户端要的 tool_choice **规范化后**放进请求（导出给套餐通道透传）。
+            // `auto` 不写（`None` → 序列化时被 skip，老服务端也安全）；认不出的值已在上面 warn 过。
+            tool_choice: {
+                let (choice, _) =
+                    crate::tool_choice::ToolChoice::parse(self.tool_choice.as_deref());
+                (choice != crate::tool_choice::ToolChoice::Auto).then(|| choice.as_str().to_owned())
+            },
         }
     }
 }
@@ -1803,6 +1810,46 @@ mod tests {
         println!("[meta] {meta}");
         assert_eq!(meta["tool_choice"], "required", "{meta}");
         assert_eq!(meta["tool_choice_effective"], "required", "{meta}");
+    }
+
+    /// t128：套餐通道（cloud）也要把 `tool_choice` 带给服务端；没设时**不带这个键**。
+    fn cloud_config(base_url: &str, tool_choice: Option<&str>) -> ChatRunConfig {
+        let mut config = config_with_request(serde_json::json!({
+            "channel": "cloud",
+            "db_path": "/tmp/app.db",
+            "protocol": "openai_completions",
+            "cloud_base_url": base_url,
+            "cloud_token": "tok-test",
+        }));
+        config.tool_choice = tool_choice.map(str::to_owned);
+        config
+    }
+
+    #[test]
+    fn cloud_channel_forwards_tool_choice_only_when_set() {
+        // 设了 required → 发往服务端的 JSON 里必须有这个字段
+        let server = ScriptedServer::start(vec![final_round("好的")]);
+        let config = cloud_config(&server.base_url(), Some("required"));
+        let _ = run_collect(config, crate::tools::ToolRegistry::new());
+        let bodies = server.bodies.lock().unwrap().clone();
+        println!("[cloud body:required] {}", bodies[0]);
+        assert!(
+            bodies[0].contains(r#""tool_choice":"required""#),
+            "套餐通道没把 tool_choice 带上：{}",
+            bodies[0]
+        );
+
+        // 没设 → 整条 JSON 里**不该**出现这个键（skip_serializing_if）
+        let server = ScriptedServer::start(vec![final_round("好的")]);
+        let config = cloud_config(&server.base_url(), None);
+        let _ = run_collect(config, crate::tools::ToolRegistry::new());
+        let bodies = server.bodies.lock().unwrap().clone();
+        println!("[cloud body:unset] {}", bodies[0]);
+        assert!(
+            !bodies[0].contains("tool_choice"),
+            "没设时不该出现该键：{}",
+            bodies[0]
+        );
     }
 
     /// t126：DeepSeek 的 Anthropic 兼容层把 `any` 按 auto 处理 → meta 必须如实报 `auto`。
