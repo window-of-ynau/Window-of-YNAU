@@ -11,6 +11,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/main.dart';
+import 'support/test_window.dart';
 import 'package:yunong/src/campus/timetable/course_palette.dart';
 import 'package:yunong/src/settings/settings_page.dart';
 import 'package:yunong/src/theme/theme_controller.dart';
@@ -91,8 +92,7 @@ void main() {
   group('A/C 主题零玻璃（没有 BackdropFilter）', () {
     for (final AppThemeId id in <AppThemeId>[AppThemeId.minimalBlack, AppThemeId.paperCoral]) {
       testWidgets('${id.label}：token 无 glass，页面无 BackdropFilter', (WidgetTester tester) async {
-        await tester.binding.setSurfaceSize(const Size(800, 600));
-        addTearDown(() => tester.binding.setSurfaceSize(null));
+        setTestWindow(tester, 800, 600);
 
         final ThemeController controller = ThemeController(initialTheme: id);
         await tester.pumpWidget(
@@ -108,8 +108,7 @@ void main() {
 
   group('切换即时生效、不重启', () {
     testWidgets('默认 A；切到 C 后颜色立刻变，HomeShell 没被重建', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(1000, 700));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 1000, 700);
 
       final ThemeController controller = ThemeController();
       await tester.pumpWidget(YunongApp(themeController: controller));
@@ -134,8 +133,7 @@ void main() {
     });
 
     testWidgets('设置页点卡片即可切换，并写进存储', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(900, 700));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 900, 700);
 
       final MemorySettingsStore store = MemorySettingsStore();
       final ThemeController controller = ThemeController(store: store);
@@ -311,8 +309,7 @@ void main() {
   group('t53：C 主题性能与明暗收敛', () {
     testWidgets('纸纹用单次绘制的 PaperTexture（不再有 Image + Opacity 平铺）',
         (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 600));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 800, 600);
 
       final ThemeController controller = ThemeController(initialTheme: AppThemeId.paperCoral);
       await tester.pumpWidget(YunongApp(themeController: controller));
@@ -324,8 +321,7 @@ void main() {
     });
 
     testWidgets('A/B 主题不挂纸纹层', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 600));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 800, 600);
 
       for (final AppThemeId id in <AppThemeId>[AppThemeId.minimalBlack, AppThemeId.deepGlass]) {
         final ThemeController controller = ThemeController(initialTheme: id);
@@ -342,8 +338,7 @@ void main() {
     });
 
     testWidgets('设置页不再出现"明暗 / 跟随系统"选项', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(900, 700));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 900, 700);
 
       final ThemeController controller = ThemeController();
       await tester.pumpWidget(
@@ -355,8 +350,7 @@ void main() {
     });
 
     testWidgets('C 主题的对话气泡改书页排版（用户为页边批注）', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(900, 700));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 900, 700);
 
       final ThemeController controller = ThemeController(initialTheme: AppThemeId.paperCoral);
       await tester.pumpWidget(YunongApp(themeController: controller));
@@ -385,8 +379,7 @@ void main() {
     });
 
     testWidgets('三主题空态结构一致：问候 + 副标题 + 建议 chip', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(1100, 760));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 1100, 760);
       for (final AppThemeId id in AppThemeId.values) {
         final ThemeController controller = ThemeController(initialTheme: id);
         await tester.pumpWidget(YunongApp(themeController: controller));
@@ -403,8 +396,7 @@ void main() {
     });
 
     testWidgets('空态整簇在内容区垂直居中（不再贴底）', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(1100, 760));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 1100, 760);
       final ThemeController controller = ThemeController();
       await tester.pumpWidget(YunongApp(themeController: controller));
       await tester.pumpAndSettle();

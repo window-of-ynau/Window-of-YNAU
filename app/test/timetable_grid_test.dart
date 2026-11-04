@@ -11,6 +11,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/src/campus/timetable/course_palette.dart';
+import 'support/test_window.dart';
 import 'package:yunong/src/campus/timetable/timetable_grid.dart';
 import 'package:yunong/src/core/timetable_service.dart';
 
@@ -96,8 +97,7 @@ void main() {
 
   group('课表网格', () {
     testWidgets('7 天 × 10 节的网格：表头 7 列、节次轴 1..10', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 600));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 800, 600);
 
       await tester.pumpWidget(_host(
         TimetableGrid(
@@ -118,8 +118,7 @@ void main() {
     });
 
     testWidgets('800×600 不溢出，且块里能看到课名 + 教室 + 节次', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 600));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 800, 600);
 
       await tester.pumpWidget(_host(
         TimetableGrid(
@@ -140,8 +139,7 @@ void main() {
     });
 
     testWidgets('480×900 窄窗（折叠周末 = 5 列）不溢出', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(480, 900));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 480, 900);
 
       await tester.pumpWidget(_host(
         TimetableGrid(
@@ -160,8 +158,7 @@ void main() {
     });
 
     testWidgets('课程块按节次跨度撑高：2 节的块约是单节块的 2 倍', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 600));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 800, 600);
 
       await tester.pumpWidget(_host(
         TimetableGrid(
@@ -184,8 +181,7 @@ void main() {
     });
 
     testWidgets('同格冲突横向分道：两门课并排，互不覆盖', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 600));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 800, 600);
 
       await tester.pumpWidget(_host(
         TimetableGrid(
@@ -210,8 +206,7 @@ void main() {
     });
 
     testWidgets('点课程块弹详情：教师/教室/周次都在', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 600));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 800, 600);
 
       await tester.pumpWidget(_host(
         TimetableGrid(
@@ -231,8 +226,7 @@ void main() {
     });
 
     testWidgets('没有学期开始日 → 表头不显示日期，也不高亮今天', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 600));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 800, 600);
 
       await tester.pumpWidget(_host(
         TimetableGrid(
@@ -249,8 +243,7 @@ void main() {
     });
 
     testWidgets('有日期时显示 MM-DD 表头', (WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 600));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      setTestWindow(tester, 800, 600);
 
       final DateTime monday = DateTime(2026, 10, 26);
       await tester.pumpWidget(_host(
