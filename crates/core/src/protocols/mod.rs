@@ -337,6 +337,7 @@ fn fixture_request(protocol: Protocol) -> ChatRequest {
         max_output_tokens: 512,
         stream: true,
         estimated_input_tokens: 100,
+        tool_choice: None,
     }
 }
 
