@@ -2105,6 +2105,219 @@ async fn oversized_email_is_rejected_without_growing_rate_limiter() {
     assert_eq!(mock.requests(), 0);
 }
 
+/// t129：`tools` 原样转发 + `tool_choice=required` 按协议映射到上游。
+///
+/// 服务端**只透传**：不改写工具定义、不做白名单、不跑工具循环。
+#[tokio::test]
+async fn tool_choice_required_is_forwarded_to_upstream() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+    let token = app.register("tools-passthrough@ynau.edu.cn").await;
+
+    let payload = json!({
+        "session_id": "s",
+        "turn_id": "turn-tools-passthrough",
+        "round": 1,
+        "model": "m",
+        "protocol": "openai_completions",
+        "messages": [{ "role": "user", "content": "现在几点了" }],
+        "tools": [{
+            "name": "get_courses",
+            "description": "查询本地课表",
+            "parameters": { "type": "object", "properties": { "weekday": { "type": "integer" } } }
+        }],
+        "tool_choice": "required",
+        "max_output_tokens": 64,
+        "stream": true,
+        "estimated_input_tokens": 1
+    })
+    .to_string();
+
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &payload,
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await;
+
+    let received = mock.last_request().body;
+    // 工具定义逐字段原样到达上游（completions 形状：function.name/description/parameters）
+    assert_eq!(received["tools"][0]["type"], "function");
+    assert_eq!(received["tools"][0]["function"]["name"], "get_courses");
+    assert_eq!(
+        received["tools"][0]["function"]["description"],
+        "查询本地课表"
+    );
+    assert_eq!(
+        received["tools"][0]["function"]["parameters"]["properties"]["weekday"]["type"],
+        "integer"
+    );
+    // completions/responses 用字符串 "required"
+    assert_eq!(received["tool_choice"], "required");
+}
+
+/// t129：`messages` 协议下 `required` 映射成 `{"type":"any"}`（与端侧 core 一致）。
+#[tokio::test]
+async fn tool_choice_required_maps_to_any_for_messages() {
+    let mock = start_mock(Script::MessagesOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+    let token = app.register("tools-messages@ynau.edu.cn").await;
+
+    let payload = json!({
+        "session_id": "s",
+        "turn_id": "turn-tools-messages",
+        "round": 1,
+        "model": "m",
+        "protocol": "anthropic_messages",
+        "messages": [{ "role": "user", "content": "查课表" }],
+        "tools": [{
+            "name": "get_courses",
+            "description": "查询本地课表",
+            "parameters": { "type": "object", "properties": {} }
+        }],
+        "tool_choice": "required",
+        "max_output_tokens": 64,
+        "stream": true,
+        "estimated_input_tokens": 1
+    })
+    .to_string();
+
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &payload,
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await;
+
+    let received = mock.last_request().body;
+    // Anthropic 形状：工具是 {name, description, input_schema}
+    assert_eq!(received["tools"][0]["name"], "get_courses");
+    assert!(received["tools"][0].get("input_schema").is_some());
+    assert_eq!(received["tool_choice"], json!({ "type": "any" }));
+}
+
+/// t129：`tool_choice=auto`（或没给）时**不写**这个字段（各家默认就是 auto，少发少风险）。
+#[tokio::test]
+async fn tool_choice_auto_is_not_sent_upstream() {
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_config(TestApp::config(&mock));
+    let token = app.register("tools-auto@ynau.edu.cn").await;
+
+    for payload in [
+        // 显式 auto
+        json!({
+            "session_id": "s", "turn_id": "turn-auto-1", "round": 1, "model": "m",
+            "protocol": "openai_completions",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [], "tool_choice": "auto",
+            "max_output_tokens": 64, "stream": true, "estimated_input_tokens": 1
+        }),
+        // 完全没给
+        json!({
+            "session_id": "s", "turn_id": "turn-auto-2", "round": 1, "model": "m",
+            "protocol": "openai_completions",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [],
+            "max_output_tokens": 64, "stream": true, "estimated_input_tokens": 1
+        }),
+    ] {
+        let response = app
+            .call(json_request(
+                "POST",
+                "/api/v1/chat/stream",
+                &payload.to_string(),
+                Some(&token),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await;
+        assert!(
+            mock.last_request().body.get("tool_choice").is_none(),
+            "auto 不该发 tool_choice 字段：{}",
+            mock.last_request().body
+        );
+    }
+}
+
+/// t129：审计只记 `tools=N,choice=…`，**绝不落工具内容**。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_audit_records_tool_count_not_tool_content() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mock = start_mock(Script::CompletionsOk).await;
+    let app = TestApp::with_db(TestApp::config(&mock), Some(db.pool.clone()));
+    let token = app.register("tools-audit@ynau.edu.cn").await;
+
+    let marker = "SECRET-TOOL-DESCRIPTION-MARKER";
+    let payload = json!({
+        "session_id": "s",
+        "turn_id": "turn-tools-audit",
+        "round": 1,
+        "model": "m",
+        "protocol": "openai_completions",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "tools": [{
+            "name": "lookup",
+            "description": marker,
+            "parameters": { "type": "object", "properties": {} }
+        }],
+        "tool_choice": "required",
+        "max_output_tokens": 64,
+        "stream": true,
+        "estimated_input_tokens": 1
+    })
+    .to_string();
+
+    let response = app
+        .call(json_request(
+            "POST",
+            "/api/v1/chat/stream",
+            &payload,
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await;
+
+    // 审计里必须有"几个工具 + 什么策略"
+    assert!(
+        wait_for_rows(
+            &db,
+            "SELECT count(*) FROM audit_logs \
+             WHERE action = 'chat.stream' AND decision = 'allow' \
+               AND reason = 'tools=1,choice=required'",
+            1
+        )
+        .await,
+        "审计应记录 tools=1,choice=required"
+    );
+    // 但绝不能出现工具内容（描述可能很长，且属于端侧数据）
+    assert_eq!(
+        count(
+            &db.pool,
+            &format!(
+                "SELECT count(*) FROM audit_logs \
+                 WHERE coalesce(target, '') LIKE '%{marker}%' \
+                    OR coalesce(reason, '') LIKE '%{marker}%'"
+            )
+        )
+        .await,
+        0,
+        "审计里不允许出现工具描述"
+    );
+    db.finish().await;
+}
+
 /// security 复核 F2（medium）：工具描述/参数同样会转发给上游，必须计入准入估算。
 #[tokio::test]
 async fn tool_definition_is_counted_in_admission_estimate() {
