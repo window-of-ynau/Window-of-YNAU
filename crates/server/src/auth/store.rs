@@ -61,6 +61,8 @@ pub struct MemoryState {
 struct MemoryUser {
     /// Argon2id 的 PHC 字符串
     password_hash: String,
+    /// 停用时间（对应 PG 的 `users.disabled_at`）。非空 = 该账号一律不可用。
+    disabled_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug)]
@@ -90,16 +92,58 @@ impl MemoryState {
             return Err(AuthError::validation("该邮箱已注册"));
         }
         let user_id = Uuid::new_v4();
-        self.users.insert(user_id, MemoryUser { password_hash });
+        self.users.insert(
+            user_id,
+            MemoryUser {
+                password_hash,
+                disabled_at: None,
+            },
+        );
         self.emails.insert(email, user_id);
         Ok(self.issue_session(user_id, None))
     }
 
     /// 按邮箱取用户与 PHC 哈希（登录用）。
+    ///
+    /// 停用账号按"不存在"处理（与 PG 的 `disabled_at IS NULL` 过滤同语义）：
+    /// 登录路径不能因为"这个账号存在但被停用"而泄露任何信息。
     pub(crate) fn password_hash(&self, email: &str) -> Option<(Uuid, String)> {
         let user_id = *self.emails.get(email)?;
         let user = self.users.get(&user_id)?;
+        if user.disabled_at.is_some() {
+            return None;
+        }
         Some((user_id, user.password_hash.clone()))
+    }
+
+    /// 停用一个账号：标记 + **立刻吊销它的所有令牌**（H1）。
+    pub(crate) fn disable_user(&mut self, user_id: Uuid) -> bool {
+        let now = OffsetDateTime::now_utc();
+        let Some(user) = self.users.get_mut(&user_id) else {
+            return false;
+        };
+        if user.disabled_at.is_some() {
+            return false;
+        }
+        user.disabled_at = Some(now);
+        for record in self.access_tokens.values_mut() {
+            if record.user_id == user_id && record.revoked_at.is_none() {
+                record.revoked_at = Some(now);
+            }
+        }
+        for record in self.refresh_tokens.values_mut() {
+            if record.user_id == user_id && record.revoked_at.is_none() {
+                record.revoked_at = Some(now);
+            }
+        }
+        true
+    }
+
+    /// 该用户是否已被停用（测试与诊断用）。
+    fn is_disabled(&self, user_id: Uuid) -> bool {
+        self.users
+            .get(&user_id)
+            .is_some_and(|user| user.disabled_at.is_some())
     }
 
     /// 签发一对新令牌（访问 + 刷新），库里只落摘要。
@@ -144,6 +188,10 @@ impl MemoryState {
         if record.revoked_at.is_some() {
             return Err(AuthError::unauthorized_with("访问令牌已吊销"));
         }
+        // H1：禁用账号即使令牌还没被吊销（理论上不该发生）也不放行
+        if self.is_disabled(record.user_id) {
+            return Err(AuthError::unauthorized_with("账号已停用"));
+        }
         if record.expires_at <= OffsetDateTime::now_utc() {
             return Err(AuthError::token_expired());
         }
@@ -168,6 +216,10 @@ impl MemoryState {
             }
             if record.expires_at <= now {
                 return Err(AuthError::unauthorized_with("刷新令牌已过期，请重新登录"));
+            }
+            // H1：禁用账号不能靠 refresh 续命
+            if self.is_disabled(record.user_id) {
+                return Err(AuthError::unauthorized_with("账号已停用"));
             }
             (record.user_id, record.device_id)
         };
@@ -214,6 +266,29 @@ mod tests {
             .register(email.to_owned(), FAKE_PHC.to_owned())
             .expect("首次注册应成功");
         (state, session)
+    }
+
+    /// t134 / H1：禁用账号后，access / refresh / 登录全部失效（内存后端与 PG 同语义）。
+    #[test]
+    fn disabled_user_cannot_authenticate_or_refresh() {
+        let (mut state, session) = state_with_user("student@ynau.edu.cn");
+        assert!(state.authenticate(&session.access_token).is_ok());
+
+        assert!(state.disable_user(session.user_id), "第一次停用应真的改动");
+        assert!(!state.disable_user(session.user_id), "重复停用应返回 false");
+
+        // 1) 访问令牌立刻不可用（禁用即吊销）
+        let error = state
+            .authenticate(&session.access_token)
+            .expect_err("停用后访问令牌必须失效");
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+        // 2) 刷新令牌也不能续命
+        let error = state
+            .rotate_refresh(&session.refresh_token)
+            .expect_err("停用后刷新令牌必须失效");
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+        // 3) 登录也查不到（按"不存在"处理，不泄露账号状态）
+        assert!(state.password_hash("student@ynau.edu.cn").is_none());
     }
 
     #[test]

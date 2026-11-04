@@ -76,9 +76,12 @@ pub(crate) async fn authenticate(
     access_token: &str,
 ) -> Result<Principal, AuthError> {
     let token_hash = token::hash(access_token);
+    // H1（t134）：令牌有效 ≠ 账号可用。禁用（毕业/封禁）后必须立刻失去访问权，
+    // 所以这里的 join 带上 `disabled_at IS NULL`——旧实现只在 login 查了它。
     let found = sqlx::query(
-        "SELECT user_id, device_id, expires_at, revoked_at \
-         FROM access_tokens WHERE token_hash = $1",
+        "SELECT t.user_id, t.device_id, t.expires_at, t.revoked_at \
+         FROM access_tokens t JOIN users u ON u.id = t.user_id \
+         WHERE t.token_hash = $1 AND u.disabled_at IS NULL",
     )
     .bind(&token_hash)
     .fetch_optional(pool)
@@ -110,9 +113,12 @@ pub(crate) async fn refresh(pool: &PgPool, refresh_token: &str) -> Result<AuthSe
     let token_hash = token::hash(refresh_token);
     let mut tx = pool.begin().await.map_err(db_error)?;
 
+    // H1（t134）：禁用的账号**不能续命**。旧实现只校验令牌本身，
+    // 于是 30 天有效的 refresh 可以把已禁用账号无限续下去（ADR-11 的"毕业即降级"失效）。
     let found = sqlx::query(
-        "SELECT user_id, device_id, expires_at, revoked_at \
-         FROM refresh_tokens WHERE token_hash = $1 FOR UPDATE",
+        "SELECT t.user_id, t.device_id, t.expires_at, t.revoked_at \
+         FROM refresh_tokens t JOIN users u ON u.id = t.user_id \
+         WHERE t.token_hash = $1 AND u.disabled_at IS NULL FOR UPDATE OF t",
     )
     .bind(&token_hash)
     .fetch_optional(&mut *tx)
@@ -150,6 +156,46 @@ pub(crate) async fn refresh(pool: &PgPool, refresh_token: &str) -> Result<AuthSe
         refresh_token: issued.refresh_token,
         expires_in: ACCESS_TOKEN_TTL_SECS,
     })
+}
+
+/// 停用一个账号（ADR-11 的"毕业即降级"/封禁入口）。
+///
+/// **禁用即吊销**：同一个事务里把该账号所有未失效的 access/refresh 令牌都吊销。
+/// 只在库里改 `disabled_at` 也能达到同样效果（迁移 0008 有触发器兜底），
+/// 但应用侧有这条路径可以显式表达意图、并且返回值能告诉调用方"是不是真的改了"。
+pub(crate) async fn disable_user(pool: &PgPool, user_id: Uuid) -> Result<bool, AuthError> {
+    let mut tx = pool.begin().await.map_err(db_error)?;
+
+    let changed =
+        sqlx::query("UPDATE users SET disabled_at = now() WHERE id = $1 AND disabled_at IS NULL")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?
+            .rows_affected();
+
+    revoke_all_tokens(&mut tx, user_id).await?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(changed == 1)
+}
+
+/// 吊销一个账号的**全部**令牌（access + refresh）。
+async fn revoke_all_tokens(conn: &mut PgConnection, user_id: Uuid) -> Result<(), AuthError> {
+    sqlx::query(
+        "UPDATE access_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(db_error)?;
+    sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(db_error)?;
+    Ok(())
 }
 
 /// 登出：吊销当前访问令牌 + 该账号全部未失效的刷新令牌。

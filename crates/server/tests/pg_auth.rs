@@ -435,3 +435,169 @@ async fn logout_revokes_current_access_token_and_all_refresh_tokens() {
 
     db.finish().await;
 }
+
+// ============ t134：H1 禁用即失效 ============
+
+/// 用 SQL 直接停用（模拟运维/ADP）也必须让令牌立刻失效 —— 靠迁移 0008 的触发器兜底。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见文件头"]
+async fn disable_via_sql_revokes_tokens_and_blocks_refresh() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let auth = AuthService::new(Some(db.pool.clone()));
+    let session = auth.register(EMAIL, PASSWORD).await.expect("注册应成功");
+    assert!(auth.authenticate(&session.access_token).await.is_ok());
+
+    // 运维路径：只改 users.disabled_at（不碰令牌表）
+    let changed =
+        sqlx::query("UPDATE users SET disabled_at = now() WHERE lower(email) = lower($1)")
+            .bind(EMAIL)
+            .execute(&db.pool)
+            .await
+            .expect("停用用户")
+            .rows_affected();
+    assert_eq!(changed, 1, "应正好停用一个用户");
+
+    // **先验安全性质**：旧实现 refresh 不管 disabled_at ⇒ 这里会成功并无限续命（H1 正是这条）。
+    // 断言顺序刻意放在吊销检查之前，让这条用例在旧实现下的失败点就是"续命成功"。
+    assert!(
+        auth.refresh(&session.refresh_token).await.is_err(),
+        "停用账号不得再用刷新令牌续命（H1）"
+    );
+    let error = auth
+        .refresh(&session.refresh_token)
+        .await
+        .expect_err("停用账号不得再用刷新令牌续命");
+    assert_eq!(error.code, ErrorCode::Unauthorized, "必须是 401");
+
+    // 访问令牌同样立刻失效（join 上 disabled_at IS NULL）
+    let error = auth
+        .authenticate(&session.access_token)
+        .await
+        .expect_err("停用账号的访问令牌必须失效");
+    assert_eq!(error.code, ErrorCode::Unauthorized, "必须是 401");
+
+    // 再验防御纵深：触发器必须把两类令牌都吊销（保留吊销时间，便于审计）
+    assert_eq!(
+        count(
+            &db.pool,
+            "SELECT count(*) FROM access_tokens WHERE revoked_at IS NULL"
+        )
+        .await,
+        0,
+        "停用后不该还有未吊销的访问令牌"
+    );
+    assert_eq!(
+        count(
+            &db.pool,
+            "SELECT count(*) FROM refresh_tokens WHERE revoked_at IS NULL"
+        )
+        .await,
+        0,
+        "停用后不该还有未吊销的刷新令牌"
+    );
+
+    // 登录也拒绝（既有行为，回归保护）
+    let error = auth
+        .login(EMAIL, PASSWORD)
+        .await
+        .expect_err("停用账号不能登录");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+
+    db.finish().await;
+}
+
+/// 应用侧入口 `AuthService::disable_user`：幂等、返回是否真的改动、令牌一并吊销。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见文件头"]
+async fn disable_via_service_is_idempotent() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let auth = AuthService::new(Some(db.pool.clone()));
+    let session = auth.register(EMAIL, PASSWORD).await.expect("注册应成功");
+
+    assert!(
+        auth.disable_user(session.user_id)
+            .await
+            .expect("停用应成功"),
+        "第一次停用应返回 true"
+    );
+    assert!(
+        !auth
+            .disable_user(session.user_id)
+            .await
+            .expect("重复停用不报错"),
+        "重复停用应返回 false（幂等）"
+    );
+
+    assert_eq!(
+        count(
+            &db.pool,
+            "SELECT count(*) FROM refresh_tokens WHERE revoked_at IS NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        auth.refresh(&session.refresh_token)
+            .await
+            .expect_err("停用后刷新必须失败")
+            .code,
+        ErrorCode::Unauthorized
+    );
+
+    db.finish().await;
+}
+
+// ============ t134：H3 邮箱 +tag ============
+
+/// `+tag` 规范化后是**同一个账号**：注册第二个必须撞唯一约束，登录用任意别名都行。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见文件头"]
+async fn email_plus_tag_maps_to_one_account() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let auth = AuthService::new(Some(db.pool.clone()));
+
+    // 第一次用别名注册
+    let session = auth
+        .register("Student+lab@YNAU.edu.cn", PASSWORD)
+        .await
+        .expect("带 +tag 的合法地址必须能注册（只是按 Base 记账）");
+    // 库里存的是规范化后的键
+    assert_eq!(
+        common::text_column(
+            &db.pool,
+            &format!("SELECT email FROM users WHERE id = '{}'", session.user_id)
+        )
+        .await
+        .as_deref(),
+        Some("student@ynau.edu.cn"),
+        "落库的应是剥掉 +tag 且小写的规范化邮箱"
+    );
+
+    // 换一个别名（以及大小写）再注册 → 必须撞唯一约束（旧实现会成功）
+    let error = auth
+        .register("STUDENT+other@ynau.edu.cn", PASSWORD)
+        .await
+        .expect_err("同一收件箱的另一个别名不得注册第二个账号");
+    assert_eq!(error.code, ErrorCode::ValidationError);
+
+    // 登录：任意别名都落到同一个账号
+    for alias in [
+        "student@ynau.edu.cn",
+        "Student+anything@ynau.edu.cn",
+        "STUDENT@YNAU.EDU.CN",
+    ] {
+        let logged = auth
+            .login(alias, PASSWORD)
+            .await
+            .unwrap_or_else(|error| panic!("{alias} 应能登录：{error:?}"));
+        assert_eq!(logged.user_id, session.user_id, "{alias} 应落到同一账号");
+    }
+
+    db.finish().await;
+}

@@ -5,6 +5,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::auth::{
     error::AuthError,
@@ -110,6 +111,20 @@ impl AuthService {
         }
     }
 
+    /// 停用一个账号（t134 / H1）：标记 + **立刻吊销全部令牌**。
+    ///
+    /// 返回 `Ok(true)` 表示这次真的把账号从"可用"改成"停用"；`Ok(false)` = 本来就已停用。
+    ///
+    /// 名字里的"停用"对应库里的 `users.disabled_at`（ADR-11 的毕业降级/封禁共用同一个开关）。
+    /// 生产上直接写 SQL 也能达到同样效果：迁移 0008 的触发器会在 `disabled_at` 变非空时
+    /// 无条件吊销令牌，所以**不存在"改了库但令牌还能用"的缝隙**。
+    pub async fn disable_user(&self, user_id: Uuid) -> Result<bool, AuthError> {
+        match &self.backend {
+            AuthBackend::Memory(state) => Ok(lock(state).disable_user(user_id)),
+            AuthBackend::Pg(pool) => pg::disable_user(pool, user_id).await,
+        }
+    }
+
     /// 登出：吊销当前访问令牌，刷新令牌一并吊销（不止当前设备）。
     pub async fn logout(&self, principal: &Principal) -> Result<(), AuthError> {
         match &self.backend {
@@ -149,10 +164,20 @@ fn lock(state: &Mutex<MemoryState>) -> MutexGuard<'_, MemoryState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 邮箱规范化：去首尾空白、转小写，并做最低限度的格式检查。
+/// 邮箱规范化：去首尾空白、**剥离 `+tag`**、转小写，并做最低限度的格式检查。
 ///
 /// 小写化与 `users (lower(email))` 唯一索引一致；格式检查只挡明显错误
 /// （登录时不区分，注册时返回 422）。
+///
+/// # 为什么要剥 `+tag`（security t134 / H3）
+///
+/// `a+1@x.com`、`a+2@x.com` … 在 RFC 里是**同一个收件箱**的不同别名。不剥的话：
+/// 1. 一个收件箱可以注册无数账号（2FA 验证码全进同一个邮箱 ⇒ 2FA 等于不存在）；
+/// 2. 封禁/限流可以靠换 tag 绕过（账号键不同）。
+///
+/// 所以账号键统一取"本地部分去掉 `+` 之后"的那一版；**只做规范化，不因此拒绝地址**
+/// （`a+tag@x.com` 仍是合法输入，注册后按 `a@x.com` 记账）。
+/// 只剥 `+` 不剥点号：`a.b@x.com` 与 `ab@x.com` 在不同邮件系统里**不**等价，剥了会误合并。
 fn normalize_email(raw: &str) -> Option<String> {
     let email = raw.trim();
     // R2-F9：账号键用 ASCII 小写（与 `users (lower(email))` 索引一致）。
@@ -167,18 +192,54 @@ fn normalize_email(raw: &str) -> Option<String> {
     if local.is_empty() || domain.is_empty() || domain.contains('@') {
         return None;
     }
+    // H3：剥掉 `+tag`。剥完为空（形如 `+tag@x.com`）没有可用的账号键 → 视为格式不对。
+    let local = local.split('+').next().unwrap_or_default();
+    if local.is_empty() {
+        return None;
+    }
     if !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.') {
         return None;
     }
     if domain.split('.').any(str::is_empty) {
         return None;
     }
-    Some(email.to_ascii_lowercase())
+    Some(format!("{local}@{domain}").to_ascii_lowercase())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// t134 / H3：`+tag` 必须被剥掉——否则一个收件箱能注册无数账号（2FA 等于不存在）。
+    #[test]
+    fn plus_tag_is_stripped_from_local_part() {
+        assert_eq!(
+            normalize_email("a+1@x.com").as_deref(),
+            Some("a@x.com"),
+            "+tag 必须剥掉"
+        );
+        assert_eq!(
+            normalize_email("A+anything@X.COM").as_deref(),
+            Some("a@x.com"),
+            "剥 +tag 与小写化要一起生效"
+        );
+        // 同一收件箱的不同别名 → 同一个账号键
+        assert_eq!(normalize_email("a+1@x.com"), normalize_email("A@x.com"));
+        // 多个 `+` 一律从第一个开始剥
+        assert_eq!(normalize_email("a+b+c@x.com").as_deref(), Some("a@x.com"));
+        // 合法地址不因为带 tag 被拒
+        assert!(normalize_email("student+tag@ynau.edu.cn").is_some());
+        // 剥完没有本地部分 → 格式不对（畸形输入，不是"合法地址被拒"）
+        assert_eq!(normalize_email("+tag@x.com"), None);
+        // 域名里的 `+` 不动（只在本地部分剥）
+        assert_eq!(
+            normalize_email("a+b@x+y.com").as_deref(),
+            Some("a@x+y.com"),
+            "只削本地部分的 tag"
+        );
+        // 点号不合并（`a.b@x.com` 与 `ab@x.com` 在多数邮件系统里并不等价）
+        assert_eq!(normalize_email("a.b@x.com").as_deref(), Some("a.b@x.com"));
+    }
 
     #[test]
     fn email_is_normalized_to_lowercase() {
