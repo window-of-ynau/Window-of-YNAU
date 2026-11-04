@@ -1,0 +1,292 @@
+//! provider 维度的协议选择与回退（t114）。
+//!
+//! 背景：设置页里用户只能选 **provider**（DeepSeek / Anthropic / 自建…），
+//! 但每个 provider 支持哪套协议并不一样：
+//!
+//! | host | 支持 | 说明 |
+//! |---|---|---|
+//! | `api.deepseek.com` | completions | 只有 OpenAI 兼容端点，`/v1/responses` 会 404 |
+//! | `api.anthropic.com` | messages | 原生 Messages API |
+//! | `api.openai.com` | responses + completions | 两套都在 |
+//! | 其它（自建/局域网/中转） | 全支持 | 不擅自替用户降级 |
+//!
+//! 回退顺序（owner 指定）：`openai_responses` → `anthropic_messages` → `openai_completions`。
+//!
+//! # 观测
+//!
+//! 回退**绝不静默**：meta 帧里带 `requested_protocol` / `effective_protocol`，
+//! 并且发生回退时单独发一条 `protocol_fallback` 事件（含原因），客户端可以直接显示
+//! "该 provider 不支持 X，已自动改用 Y"。
+//!
+//! # 已知限制
+//!
+//! 这里是**静态**判定（按 host 表 + 用户偏好）。真正"上游说 404 再换一个协议重试"的
+//! 运行时回退还没做——见 [`resolve`] 的说明与 `docs/` 里的后续计划。
+
+use yunong_shared::Protocol;
+
+/// 回退顺序（owner 指定）。
+pub const FALLBACK_ORDER: [Protocol; 3] = [
+    Protocol::OpenaiResponses,
+    Protocol::AnthropicMessages,
+    Protocol::OpenaiCompletions,
+];
+
+/// 协议在 wire/日志里的稳定名字。
+pub const fn protocol_name(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::OpenaiCompletions => "openai_completions",
+        Protocol::OpenaiResponses => "openai_responses",
+        Protocol::AnthropicMessages => "anthropic_messages",
+    }
+}
+
+/// 宽进严出地解析协议名（客户端可能写 `responses` / `messages` / `openai_responses`…）。
+///
+/// 返回 `Err` 表示**认不出来**——调用方默认按 completions 处理，但**必须**在观测里说清楚，
+/// 不能像以前那样静默当成 completions（t114 的 194 条事件就是这么产生的）。
+pub fn parse_protocol_name(raw: &str) -> Result<Protocol, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "openai_completions" | "completions" | "openai-chat" | "chat_completions" => {
+            Ok(Protocol::OpenaiCompletions)
+        }
+        "openai_responses" | "responses" | "openai-responses" => Ok(Protocol::OpenaiResponses),
+        "anthropic_messages" | "messages" | "anthropic" | "anthropic-messages" => {
+            Ok(Protocol::AnthropicMessages)
+        }
+        other => Err(format!("认不出的协议名：{other}")),
+    }
+}
+
+/// 一次解析的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    /// 客户端/设置里给的**原始字符串**（观测用，`requested_protocol` 用的就是它）
+    pub requested_name: String,
+    /// 用户/设置里要的协议
+    pub requested: Protocol,
+    /// 实际会用的协议（== requested 时表示没回退）
+    pub effective: Protocol,
+    /// 从 `base_url` 解析出的 host（空串 = 没配 base_url）
+    pub provider: String,
+    /// 回退原因（None = 没回退）
+    pub fallback_reason: Option<String>,
+}
+
+impl Choice {
+    pub fn fallback(&self) -> bool {
+        self.requested != self.effective
+    }
+}
+
+/// 从 `base_url` 里取 host（小写）。没有 scheme 也能取（例如 `api.deepseek.com/v1`）。
+pub fn provider_host(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    // 去掉端口（`localhost:8080` → `localhost`），但保留 IPv6 的方括号主体
+    let host = match host.rsplit_once(':') {
+        Some((head, tail)) if tail.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => host,
+    };
+    host.to_ascii_lowercase()
+}
+
+/// 这个 host 支持哪些协议（按 [`FALLBACK_ORDER`] 的顺序）。
+///
+/// **未知 host 视为全都支持**：自建网关/中转可能支持任意一套，替用户擅自降级更糟。
+pub fn supported_protocols(host: &str) -> Vec<Protocol> {
+    let host = host.trim().to_ascii_lowercase();
+    let matches = |suffix: &str| host == suffix || host.ends_with(&format!(".{suffix}"));
+    if matches("api.deepseek.com") || matches("deepseek.com") {
+        return vec![Protocol::OpenaiCompletions];
+    }
+    if matches("api.anthropic.com") || matches("anthropic.com") {
+        return vec![Protocol::AnthropicMessages];
+    }
+    if matches("api.openai.com") || matches("openai.com") {
+        return vec![Protocol::OpenaiResponses, Protocol::OpenaiCompletions];
+    }
+    FALLBACK_ORDER.to_vec()
+}
+
+/// 解析"该用哪个协议"。
+///
+/// 规则：
+/// 1. `requested` 在 supported 里 → 直接用（不回退）；
+/// 2. 否则按 [`FALLBACK_ORDER`] 取第一个 supported 的；
+/// 3. 一个都不支持（理论上不会）→ 退回 `requested`，让上游如实报错。
+pub fn resolve(base_url: &str, requested: Protocol) -> Choice {
+    resolve_named(base_url, protocol_name(requested), requested).0
+}
+
+/// 同 [`resolve`]，但以**客户端给的原始字符串**为准（未知名字会降级并如实报告）。
+pub fn resolve_raw(base_url: &str, raw_protocol: &str) -> Choice {
+    match parse_protocol_name(raw_protocol) {
+        Ok(requested) => resolve_named(base_url, raw_protocol, requested).0,
+        Err(reason) => {
+            // 认不出协议名：按 completions 处理，但把原因说出来
+            let mut choice = resolve_named(base_url, raw_protocol, Protocol::OpenaiCompletions).0;
+            choice.fallback_reason = Some(format!(
+                "{reason}；已按 openai_completions 处理（设置里请选 openai_responses / anthropic_messages / openai_completions）"
+            ));
+            choice
+        }
+    }
+}
+
+fn resolve_named(base_url: &str, requested_name: &str, requested: Protocol) -> (Choice, ()) {
+    let provider = provider_host(base_url);
+    let supported = supported_protocols(&provider);
+    if supported.contains(&requested) {
+        return (
+            Choice {
+                requested_name: requested_name.to_owned(),
+                requested,
+                effective: requested,
+                provider,
+                fallback_reason: None,
+            },
+            (),
+        );
+    }
+    let effective = FALLBACK_ORDER
+        .iter()
+        .copied()
+        .find(|protocol| supported.contains(protocol))
+        .unwrap_or(requested);
+    let reason = format!(
+        "该 provider（{}）不支持 {}，已自动改用 {}",
+        if provider.is_empty() {
+            "未配置 base_url"
+        } else {
+            &provider
+        },
+        protocol_name(requested),
+        protocol_name(effective)
+    );
+    (
+        Choice {
+            requested_name: requested_name.to_owned(),
+            requested,
+            effective,
+            provider,
+            fallback_reason: Some(reason),
+        },
+        (),
+    )
+}
+
+/// `protocol_fallback` 事件（wire 形状，紧跟 meta 之后发一条）。
+///
+/// ```json
+/// {"type":"protocol_fallback","requested_protocol":"openai_responses",
+///  "effective_protocol":"openai_completions","provider":"api.deepseek.com",
+///  "reason":"该 provider（api.deepseek.com）不支持 openai_responses，已自动改用 openai_completions"}
+/// ```
+pub fn fallback_event_json(choice: &Choice, reason: &str) -> String {
+    serde_json::json!({
+        "type": "protocol_fallback",
+        "requested_protocol": protocol_name(choice.requested),
+        "effective_protocol": protocol_name(choice.effective),
+        "provider": choice.provider,
+        "reason": reason,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_host_handles_scheme_port_and_bare_host() {
+        assert_eq!(
+            provider_host("https://api.deepseek.com/v1"),
+            "api.deepseek.com"
+        );
+        assert_eq!(
+            provider_host("https://api.deepseek.com"),
+            "api.deepseek.com"
+        );
+        assert_eq!(provider_host("api.deepseek.com/v1"), "api.deepseek.com");
+        assert_eq!(provider_host("http://localhost:8080/v1"), "localhost");
+        assert_eq!(provider_host(""), "");
+        assert_eq!(provider_host("HTTPS://API.OPENAI.COM/v1"), "api.openai.com");
+    }
+
+    #[test]
+    fn known_providers_support_what_we_think() {
+        assert_eq!(
+            supported_protocols("api.deepseek.com"),
+            vec![Protocol::OpenaiCompletions]
+        );
+        assert_eq!(
+            supported_protocols("api.anthropic.com"),
+            vec![Protocol::AnthropicMessages]
+        );
+        assert_eq!(
+            supported_protocols("api.openai.com"),
+            vec![Protocol::OpenaiResponses, Protocol::OpenaiCompletions]
+        );
+        // 未知 host：全支持（不擅自降级）
+        assert_eq!(
+            supported_protocols("llm.internal.example"),
+            FALLBACK_ORDER.to_vec()
+        );
+    }
+
+    #[test]
+    fn deepseek_with_responses_falls_back_to_completions() {
+        let choice = resolve("https://api.deepseek.com/v1", Protocol::OpenaiResponses);
+        assert!(choice.fallback());
+        assert_eq!(choice.effective, Protocol::OpenaiCompletions);
+        assert_eq!(choice.provider, "api.deepseek.com");
+        assert!(choice
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("不支持 openai_responses"));
+    }
+
+    #[test]
+    fn openai_keeps_responses_and_anthropic_keeps_messages() {
+        let openai = resolve("https://api.openai.com/v1", Protocol::OpenaiResponses);
+        assert!(!openai.fallback());
+        let anthropic = resolve("https://api.anthropic.com", Protocol::AnthropicMessages);
+        assert!(!anthropic.fallback());
+        // Anthropic + completions → 回退到 messages
+        let wrong = resolve("https://api.anthropic.com", Protocol::OpenaiCompletions);
+        assert_eq!(wrong.effective, Protocol::AnthropicMessages);
+        assert!(wrong.fallback());
+    }
+
+    #[test]
+    fn unknown_provider_keeps_whatever_user_picked() {
+        let choice = resolve("https://llm.internal.example/v1", Protocol::OpenaiResponses);
+        assert!(!choice.fallback(), "{choice:?}");
+        assert_eq!(choice.effective, Protocol::OpenaiResponses);
+    }
+
+    #[test]
+    fn fallback_event_has_the_contract_fields() {
+        let choice = resolve("https://api.deepseek.com/v1", Protocol::OpenaiResponses);
+        let event: serde_json::Value =
+            serde_json::from_str(&fallback_event_json(&choice, "原因")).unwrap();
+        assert_eq!(event["type"], "protocol_fallback");
+        assert_eq!(event["requested_protocol"], "openai_responses");
+        assert_eq!(event["effective_protocol"], "openai_completions");
+        assert_eq!(event["provider"], "api.deepseek.com");
+        assert_eq!(event["reason"], "原因");
+    }
+}
