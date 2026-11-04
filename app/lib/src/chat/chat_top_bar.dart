@@ -53,16 +53,24 @@ class ChatTopBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    return _buildBar(context, theme);
+  }
+
+  Widget _buildBar(BuildContext context, ThemeData theme) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
       child: Row(
         children: <Widget>[
-          // t117：窄窗（480）下侧栏 rail 占 64px，顶栏必须可收缩，否则横向溢出。
-          Flexible(
-            child: FittedBox(
-              fit: BoxFit.scaleDown,
+          // t127：用 Expanded + Align 占满左侧剩余空间（内容仍左对齐）。
+          // 之前是 Flexible(FittedBox) + Spacer：Flexible 的 loose slot 会留下未分配空间，
+          // 把 ⋮ 挤到离右边缘 363px 的位置（实测 gap=363.5）。
+          Expanded(
+            child: Align(
               alignment: Alignment.centerLeft,
-              child: SegmentedButton<String>(
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.centerLeft,
+                child: SegmentedButton<String>(
             segments: const <ButtonSegment<String>>[
               ButtonSegment<String>(value: 'byok', label: Text('直连')),
               ButtonSegment<String>(value: 'cloud', label: Text('套餐')),
@@ -76,6 +84,7 @@ class ChatTopBar extends StatelessWidget {
                 onSelectionChanged: (Set<String> value) => onChannelChanged(value.first),
               ),
             ),
+            ),
           ),
           const SizedBox(width: 4),
           // 状态：图标 + tooltip（不占横向空间，480px 也放得下）
@@ -88,8 +97,9 @@ class ChatTopBar extends StatelessWidget {
               color: keyDegraded ? theme.colorScheme.tertiary : theme.hintColor,
             ),
           ),
-          const Spacer(),
+          const SizedBox(width: 8),
           PopupMenuButton<String>(
+            key: const Key('chat-menu'),
             tooltip: '更多',
             icon: const Icon(Icons.more_vert),
             onSelected: (String value) {
