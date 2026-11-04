@@ -12,6 +12,8 @@ import '../core/build_info.dart';
 import '../core/auth_service.dart';
 import '../core/secret_service.dart';
 import 'key_account_group.dart';
+import 'provider_card.dart';
+import '../core/provider_store.dart';
 
 import '../theme/theme_controller.dart';
 import '../theme/glass_panel.dart';
@@ -25,6 +27,7 @@ class SettingsPage extends StatelessWidget {
       this.chatSettings,
       this.authService,
       this.secretService,
+      this.providerStore,
       this.keyValidator,
       this.onKeySaved,
       this.version = '0.9.0（W2b）'});
@@ -39,6 +42,12 @@ class SettingsPage extends StatelessWidget {
 
   /// Key 能力（t88 下沉）：给了它，保存 Key 的校验/保存/回读都在面板内完成
   final SecretService? secretService;
+
+  /// 供应商列表（t115）：没传就建一个内存版（测试/无核心时也能渲染页面）。
+  final ProviderStore? providerStore;
+
+  /// 没传 store 时的兜底（无核心/测试环境也能渲染供应商卡）。
+  static final ProviderStore _fallbackProviders = ProviderStore();
   final Future<String?> Function(String apiKey)? keyValidator;
   final void Function(SecretStatus status)? onKeySaved;
   final String version;
@@ -64,6 +73,13 @@ class SettingsPage extends StatelessWidget {
           body: ListView(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
             children: <Widget>[
+              // t115：设置页只负责**供应商**（唯一填 Key 的地方）；模型/effort 在对话页。
+              _Group(
+                title: '供应商',
+                children: <Widget>[
+                  ProviderCard(store: providerStore ?? _fallbackProviders, secrets: secretService),
+                ],
+              ),
               // t86：对话设置收进**同一个**设置页（owner：不要两个设置面板）
               if (chatSettings != null)
                 _Group(

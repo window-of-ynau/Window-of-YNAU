@@ -21,6 +21,7 @@ import '../core/secret_service.dart';
 import '../memory/memory_page.dart';
 import '../core/build_info.dart';
 import 'chat_settings_section.dart';
+import 'model_selector.dart';
 import 'tool_call_card.dart';
 
 // `ChatSettings` 已随设置面板搬到 `chat_settings_section.dart`；这里 re-export，
@@ -788,7 +789,12 @@ class ChatPageState extends State<ChatPage> {
         else
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-            child: _composer(),
+            // t115：输入框上方是模型与 effort（设置页只负责供应商）
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[const ModelSelector(), _composer()],
+            ),
           ),
       ],
     );

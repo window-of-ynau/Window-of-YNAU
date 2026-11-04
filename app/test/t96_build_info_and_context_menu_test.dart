@@ -25,6 +25,13 @@ void main() {
       ));
       await tester.pumpAndSettle();
 
+    // t115：设置页新增「供应商」卡后，关于组在更下方——先滚到底再断言
+    await tester.scrollUntilVisible(
+      find.textContaining('云农之窗', skipOffstage: false),
+      200,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.pumpAndSettle();
       expect(find.textContaining('云农之窗', skipOffstage: false), findsOneWidget);
       expect(find.textContaining('构建 dev', skipOffstage: false), findsOneWidget);
     });
