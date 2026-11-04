@@ -18,10 +18,33 @@ pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub(crate) fn endpoint(base_url: &str, protocol: Protocol) -> String {
     let base = base_url.trim_end_matches('/');
     let base = base.strip_suffix("/v1").unwrap_or(base);
-    let path = match protocol {
-        Protocol::OpenaiCompletions => "/v1/chat/completions",
-        Protocol::OpenaiResponses => "/v1/responses",
-        Protocol::AnthropicMessages => "/v1/messages",
+    let host = crate::protocol_pick::provider_host(base);
+
+    // **各家的路径不一样，不能一律 `/v1/xxx`**（t118）。
+    //
+    // 依据（owner 提供的官方文档，原文已核对）：
+    // - DeepSeek：Responses 用 `base_url = https://api.deepseek.com`（SDK 自己拼 `/responses`）；
+    //   Anthropic 兼容层的 `base_url` 是 `https://api.deepseek.com/anthropic`
+    //   → 端点 `/anthropic/v1/messages`（**不是** `/v1/messages`）；
+    //   Completions 仍是 OpenAI 兼容的 `/chat/completions`（`/v1/chat/completions` 也是兼容别名）。
+    // - Anthropic 官方：`/v1/messages`。
+    // - OpenAI 官方：`/v1/responses`、`/v1/chat/completions`。
+    // - 其它（自建/中转）：保持原来的"base + 标准 `/v1` 后缀"，不猜。
+    //
+    // 说明：本轮**没能**用真实 Key 实测（`api.deepseek.com` 在当前网络策略下探不通，
+    // curl/Invoke-WebRequest 都是 000）；不写死"某路径一定可用"的断言，按文档拼接，
+    // 端到端验证交给 lead-client 用真 Key 跑一次。
+    let is_deepseek = host.ends_with("deepseek.com");
+    let is_anthropic = host.ends_with("anthropic.com");
+
+    let path = match (is_deepseek, is_anthropic, protocol) {
+        (true, _, Protocol::OpenaiCompletions) => "/chat/completions",
+        (true, _, Protocol::OpenaiResponses) => "/responses",
+        (true, _, Protocol::AnthropicMessages) => "/anthropic/v1/messages",
+        (_, true, Protocol::AnthropicMessages) => "/v1/messages",
+        (_, _, Protocol::OpenaiCompletions) => "/v1/chat/completions",
+        (_, _, Protocol::OpenaiResponses) => "/v1/responses",
+        (_, _, Protocol::AnthropicMessages) => "/v1/messages",
     };
     format!("{base}{path}")
 }
@@ -42,6 +65,63 @@ pub(crate) fn auth_headers(protocol: Protocol, api_key: &str) -> Vec<(&'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deepseek_paths_follow_its_own_layout() {
+        // 依据官方文档（owner 提供）：Responses 用 /responses；Anthropic 兼容层在
+        // /anthropic/v1/messages；Completions 是 /chat/completions。
+        let base = "https://api.deepseek.com";
+        assert_eq!(
+            endpoint(base, Protocol::OpenaiResponses),
+            "https://api.deepseek.com/responses"
+        );
+        assert_eq!(
+            endpoint(base, Protocol::AnthropicMessages),
+            "https://api.deepseek.com/anthropic/v1/messages"
+        );
+        assert_eq!(
+            endpoint(base, Protocol::OpenaiCompletions),
+            "https://api.deepseek.com/chat/completions"
+        );
+        // 用户把 SDK 里的 `/v1` 也粘进来时先去掉再拼
+        assert_eq!(
+            endpoint("https://api.deepseek.com/v1", Protocol::OpenaiResponses),
+            "https://api.deepseek.com/responses"
+        );
+    }
+
+    #[test]
+    fn anthropic_and_openai_use_standard_paths() {
+        assert_eq!(
+            endpoint("https://api.anthropic.com", Protocol::AnthropicMessages),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            endpoint("https://api.openai.com", Protocol::OpenaiResponses),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            endpoint("https://api.openai.com/v1", Protocol::OpenaiCompletions),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn custom_gateway_keeps_standard_suffixes() {
+        let base = "http://10.0.0.5:8080";
+        assert_eq!(
+            endpoint(base, Protocol::OpenaiCompletions),
+            "http://10.0.0.5:8080/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint(base, Protocol::OpenaiResponses),
+            "http://10.0.0.5:8080/v1/responses"
+        );
+        assert_eq!(
+            endpoint(base, Protocol::AnthropicMessages),
+            "http://10.0.0.5:8080/v1/messages"
+        );
+    }
 
     #[test]
     fn endpoint_per_protocol() {
