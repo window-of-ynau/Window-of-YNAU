@@ -8,8 +8,6 @@ import 'package:yunong/src/core/auth_service.dart';
 import 'package:yunong/src/core/chat_service.dart';
 import 'package:yunong/src/chat/chat_settings_section.dart';
 import 'package:yunong/src/core/secret_service.dart';
-import 'package:yunong/src/settings/settings_page.dart';
-import 'package:yunong/src/theme/theme_controller.dart';
 
 class FakeAuthApi implements AuthApi {
   FakeAuthApi({this.loginError});
@@ -97,17 +95,10 @@ void main() {
       loginError: const AuthException('WRONG_CREDENTIALS', '邮箱或密码不正确'),
     );
     await _pumpChat(tester, auth);
-    // t112：账号入口已移到设置页 → 走设置页的「套餐账号」登录（不再经 ⋮ 菜单）
-    await tester.pumpWidget(MaterialApp(
-      home: SettingsPage(
-        controller: ThemeController(store: MemorySettingsStore()),
-        authService: auth,
-        secretService: SecretService(backend: _NoopSecrets(), dbPath: "/tmp/t112"),
-      ),
-    ));
+    // t130：账号入口已从设置页移除 → 走对话页「模型选择器 → 套餐通道」登录。
+    await tester.tap(find.byKey(const Key('model-selector-button')));
     await tester.pumpAndSettle();
-    await tester.tap(find.widgetWithText(TextButton, '登录'));
-    await tester.pumpAndSettle();
+    await tester.tap(find.text('套餐通道'));
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextField, '邮箱'), 'test@example.com');
     await tester.enterText(find.widgetWithText(TextField, '密码'), 'bad');

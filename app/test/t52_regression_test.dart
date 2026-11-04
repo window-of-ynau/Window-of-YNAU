@@ -9,8 +9,6 @@ import 'package:yunong/src/chat/chat_page.dart';
 import 'package:yunong/src/core/chat_service.dart';
 import 'package:yunong/src/chat/chat_settings_section.dart';
 import 'package:yunong/src/core/secret_service.dart';
-import 'package:yunong/src/settings/settings_page.dart';
-import 'package:yunong/src/theme/theme_controller.dart';
 
 class _ChatBackend implements ChatBackend {
   int starts = 0;
@@ -86,17 +84,20 @@ Future<void> _pumpChat(
 }
 
 Future<void> _openSettingsAndSave(WidgetTester tester, String key) async {
+  // t130：设置页已删掉「对话设置」入口 —— 直接把面板 push 成路由
+  //（ChatPage 仍留在栈底，后面的“回读显示掩码”断言才能继续用）。
   final NavigatorState navigator = tester.state<NavigatorState>(find.byType(Navigator));
   unawaited(navigator.push(MaterialPageRoute<void>(
-    builder: (BuildContext context) => SettingsPage(
-      controller: ThemeController(store: MemorySettingsStore()),
-      chatSettings: _sharedSettings,
-      secretService: _secretsService,
-      keyValidator: _validator,
+    builder: (BuildContext context) => Scaffold(
+      body: ChatSettingsSection(
+        settings: _sharedSettings.settings,
+        searchLabel: '未配置',
+        searchHint: '',
+        secrets: _secretsService,
+        keyValidator: _validator,
+      ),
     ),
   )));
-  await tester.pumpAndSettle();
-  await tester.tap(find.text('对话设置').first);
   await tester.pumpAndSettle();
   // 按标签定位 BYOK Key（比按序号稳，t89：字段顺序随面板调整过）
   await tester.enterText(find.widgetWithText(TextField, 'BYOK API Key'), key);

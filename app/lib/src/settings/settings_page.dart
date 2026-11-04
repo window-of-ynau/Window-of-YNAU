@@ -11,7 +11,6 @@ import '../chat/chat_settings_section.dart';
 import '../core/build_info.dart';
 import '../core/auth_service.dart';
 import '../core/secret_service.dart';
-import 'key_account_group.dart';
 import 'provider_card.dart';
 import '../core/provider_store.dart';
 
@@ -80,42 +79,9 @@ class SettingsPage extends StatelessWidget {
                   ProviderCard(store: providerStore ?? _fallbackProviders, secrets: secretService),
                 ],
               ),
-              // t86：对话设置收进**同一个**设置页（owner：不要两个设置面板）
-              if (chatSettings != null)
-                _Group(
-                  title: '对话',
-                  children: <Widget>[
-                    InkWell(
-                      onTap: () => openChatSettingsDialog(
-                            context,
-                            chatSettings!,
-                            auth: authService,
-                            secrets: secretService,
-                            keyValidator: keyValidator,
-                            onKeySaved: onKeySaved,
-                          ),
-                      child: const _Row(
-                        icon: Icons.chat_bubble_outline,
-                        title: '对话设置',
-                        subtitle: '通道 / 模型 / 协议 / Key / 令牌',
-                        trailing: const Icon(Icons.chevron_right, size: 18),
-                      ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-                      child: ListenableBuilder(
-                        listenable: chatSettings!,
-                        builder: (BuildContext context, Widget? _) => Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            chatSettings!.summary,
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),              _Group(
+              // t130：设置页只保留「供应商 / 外观 / 隐私与记忆 / 关于」。
+              // 「对话」组已删除：通道、模型、effort、套餐登录全部在对话页的模型选择器里。
+              _Group(
                 title: '外观',
                 children: <Widget>[
                   Padding(
@@ -183,14 +149,8 @@ class SettingsPage extends StatelessWidget {
                   ),
                 ],
               ),
-              _Group(
-                title: '模型与凭据',
-                children: <Widget>[
-                  // t112：Key 与套餐账号的“状态 / 删除 / 登录退出”统一在这里，
-                  // 对话设置只负责通道/模型/协议/Key 输入（不再重复放状态与账号按钮）。
-                  KeyAccountGroup(auth: authService, secrets: secretService),
-                ],
-              ),
+              // t130：「模型与凭据」组已删除 —— Key 只在「供应商」卡里填；
+              // 套餐账号状态/登录只在对话页「模型选择器 → 套餐通道」出现。
               _Group(
                 title: '隐私与记忆',
                 children: <Widget>[
