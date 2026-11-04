@@ -13,7 +13,10 @@
 // setTestWindow(tester, 480, 900);
 // ```
 //
-// 该 helper 内部已 `addTearDown(tester.view.reset)`，调用方不要再手动清理。
+// 该 helper 内部已 ddTearDown(tester.view.reset)，调用方不要再手动清理。
+//
+// 护栏：任何声明了窗口尺寸的用例，必须用 `setTestWindow`；用 `setSurfaceSize` 会让
+// MediaQuery 不变（实测仍 800×600），断言假绿。
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
