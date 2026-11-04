@@ -6,7 +6,7 @@
 // final chat = ChatService();          // 内部复用端侧核心 DLL
 // final stream = chat.send(ChatRequestDto(
 //   channel: ChatChannel.byok,          // ★ 通道可选
-//   model: 'deepseek-chat',
+//   model: 'deepseek-flash',
 //   apiKey: key,                        // ★ 只进 DLL，不进日志
 //   messages: <ChatTurn>[ChatTurn.user('你好')],
 // ));

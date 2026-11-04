@@ -18,7 +18,7 @@ class ModelSelector extends StatelessWidget {
     this.providers = const <ProviderConfig>[],
     this.activeProviderId,
     this.models = const <String>[],
-    this.model = 'deepseek-chat',
+    this.model = DeepSeekPreset.defaultModel,
     this.effort = 'auto',
     this.signedIn = false,
     this.accountLabel = '',

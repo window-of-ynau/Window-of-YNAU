@@ -140,7 +140,9 @@ class ChatPageState extends State<ChatPage> {
   bool _localPanelOpen = false;
 
   /// t122：对话内模型（与 `ModelSelector` 同源，请求就用它，避免“显示 A 发 B”）。
-  String _model = 'deepseek-chat';
+  /// t125：默认模型取自文档（`deepseek-flash`），旧名在初始化时静默迁移。
+  String _model = DeepSeekPreset.defaultModel;
+  String? _modelMigrationNote;
 
   /// t123：推理等级（模型选择器弹层里选）。
   String _effort = 'auto';
@@ -149,8 +151,7 @@ class ChatPageState extends State<ChatPage> {
   late final ProviderStore _providers = ProviderStore();
   List<String> get _models => <String>[
         ..._providers.active.models,
-        'deepseek-chat',
-        'deepseek-reasoner',
+        ...DeepSeekPreset.models,
       ];
 
   /// t122：强制工具调用（诊断弹窗可切）。开启后请求带 `tool_choice=required`。
@@ -188,6 +189,7 @@ class ChatPageState extends State<ChatPage> {
     unawaited(_refreshKeyStatus());
     // t123：供应商列表（与设置页同一份存储）
     unawaited(_providers.load());
+    _migrateLegacyModel();
     unawaited(_refreshSearchStatus());
   }
 
@@ -439,6 +441,20 @@ class ChatPageState extends State<ChatPage> {
     });
   }
 
+  /// t125：把已存配置/当前选择里的旧模型名静默迁到 `deepseek-flash`（不弹窗，只在诊断里记一行）。
+  void _migrateLegacyModel() {
+    final ({String model, String? migratedFrom}) result = migrateModelName(_model);
+    if (result.migratedFrom == null && result.model == _model) {
+      return;
+    }
+    setState(() {
+      _model = result.model;
+      if (result.migratedFrom != null) {
+        _modelMigrationNote = '已把旧模型名 ${result.migratedFrom} 迁移为 ${result.model}';
+      }
+    });
+  }
+
   /// 套餐通道登录（t123：入口在「模型选择器 → 套餐通道」）。
   Future<void> _signInCloud() async {
     final result = await showDialog<({String email, String password})>(
@@ -504,7 +520,9 @@ class ChatPageState extends State<ChatPage> {
     final keyLine =
         'key=`${_keyStatus.masked.isEmpty ? '未设置' : _keyStatus.masked} | protocol=`${_settings.protocol}'
         ' | key_status_error=`${_keyStatusError ?? ''}'
-        ' | build=`${BuildInfo.label}';
+        ' | build=`${BuildInfo.label}'
+        // t125：旧模型名迁移只在这里留一行记录（不弹窗打扰）
+        ' | model=`$_model`${_modelMigrationNote == null ? '' : '（$_modelMigrationNote）'}';
     final text = keyLine + '\n' + (diag == null ? '还没有发起过对话' : diag.toClipboardText());
     if (!mounted) {
       return;

@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 
 import '../core/auth_service.dart';
 import '../core/secret_service.dart';
+import '../core/provider_store.dart';
 /// 对话设置（通道/模型/协议/Key/令牌）——随设置面板一起搬迁。
 class ChatSettings {
   String channel = 'byok';
@@ -21,7 +22,8 @@ class ChatSettings {
   String baseUrl = 'https://api.deepseek.com';
   String byokKey = '';
   String cloudToken = '';
-  String model = 'deepseek-chat';
+  /// 默认模型：文档值为 `deepseek-flash`（见 provider_store.dart 顶部来源说明）。
+  String model = DeepSeekPreset.defaultModel;
   String protocol = 'openai_completions';
 }
 
@@ -200,7 +202,7 @@ class _ChatSettingsSectionState extends State<ChatSettingsSection> {
             widget.settings
               ..channel = _channel
               ..model = _model.text.trim().isEmpty
-                  ? 'deepseek-chat'
+                  ? DeepSeekPreset.defaultModel
                   : _model.text.trim()
               ..protocol = _protocol
               ..byokKey = _key.text.trim()
