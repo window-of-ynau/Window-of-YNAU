@@ -2,18 +2,23 @@
 //
 // # 目的（一次性前置验证，不是产品功能）
 //
-// 我们要判断：**拿到校方会话后，能否脱离 WebView、用纯 HTTP 请求打学校接口拿到 200**。
-// 如果学校把会话绑定到浏览器特征（UA / 指纹 / JS 签名），云端"带令牌校验学号"的方案就不成立，
-// 整个防刷模型要重做。这个探针就是为了在写任何云端代码之前把假设验证掉。
+// 判断：**拿到校方会话后，能否脱离 WebView、用纯 HTTP 请求打学校"需要登录"的接口拿到 200**。
+// 如果学校把会话绑定到浏览器特征（UA / 指纹 / JS 签名），云端"带令牌校验学号"的方案就不成立。
+//
+// # t136 修正（第一版判读有缺陷，owner 实测拿到无效证据）
+//
+// owner 实际跑出「Cookie 0 条 / 200 / 命中学号」—— 说明目标 URL 是**公开页面**，结论不可信。
+// 因此本版：
+//   1. Cookie 为空时**直接不给 ✅**，只给「未带会话，不能用于判断」；
+//   2. 每次运行做**匿名对照**（同一 URL 先带 Cookie、再不带），两次哈希相同 → 公开页面/登录页 → 无效；
+//   3. 学号只给**脱敏片段**（前2 + *** + 后2），并提取 `<title>` 与是否含「登录/统一身份认证」；
+//   4. 结论句式直白（见 [SessionProbeResult.verdict]）。
 //
 // # 安全约束
 //
-// - Cookie **不出设备**：不打印、不上传、不写文件，也不出现在任何 UI 文案里；
-// - 结果只展示：状态码 / Content-Type / 响应体长度 / 是否命中 10~12 位数字 /
-//   响应体前 200 字的**哈希**（非加密哈希，仅用于比对两个端点是否同一页面）/ 耗时 / 用的 UA；
-// - 只发 **GET**，不跟随重定向（这样能看到 302 这类"被弹回登录页"的信号）。
-//
-// 依赖：只用 `dart:io` 的 HttpClient（不引入新依赖）。
+// - Cookie **不出设备**：不打印、不上传、不写文件，也不出现在任何 UI 文案里（只显示条数）；
+// - 匿名对照组**不带任何会话信息**（不带 Cookie 头）；
+// - 只发 **GET**，不跟随重定向（能看到 302）。
 
 import 'dart:async';
 import 'dart:convert';
@@ -27,69 +32,103 @@ class ProbeCookie {
   final String value;
 }
 
-/// 探针结果（**不含 Cookie、不含原始响应体**）。
-class SessionProbeResult {
-  const SessionProbeResult({
-    required this.url,
-    required this.userAgent,
+/// 单次请求的观测结果（**不含 Cookie、不含原始响应体**）。
+class ProbeRun {
+  const ProbeRun({
     required this.statusCode,
     required this.contentType,
     required this.bodyLength,
-    required this.studentIdHit,
-    required this.studentIdMatchLength,
     required this.bodyHash,
     required this.elapsedMs,
-    required this.cookieCount,
+    this.studentIdMasked,
+    this.title = '',
+    this.loginHint = false,
     this.error,
   });
 
-  final String url;
-  final String userAgent;
   final int statusCode;
   final String contentType;
   final int bodyLength;
-
-  /// 是否命中"像学号"的 10~12 位数字（只给布尔，不给原文）。
-  final bool studentIdHit;
-
-  /// 命中的数字串长度（0 = 未命中）。
-  final int studentIdMatchLength;
-
-  /// 前 200 个字符的 FNV-1a 64 哈希（十六进制）——只用于比对两个端点是否同一页面。
   final String bodyHash;
   final int elapsedMs;
 
-  /// 这次请求带了多少条 Cookie（数量，不含内容）。
-  final int cookieCount;
+  /// 脱敏后的学号片段：`20***56`（未命中 = null）。
+  final String? studentIdMasked;
+
+  /// `<title>` 文本（截断到 80 字）。
+  final String title;
+
+  /// 页面里出现「登录」/「统一身份认证」等字样（几乎一定说明会话无效）。
+  final bool loginHint;
   final String? error;
 
   bool get ok => error == null && statusCode >= 200 && statusCode < 300;
 
-  /// 判读结论（给 owner 一眼看结论）。
+  @override
+  String toString() => 'ProbeRun(status=$statusCode, len=$bodyLength, hash=$bodyHash, '
+      'sid=$studentIdMasked, title="$title", login=$loginHint, ms=$elapsedMs, error=$error)';
+}
+
+/// 一次探针运行 = 带 Cookie + 匿名对照（同一 URL）。
+class SessionProbeResult {
+  const SessionProbeResult({
+    required this.url,
+    required this.userAgent,
+    required this.cookieCount,
+    required this.withCookie,
+    required this.anonymous,
+  });
+
+  final String url;
+  final String userAgent;
+  final int cookieCount;
+  final ProbeRun withCookie;
+  final ProbeRun anonymous;
+
+  /// 两次响应是否同一页面（公开页面 / 同一张登录页）。
+  bool get sameAsAnonymous =>
+      withCookie.bodyHash.isNotEmpty && withCookie.bodyHash == anonymous.bodyHash;
+
+  /// 结论（t136 判定表，按顺序命中即返回）。
   String get verdict {
-    if (error != null) {
-      return '❌ 请求失败：$error';
+    // 1) 没带会话：任何"看起来 OK"的结果都不可用于判断
+    if (cookieCount == 0) {
+      return '⚠️ 未带会话：本次结果**不能**用于判断会话可用性（请先在校务 WebView 里登录后重试）';
     }
-    if (statusCode == 302 || statusCode == 301 || statusCode == 303 || statusCode == 307) {
-      return '❌ 被重定向（多半弹回登录页）→ 会话可能绑定浏览器特征';
+    if (withCookie.error != null) {
+      return '❌ 请求失败（${withCookie.error}）：换 URL 或检查网络后再试';
     }
-    if (statusCode == 401 || statusCode == 403) {
-      return '❌ 被拒绝（$statusCode）→ 会话不可脱离 WebView 使用';
+    // 2) 被重定向 / 拒绝 → 会话不能脱离 WebView 使用
+    const Set<int> redirects = <int>{301, 302, 303, 307, 308};
+    if (redirects.contains(withCookie.statusCode)) {
+      return '⚠️ 会话无效：带 Cookie 被重定向（${withCookie.statusCode}）→ 多半弹回登录页';
     }
-    if (statusCode >= 200 && statusCode < 300) {
-      return studentIdHit
-          ? '✅ 200 且命中 10~12 位数字 → 会话可脱离 WebView 使用，可能能找到身份端点'
-          : '⚠️ 200 但没有 10~12 位数字 → 会话可用，但该端点不带身份信息';
+    if (withCookie.statusCode == 401 || withCookie.statusCode == 403) {
+      return '❌ 会话无效：带 Cookie 被拒绝（${withCookie.statusCode}）';
     }
-    return '⚠️ 未预期状态码：$statusCode';
+    if (!withCookie.ok) {
+      return '⚠️ 未预期状态码：${withCookie.statusCode}';
+    }
+    // 3) 对照组：内容与匿名一致 → 公开页面/登录页，结果无效
+    if (sameAsAnonymous) {
+      return '❌ 会话无效：带 Cookie 与不带 Cookie 返回相同（公开页面或登录页）→ 请换一个需要登录的接口';
+    }
+    // 4) 200 且内容不同，但正文像登录页 → 仍判定无效
+    if (withCookie.loginHint) {
+      final String title = withCookie.title.isEmpty ? '无标题' : withCookie.title;
+      return '⚠️ 会话无效：返回内容含「登录/统一身份认证」字样（$title）';
+    }
+    // 5) 200 + 内容不同 → 会话可用；有学号片段才算能验证身份
+    if (withCookie.studentIdMasked != null) {
+      return '✅ 会话有效：带 Cookie 返回 200 且内容不同，并命中疑似学号 ${withCookie.studentIdMasked}';
+    }
+    return '✅ 会话有效：带 Cookie 返回 200 且内容不同（但该端点没有学号线索，无法验证“令牌属于该学号”）';
   }
 
-  /// 刻意只输出这些字段：**永远不包含 Cookie 值或响应体原文**。
+  /// 刻意只输出这些字段：**永远不包含 Cookie 值**。
   @override
-  String toString() =>
-      'SessionProbeResult(url=$url, ua=$userAgent, status=$statusCode, '
-      'contentType=$contentType, len=$bodyLength, studentId=$studentIdHit/$studentIdMatchLength, '
-      'hash=$bodyHash, ms=$elapsedMs, cookies=$cookieCount, error=$error)';
+  String toString() => 'SessionProbeResult(url=$url, ua=$userAgent, cookies=$cookieCount, '
+      'with=$withCookie, anon=$anonymous, same=$sameAsAnonymous)';
 }
 
 /// HTTP 客户端抽象（测试注入假实现；默认走 dart:io HttpClient）。
@@ -139,16 +178,30 @@ class IoProbeClient implements ProbeClient {
   }
 }
 
-/// 会话域：默认探针目标（只读、无副作用）。
-const String kProbeDefaultUrl = 'https://jwxt.ynau.edu.cn/DefaultStu';
+/// 默认目标：**需要登录**的课表数据接口（只读）。
+///
+/// 来源：`portal_api.dart` 的 `kScheduleApiPath = '/api/uppcard/kbsz/queryAWeekSchedule'`
+/// —— 门户页登录后才可由脚本调用；未登录会 302/401，而不是返回数据。
+const String kProbeDefaultUrl =
+    'https://one.ynau.edu.cn/api/uppcard/kbsz/queryAWeekSchedule?years=2026-2027&results=1';
 
-/// 默认 UA：用 Flutter WebView2 的桌面 UA（探针默认值，可改）。
+/// 默认 UA：桌面 WebView2 的 UA（可改，用来判断有无 UA 校验）。
 const String kProbeDefaultUserAgent =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
     'Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0';
 
-/// 学号正则：10~12 位连续数字（不展示原文）。
+/// 学号正则：10~12 位连续数字（只展示脱敏片段）。
 final RegExp kStudentIdPattern = RegExp(r'\b\d{10,12}\b');
+final RegExp _titlePattern = RegExp(r'<title[^>]*>(.*?)</title>', dotAll: true, caseSensitive: false);
+final RegExp _loginPattern = RegExp(r'登录|统一身份认证|请先登录|login', caseSensitive: false);
+
+/// 学号脱敏：`2023123456` → `20***56`。
+String maskStudentId(String raw) {
+  if (raw.length <= 4) {
+    return '**';
+  }
+  return '${raw.substring(0, 2)}***${raw.substring(raw.length - 2)}';
+}
 
 /// FNV-1a 64 位（非加密；仅用于"两个端点是不是同一张页面"的比对）。
 String fnv1a64Hex(String text) {
@@ -163,9 +216,35 @@ String fnv1a64Hex(String text) {
   return hash.toUnsigned(64).toRadixString(16).padLeft(16, '0');
 }
 
-/// 跑一次探针。
+ProbeRun _toRun(ProbeResponse response, int elapsedMs) {
+  final String body = response.body;
+  final RegExpMatch? sid = kStudentIdPattern.firstMatch(body);
+  final String rawTitle = _titlePattern.firstMatch(body)?.group(1) ?? '';
+  final String title = rawTitle.replaceAll(RegExp(r'\s+'), ' ').trim();
+  return ProbeRun(
+    statusCode: response.statusCode,
+    contentType: response.contentType,
+    bodyLength: body.length,
+    bodyHash: fnv1a64Hex(body),
+    elapsedMs: elapsedMs,
+    studentIdMasked: sid == null ? null : maskStudentId(sid.group(0) ?? ''),
+    title: title.length > 80 ? title.substring(0, 80) : title,
+    loginHint: _loginPattern.hasMatch(body) || _loginPattern.hasMatch(title),
+  );
+}
+
+ProbeRun _errorRun(int elapsedMs, String error) => ProbeRun(
+      statusCode: 0,
+      contentType: '',
+      bodyLength: 0,
+      bodyHash: '',
+      elapsedMs: elapsedMs,
+      error: error,
+    );
+
+/// 跑一次探针：**同一 URL 先带 Cookie、再匿名对照**。
 ///
-/// 注意：`cookies` 只用于拼 `Cookie` 请求头，**不会**出现在返回结果里。
+/// `cookies` 只用于拼 `Cookie` 请求头，**不会**出现在返回结果里；匿名请求不带任何会话信息。
 Future<SessionProbeResult> runSessionProbe({
   required String url,
   required String userAgent,
@@ -183,61 +262,60 @@ Future<SessionProbeResult> runSessionProbe({
     return _errorResult(url, userAgent, cookies.length, 'URL 必须是 http(s)');
   }
 
-  final Map<String, String> headers = <String, String>{
+  final ProbeClient probeClient = client ?? IoProbeClient();
+  final Map<String, String> baseHeaders = <String, String>{
     'User-Agent': userAgent,
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    if (cookies.isNotEmpty)
-      'Cookie': cookies.map((ProbeCookie c) => '${c.name}=${c.value}').join('; '),
+    'Accept': 'text/html,application/json,application/xhtml+xml,*/*;q=0.8',
   };
 
-  final Stopwatch watch = Stopwatch()..start();
+  // ① 带 Cookie
+  final Stopwatch withWatch = Stopwatch()..start();
+  ProbeRun withCookie;
   try {
-    final ProbeResponse response =
-        await (client ?? IoProbeClient()).get(url: parsed, headers: headers, timeout: timeout);
-    watch.stop();
-    final RegExpMatch? match = kStudentIdPattern.firstMatch(response.body);
-    return SessionProbeResult(
-      url: parsed.toString(),
-      userAgent: userAgent,
-      statusCode: response.statusCode,
-      contentType: response.contentType,
-      bodyLength: response.body.length,
-      studentIdHit: match != null,
-      studentIdMatchLength: match?.group(0)?.length ?? 0,
-      bodyHash: fnv1a64Hex(response.body),
-      elapsedMs: watch.elapsedMilliseconds,
-      cookieCount: cookies.length,
+    withCookie = _toRun(
+      await probeClient.get(
+        url: parsed,
+        headers: <String, String>{
+          ...baseHeaders,
+          if (cookies.isNotEmpty)
+            'Cookie': cookies.map((ProbeCookie c) => '${c.name}=${c.value}').join('; '),
+        },
+        timeout: timeout,
+      ),
+      withWatch.elapsedMilliseconds,
     );
   } on Object catch (failure) {
-    watch.stop();
-    return SessionProbeResult(
-      url: parsed.toString(),
-      userAgent: userAgent,
-      statusCode: 0,
-      contentType: '',
-      bodyLength: 0,
-      studentIdHit: false,
-      studentIdMatchLength: 0,
-      bodyHash: '',
-      elapsedMs: watch.elapsedMilliseconds,
-      cookieCount: cookies.length,
-      // 只给异常类型，避免把含 Cookie 的请求细节带进 UI
-      error: failure.runtimeType.toString(),
-    );
+    withCookie = _errorRun(withWatch.elapsedMilliseconds, failure.runtimeType.toString());
   }
+  withWatch.stop();
+
+  // ② 匿名对照（不带 Cookie）
+  final Stopwatch anonWatch = Stopwatch()..start();
+  ProbeRun anonymous;
+  try {
+    anonymous = _toRun(
+      await probeClient.get(url: parsed, headers: baseHeaders, timeout: timeout),
+      anonWatch.elapsedMilliseconds,
+    );
+  } on Object catch (failure) {
+    anonymous = _errorRun(anonWatch.elapsedMilliseconds, failure.runtimeType.toString());
+  }
+  anonWatch.stop();
+
+  return SessionProbeResult(
+    url: parsed.toString(),
+    userAgent: userAgent,
+    cookieCount: cookies.length,
+    withCookie: withCookie,
+    anonymous: anonymous,
+  );
 }
 
 SessionProbeResult _errorResult(String url, String userAgent, int cookieCount, String error) =>
     SessionProbeResult(
       url: url,
       userAgent: userAgent,
-      statusCode: 0,
-      contentType: '',
-      bodyLength: 0,
-      studentIdHit: false,
-      studentIdMatchLength: 0,
-      bodyHash: '',
-      elapsedMs: 0,
       cookieCount: cookieCount,
-      error: error,
+      withCookie: _errorRun(0, error),
+      anonymous: _errorRun(0, error),
     );

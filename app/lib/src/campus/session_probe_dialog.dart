@@ -146,14 +146,11 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
                 const Divider(),
                 Text(result.verdict, style: theme.textTheme.titleSmall),
                 const SizedBox(height: 6),
-                _kv('状态码', '${result.statusCode}'),
-                _kv('Content-Type', result.contentType.isEmpty ? '—' : result.contentType),
-                _kv('响应体长度', '${result.bodyLength}'),
-                _kv('命中 10~12 位数字', result.studentIdHit ? '是（长度 ${result.studentIdMatchLength}）' : '否'),
-                _kv('前 200 字哈希', result.bodyHash.isEmpty ? '—' : result.bodyHash),
-                _kv('耗时', '${result.elapsedMs} ms'),
+                _kv('会话 Cookie', '${result.cookieCount} 条（不含内容）'),
+                _kv('两次是否同页', result.sameAsAnonymous ? '是（公开页面/登录页 → 结果无效）' : '否'),
+                _runCard('带 Cookie', result.withCookie),
+                _runCard('匿名对照（不带 Cookie）', result.anonymous),
                 _kv('UA', result.userAgent),
-                if (result.error != null) _kv('错误', result.error!),
               ],
             ],
           ),
@@ -169,6 +166,25 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
       ],
     );
   }
+
+  Widget _runCard(String label, ProbeRun run) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Padding(
+            padding: const EdgeInsets.only(top: 10, bottom: 2),
+            child: Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+          ),
+          _kv('状态码', '${run.statusCode}'),
+          _kv('Content-Type', run.contentType.isEmpty ? '—' : run.contentType),
+          _kv('响应体长度', '${run.bodyLength}'),
+          _kv('学号片段', run.studentIdMasked ?? '未命中'),
+          _kv('页面标题', run.title.isEmpty ? '—' : run.title),
+          _kv('含「登录」字样', run.loginHint ? '是（多半是登录页）' : '否'),
+          _kv('前 200 字哈希', run.bodyHash.isEmpty ? '—' : run.bodyHash),
+          _kv('耗时', '${run.elapsedMs} ms'),
+          if (run.error != null) _kv('错误', run.error!),
+        ],
+      );
 
   Widget _kv(String key, String value) => Padding(
         padding: const EdgeInsets.symmetric(vertical: 2),
