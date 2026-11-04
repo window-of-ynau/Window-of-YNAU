@@ -20,72 +20,16 @@ class KeyAccountGroup extends StatefulWidget {
 }
 
 class _KeyAccountGroupState extends State<KeyAccountGroup> {
-  SecretStatus? _status;
-  String? _keyError;
+  // t115：Key 状态显示已移到「供应商」卡；这里只保留套餐账号。
+
   bool _busy = false;
 
   @override
   void initState() {
     super.initState();
-    _refreshKey();
   }
 
-  Future<void> _refreshKey() async {
-    final SecretService? secrets = widget.secrets;
-    if (secrets == null) {
-      return;
-    }
-    try {
-      final SecretStatus status = await secrets.status(SecretService.byokKeyName);
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _status = status;
-        _keyError = null;
-      });
-    } on Object catch (failure) {
-      if (!mounted) {
-        return;
-      }
-      // 读不到状态时**不清空既有显示**，也不谎报“未设置”。
-      setState(() => _keyError = '无法读取本机密钥状态：$failure');
-    }
-  }
 
-  Future<void> _deleteKey() async {
-    final SecretService? secrets = widget.secrets;
-    if (secrets == null) {
-      return;
-    }
-    final bool? confirmed = await showDialog<bool>(
-      context: context,
-      builder: (BuildContext context) => AlertDialog(
-        title: const Text('删除已保存的 Key？'),
-        content: const Text('删除后直连通道需要重新填写 Key；套餐账号不受影响。'),
-        actions: <Widget>[
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('删除')),
-        ],
-      ),
-    );
-    if (confirmed != true) {
-      return;
-    }
-    setState(() => _busy = true);
-    try {
-      await secrets.delete(SecretService.byokKeyName);
-      await _refreshKey();
-    } on Object catch (failure) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('删除失败：$failure')));
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _busy = false);
-      }
-    }
-  }
 
   Future<void> _signIn() async {
     final AuthService? auth = widget.auth;
@@ -153,27 +97,13 @@ class _KeyAccountGroupState extends State<KeyAccountGroup> {
     final SecretService? secrets = widget.secrets;
     final bool available = auth != null || secrets != null;
 
-    final String keySubtitle = _keyError ??
-        (secrets == null
-            ? '端侧核心不可用，暂无法读取密钥状态'
-            : (_status == null ? '正在读取…' : '本机安全存储：${_status!.display}${_status!.broken ? '（密文损坏，请重新填写）' : ''}'));
 
     // 外层 _Group 是带底色的 DecoratedBox：包一层透明 Material，ListTile 的水墨才可见
     return Material(
       type: MaterialType.transparency,
       child: Column(
       children: <Widget>[
-        ListTile(
-          leading: const Icon(Icons.key_outlined),
-          title: const Text('BYOK 密钥'),
-          subtitle: Text(keySubtitle),
-          trailing: (_status?.set ?? false)
-              ? TextButton(
-                  onPressed: _busy ? null : () => _deleteKey(),
-                  child: const Text('删除'),
-                )
-              : null,
-        ),
+        // t115：Key 输入只在「供应商」卡里（这里不再出现第二个可填 Key 的位置）
         ListTile(
           leading: const Icon(Icons.account_circle_outlined),
           title: const Text('套餐账号'),

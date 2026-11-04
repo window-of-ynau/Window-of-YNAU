@@ -1,6 +1,5 @@
 // t62 套餐通道 UI：菜单登录/登出、打码邮箱、错误文案、窄窗不溢出。
 
-import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
