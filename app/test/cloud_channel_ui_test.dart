@@ -91,21 +91,6 @@ Future<void> _pumpChat(WidgetTester tester, AuthService auth, {Size? size}) asyn
   await tester.pumpAndSettle();
 }
 
-Future<void> _openMenu(WidgetTester tester) async {
-  final NavigatorState navigator = tester.state<NavigatorState>(find.byType(Navigator));
-  unawaited(navigator.push(MaterialPageRoute<void>(
-    builder: (BuildContext context) => SettingsPage(
-      controller: ThemeController(store: MemorySettingsStore()),
-      chatSettings: _sharedSettings,
-      authService: _authService,
-      secretService: _secretsService,
-    ),
-  )));
-  await tester.pumpAndSettle();
-  await tester.tap(find.text('对话设置').first);
-  await tester.pumpAndSettle();
-}
-
 void main() {
 
   testWidgets('登录失败（密码错）→ 中文文案，不显示原始错误串', (WidgetTester tester) async {
@@ -113,8 +98,17 @@ void main() {
       loginError: const AuthException('WRONG_CREDENTIALS', '邮箱或密码不正确'),
     );
     await _pumpChat(tester, auth);
-    await _openMenu(tester);
+    // t112：账号入口已移到设置页 → 走设置页的「套餐账号」登录（不再经 ⋮ 菜单）
+    await tester.pumpWidget(MaterialApp(
+      home: SettingsPage(
+        controller: ThemeController(store: MemorySettingsStore()),
+        authService: auth,
+        secretService: SecretService(backend: _NoopSecrets(), dbPath: "/tmp/t112"),
+      ),
+    ));
+    await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(TextButton, '登录'));
+    await tester.pumpAndSettle();
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextField, '邮箱'), 'test@example.com');
     await tester.enterText(find.widgetWithText(TextField, '密码'), 'bad');

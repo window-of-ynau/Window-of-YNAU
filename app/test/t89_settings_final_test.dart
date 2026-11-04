@@ -72,7 +72,8 @@ void main() {
 
     expect(find.text('设置'), findsNothing, reason: '对话页不应再有设置入口（统一到设置页）');
     expect(find.text('对话诊断'), findsOneWidget);
-    expect(find.text('登录套餐账号'), findsOneWidget);
+    // t112：Key / 账号项已移到设置页
+    expect(find.text('登录套餐账号'), findsNothing);
   });
 
   testWidgets('设置页有「对话设置」卡片，能打开同一个面板', (WidgetTester tester) async {

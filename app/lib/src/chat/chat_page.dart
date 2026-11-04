@@ -397,63 +397,38 @@ class ChatPageState extends State<ChatPage> {
     });
   }
 
-  Future<void> _signInCloud() async {
-    final result = await showDialog<({String email, String password})>(
-      context: context,
-      builder: (BuildContext context) => const CloudLoginDialog(),
-    );
-    if (result == null || !mounted) {
+  /// 清空当前对话历史（t112）：二次确认 → 清消息、复位输入框与统计、回到空态。
+  Future<void> _clearConversation() async {
+    if (_bubbles.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('当前对话已经是空的')),
+      );
       return;
     }
-    try {
-      await _auth.signIn(email: result.email, password: result.password);
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _channel = 'cloud';
-        _error = null;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已登录套餐账号 ${_auth.maskedEmail}')),
-      );
-    } on AuthException catch (failure) {
-      _showError(failure.userHint);
-    } on Object {
-      _showError('登录失败，请稍后重试');
-    }
-  }
-
-  Future<void> _signOutCloud() async {
-    final confirmed = await showDialog<bool>(
+    final bool? confirmed = await showDialog<bool>(
       context: context,
       builder: (BuildContext context) => AlertDialog(
-        backgroundColor: Theme.of(context).colorScheme.surface,
-        surfaceTintColor: Colors.transparent,
-        title: const Text('退出套餐账号？'),
-        content: Text('将退出 ${_auth.maskedEmail}，本机令牌会被清除。'),
+        title: const Text('清空当前对话历史？'),
+        content: const Text('将删除本窗口的全部消息（本地记忆与课表不受影响），此操作不可撤销。'),
         actions: <Widget>[
-          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.of(context).pop(true), child: const Text('退出')),
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('清空')),
         ],
       ),
     );
-    if (confirmed != true) {
-      return;
-    }
-    await _auth.signOut();
-    if (!mounted) {
+    if (confirmed != true || !mounted) {
       return;
     }
     setState(() {
-      if (_channel == 'cloud') {
-        _channel = 'byok';
-      }
+      _bubbles.clear();
+      _promptTokens = 0;
+      _completionTokens = 0;
+      _error = null;
+      _input.clear();
+      _streaming = false;
     });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('已退出套餐账号')),
-    );
   }
+
   /// 对话诊断（始终可达）：显示最近一轮的观测数据并支持复制。
   ///
   /// P0-1 观测口径：`delta_count` / `last_delta_len` / `merged_chars` 能直接回答
@@ -595,16 +570,6 @@ class ChatPageState extends State<ChatPage> {
   /// 端侧数据**目录**（Rust `data_dir`）：由 `AppPaths.dataDirOf` 统一推导。
   String get _dataDir => AppPaths.dataDirOf(widget.dbPath);
 
-  Future<void> _deleteKey() async {
-    try {
-      await _secrets.delete(SecretService.byokKeyName);
-      await _refreshKeyStatus();
-    } on SecretException catch (failure) {
-      if (mounted) {
-        setState(() => _error = failure.userHint);
-      }
-    }
-  }
 
 
   @override
@@ -628,10 +593,9 @@ class ChatPageState extends State<ChatPage> {
           accountLabel: _auth.signedIn ? _auth.maskedEmail : '未登录',
           onLocalSearch: () => setState(() => _localPanelOpen = !_localPanelOpen),
           onMemory: () => unawaited(_openMemory()),
-          onSignIn: () => unawaited(_signInCloud()),
-          onSignOut: () => unawaited(_signOutCloud()),
           onDiagnostics: () => unawaited(_showDiagnostics()),
-          onDeleteKey: _keyStatus.set ? () => unawaited(_deleteKey()) : null,
+          // t112：Key 与套餐账号入口已移到设置页
+          onClearConversation: () => unawaited(_clearConversation()),
         ),
         if (_keyStatus.degraded)
           Padding(
@@ -1014,8 +978,10 @@ class _MessageBubble extends StatelessWidget {
           ),
         );
       }
+      // t112：助手正文不再顶到左边界——左侧留 24（与用户消息右侧 24 对称），
+      // 竖直留白保持 12，阅读节奏不变。
       return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 12),
+        padding: const EdgeInsets.fromLTRB(24, 12, 0, 12),
         child: Text(text, style: theme.textTheme.bodyMedium),
       );
     }

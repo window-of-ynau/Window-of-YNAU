@@ -97,8 +97,10 @@ void main() {
     await tester.tap(find.byIcon(Icons.more_vert));
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
-    expect(find.text('登录套餐账号'), findsWidgets);
+    // t112：账号入口已移到设置页，⋮ 菜单里不再有它
+    expect(find.text('登录套餐账号'), findsNothing);
   });
+
 
   test('auth_refresh: ok → 已登录，只用 Rust 结果', () async {
     final backend = _FakeRefreshBackend(<String, dynamic>{

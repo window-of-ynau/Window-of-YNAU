@@ -26,10 +26,8 @@ class ChatTopBar extends StatelessWidget {
     required this.accountLabel,
     required this.onLocalSearch,
     required this.onMemory,
-    required this.onSignIn,
-    required this.onSignOut,
     required this.onDiagnostics,
-    this.onDeleteKey,
+    required this.onClearConversation,
   });
 
   final String channel;
@@ -45,12 +43,12 @@ class ChatTopBar extends StatelessWidget {
 
   final VoidCallback onLocalSearch;
   final VoidCallback onMemory;
-  final VoidCallback onSignIn;
-  final VoidCallback onSignOut;
 
   /// 对话诊断（**始终可达**：不是只在失败时出现）
   final VoidCallback onDiagnostics;
-  final VoidCallback? onDeleteKey;
+
+  /// 清空当前对话历史（t112：二次确认在页面里做）
+  final VoidCallback onClearConversation;
 
   @override
   Widget build(BuildContext context) {
@@ -93,27 +91,18 @@ class ChatTopBar extends StatelessWidget {
                   onLocalSearch();
                 case 'memory':
                   onMemory();
-                case 'signIn':
-                  onSignIn();
-                case 'signOut':
-                  onSignOut();
                 case 'diagnostics':
                   onDiagnostics();
-                case 'deleteKey':
-                  onDeleteKey?.call();
+                case 'clear':
+                  onClearConversation();
               }
             },
             itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
               const PopupMenuItem<String>(value: 'local', child: Text('搜索本地资料（不联网）')),
               const PopupMenuItem<String>(value: 'memory', child: Text('记忆')),
               const PopupMenuItem<String>(value: 'diagnostics', child: Text('对话诊断')),
-              if (keyLabel.isNotEmpty)
-                const PopupMenuItem<String>(value: 'deleteKey', child: Text('删除已保存的 Key')),
               const PopupMenuDivider(),
-              if (signedIn)
-                PopupMenuItem<String>(value: 'signOut', child: Text('退出套餐（$accountLabel）'))
-              else
-                const PopupMenuItem<String>(value: 'signIn', child: Text('登录套餐账号')),
+              const PopupMenuItem<String>(value: 'clear', child: Text('清空当前对话历史')),
             ],
           ),
         ],

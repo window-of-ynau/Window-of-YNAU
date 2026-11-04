@@ -183,41 +183,52 @@ class _HomeShellState extends State<HomeShell> {
                 child: SizedBox.expand(),
               ),
         title: Text(destination?.label ?? '云农之窗'),
-        actions: <Widget>[
-          IconButton(
-            tooltip: '设置',
-            onPressed: _openSettings,
-            icon: const Icon(Icons.settings_outlined),
-          ),
-        ],
+        // t112：设置入口移到侧栏底部（见下方 drawer），顶栏不再放齿轮。
       ),
       drawer: Drawer(
         // 分组侧栏（t76 视觉新增）：上组「功能」、下组「校园 · N」。
-        // 只改分组标签与密度；「设置」入口仍统一走 AppBar 的齿轮（不回退 main 的统一入口）。
-        child: ListView(
-          padding: const EdgeInsets.only(top: 8, bottom: 12),
+        // t112：「设置」固定在抽屉**底部**、整行横格，不随列表滚动。
+        child: Column(
           children: <Widget>[
-            Padding(
-              padding: const EdgeInsets.fromLTRB(18, 20, 18, 8),
-              child: Text('云农之窗', style: Theme.of(context).textTheme.headlineSmall),
-            ),
-            const _DrawerSectionLabel(text: '功能'),
-            ListTile(
-              dense: true,
-              leading: const Icon(Icons.chat_bubble_outline),
-              title: const Text('对话'),
-              selected: _selected == 0,
-              onTap: () => _select(0),
-            ),
-            _DrawerSectionLabel(text: '校园 · ${entries.length}'),
-            for (var i = 0; i < entries.length; i++)
-              ListTile(
-                dense: true,
-                leading: const Icon(Icons.school_outlined),
-                title: Text(entries[i].label),
-                selected: _selected == i + 1,
-                onTap: () => _select(i + 1),
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.only(top: 8),
+                children: <Widget>[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(18, 20, 18, 8),
+                    child: Text('云农之窗', style: Theme.of(context).textTheme.headlineSmall),
+                  ),
+                  const _DrawerSectionLabel(text: '功能'),
+                  ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.chat_bubble_outline),
+                    title: const Text('对话'),
+                    selected: _selected == 0,
+                    onTap: () => _select(0),
+                  ),
+                  _DrawerSectionLabel(text: '校园 · ${entries.length}'),
+                  for (var i = 0; i < entries.length; i++)
+                    ListTile(
+                      dense: true,
+                      leading: const Icon(Icons.school_outlined),
+                      title: Text(entries[i].label),
+                      selected: _selected == i + 1,
+                      onTap: () => _select(i + 1),
+                    ),
+                ],
               ),
+            ),
+            const Divider(height: 1),
+            // 底部固定格：撑满整行、图标 + 文字
+            SizedBox(
+              width: double.infinity,
+              child: ListTile(
+                key: const Key('drawer-settings'),
+                leading: const Icon(Icons.settings_outlined),
+                title: const Text('设置'),
+                onTap: _openSettings,
+              ),
+            ),
           ],
         ),
       ),

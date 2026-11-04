@@ -81,6 +81,25 @@ class _TimetablePageState extends State<TimetablePage> {
     // t111：页面被重建（切栏目再切回）时必须从 SQLite 回填已有课表，
     // 否则用户会以为“抓到的课表丢了”，被迫重抓一次。
     unawaited(_loadCoursesFromDb());
+    // t112：手改学期要立即按新学期重载（旧学期的课必须清掉，否则误导）。
+    _term.addListener(_onTermChanged);
+  }
+
+  /// 学期切换代次：慢请求回来时若学期已变，丢弃结果，避免覆盖新学期。
+  int _termGeneration = 0;
+
+  void _onTermChanged() {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _courses = const <StoredCourse>[];
+      _warnings = const <String>[];
+      _failure = null;
+      _termStartDraft = suggestedTermStart(_currentTerm);
+    });
+    unawaited(_loadCoursesFromDb());
+    unawaited(_loadTermStart());
   }
 
   /// 从本地 SQLite 读取当前学期的课表（t111）。
@@ -91,9 +110,10 @@ class _TimetablePageState extends State<TimetablePage> {
     if (term.isEmpty) {
       return;
     }
+    final int generation = ++_termGeneration;
     try {
       final List<StoredCourse> courses = await widget.service.listCourses(term: term);
-      if (!mounted) {
+      if (!mounted || generation != _termGeneration) {
         return;
       }
       setState(() {
@@ -121,6 +141,7 @@ class _TimetablePageState extends State<TimetablePage> {
 
   @override
   void dispose() {
+    _term.removeListener(_onTermChanged);
     _term.dispose();
     super.dispose();
   }
