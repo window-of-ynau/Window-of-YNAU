@@ -13,8 +13,10 @@ MemorySettingsStore _store() => MemorySettingsStore();
 double _width(WidgetTester tester) => tester.getSize(find.byKey(_sidebar)).width;
 
 Future<void> _pumpApp(WidgetTester tester, {required Size size, required SettingsStore store}) async {
-  await tester.binding.setSurfaceSize(size);
-  addTearDown(() => tester.binding.setSurfaceSize(null));
+  // 用 view 尺寸（setSurfaceSize 不改变 MediaQuery 的 view 尺寸时不可靠）
+  tester.view.physicalSize = size;
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.reset);
   await tester.pumpWidget(YunongApp(themeController: ThemeController(store: store)));
   await tester.pumpAndSettle();
 }
@@ -59,4 +61,20 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(_width(tester), lessThanOrEqualTo(72), reason: '窄窗应默认折叠为 rail');
   });
-}
+
+  testWidgets('320px 超窄窗也不溢出（验证不是“刚好够”）', (WidgetTester tester) async {
+    await _pumpApp(tester, size: const Size(320, 900), store: _store());
+    expect(tester.takeException(), isNull);
+    expect(_width(tester), lessThanOrEqualTo(72));
+  });
+
+  testWidgets('折叠动画中途（约 128~250px）不溢出', (WidgetTester tester) async {
+    await _pumpApp(tester, size: const Size(1280, 800), store: _store());
+    await tester.tap(find.byKey(_toggle));
+    // 动画进行到一半时不 pumpAndSettle，直接检查
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 90));
+    expect(tester.takeException(), isNull, reason: '动画中途不应溢出');
+    await tester.pumpAndSettle();
+    expect(_width(tester), lessThanOrEqualTo(72));
+  });}

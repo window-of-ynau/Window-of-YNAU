@@ -1,8 +1,10 @@
-// 对话页模型与 effort 选择条（t115）。
+// 对话页模型与 effort 选择条（t115；t119 改为可收缩布局）。
 //
-// 为什么在对话框里而不是设置页：
-// owner 的 IA 是「设置只选供应商；模型/推理强度属于“这次对话怎么问”」。
-// 没有 provider 信息时也能用：只列出内置模型。
+// 为什么在对话框里：owner 的 IA 是「设置只选供应商；模型/推理强度属于“这次怎么问”」。
+//
+// t119 教训：**不要用 Wrap 包 DropdownButton** —— DropdownButton 的固有宽度
+// （模型名 + 箭头）在 480/320 窄窗会让内部横向 Row 溢出（实测 36px）。
+// 现在用 `Row + Flexible + isExpanded`，两个下拉都能压缩并省略文本。
 
 import 'package:flutter/material.dart';
 
@@ -41,44 +43,63 @@ class ModelSelectorState extends State<ModelSelector> {
     }
     return Padding(
       padding: const EdgeInsets.only(bottom: 2),
-      child: Wrap(
-        spacing: 8,
-        runSpacing: 2,
-        crossAxisAlignment: WrapCrossAlignment.center,
+      child: Row(
         children: <Widget>[
-          DropdownButton<String>(
-            key: const Key('chat-model-selector'),
-            value: _model,
-            isDense: true,
-            underline: const SizedBox.shrink(),
-            style: theme.textTheme.bodySmall,
-            items: <DropdownMenuItem<String>>[
-              for (final String item in models)
-                DropdownMenuItem<String>(value: item, child: Text(item)),
-            ],
-            onChanged: (String? value) {
-              if (value != null) {
-                setState(() => _model = value);
-              }
-            },
+          Flexible(
+            child: DropdownButton<String>(
+              key: const Key('chat-model-selector'),
+              value: _model,
+              isExpanded: true,
+              isDense: true,
+              underline: const SizedBox.shrink(),
+              style: theme.textTheme.bodySmall,
+              items: <DropdownMenuItem<String>>[
+                for (final String item in models)
+                  DropdownMenuItem<String>(
+                    value: item,
+                    child: Text(item, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ),
+              ],
+              onChanged: (String? value) {
+                if (value != null) {
+                  setState(() => _model = value);
+                }
+              },
+            ),
           ),
-          DropdownButton<String>(
-            key: const Key('chat-effort-selector'),
-            value: _effort,
-            isDense: true,
-            underline: const SizedBox.shrink(),
-            style: theme.textTheme.bodySmall,
-            items: const <DropdownMenuItem<String>>[
-              DropdownMenuItem<String>(value: 'auto', child: Text('effort 自动')),
-              DropdownMenuItem<String>(value: 'low', child: Text('effort 低')),
-              DropdownMenuItem<String>(value: 'medium', child: Text('effort 中')),
-              DropdownMenuItem<String>(value: 'high', child: Text('effort 高')),
-            ],
-            onChanged: (String? value) {
-              if (value != null) {
-                setState(() => _effort = value);
-              }
-            },
+          const SizedBox(width: 8),
+          Flexible(
+            child: DropdownButton<String>(
+              key: const Key('chat-effort-selector'),
+              value: _effort,
+              isExpanded: true,
+              isDense: true,
+              underline: const SizedBox.shrink(),
+              style: theme.textTheme.bodySmall,
+              items: const <DropdownMenuItem<String>>[
+                DropdownMenuItem<String>(
+                  value: 'auto',
+                  child: Text('effort 自动', maxLines: 1, overflow: TextOverflow.ellipsis),
+                ),
+                DropdownMenuItem<String>(
+                  value: 'low',
+                  child: Text('effort 低', maxLines: 1, overflow: TextOverflow.ellipsis),
+                ),
+                DropdownMenuItem<String>(
+                  value: 'medium',
+                  child: Text('effort 中', maxLines: 1, overflow: TextOverflow.ellipsis),
+                ),
+                DropdownMenuItem<String>(
+                  value: 'high',
+                  child: Text('effort 高', maxLines: 1, overflow: TextOverflow.ellipsis),
+                ),
+              ],
+              onChanged: (String? value) {
+                if (value != null) {
+                  setState(() => _effort = value);
+                }
+              },
+            ),
           ),
         ],
       ),
