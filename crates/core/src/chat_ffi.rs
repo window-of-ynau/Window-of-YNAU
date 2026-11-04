@@ -319,7 +319,13 @@ pub fn run_stream_with_registry(
     let mut callback = SendableClosure(on_chunk);
     // 统一按 JSON 投递：工具事件不走 `Chunk` 枚举，但共用同一条回调
     // （字符串所有权仍是 `into_raw` + 调用方 free，见 `ffi::ChatCallback::emit`）
+    // t116：记录"是否已经向客户端写出过可见内容"——写出过就**不许**回退协议
+    //（用户已经看到半截回答，重来一次更糟）
+    let streamed = std::sync::atomic::AtomicBool::new(false);
     let mut emit = |json: String| -> bool {
+        if json.contains("\"type\":\"delta\"") || json.contains("\"type\":\"tool_call\"") {
+            streamed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         if callback.call(json) {
             false
         } else {
@@ -362,183 +368,240 @@ pub fn run_stream_with_registry(
     let outcome: Option<crate::error::CoreResult<StreamSummary>> = if stop_early {
         None
     } else {
-        let summary: crate::error::CoreResult<StreamSummary> = if use_tools {
-            // ---- 工具循环路径 ----
-            let gateway: Box<dyn crate::gateway::ModelGateway> = match config.channel.as_str() {
-                "cloud" => Box::new(crate::gateway::CloudProxy::new(
-                    config.cloud_base_url.clone().unwrap_or_default(),
-                    config.cloud_token.clone().unwrap_or_default(),
-                )),
-                _ => Box::new(
-                    crate::gateway::DirectProvider::new(
-                        parse_protocol(&config.protocol),
-                        config.base_url.clone().unwrap_or_default(),
-                        config.model.clone(),
-                    )
-                    .with_api_key(api_key.clone()),
-                ),
-            };
-            let loop_config = crate::tool_loop::LoopConfig {
-                // 套餐通道按 ADR-05 最多 4 轮；BYOK 只受本地 24 轮约束
-                wire_max_rounds: (config.channel.as_str() == "cloud")
-                    .then_some(yunong_shared::MAX_ROUNDS),
-                // 单工具超时：默认 10s；请求里可调（测试/联调要短超时）
-                tool_timeout: config
-                    .tool_timeout_ms
-                    .map(std::time::Duration::from_millis)
-                    .unwrap_or_else(|| crate::tool_loop::LoopConfig::default().tool_timeout),
-                ..crate::tool_loop::LoopConfig::default()
-            };
-            let mut usage = Usage::default();
-            let mut finish = FinishReason::Stop;
-            let loop_result = {
-                // 作用域：让 `on_event` 在 guard.drain 之前释放（它借用 guard 与 emit）
-                let mut on_event = |event: crate::tool_loop::LoopEvent| -> crate::gateway::Flow {
-                    match event {
-                        crate::tool_loop::LoopEvent::Delta { text } => {
-                            if emit(chunk_json(&Chunk::Delta { text })) {
-                                crate::gateway::Flow::Stop
-                            } else {
-                                crate::gateway::Flow::Continue
-                            }
-                        }
-                        crate::tool_loop::LoopEvent::ToolCallCompleted {
-                            index,
-                            id,
-                            name,
-                            arguments,
-                        } => {
-                            guard.opened(&id);
-                            let json = crate::tool_events::tool_call_json(
-                                &id,
-                                &name,
-                                &arguments,
-                                Some(index),
-                            );
-                            if emit(json) {
-                                crate::gateway::Flow::Stop
-                            } else {
-                                crate::gateway::Flow::Continue
-                            }
-                        }
-                        crate::tool_loop::LoopEvent::ToolResult {
-                            id, ok, content, ..
-                        } => {
-                            guard.closed(&id);
-                            let code = if ok {
-                                None
-                            } else {
-                                Some(crate::tool_events::FailureCode::from_message(&content))
-                            };
-                            let json =
-                                crate::tool_events::tool_result_json(&id, ok, &content, code);
-                            if emit(json) {
-                                crate::gateway::Flow::Stop
-                            } else {
-                                crate::gateway::Flow::Continue
-                            }
-                        }
-                        crate::tool_loop::LoopEvent::RoundFinished {
-                            usage: round_usage,
-                            finish: round_finish,
-                            ..
-                        } => {
-                            usage.tokens_in = usage.tokens_in.saturating_add(round_usage.tokens_in);
-                            usage.tokens_out =
-                                usage.tokens_out.saturating_add(round_usage.tokens_out);
-                            usage.estimated |= round_usage.estimated;
-                            finish = round_finish;
-                            crate::gateway::Flow::Continue
-                        }
-                        _ => crate::gateway::Flow::Continue,
-                    }
-                };
-                runtime.block_on(crate::tool_loop::run(
-                    &*gateway,
-                    &registry,
-                    request,
-                    loop_config,
-                    &mut on_event,
-                ))
-            };
-            match loop_result {
-                Ok(loop_outcome) => {
-                    if loop_outcome.usage.tokens_in + loop_outcome.usage.tokens_out > 0 {
-                        usage = loop_outcome.usage;
-                    }
-                    let was_cancelled = loop_outcome.cancelled;
-                    Ok(StreamSummary {
-                        usage,
-                        finish: if was_cancelled {
-                            FinishReason::Stop
-                        } else {
-                            finish
-                        },
-                        cancelled: was_cancelled,
-                        usage_reported: false,
-                    })
-                }
-                Err(err) => {
-                    // 轮次上限 / 截断 / 上游错误：先把悬空的工具调用闭环，再把错误上抛
-                    let code = if matches!(err, crate::error::CoreError::RoundLimit(_)) {
-                        crate::tool_events::FailureCode::RoundLimit
-                    } else {
-                        crate::tool_events::FailureCode::ToolError
-                    };
-                    let reason = format!("工具未返回结果：{err}");
-                    for json in guard.drain(&reason, code) {
-                        emit(json);
-                    }
-                    Err(err)
-                }
-            }
-        } else {
-            // ---- 直连路径（无工具，行为与之前完全一致）----
-            match config.channel.as_str() {
-                "cloud" => {
-                    let gateway = crate::gateway::CloudProxy::new(
+        // t116：运行时回退——**只**在"协议不被支持"的明确信号上重试一次
+        let mut protocol = effective_protocol;
+        let mut attempted: Vec<Protocol> = vec![protocol];
+        let result: crate::error::CoreResult<StreamSummary>;
+        loop {
+            let mut attempt_request = request.clone();
+            attempt_request.protocol = protocol;
+            let summary: crate::error::CoreResult<StreamSummary> = if use_tools {
+                // ---- 工具循环路径 ----
+                let gateway: Box<dyn crate::gateway::ModelGateway> = match config.channel.as_str() {
+                    "cloud" => Box::new(crate::gateway::CloudProxy::new(
                         config.cloud_base_url.clone().unwrap_or_default(),
                         config.cloud_token.clone().unwrap_or_default(),
-                    );
-                    runtime.block_on(gateway.chat_stream(&request, &mut |chunk| {
-                        // 首帧 meta 上面已经发过：装配器再送的那条丢掉（meta 必首且唯一）
-                        if matches!(chunk, Chunk::Meta { .. }) {
-                            return crate::gateway::Flow::Continue;
+                    )),
+                    _ => Box::new(
+                        crate::gateway::DirectProvider::new(
+                            protocol,
+                            config.base_url.clone().unwrap_or_default(),
+                            config.model.clone(),
+                        )
+                        .with_api_key(api_key.clone()),
+                    ),
+                };
+                let loop_config = crate::tool_loop::LoopConfig {
+                    // 套餐通道按 ADR-05 最多 4 轮；BYOK 只受本地 24 轮约束
+                    wire_max_rounds: (config.channel.as_str() == "cloud")
+                        .then_some(yunong_shared::MAX_ROUNDS),
+                    // 单工具超时：默认 10s；请求里可调（测试/联调要短超时）
+                    tool_timeout: config
+                        .tool_timeout_ms
+                        .map(std::time::Duration::from_millis)
+                        .unwrap_or_else(|| crate::tool_loop::LoopConfig::default().tool_timeout),
+                    ..crate::tool_loop::LoopConfig::default()
+                };
+                let mut usage = Usage::default();
+                let mut finish = FinishReason::Stop;
+                let loop_result = {
+                    // 作用域：让 `on_event` 在 guard.drain 之前释放（它借用 guard 与 emit）
+                    let mut on_event =
+                        |event: crate::tool_loop::LoopEvent| -> crate::gateway::Flow {
+                            match event {
+                                crate::tool_loop::LoopEvent::Delta { text } => {
+                                    if emit(chunk_json(&Chunk::Delta { text })) {
+                                        crate::gateway::Flow::Stop
+                                    } else {
+                                        crate::gateway::Flow::Continue
+                                    }
+                                }
+                                crate::tool_loop::LoopEvent::ToolCallCompleted {
+                                    index,
+                                    id,
+                                    name,
+                                    arguments,
+                                } => {
+                                    guard.opened(&id);
+                                    let json = crate::tool_events::tool_call_json(
+                                        &id,
+                                        &name,
+                                        &arguments,
+                                        Some(index),
+                                    );
+                                    if emit(json) {
+                                        crate::gateway::Flow::Stop
+                                    } else {
+                                        crate::gateway::Flow::Continue
+                                    }
+                                }
+                                crate::tool_loop::LoopEvent::ToolResult {
+                                    id, ok, content, ..
+                                } => {
+                                    guard.closed(&id);
+                                    let code = if ok {
+                                        None
+                                    } else {
+                                        Some(crate::tool_events::FailureCode::from_message(
+                                            &content,
+                                        ))
+                                    };
+                                    let json = crate::tool_events::tool_result_json(
+                                        &id, ok, &content, code,
+                                    );
+                                    if emit(json) {
+                                        crate::gateway::Flow::Stop
+                                    } else {
+                                        crate::gateway::Flow::Continue
+                                    }
+                                }
+                                crate::tool_loop::LoopEvent::RoundFinished {
+                                    usage: round_usage,
+                                    finish: round_finish,
+                                    ..
+                                } => {
+                                    usage.tokens_in =
+                                        usage.tokens_in.saturating_add(round_usage.tokens_in);
+                                    usage.tokens_out =
+                                        usage.tokens_out.saturating_add(round_usage.tokens_out);
+                                    usage.estimated |= round_usage.estimated;
+                                    finish = round_finish;
+                                    crate::gateway::Flow::Continue
+                                }
+                                _ => crate::gateway::Flow::Continue,
+                            }
+                        };
+                    runtime.block_on(crate::tool_loop::run(
+                        &*gateway,
+                        &registry,
+                        attempt_request.clone(),
+                        loop_config,
+                        &mut on_event,
+                    ))
+                };
+                match loop_result {
+                    Ok(loop_outcome) => {
+                        if loop_outcome.usage.tokens_in + loop_outcome.usage.tokens_out > 0 {
+                            usage = loop_outcome.usage;
                         }
-                        if emit(chunk_json(&chunk)) {
-                            crate::gateway::Flow::Stop
+                        let was_cancelled = loop_outcome.cancelled;
+                        Ok(StreamSummary {
+                            usage,
+                            finish: if was_cancelled {
+                                FinishReason::Stop
+                            } else {
+                                finish
+                            },
+                            cancelled: was_cancelled,
+                            usage_reported: false,
+                        })
+                    }
+                    Err(err) => {
+                        // 轮次上限 / 截断 / 上游错误：先把悬空的工具调用闭环，再把错误上抛
+                        let code = if matches!(err, crate::error::CoreError::RoundLimit(_)) {
+                            crate::tool_events::FailureCode::RoundLimit
                         } else {
-                            crate::gateway::Flow::Continue
+                            crate::tool_events::FailureCode::ToolError
+                        };
+                        let reason = format!("工具未返回结果：{err}");
+                        for json in guard.drain(&reason, code) {
+                            emit(json);
                         }
-                    }))
+                        Err(err)
+                    }
                 }
-                _ => {
-                    let gateway = crate::gateway::DirectProvider::new(
-                        parse_protocol(&config.protocol),
-                        config.base_url.clone().unwrap_or_default(),
-                        config.model.clone(),
-                    )
-                    .with_api_key(api_key.clone());
-                    runtime.block_on(gateway.chat_stream(&request, &mut |chunk| {
-                        if matches!(chunk, Chunk::Meta { .. }) {
-                            return crate::gateway::Flow::Continue;
+            } else {
+                // ---- 直连路径（无工具，行为与之前完全一致）----
+                match config.channel.as_str() {
+                    "cloud" => {
+                        let gateway = crate::gateway::CloudProxy::new(
+                            config.cloud_base_url.clone().unwrap_or_default(),
+                            config.cloud_token.clone().unwrap_or_default(),
+                        );
+                        runtime.block_on(gateway.chat_stream(&attempt_request, &mut |chunk| {
+                            // 首帧 meta 上面已经发过：装配器再送的那条丢掉（meta 必首且唯一）
+                            if matches!(chunk, Chunk::Meta { .. }) {
+                                return crate::gateway::Flow::Continue;
+                            }
+                            if emit(chunk_json(&chunk)) {
+                                crate::gateway::Flow::Stop
+                            } else {
+                                crate::gateway::Flow::Continue
+                            }
+                        }))
+                    }
+                    _ => {
+                        let gateway = crate::gateway::DirectProvider::new(
+                            protocol,
+                            config.base_url.clone().unwrap_or_default(),
+                            config.model.clone(),
+                        )
+                        .with_api_key(api_key.clone());
+                        runtime.block_on(gateway.chat_stream(&attempt_request, &mut |chunk| {
+                            if matches!(chunk, Chunk::Meta { .. }) {
+                                return crate::gateway::Flow::Continue;
+                            }
+                            if emit(chunk_json(&chunk)) {
+                                crate::gateway::Flow::Stop
+                            } else {
+                                crate::gateway::Flow::Continue
+                            }
+                        }))
+                    }
+                }
+                .map(|stream_outcome| StreamSummary {
+                    usage: stream_outcome.usage,
+                    finish: stream_outcome.finish,
+                    cancelled: stream_outcome.cancelled,
+                    usage_reported: true,
+                })
+            };
+            match summary {
+                Ok(summary) => {
+                    result = Ok(summary);
+                    break;
+                }
+                Err(err) => {
+                    // 运行时回退只对 **BYOK 直连**开放：套餐通道走我们自己的代理，
+                    // 换协议重试等于对同一 turn 打两次请求（会重复计费），不做。
+                    let byok = config.channel.as_str() != "cloud";
+                    let retry = if byok
+                        && !streamed.load(std::sync::atomic::Ordering::SeqCst)
+                        && attempted.len() < 2
+                    {
+                        crate::protocol_pick::unsupported_signal(&err).zip(
+                            crate::protocol_pick::next_runtime_candidate(
+                                &protocol_choice.provider,
+                                protocol,
+                                &attempted,
+                            ),
+                        )
+                    } else {
+                        None
+                    };
+                    match retry {
+                        Some((reason, next)) => {
+                            // 只重试一次，且写清"这是重试"（retried / attempt）
+                            emit(crate::protocol_pick::retried_event_json(
+                                &protocol_choice.requested_name,
+                                &protocol_choice.provider,
+                                next,
+                                &reason,
+                                attempted.len() as u32 + 1,
+                            ));
+                            attempted.push(next);
+                            protocol = next;
+                            continue;
                         }
-                        if emit(chunk_json(&chunk)) {
-                            crate::gateway::Flow::Stop
-                        } else {
-                            crate::gateway::Flow::Continue
+                        None => {
+                            result = Err(err);
+                            break;
                         }
-                    }))
+                    }
                 }
             }
-            .map(|stream_outcome| StreamSummary {
-                usage: stream_outcome.usage,
-                finish: stream_outcome.finish,
-                cancelled: stream_outcome.cancelled,
-                usage_reported: true,
-            })
-        };
-        Some(summary)
+        }
+        Some(result)
     };
 
     // ---- 收尾：先把悬空的工具调用闭环，再发结束帧 ----
@@ -868,16 +931,23 @@ mod tests {
 
     impl ScriptedServer {
         fn start(responses: Vec<String>) -> Self {
+            let scripted: Vec<(u16, String)> =
+                responses.into_iter().map(|body| (200, body)).collect();
+            Self::start_with_status(scripted)
+        }
+
+        /// 每个连接按顺序回放 `(状态码, 响应体)`；用来模拟"协议不支持"（404/405）等失败。
+        fn start_with_status(responses: Vec<(u16, String)>) -> Self {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
             let recorder = std::sync::Arc::clone(&bodies);
             std::thread::spawn(move || {
-                for body in responses {
+                for (status, body) in responses {
                     let Ok((mut socket, _)) = listener.accept() else {
                         return;
                     };
-                    // 读完请求头，避免上游比客户端先关
+                    // 读完请求头 + body，避免上游比客户端先关
                     let mut buffer = [0_u8; 4096];
                     let mut seen = Vec::new();
                     let mut header_end = None;
@@ -894,7 +964,6 @@ mod tests {
                             break;
                         }
                     }
-                    // 再把 body 读全（Content-Length），便于断言请求体
                     if let Some(start) = header_end {
                         let head = String::from_utf8_lossy(&seen[..start]).to_lowercase();
                         let length = head
@@ -912,8 +981,14 @@ mod tests {
                         let body = String::from_utf8_lossy(&seen[start..]).into_owned();
                         recorder.lock().unwrap().push(body);
                     }
+                    let reason = if status == 200 { "OK" } else { "ERR" };
+                    let content_type = if status == 200 {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     );
@@ -926,6 +1001,10 @@ mod tests {
 
         fn base_url(&self) -> String {
             format!("http://127.0.0.1:{}/v1", self.port)
+        }
+
+        fn request_count(&self) -> usize {
+            self.bodies.lock().unwrap().len()
         }
     }
 
@@ -1268,6 +1347,147 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("认不出的协议名"));
+    }
+
+    // ---------------------------------------------------------------------
+    // t116：运行时回退（只在"协议不支持"的明确信号上，重试一次，不覆盖已写出的流）
+    // ---------------------------------------------------------------------
+
+    /// Responses 协议的 SSE 片段（回退目标用）。
+    fn responses_body(text: &str) -> String {
+        format!(
+            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\"}}\n\n\
+             event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":1}}}}}}\n\n"
+        )
+    }
+
+    fn config_with_protocol(base_url: &str, protocol: &str) -> ChatRunConfig {
+        let mut config = ChatRunConfig::parse(&byok_json("sk-test")).unwrap();
+        config.base_url = Some(base_url.to_owned());
+        config.protocol = protocol.to_owned();
+        config
+    }
+
+    /// ① 第一轮 404 → 回退到下一协议并成功：retried / attempt=2 / delta 正常。
+    #[test]
+    fn runtime_fallback_retries_once_on_404() {
+        let server = ScriptedServer::start_with_status(vec![
+            (
+                404,
+                "{\"error\":{\"message\":\"no such endpoint\"}}".to_owned(),
+            ),
+            (200, responses_body("下午没课")),
+        ]);
+        let config = config_with_protocol(&server.base_url(), "openai_completions");
+        let chunks = run_collect(config, crate::tools::ToolRegistry::new());
+        let events = parse_all(&chunks);
+        for event in &events {
+            println!("[wire] {event}");
+        }
+        let fallback = events
+            .iter()
+            .find(|event| event["type"] == "protocol_fallback")
+            .unwrap_or_else(|| panic!("没有 protocol_fallback：{chunks:#?}"));
+        assert_eq!(fallback["retried"], true, "{fallback}");
+        assert_eq!(fallback["attempt"], 2, "{fallback}");
+        assert_eq!(
+            fallback["effective_protocol"], "openai_responses",
+            "{fallback}"
+        );
+        assert_eq!(
+            fallback["requested_protocol"], "openai_completions",
+            "{fallback}"
+        );
+        // 重试成功后的 delta 正常到达，且以 done 收尾
+        assert!(
+            events.iter().any(|event| event["type"] == "delta"),
+            "{chunks:#?}"
+        );
+        assert_eq!(events.last().unwrap()["type"], "done", "{chunks:#?}");
+        // 恰好两个请求
+        assert_eq!(server.request_count(), 2, "应只重试一次");
+    }
+
+    /// ② 401 鉴权失败 → **不回退**，直接报错（只发一个请求）。
+    #[test]
+    fn no_runtime_fallback_on_401() {
+        let server = ScriptedServer::start_with_status(vec![(
+            401,
+            "{\"error\":{\"message\":\"invalid api key\"}}".to_owned(),
+        )]);
+        let config = config_with_protocol(&server.base_url(), "openai_completions");
+        let chunks = run_collect(config, crate::tools::ToolRegistry::new());
+        let events = parse_all(&chunks);
+        for event in &events {
+            println!("[wire] {event}");
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "protocol_fallback"),
+            "401 不该回退：{chunks:#?}"
+        );
+        let error = events
+            .iter()
+            .find(|event| event["type"] == "error")
+            .unwrap_or_else(|| panic!("应收到 error 帧：{chunks:#?}"));
+        assert_eq!(error["code"], "UNAUTHORIZED", "{error}");
+        assert_eq!(server.request_count(), 1, "401 只该发一个请求");
+    }
+
+    /// ③ 已写出 delta 后失败 → **不回退**（用户已经看到半截内容）。
+    #[test]
+    fn no_runtime_fallback_after_streaming_started() {
+        // 第一条响应先给一个 delta，然后**直接关连接**（不发 [DONE]，也不发结束帧）
+        let partial = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",",
+            "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"半截\"},\"finish_reason\":null}]}\n\n"
+        )
+        .to_owned();
+        let server = ScriptedServer::start_with_status(vec![
+            (200, partial),
+            (200, responses_body("不该出现")),
+        ]);
+        let config = config_with_protocol(&server.base_url(), "openai_completions");
+        let chunks = run_collect(config, crate::tools::ToolRegistry::new());
+        let events = parse_all(&chunks);
+        for event in &events {
+            println!("[wire] {event}");
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "protocol_fallback"),
+            "已发 delta 后不许回退：{chunks:#?}"
+        );
+        assert!(
+            !chunks.iter().any(|json| json.contains("不该出现")),
+            "没有第二次请求：{chunks:#?}"
+        );
+        assert_eq!(server.request_count(), 1, "已开始流式就不再重试");
+    }
+
+    /// ④ 两次都 404 → 报错、只重试一次、不无限重试。
+    #[test]
+    fn runtime_fallback_stops_after_one_retry() {
+        let not_found = (404, "{\"error\":{\"message\":\"not found\"}}".to_owned());
+        let server = ScriptedServer::start_with_status(vec![not_found.clone(), not_found]);
+        let config = config_with_protocol(&server.base_url(), "openai_completions");
+        let chunks = run_collect(config, crate::tools::ToolRegistry::new());
+        let events = parse_all(&chunks);
+        for event in &events {
+            println!("[wire] {event}");
+        }
+        let fallbacks = events
+            .iter()
+            .filter(|event| event["type"] == "protocol_fallback")
+            .count();
+        assert_eq!(fallbacks, 1, "只回退一次：{chunks:#?}");
+        assert_eq!(server.request_count(), 2, "总共两个请求（原始 + 一次重试）");
+        assert!(
+            events.iter().any(|event| event["type"] == "error"),
+            "最终要报错：{chunks:#?}"
+        );
     }
 
     /// 真实流里：deepseek + responses → 自动回退到 completions，并**发一条 protocol_fallback**。
