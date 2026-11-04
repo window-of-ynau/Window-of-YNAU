@@ -19,6 +19,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import 'campus_entries.dart';
+import 'card_id_hints.dart';
 import 'portal_api.dart';
 import 'session_cookie_diagnostics.dart';
 import 'session_probe.dart';
@@ -71,6 +72,7 @@ class SessionProbeDialog extends StatefulWidget {
     this.jsProbe,
     this.inPageFetch,
     this.navigate,
+    this.probeCardIds,
   });
 
   /// 测试注入；默认走真实 CookieManager。
@@ -83,6 +85,9 @@ class SessionProbeDialog extends StatefulWidget {
 
   /// CAS 探针的导航注入点（默认用课表页 WebView）。
   final Future<void> Function(String url)? navigate;
+
+  /// t142：cardId 自动探测的注入点（默认用页面内 JS 桥）。
+  final Future<List<CardIdHint>> Function()? probeCardIds;
 
   @override
   State<SessionProbeDialog> createState() => _SessionProbeDialogState();
@@ -122,6 +127,10 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
   Completer<void>? _casDone;
   Timer? _casTicker;
   String? _notice;
+
+  /// t142：cardId 候选（页面内纯本地探测，最多 10 个）。
+  List<CardIdHint> _cardIdHints = const <CardIdHint>[];
+  String? _cardIdHintMessage;
 
   @override
   void initState() {
@@ -221,6 +230,34 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
       if (_cooldownLeftSeconds <= 0) {
         timer.cancel();
       }
+    });
+  }
+
+  /// t142：自动探测 cardId（**纯本地 JS，不发任何网络请求**）。
+  Future<void> _probeCardIds() async {
+    setState(() => _busy = true);
+    final Future<List<CardIdHint>> Function()? probe =
+        widget.probeCardIds ?? SessionProbeJsBridge.probeCardIds;
+    List<CardIdHint> hints = const <CardIdHint>[];
+    if (probe == null) {
+      _cardIdHintMessage = '当前没有可用的 WebView：请先打开「我的课表」再回来探测。';
+    } else {
+      hints = await probe();
+      _cardIdHintMessage = hints.isEmpty ? kNoCardIdHintMessage : null;
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _cardIdHints = hints;
+      _busy = false;
+    });
+  }
+
+  void _useCardId(CardIdHint hint) {
+    setState(() {
+      _cardId.text = hint.value;
+      _cardIdHintMessage = '已填入 ${hint.masked}（来源 ${hint.source}）';
     });
   }
 
@@ -360,8 +397,42 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
               TextField(
                 key: const Key('probe-cardid'),
                 controller: _cardId,
-                decoration: const InputDecoration(labelText: 'cardId（32 位 hex，从课表页网络请求复制）'),
+                decoration: const InputDecoration(labelText: 'cardId（32 位 hex，可点下面「自动探测」）'),
               ),
+              // t142：自动探测 cardId（页面内纯本地扫描，不发请求）
+              Wrap(
+                spacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: <Widget>[
+                  TextButton.icon(
+                    key: const Key('probe-cardid-detect'),
+                    onPressed: _busy ? null : _probeCardIds,
+                    icon: const Icon(Icons.search, size: 18),
+                    label: const Text('自动探测 cardId'),
+                  ),
+                  const Text('纯本地扫描，不发请求', style: TextStyle(fontSize: 11)),
+                ],
+              ),
+              if (_cardIdHintMessage != null)
+                Text(_cardIdHintMessage!, style: theme.textTheme.bodySmall),
+              if (_cardIdHints.isNotEmpty) ...<Widget>[
+                Text('候选（${_cardIdHints.length}）：', style: theme.textTheme.bodySmall),
+                for (final CardIdHint hint in _cardIdHints)
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: Text(
+                          '${hint.masked}   ← ${hint.source}',
+                          style: theme.textTheme.bodySmall,
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () => _useCardId(hint),
+                        child: const Text('用这个'),
+                      ),
+                    ],
+                  ),
+              ],
               const SizedBox(height: 8),
               Wrap(
                 spacing: 8,

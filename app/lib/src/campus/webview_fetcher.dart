@@ -23,6 +23,7 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import '../core/timetable_service.dart';
 import 'campus_bridge.dart';
 import 'portal_api.dart';
+import 'card_id_hints.dart'; // 【临时诊断 t142】cardId 候选解析
 import 'session_cookie_diagnostics.dart';
 import 'session_probe.dart'; // 【临时诊断 t137】验证后删除
 import 'webview_session.dart';
@@ -531,6 +532,12 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
                         forMainFrameOnly: false,
                       ),
+                      // 【临时诊断 t142】页面内 cardId 探测器（纯本地，不发请求）
+                      UserScript(
+                        source: kCardIdProbeInstallScript,
+                        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+                        forMainFrameOnly: false,
+                      ),
                       if (widget.mode == CampusFetchMode.portalApi)
                         UserScript(
                           source: kPortalScheduleScript,
@@ -552,6 +559,13 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       // 【临时诊断 t138】CAS ticket 探针：用这个 WebView 导航，并记录重定向链。
                       CasTicketProbe.navigate = (String target) async {
                         await controller.loadUrl(urlRequest: URLRequest(url: WebUri(target)));
+                      };
+                      // 【临时诊断 t142】页面内纯本地探测 cardId 候选（不发请求、不读 Cookie）
+                      SessionProbeJsBridge.probeCardIds = () async {
+                        final Object? raw = await controller.evaluateJavascript(
+                          source: kCardIdProbeScript,
+                        );
+                        return parseCardIdHints('${raw ?? ''}');
                       };
                       // 【临时诊断 t140】校方域名只在 WebView 内用 fetch 取：
                       // 页面里是真实浏览器环境，能过动态 JS 挑战；只回传摘要，不回传响应体/Cookie。
