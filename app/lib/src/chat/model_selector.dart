@@ -9,7 +9,17 @@
 import 'package:flutter/material.dart';
 
 class ModelSelector extends StatefulWidget {
-  const ModelSelector({super.key, this.models = const <String>[], this.initialModel = 'deepseek-chat'});
+  const ModelSelector({
+    super.key,
+    this.models = const <String>[],
+    this.initialModel = 'deepseek-chat',
+    this.value,
+    this.onChanged,
+  });
+
+  /// 受控值（给 `ChatPage` 用：界面显示与请求里的 model 同源）。
+  final String? value;
+  final ValueChanged<String>? onChanged;
 
   /// provider 自定义模型（空 = 只用内置）。
   final List<String> models;
@@ -22,7 +32,7 @@ class ModelSelector extends StatefulWidget {
 class ModelSelectorState extends State<ModelSelector> {
   static const List<String> _builtinModels = <String>['deepseek-chat', 'deepseek-reasoner'];
 
-  late String _model = widget.initialModel;
+  late String _model = widget.value ?? widget.initialModel;
 
   /// 当前选择（供测试与发送时读取）。
   String get model => _model;
@@ -63,6 +73,7 @@ class ModelSelectorState extends State<ModelSelector> {
               onChanged: (String? value) {
                 if (value != null) {
                   setState(() => _model = value);
+                  widget.onChanged?.call(value);
                 }
               },
             ),
