@@ -10,7 +10,7 @@ void main() {
   testWidgets('设置页有「对话」分组：卡片 + 摘要，点击能打开设置弹窗', (WidgetTester tester) async {
     final theme = ThemeController(store: MemorySettingsStore());
     final chat = ChatSettingsController();
-    chat.settings.model = 'deepseek-chat';
+    chat.settings.model = 'deepseek-flash';
 
     await tester.pumpWidget(MaterialApp(
       home: SettingsPage(controller: theme, chatSettings: chat),
@@ -20,7 +20,7 @@ void main() {
     expect(find.text('对话'), findsWidgets);
     expect(find.text('对话设置'), findsOneWidget);
     expect(find.textContaining('通道：BYOK 直连'), findsOneWidget);
-    expect(find.textContaining('deepseek-chat'), findsOneWidget);
+    expect(find.textContaining('deepseek-flash'), findsOneWidget);
 
     await tester.tap(find.text('对话设置'));
     await tester.pumpAndSettle();
@@ -36,7 +36,7 @@ void main() {
       home: SettingsPage(controller: theme, chatSettings: chat),
     ));
     await tester.pumpAndSettle();
-    expect(find.textContaining('deepseek-chat'), findsOneWidget);
+    expect(find.textContaining('deepseek-flash'), findsOneWidget);
 
     final next = ChatSettings()
       ..channel = 'cloud'
