@@ -6,6 +6,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/main.dart';
+import 'package:yunong/src/theme/theme_controller.dart';
 import 'package:yunong/src/chat/chat_top_bar.dart';
 
 Widget _host(Widget child) => MaterialApp(home: Scaffold(body: child));
@@ -48,11 +49,16 @@ void main() {
 
   group('设置入口在抽屉底部（t112 第五项）', () {
     testWidgets('顶栏无齿轮；抽屉底部有整行「设置」', (WidgetTester tester) async {
-      await tester.pumpWidget(const YunongApp());
+      // t135：必须注入 MemorySettingsStore —— 默认 FileSettingsStore 会读真实 settings.json，
+      // 里面可能残留 `sidebar.collapsed=true`，导致这条测试随本机状态飘。
+      await tester.pumpWidget(YunongApp(themeController: ThemeController(store: MemorySettingsStore())));
       await tester.pumpAndSettle();
 
-      // 顶栏齿轮已移除
-      expect(find.byTooltip('设置'), findsNothing);
+      // 顶栏齿轮已移除（t132 起 rail 底部的设置图标也带 tooltip，故限定在 AppBar 内断言）
+      expect(
+        find.descendant(of: find.byType(AppBar), matching: find.byTooltip('设置')),
+        findsNothing,
+      );
 
       // t117：侧栏改为常驻可折叠（不再有抽屉），设置入口在侧栏底部
 
