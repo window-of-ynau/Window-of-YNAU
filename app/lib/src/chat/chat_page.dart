@@ -18,6 +18,7 @@ import '../core/local_search_service.dart';
 import '../core/memory_service.dart';
 import '../core/search_service.dart';
 import '../core/secret_service.dart';
+import '../core/provider_store.dart';
 import '../memory/memory_page.dart';
 import '../core/build_info.dart';
 import 'chat_settings_section.dart';
@@ -141,6 +142,17 @@ class ChatPageState extends State<ChatPage> {
   /// t122：对话内模型（与 `ModelSelector` 同源，请求就用它，避免“显示 A 发 B”）。
   String _model = 'deepseek-chat';
 
+  /// t123：推理等级（模型选择器弹层里选）。
+  String _effort = 'auto';
+
+  /// t123：供应商列表（与设置页共用同一份存储；对话里可直接切换）。
+  late final ProviderStore _providers = ProviderStore();
+  List<String> get _models => <String>[
+        ..._providers.active.models,
+        'deepseek-chat',
+        'deepseek-reasoner',
+      ];
+
   /// t122：强制工具调用（诊断弹窗可切）。开启后请求带 `tool_choice=required`。
   bool _toolChoiceRequired = false;
 
@@ -174,6 +186,8 @@ class ChatPageState extends State<ChatPage> {
     // 共享设置源变化（例如在设置页保存了 Key）→ 立即刷新本页状态
     widget.chatSettings?.addListener(_onSharedSettingsChanged);
     unawaited(_refreshKeyStatus());
+    // t123：供应商列表（与设置页同一份存储）
+    unawaited(_providers.load());
     unawaited(_refreshSearchStatus());
   }
 
@@ -188,6 +202,8 @@ class ChatPageState extends State<ChatPage> {
 
   void _onSharedSettingsChanged() {
     unawaited(_refreshKeyStatus());
+    // t123：供应商列表（与设置页同一份存储）
+    unawaited(_providers.load());
     if (mounted) {
       setState(() {});
     }
@@ -423,6 +439,30 @@ class ChatPageState extends State<ChatPage> {
     });
   }
 
+  /// 套餐通道登录（t123：入口在「模型选择器 → 套餐通道」）。
+  Future<void> _signInCloud() async {
+    final result = await showDialog<({String email, String password})>(
+      context: context,
+      builder: (BuildContext context) => const CloudLoginDialog(),
+    );
+    if (result == null || !mounted) {
+      return;
+    }
+    try {
+      await _auth.signIn(email: result.email, password: result.password);
+      if (!mounted) {
+        return;
+      }
+      setState(() => _channel = 'cloud');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已登录套餐账号 ${_auth.maskedEmail}')),
+      );
+    } on AuthException catch (failure) {
+      _showError(failure.userHint);
+    } on Object {
+      _showError('登录失败，请稍后重试');
+    }
+  }
   /// 清空当前对话历史（t112）：二次确认 → 清消息、复位输入框与统计、回到空态。
   Future<void> _clearConversation() async {
     if (_bubbles.isEmpty) {
@@ -835,8 +875,17 @@ class ChatPageState extends State<ChatPage> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
                 ModelSelector(
-                  value: _model,
-                  onChanged: (String value) => setState(() => _model = value),
+                  providers: _providers.providers,
+                  activeProviderId: _providers.activeId,
+                  models: _models,
+                  model: _model,
+                  effort: _effort,
+                  signedIn: _auth.signedIn,
+                  accountLabel: _auth.signedIn ? _auth.maskedEmail : '',
+                  onProviderChanged: (String id) => unawaited(_providers.setActive(id)),
+                  onModelChanged: (String value) => setState(() => _model = value),
+                  onEffortChanged: (String value) => setState(() => _effort = value),
+                  onUseCloud: () => unawaited(_signInCloud()),
                 ),
                 _composer(),
               ],
