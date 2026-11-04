@@ -294,7 +294,17 @@ pub fn run_stream_with_registry(
         (None, Some(value)) => value,
         (None, None) => String::new(),
     };
+    // t114：provider 维度选协议（responses → messages → completions），**回退不静默**
+    let provider_base = if config.channel.as_str() == "cloud" {
+        config.cloud_base_url.clone().unwrap_or_default()
+    } else {
+        config.base_url.clone().unwrap_or_default()
+    };
+    let protocol_choice = crate::protocol_pick::resolve_raw(&provider_base, &config.protocol);
+    let effective_protocol = protocol_choice.effective;
+
     let mut request = config.to_request();
+    request.protocol = effective_protocol;
     // 广告的 tools 必须**正好等于**注册了处理器的工具（见 `tools::specs_for`）
     let registered: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
     if !registered.is_empty() {
@@ -332,12 +342,24 @@ pub fn run_stream_with_registry(
         &config.model,
         channel,
         &tool_names,
+        &protocol_choice.requested_name,
+        effective_protocol,
     ));
+    // 回退必须可见：紧跟 meta 发一条 protocol_fallback（不静默换协议）
+    let mut stop_early = meta_cancelled;
+    if !stop_early {
+        if let Some(reason) = protocol_choice.fallback_reason.clone() {
+            stop_early = emit(crate::protocol_pick::fallback_event_json(
+                &protocol_choice,
+                &reason,
+            ));
+        }
+    }
 
     let use_tools = !registry.names().is_empty();
     let mut guard = crate::tool_events::PairGuard::new();
 
-    let outcome: Option<crate::error::CoreResult<StreamSummary>> = if meta_cancelled {
+    let outcome: Option<crate::error::CoreResult<StreamSummary>> = if stop_early {
         None
     } else {
         let summary: crate::error::CoreResult<StreamSummary> = if use_tools {
@@ -578,14 +600,21 @@ struct StreamSummary {
     usage_reported: bool,
 }
 
-/// `meta` 帧（首帧）：在契约字段之外**多加两个诊断字段**。
+/// `meta` 帧（首帧）：在契约字段之外**多加几个诊断字段**。
 ///
-/// - `tools_enabled`：这次有没有挂端侧工具（false = 模型根本不知道有课表/记忆可查）；
-/// - `tools`：挂上的工具名列表。
+/// - `tools_enabled` / `tools`：这次有没有挂端侧工具、挂了哪些（false = 模型根本不知道有课表/记忆可查）；
+/// - `requested_protocol` / `effective_protocol`：用户要的协议 vs 实际用的（不同就表示发生了回退）。
 ///
 /// 不加进 `crates/shared::Chunk`（那是共享契约，改它要过 captain）：这里手写 JSON，
 /// 老客户端按已知字段解析、多出来的字段自然忽略。
-fn meta_json(request_id: &str, model: &str, channel: Channel, tools: &[String]) -> String {
+fn meta_json(
+    request_id: &str,
+    model: &str,
+    channel: Channel,
+    tools: &[String],
+    requested_protocol: &str,
+    effective_protocol: Protocol,
+) -> String {
     serde_json::json!({
         "type": "meta",
         "request_id": request_id,
@@ -593,6 +622,8 @@ fn meta_json(request_id: &str, model: &str, channel: Channel, tools: &[String]) 
         "channel": channel,
         "tools_enabled": !tools.is_empty(),
         "tools": tools,
+        "requested_protocol": requested_protocol,
+        "effective_protocol": crate::protocol_pick::protocol_name(effective_protocol),
     })
     .to_string()
 }
@@ -1161,6 +1192,134 @@ mod tests {
             first.get("tools").is_none(),
             "没有工具时不该带 tools：{first}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // t114：三条协议都要广告工具 + 协议回退可观测
+    // ---------------------------------------------------------------------
+
+    /// 三协议按**各自的 wire 格式**广告工具（对象/数组形状不同，但都必须有）。
+    #[test]
+    fn all_three_protocols_advertise_tools_in_their_own_shape() {
+        for protocol in [
+            yunong_shared::Protocol::OpenaiCompletions,
+            yunong_shared::Protocol::OpenaiResponses,
+            yunong_shared::Protocol::AnthropicMessages,
+        ] {
+            let config = config_with_request(serde_json::json!({
+                "db_path": "/tmp/app.db",
+                "protocol": crate::protocol_pick::protocol_name(protocol),
+            }));
+            let mut request = config.to_request();
+            request.protocol = protocol;
+            let body = crate::protocols::build_body(protocol, &request);
+            let tools = body["tools"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "{} 没有 tools：{body}",
+                    crate::protocol_pick::protocol_name(protocol)
+                )
+            });
+            println!(
+                "[tools:{}] {}",
+                crate::protocol_pick::protocol_name(protocol),
+                serde_json::to_string(tools).unwrap()
+            );
+            assert_eq!(tools.len(), 2, "两个内置工具都要广告");
+            let names: Vec<&str> = tools
+                .iter()
+                .map(|tool| {
+                    // completions: {"type":"function","function":{"name":…}}
+                    // responses:   {"type":"function","name":…}
+                    // messages:    {"name":…,"input_schema":…}
+                    tool["function"]["name"]
+                        .as_str()
+                        .or_else(|| tool["name"].as_str())
+                        .unwrap_or_default()
+                })
+                .collect();
+            assert!(names.contains(&"timetable_query"), "{names:?}");
+            assert!(names.contains(&"memory_search"), "{names:?}");
+        }
+    }
+
+    /// 回退必须**可观测**：meta 里 requested/effective 都写出来，且发一条 protocol_fallback。
+    #[test]
+    fn protocol_fallback_is_visible_in_meta_and_as_an_event() {
+        // 用 deepseek 的 host + responses：一定回退到 completions
+        let choice =
+            crate::protocol_pick::resolve_raw("https://api.deepseek.com/v1", "openai_responses");
+        assert!(choice.fallback(), "{choice:?}");
+        let event: serde_json::Value =
+            serde_json::from_str(&crate::protocol_pick::fallback_event_json(
+                &choice,
+                choice.fallback_reason.as_deref().unwrap(),
+            ))
+            .unwrap();
+        println!("[fallback] {event}");
+        assert_eq!(event["type"], "protocol_fallback");
+        assert_eq!(event["requested_protocol"], "openai_responses");
+        assert_eq!(event["effective_protocol"], "openai_completions");
+
+        // 认不出的协议名：按 completions 处理，但**说明原因**（以前是静默的）
+        let typo = crate::protocol_pick::resolve_raw("https://api.deepseek.com/v1", "responses_v2");
+        assert_eq!(typo.effective, yunong_shared::Protocol::OpenaiCompletions);
+        assert!(typo
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("认不出的协议名"));
+    }
+
+    /// 真实流里：deepseek + responses → 自动回退到 completions，并**发一条 protocol_fallback**。
+    ///
+    /// 这里 `base_url` 指向 1 号端口（连不上），但 meta 与回退事件在联网**之前**就发出去了，
+    /// 所以正好能验证"回退决策 + 可观测性"这段接线。
+    #[test]
+    fn deepseek_responses_falls_back_in_a_real_stream() {
+        let config = config_with_request(serde_json::json!({
+            "db_path": "/tmp/app.db",
+            "protocol": "openai_responses",
+            "base_url": "http://api.deepseek.com:1/v1",
+        }));
+        // 收到回退事件就让回调返回 false（模拟客户端叫停），不必真的去连 deepseek
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&chunks);
+        std::thread::spawn(move || {
+            run_stream_with_registry(config, crate::tools::ToolRegistry::new(), move |json| {
+                let mut guard = sink.lock().unwrap();
+                let stop = json.contains("protocol_fallback");
+                guard.push(json);
+                !stop
+            })
+            .unwrap();
+        })
+        .join()
+        .unwrap();
+        let chunks = chunks.lock().unwrap().clone();
+        let events = parse_all(&chunks);
+        let meta = &events[0];
+        assert_eq!(meta["type"], "meta", "{meta}");
+        assert_eq!(meta["requested_protocol"], "openai_responses", "{meta}");
+        assert_eq!(meta["effective_protocol"], "openai_completions", "{meta}");
+        // 第二条必须是回退事件（紧跟 meta，不许静默）
+        let fallback = &events[1];
+        assert_eq!(fallback["type"], "protocol_fallback", "{fallback}");
+        assert_eq!(fallback["provider"], "api.deepseek.com", "{fallback}");
+        assert!(fallback["reason"].as_str().unwrap().contains("不支持"));
+    }
+
+    /// meta 帧在真实流里带上 requested/effective 两个字段。
+    #[test]
+    fn meta_reports_both_protocols() {
+        let server = ScriptedServer::start(vec![final_round("你好")]);
+        let config = byok_config(&server.base_url(), None);
+        let chunks = run_collect(config, crate::tools::ToolRegistry::new());
+        let meta = parse_all(&chunks).into_iter().next().unwrap();
+        println!("[meta] {meta}");
+        assert_eq!(meta["type"], "meta");
+        assert!(meta["requested_protocol"].is_string(), "{meta}");
+        assert!(meta["effective_protocol"].is_string(), "{meta}");
+        assert_eq!(meta["effective_protocol"], "openai_completions", "{meta}");
     }
 
     /// t109 回归：**空结果**与**有结果**两条工具路径都必须收到 `done`。
