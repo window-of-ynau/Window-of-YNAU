@@ -53,6 +53,11 @@ pub struct ChatRunConfig {
     /// 应用数据目录（用于定位 secret store；缺省用当前目录）
     #[serde(default)]
     pub data_dir: Option<String>,
+    /// 本次请求的「工具选择」：`auto`（默认）/ `none` / `required`（t124）。
+    ///
+    /// **只对这一次提问生效**，不是持久配置；工具循环的第 2 轮起自动退回 auto。
+    #[serde(default)]
+    pub tool_choice: Option<String>,
     /// 套餐通道的 access token
     #[serde(default)]
     pub cloud_token: Option<String>,
@@ -301,6 +306,12 @@ pub fn run_stream_with_registry(
         config.base_url.clone().unwrap_or_default()
     };
     let protocol_choice = crate::protocol_pick::resolve_raw(&provider_base, &config.protocol);
+    // 本次请求的 tool_choice（认不出的值 → auto + warn）
+    let (tool_choice, tool_choice_warn) =
+        crate::tool_choice::ToolChoice::parse(config.tool_choice.as_deref());
+    if let Some(warn) = &tool_choice_warn {
+        eprintln!("[yunong][chat] {warn}");
+    }
     let effective_protocol = protocol_choice.effective;
 
     let mut request = config.to_request();
@@ -322,9 +333,14 @@ pub fn run_stream_with_registry(
     // t116：记录"是否已经向客户端写出过可见内容"——写出过就**不许**回退协议
     //（用户已经看到半截回答，重来一次更糟）
     let streamed = std::sync::atomic::AtomicBool::new(false);
+    // 本次提问里模型到底调了几个工具（判 tool_choice=required 有没有被遵守）
+    let tool_calls_seen = std::sync::atomic::AtomicUsize::new(0);
     let mut emit = |json: String| -> bool {
         if json.contains("\"type\":\"delta\"") || json.contains("\"type\":\"tool_call\"") {
             streamed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if json.contains("\"type\":\"tool_call\"") {
+            tool_calls_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         if callback.call(json) {
             false
@@ -350,6 +366,7 @@ pub fn run_stream_with_registry(
         &tool_names,
         &protocol_choice.requested_name,
         effective_protocol,
+        tool_choice,
     ));
     // 回退必须可见：紧跟 meta 发一条 protocol_fallback（不静默换协议）
     let mut stop_early = meta_cancelled;
@@ -390,7 +407,8 @@ pub fn run_stream_with_registry(
                             config.base_url.clone().unwrap_or_default(),
                             config.model.clone(),
                         )
-                        .with_api_key(api_key.clone()),
+                        .with_api_key(api_key.clone())
+                        .with_tool_choice(Some(tool_choice)),
                     ),
                 };
                 let loop_config = crate::tool_loop::LoopConfig {
@@ -527,7 +545,15 @@ pub fn run_stream_with_registry(
                             }
                             // done 帧补 `effective_protocol`（t118：最终实际用的协议）
                             if let Chunk::Done { finish } = chunk {
-                                return if emit(done_json_with_protocol(finish, protocol)) {
+                                let done = done_json_full(
+                                    finish,
+                                    protocol,
+                                    tool_choice_honored(
+                                        tool_choice,
+                                        tool_calls_seen.load(std::sync::atomic::Ordering::SeqCst),
+                                    ),
+                                );
+                                return if emit(done) {
                                     crate::gateway::Flow::Stop
                                 } else {
                                     crate::gateway::Flow::Continue
@@ -546,14 +572,23 @@ pub fn run_stream_with_registry(
                             config.base_url.clone().unwrap_or_default(),
                             config.model.clone(),
                         )
-                        .with_api_key(api_key.clone());
+                        .with_api_key(api_key.clone())
+                        .with_tool_choice(Some(tool_choice));
                         runtime.block_on(gateway.chat_stream(&attempt_request, &mut |chunk| {
                             if matches!(chunk, Chunk::Meta { .. }) {
                                 return crate::gateway::Flow::Continue;
                             }
                             // done 帧补 `effective_protocol`（t118：最终实际用的协议）
                             if let Chunk::Done { finish } = chunk {
-                                return if emit(done_json_with_protocol(finish, protocol)) {
+                                let done = done_json_full(
+                                    finish,
+                                    protocol,
+                                    tool_choice_honored(
+                                        tool_choice,
+                                        tool_calls_seen.load(std::sync::atomic::Ordering::SeqCst),
+                                    ),
+                                );
+                                return if emit(done) {
                                     crate::gateway::Flow::Stop
                                 } else {
                                     crate::gateway::Flow::Continue
@@ -631,7 +666,14 @@ pub fn run_stream_with_registry(
             {
                 emit(json);
             }
-            emit(done_json_with_protocol(FinishReason::Stop, final_protocol));
+            emit(done_json_full(
+                FinishReason::Stop,
+                final_protocol,
+                tool_choice_honored(
+                    tool_choice,
+                    tool_calls_seen.load(std::sync::atomic::Ordering::SeqCst),
+                ),
+            ));
             Ok(())
         }
         Some(Ok(summary)) => {
@@ -652,7 +694,14 @@ pub fn run_stream_with_registry(
                         estimated: summary.usage.estimated,
                     }));
                 }
-                emit(done_json_with_protocol(summary.finish, final_protocol));
+                emit(done_json_full(
+                    summary.finish,
+                    final_protocol,
+                    tool_choice_honored(
+                        tool_choice,
+                        tool_calls_seen.load(std::sync::atomic::Ordering::SeqCst),
+                    ),
+                ));
             } else if summary.cancelled {
                 // R5-F7：取消后补终帧，否则客户端停在"加载中"
                 emit(done_json());
@@ -694,6 +743,7 @@ fn meta_json(
     tools: &[String],
     requested_protocol: &str,
     effective_protocol: Protocol,
+    tool_choice: crate::tool_choice::ToolChoice,
 ) -> String {
     serde_json::json!({
         "type": "meta",
@@ -704,6 +754,11 @@ fn meta_json(
         "tools": tools,
         "requested_protocol": requested_protocol,
         "effective_protocol": crate::protocol_pick::protocol_name(effective_protocol),
+        // t124：本次请求的「工具选择」策略与实际生效值
+        // （messages 协议下 required 只能发 `{"type":"any"}`，DeepSeek 兼容层按 auto 处理，
+        //   所以 effective 会是 "any" 而不是 "required"）
+        "tool_choice": tool_choice.as_str(),
+        "tool_choice_effective": crate::tool_choice::effective_label(effective_protocol, tool_choice),
     })
     .to_string()
 }
@@ -722,12 +777,39 @@ fn chunk_json(chunk: &Chunk) -> String {
 ///
 /// 不改 `crates/shared::Chunk`（共享契约），这里手写 JSON 注入字段，老客户端忽略即可。
 fn done_json_with_protocol(finish: FinishReason, protocol: Protocol) -> String {
+    done_json_full(finish, protocol, None)
+}
+
+/// 这次 `tool_choice=required` 有没有被模型遵守（没强制时返回 `None`）。
+///
+/// - 只有 `required` 才有意义；`auto`/`none` → `None`（不写字段）；
+/// - 模型一次工具都没调用 → `Some(false)`，`done` 里会标注，
+///   客户端据此提示"已强制但模型仍然只回了文本"，**不会**因此重试。
+fn tool_choice_honored(
+    choice: crate::tool_choice::ToolChoice,
+    tool_calls_seen: usize,
+) -> Option<bool> {
+    matches!(choice, crate::tool_choice::ToolChoice::Required).then_some(tool_calls_seen > 0)
+}
+
+/// `done` 帧的完整版本：`effective_protocol` + 可选的 `tool_choice_honored`。
+fn done_json_full(
+    finish: FinishReason,
+    protocol: Protocol,
+    tool_choice_honored: Option<bool>,
+) -> String {
     let base = serde_json::to_value(Chunk::Done { finish }).unwrap_or(serde_json::Value::Null);
     let mut object = base.as_object().cloned().unwrap_or_default();
     object.insert(
         "effective_protocol".to_owned(),
         serde_json::Value::String(crate::protocol_pick::protocol_name(protocol).to_owned()),
     );
+    if let Some(honored) = tool_choice_honored {
+        object.insert(
+            "tool_choice_honored".to_owned(),
+            serde_json::Value::Bool(honored),
+        );
+    }
     serde_json::Value::Object(object).to_string()
 }
 
@@ -1592,6 +1674,128 @@ mod tests {
                 .any(|event| event["type"] == "protocol_fallback"),
             "deepseek + responses 不该静态回退：{events:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // t124：tool_choice 透传（auto / none / required）
+    // ---------------------------------------------------------------------
+
+    fn config_with_tool_choice(base_url: &str, tool_choice: &str) -> ChatRunConfig {
+        let mut config = config_with_request(serde_json::json!({
+            "db_path": "/tmp/app.db",
+            "protocol": "openai_completions",
+            "base_url": base_url,
+            "tool_choice": tool_choice,
+        }));
+        config.messages = vec![yunong_shared::ChatMessage {
+            role: yunong_shared::Role::User,
+            content: "查课表".to_owned(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: Vec::new(),
+        }];
+        config
+    }
+
+    /// 一个带 `echo` 处理的 registry（工具循环测试用）。
+    fn echo_registry() -> crate::tools::ToolRegistry {
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.register("timetable_query", |_args| Ok("第 3 周有课".to_owned()));
+        registry
+    }
+
+    /// 三协议下 `tool_choice=required` 的实际写法（`build_body_with`）。
+    #[test]
+    fn tool_choice_is_encoded_per_protocol() {
+        use yunong_shared::Protocol;
+        for (protocol, expected) in [
+            (Protocol::OpenaiCompletions, serde_json::json!("required")),
+            (Protocol::OpenaiResponses, serde_json::json!("required")),
+            (
+                Protocol::AnthropicMessages,
+                serde_json::json!({ "type": "any" }),
+            ),
+        ] {
+            let mut request = config_with_request(serde_json::json!({
+                "db_path": "/tmp/app.db",
+                "protocol": crate::protocol_pick::protocol_name(protocol),
+            }))
+            .to_request();
+            request.tools = crate::tools::specs_for(&["timetable_query".to_owned()]);
+            let options = crate::protocols::BuildOptions {
+                tool_choice: Some(crate::tool_choice::ToolChoice::Required),
+                ..Default::default()
+            };
+            let body = crate::protocols::build_body_with(protocol, &request, &options);
+            println!(
+                "[tool_choice:{}] {}",
+                crate::protocol_pick::protocol_name(protocol),
+                body["tool_choice"]
+            );
+            assert_eq!(body["tool_choice"], expected, "{body}");
+        }
+    }
+
+    /// 端到端：首轮请求体带 `tool_choice`，**第二轮不带**（不逼模型反复调工具）。
+    #[test]
+    fn tool_choice_goes_out_on_the_first_round_only() {
+        let server = ScriptedServer::start(vec![
+            tool_round("timetable_query", "call_1", "{\"week\":3}"),
+            final_round("第 3 周有课"),
+        ]);
+        let config = config_with_tool_choice(&server.base_url(), "required");
+        let chunks = run_collect(config, echo_registry());
+        let bodies = server.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "两轮都该发出去");
+        assert!(
+            bodies[0].contains("\"tool_choice\":\"required\""),
+            "首轮必须带 tool_choice：{}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[1].contains("tool_choice"),
+            "第二轮不该再强制：{}",
+            bodies[1]
+        );
+        // 模型这次确实调了工具 → done 里 honored = true
+        let done = parse_all(&chunks)
+            .into_iter()
+            .find(|event| event["type"] == "done")
+            .unwrap();
+        println!("[done] {done}");
+        assert_eq!(done["tool_choice_honored"], true, "{done}");
+    }
+
+    /// 强制了但模型仍然只回文本：**不重试**，done 标注 `tool_choice_honored=false`。
+    #[test]
+    fn required_but_text_only_marks_not_honored_without_retry() {
+        let server = ScriptedServer::start(vec![final_round("第 3 周有课")]);
+        let config = config_with_tool_choice(&server.base_url(), "required");
+        let chunks = run_collect(config, echo_registry());
+        assert_eq!(server.request_count(), 1, "不得因为没调工具而重试");
+        let events = parse_all(&chunks);
+        let done = events.iter().find(|event| event["type"] == "done").unwrap();
+        println!("[done] {done}");
+        assert_eq!(done["tool_choice_honored"], false, "{done}");
+        // meta 里回报请求值与实际生效值
+        let meta = &events[0];
+        println!("[meta] {meta}");
+        assert_eq!(meta["tool_choice"], "required", "{meta}");
+        assert_eq!(meta["tool_choice_effective"], "required", "{meta}");
+    }
+
+    /// 未识别的取值 → 按 auto 处理（不发字段），并在 meta 里如实回报。
+    #[test]
+    fn unknown_tool_choice_falls_back_to_auto() {
+        let server = ScriptedServer::start(vec![final_round("你好")]);
+        let config = config_with_tool_choice(&server.base_url(), "must");
+        let chunks = run_collect(config, echo_registry());
+        let bodies = server.bodies.lock().unwrap().clone();
+        assert!(!bodies[0].contains("tool_choice"), "{}", bodies[0]);
+        let meta = parse_all(&chunks).into_iter().next().unwrap();
+        println!("[meta] {meta}");
+        assert_eq!(meta["tool_choice"], "auto", "{meta}");
+        assert_eq!(meta["tool_choice_effective"], "auto", "{meta}");
     }
 
     /// t118：`done` 帧带 `effective_protocol`——**最终实际成功**的协议（权威值）。

@@ -20,12 +20,20 @@
 //! - `ChatRequest` 没有 `temperature`：不发送该字段（缺口 C2）。
 
 use serde_json::{json, Map, Value};
-use yunong_shared::{ChatMessage, ChatRequest, Chunk, Role, ToolSpec};
+use yunong_shared::{ChatMessage, ChatRequest, Chunk, Protocol, Role, ToolSpec};
 
-use super::{call_index, finish_reason, openai_usage, partial_json, system_prompt};
+use super::{
+    apply_tool_choice, call_index, finish_reason, openai_usage, partial_json, system_prompt,
+    BuildOptions,
+};
 
-/// 构造请求体。
+/// 构造请求体（默认开关）。
 pub(super) fn build(request: &ChatRequest) -> Value {
+    build_with(request, &BuildOptions::default())
+}
+
+/// 构造请求体（含本次请求的 tool_choice 等开关）。
+pub(super) fn build_with(request: &ChatRequest, options: &BuildOptions) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(request.model));
     body.insert("stream".into(), json!(request.stream));
@@ -44,6 +52,8 @@ pub(super) fn build(request: &ChatRequest) -> Value {
     if !request.tools.is_empty() {
         body.insert("tools".into(), encode_tools(&request.tools));
     }
+    // 本次请求的「强制/禁止调用工具」策略（三协议形状不同，见 crate::tool_choice）
+    apply_tool_choice(&mut body, Protocol::AnthropicMessages, options);
     Value::Object(body)
 }
 

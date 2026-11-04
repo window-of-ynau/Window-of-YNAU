@@ -72,6 +72,8 @@ pub struct DirectProvider {
     pub model: String,
     key: Option<ApiKeySource>,
     report_usage: bool,
+    /// 本次请求的 tool_choice（只对首轮生效；`None` = 不写字段）
+    tool_choice: Option<crate::tool_choice::ToolChoice>,
     timeouts: Timeouts,
 }
 
@@ -84,6 +86,7 @@ impl DirectProvider {
             model: model.into(),
             key: None,
             report_usage: true,
+            tool_choice: None,
             timeouts: Timeouts::default(),
         }
     }
@@ -110,6 +113,15 @@ impl DirectProvider {
     /// （不要做"400 后自动去字段重试"：隐式重试会让计费翻倍且难排查）。
     pub fn with_usage_reporting(mut self, enabled: bool) -> Self {
         self.report_usage = enabled;
+        self
+    }
+
+    /// 本次请求的 `tool_choice`（`auto`/`none`/`required`）。
+    ///
+    /// 只影响**首轮**请求（`request.round <= 1`）：工具循环的后续轮次会退回 auto，
+    /// 否则模型会被逼着一轮接一轮地调工具直到轮次上限。
+    pub fn with_tool_choice(mut self, choice: Option<crate::tool_choice::ToolChoice>) -> Self {
+        self.tool_choice = choice;
         self
     }
 
@@ -145,6 +157,8 @@ impl ModelGateway for DirectProvider {
                 request,
                 &BuildOptions {
                     report_usage: self.report_usage,
+                    // 只有**首轮**才带 tool_choice：工具循环后续轮次再强制会逼模型反复调工具
+                    tool_choice: (request.round <= 1).then_some(self.tool_choice).flatten(),
                 },
             );
             let payload = serde_json::to_vec(&body)
