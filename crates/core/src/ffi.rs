@@ -3160,7 +3160,7 @@ mod tests {
         let request = serde_json::json!({
             "channel": "byok",
             "protocol": "openai_completions",
-            "model": "deepseek-chat",
+            "model": "deepseek-flash",
             "base_url": "http://127.0.0.1:1",
             "api_key": "sk-test",
             "messages": [{ "role": "user", "content": "你好" }]

@@ -319,7 +319,7 @@ fn fixture_request(protocol: Protocol) -> ChatRequest {
         session_id: "s_1".into(),
         turn_id: "t_1".into(),
         round: 1,
-        model: "deepseek-chat".into(),
+        model: "deepseek-flash".into(),
         protocol,
         messages: vec![
             ChatMessage::system(FIXTURE_SYSTEM),
@@ -381,7 +381,35 @@ fn fixture_text_and_tool_round(protocol: Protocol) -> ChatRequest {
 const FIXTURE_SYSTEM: &str = "你是云农之窗助手";
 
 #[cfg(test)]
-const FIXTURE_MODEL: &str = "deepseek-chat";
+const FIXTURE_MODEL: &str = "deepseek-flash";
+
+/// t126：**不要**给上游发 `thinking` / `reasoning` 之类的开关。
+///
+/// DeepSeek 文档说明思考模式**默认开启**；我们一个字段都不发，等于"跟随默认"。
+/// 一旦有人在协议构造里写死 `thinking: disabled` 或 `reasoning.effort`，
+/// 这条测试会红（防止无意中关掉思考）。
+#[test]
+fn request_bodies_never_disable_thinking() {
+    for protocol in [
+        Protocol::OpenaiCompletions,
+        Protocol::OpenaiResponses,
+        Protocol::AnthropicMessages,
+    ] {
+        let body = build_body(protocol, &fixture_request(protocol));
+        println!(
+            "[body:{}] {}",
+            crate::protocol_pick::protocol_name(protocol),
+            body
+        );
+        for key in ["thinking", "reasoning", "reasoning_effort"] {
+            assert!(
+                body.get(key).is_none(),
+                "{} 不该发 {key} 字段：{body}",
+                crate::protocol_pick::protocol_name(protocol)
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

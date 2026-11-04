@@ -140,14 +140,14 @@ mod tests {
     fn meta_carries_request_id() {
         let chunk = parse(
             "meta",
-            r#"{"request_id":"req_9f3c","model":"deepseek-chat","channel":"plan"}"#,
+            r#"{"request_id":"req_9f3c","model":"deepseek-flash","channel":"plan"}"#,
         )
         .unwrap();
         assert_eq!(
             chunk,
             Chunk::Meta {
                 request_id: "req_9f3c".into(),
-                model: "deepseek-chat".into(),
+                model: "deepseek-flash".into(),
                 channel: Channel::Plan,
             }
         );

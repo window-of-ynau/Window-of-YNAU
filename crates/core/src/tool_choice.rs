@@ -16,10 +16,10 @@
 //! |---|---|---|
 //! | `openai_completions` | `"tool_choice": "required"` | ✅ 原生支持 |
 //! | `openai_responses` | `"tool_choice": "required"` | ✅（DeepSeek 文档明确支持） |
-//! | `anthropic_messages` | `{"type": "any"}` | ⚠️ **不保证**：DeepSeek 的 Anthropic 兼容层把 `any` 按
-//!   `auto` 处理，所以这条路径下"强制"可能不生效 |
+//! | `anthropic_messages` | `{"type": "any"}` | ⚠️ **不强制**：DeepSeek 文档写明兼容层把 `any` 按
+//!   `auto` 处理。因此 meta 的 `tool_choice_effective` 在 messages 路径下如实报 **`auto`** |
 //!
-//! 因此对 `messages` 协议，`effective` 会报成 `"any"`（而不是 `required`），
+//! 因此对 `messages` 协议，`effective` 如实报 **`"auto"`**（不是 `required`，也不是 `any`），
 //! 客户端据此知道"这次没被真正强制"。若模型最终没调用工具，`done` 帧里会有
 //! `tool_choice_honored: false`（见 `chat_ffi`）。
 //!
@@ -80,7 +80,8 @@ pub fn wire_value(protocol: Protocol, choice: ToolChoice) -> Option<Value> {
         (Protocol::OpenaiCompletions | Protocol::OpenaiResponses, ToolChoice::None) => {
             Some(Value::String("none".to_owned()))
         }
-        // Anthropic 是对象；`any` 在 DeepSeek 兼容层里**不强制**（见模块文档）
+        // Anthropic 是对象；`any` 在 DeepSeek 兼容层里**不强制**（见模块文档），
+        // 但线上写法仍是 `any`（这是能表达"想强制"的唯一形状）。
         (Protocol::AnthropicMessages, ToolChoice::Required) => {
             Some(serde_json::json!({ "type": "any" }))
         }
@@ -97,7 +98,9 @@ pub fn effective_label(protocol: Protocol, choice: ToolChoice) -> &'static str {
     match (protocol, choice) {
         (_, ToolChoice::Auto) => "auto",
         (_, ToolChoice::None) => "none",
-        (Protocol::AnthropicMessages, ToolChoice::Required) => "any",
+        // t126：DeepSeek 文档写明 Anthropic 兼容层的 `any` **按 auto 处理**，
+        // 所以这里如实报 `auto`（不假装 required 生效）；客户端据此提示用户。
+        (Protocol::AnthropicMessages, ToolChoice::Required) => "auto",
         (_, ToolChoice::Required) => "required",
     }
 }
@@ -105,6 +108,22 @@ pub fn effective_label(protocol: Protocol, choice: ToolChoice) -> &'static str {
 /// 这个组合下"强制调用"是否**真的**被上游强制执行。
 pub fn is_enforced(protocol: Protocol, choice: ToolChoice) -> bool {
     matches!(choice, ToolChoice::Required) && protocol != Protocol::AnthropicMessages
+}
+
+/// 带厂商事实的 `effective` 取值（t126）：Anthropic 兼容层的 `any` 是否强制由**厂商**决定。
+///
+/// - 非 messages 协议：与 [`effective_label`] 相同（`required` / `none` / `auto`）；
+/// - messages + required：厂商文档说 `any` 会被当 auto（DeepSeek）→ `"auto"`；
+///   标准 Anthropic 语义下 `any` 是真强制 → `"any"`。
+pub fn effective_label_for(
+    protocol: Protocol,
+    choice: ToolChoice,
+    anthropic_any_forces_tools: bool,
+) -> &'static str {
+    match (protocol, choice) {
+        (Protocol::AnthropicMessages, ToolChoice::Required) if anthropic_any_forces_tools => "any",
+        _ => effective_label(protocol, choice),
+    }
 }
 
 #[cfg(test)]
@@ -148,9 +167,10 @@ mod tests {
             wire_value(Protocol::AnthropicMessages, ToolChoice::Required),
             Some(serde_json::json!({ "type": "any" }))
         );
+        // t126：文档说 `any` 按 auto 处理 → 如实报 auto
         assert_eq!(
             effective_label(Protocol::AnthropicMessages, ToolChoice::Required),
-            "any"
+            "auto"
         );
         assert!(!is_enforced(
             Protocol::AnthropicMessages,
