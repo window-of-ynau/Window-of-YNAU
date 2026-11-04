@@ -303,7 +303,7 @@ mod tests {
     /// fixture 1：纯文本增量。
     #[test]
     fn text_delta_fixture() {
-        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"下午没课"},"finish_reason":null}]}"#;
+        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-flash","choices":[{"index":0,"delta":{"content":"下午没课"},"finish_reason":null}]}"#;
         assert_eq!(
             parse_one(data),
             Some(Chunk::Delta {

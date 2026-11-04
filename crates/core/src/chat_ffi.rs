@@ -359,15 +359,16 @@ pub fn run_stream_with_registry(
     let early_request_id = format!("{}_{}", channel.as_str(), uuid::Uuid::new_v4().simple());
     // 诊断（t113）：客户端/老板一眼看出"这次有没有挂工具"
     let tool_names: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
-    let meta_cancelled = emit(meta_json(
-        &early_request_id,
-        &config.model,
+    let meta_cancelled = emit(meta_json(&MetaContext {
+        request_id: &early_request_id,
+        model: &config.model,
         channel,
-        &tool_names,
-        &protocol_choice.requested_name,
+        tools: &tool_names,
+        requested_protocol: &protocol_choice.requested_name,
         effective_protocol,
         tool_choice,
-    ));
+        base_url: &provider_base,
+    }));
     // 回退必须可见：紧跟 meta 发一条 protocol_fallback（不静默换协议）
     let mut stop_early = meta_cancelled;
     if !stop_early {
@@ -736,15 +737,28 @@ struct StreamSummary {
 ///
 /// 不加进 `crates/shared::Chunk`（那是共享契约，改它要过 captain）：这里手写 JSON，
 /// 老客户端按已知字段解析、多出来的字段自然忽略。
-fn meta_json(
-    request_id: &str,
-    model: &str,
+struct MetaContext<'a> {
+    request_id: &'a str,
+    model: &'a str,
     channel: Channel,
-    tools: &[String],
-    requested_protocol: &str,
+    tools: &'a [String],
+    requested_protocol: &'a str,
     effective_protocol: Protocol,
     tool_choice: crate::tool_choice::ToolChoice,
-) -> String {
+    base_url: &'a str,
+}
+
+fn meta_json(context: &MetaContext<'_>) -> String {
+    let MetaContext {
+        request_id,
+        model,
+        channel,
+        tools,
+        requested_protocol,
+        effective_protocol,
+        tool_choice,
+        base_url,
+    } = *context;
     serde_json::json!({
         "type": "meta",
         "request_id": request_id,
@@ -758,7 +772,14 @@ fn meta_json(
         // （messages 协议下 required 只能发 `{"type":"any"}`，DeepSeek 兼容层按 auto 处理，
         //   所以 effective 会是 "any" 而不是 "required"）
         "tool_choice": tool_choice.as_str(),
-        "tool_choice_effective": crate::tool_choice::effective_label(effective_protocol, tool_choice),
+        // 厂商事实决定 messages 下 `any` 到底强制不强制（DeepSeek：不强制 → 报 auto）
+        "tool_choice_effective": crate::tool_choice::effective_label_for(
+            effective_protocol,
+            tool_choice,
+            crate::providers::anthropic_any_forces_tools(&crate::protocol_pick::provider_host(
+                base_url,
+            )),
+        ),
     })
     .to_string()
 }
@@ -849,7 +870,7 @@ mod tests {
         serde_json::json!({
             "channel": "byok",
             "protocol": "openai_completions",
-            "model": "deepseek-chat",
+            "model": "deepseek-flash",
             "api_key": api_key,
             "messages": [{ "role": "user", "content": "你好" }]
         })
@@ -866,7 +887,7 @@ mod tests {
                     "id": "c1",
                     "object": "chat.completion.chunk",
                     "created": 1,
-                    "model": "deepseek-chat",
+                    "model": "deepseek-flash",
                     "choices": [{
                         "index": 0,
                         "delta": { "content": text },
@@ -981,7 +1002,7 @@ mod tests {
         assert!(request.stream);
         assert!(!request.session_id.is_empty());
         assert!(!request.turn_id.is_empty());
-        assert_eq!(request.model, "deepseek-chat");
+        assert_eq!(request.model, "deepseek-flash");
         assert_eq!(request.messages.len(), 1);
     }
 
@@ -1263,7 +1284,7 @@ mod tests {
         let mut request = serde_json::json!({
             "channel": "byok",
             "protocol": "openai_completions",
-            "model": "deepseek-chat",
+            "model": "deepseek-flash",
             "api_key": "sk-test",
             "messages": [{ "role": "user", "content": "第 8 周哪天最累？" }]
         });
@@ -1782,6 +1803,37 @@ mod tests {
         println!("[meta] {meta}");
         assert_eq!(meta["tool_choice"], "required", "{meta}");
         assert_eq!(meta["tool_choice_effective"], "required", "{meta}");
+    }
+
+    /// t126：DeepSeek 的 Anthropic 兼容层把 `any` 按 auto 处理 → meta 必须如实报 `auto`。
+    #[test]
+    fn messages_required_reports_auto_for_deepseek() {
+        let config = config_with_request(serde_json::json!({
+            "db_path": "/tmp/app.db",
+            "protocol": "anthropic_messages",
+            "base_url": "http://api.deepseek.com:1/v1",
+            "tool_choice": "required",
+        }));
+        // 只看首帧 meta（随后让回调叫停，不必真联网）
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&chunks);
+        std::thread::spawn(move || {
+            run_stream_with_registry(config, echo_registry(), move |json| {
+                sink.lock().unwrap().push(json);
+                false
+            })
+            .unwrap();
+        })
+        .join()
+        .unwrap();
+        let events = parse_all(&chunks.lock().unwrap().clone());
+        let meta = &events[0];
+        println!("[meta] {meta}");
+        assert_eq!(meta["tool_choice"], "required", "{meta}");
+        assert_eq!(
+            meta["tool_choice_effective"], "auto",
+            "DeepSeek 兼容层不强制 any，必须如实报 auto：{meta}"
+        );
     }
 
     /// 未识别的取值 → 按 auto 处理（不发字段），并在 meta 里如实回报。

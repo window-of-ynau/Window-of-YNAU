@@ -27,6 +27,7 @@ pub mod memory_ref;
 pub mod parse;
 pub mod protocol_pick;
 pub mod protocols;
+pub mod providers;
 pub mod schedule;
 pub mod search;
 pub mod secret;

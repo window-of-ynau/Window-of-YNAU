@@ -196,8 +196,8 @@ fn resolve_named(base_url: &str, requested_name: &str, requested: Protocol) -> (
 ///
 /// ```json
 /// {"type":"protocol_fallback","requested_protocol":"openai_responses",
-///  "effective_protocol":"openai_completions","provider":"api.deepseek.com",
-///  "reason":"该 provider（api.deepseek.com）不支持 openai_responses，已自动改用 openai_completions"}
+///  "effective_protocol":"anthropic_messages","provider":"api.deepseek.com",
+///  "reason":"该 provider（api.deepseek.com）不支持 openai_completions，已自动改用 anthropic_messages"}
 /// ```
 pub fn fallback_event_json(choice: &Choice, reason: &str) -> String {
     serde_json::json!({

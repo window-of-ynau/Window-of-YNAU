@@ -26,7 +26,7 @@ fn request(protocol: Protocol) -> ChatRequest {
         session_id: "s_1".into(),
         turn_id: "t_1".into(),
         round: 1,
-        model: "deepseek-chat".into(),
+        model: "deepseek-flash".into(),
         protocol,
         messages: vec![
             ChatMessage::system("你是助手"),
@@ -57,7 +57,7 @@ fn fast_timeouts(millis: u64) -> Timeouts {
 }
 
 fn byok(server: &FakeServer, protocol: Protocol) -> DirectProvider {
-    DirectProvider::new(protocol, server.base_url(), "deepseek-chat")
+    DirectProvider::new(protocol, server.base_url(), "deepseek-flash")
         .with_api_key("sk-test-123456")
         .with_timeouts(timeouts())
 }
@@ -676,7 +676,7 @@ async fn cloud_stream_parses_contract_events_in_order() {
         vec![
             Step::Write(sse(
                 "meta",
-                r#"{"request_id":"req_9f3c","model":"deepseek-chat","channel":"plan"}"#,
+                r#"{"request_id":"req_9f3c","model":"deepseek-flash","channel":"plan"}"#,
             )),
             Step::Write(sse("ping", "{}")),
             Step::Write(sse("delta", r#"{"text":"下周三下午"}"#)),
