@@ -4,10 +4,13 @@
 // 会从 WebView 的 Cookie 管理器取当前校务会话 Cookie，再用纯 HTTP（dart:io）打一次 GET。
 // Cookie 只在内存里用于拼请求头，**不打印、不上传、不写文件**。
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import 'campus_entries.dart';
+import 'portal_api.dart';
 import 'session_probe.dart';
 import 'session_cookie_diagnostics.dart';
 import 'webview_session.dart';
@@ -87,6 +90,13 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
   final TextEditingController _casBase = TextEditingController(text: CasTicketProbe.defaultCasBase);
   final TextEditingController _serviceUrl =
       TextEditingController(text: CasTicketProbe.defaultServiceUrl);
+  // t139：页内同款请求的参数（学期 / 卡片 / 是否对齐）+ CAS 运行态
+  final TextEditingController _years = TextEditingController(text: '2026-2027-1');
+  final TextEditingController _cardId = TextEditingController();
+  bool _usePageLike = true;
+  bool _casRunning = false;
+  Timer? _casTicker;
+  Completer<void>? _casDone;
   SessionProbeResult? _result;
   CookieDiagnostics? _diagnostics;
   List<HeaderTrial> _headers = const <HeaderTrial>[];
@@ -129,11 +139,27 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
     }
   }
 
+  /// t139：按开关决定实际请求（页内同款 = 与 `kPortalScheduleScript` 完全一致）。
+  Uri _effectiveUrl() {
+    if (!_usePageLike) {
+      return Uri.parse(_url.text.trim());
+    }
+    final Uri base = Uri.parse(_url.text.trim());
+    return buildScheduleApiUrl(
+      origin: '${base.scheme}://${base.host}',
+      years: _years.text.trim(),
+      week: 1,
+      cardId: _cardId.text.trim(),
+    );
+  }
+
+  String get _effectiveAccept => _usePageLike ? kScheduleAcceptHeader : 'text/html,application/json,*/*;q=0.8';
+
   /// t138：三组请求头对照（裸 / 加浏览器头 / 加浏览器头+同 UA）。
   Future<void> _runHeaderMatrix() async {
     setState(() => _busy = true);
     final List<HeaderTrial> trials = await runHeaderMatrix(
-      url: _url.text,
+      url: _effectiveUrl().toString(),
       userAgent: _ua.text,
       cookies: _cookies,
       client: widget.client,
@@ -148,9 +174,16 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
   }
 
   /// t138：CAS ticket 探针（方案 E）——导航 + 记录重定向链，只看是否有 `ticket=ST-`。
+  ///
+  /// t139 修「点了没反应一直转」：
+  /// - **不再**用 `shouldOverrideUrlLoading` 拦截（那是同步阻塞点），只做正常导航 + `onLoadStart` 记录；
+  /// - 10s 超时 + 「取消」按钮，超时也把已记录的跳数显示出来；
+  /// - 每 250ms 刷新一次跳转链（实时可见）；
+  /// - 结束后自动导航回原页面（不把用户的课表页留在 CAS 上）。
   Future<void> _runCasProbe() async {
     setState(() {
       _busy = true;
+      _casRunning = true;
       _cas = null;
     });
     final String loginUrl = CasTicketProbe.loginUrl(
@@ -161,24 +194,81 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
     if (navigate == null) {
       setState(() {
         _busy = false;
+        _casRunning = false;
         _notice = '当前没有可用的 WebView：请先打开「我的课表」再回来试 CAS 探针。';
       });
       return;
     }
+
+    final String origin = CasTicketProbe.returnUrl ?? kProbeDefaultUrl;
     CasTicketProbe.start();
+    // 实时刷新：每 250ms 把当前链写入状态（不必等结束）
+    _casTicker?.cancel();
+    _casTicker = Timer.periodic(const Duration(milliseconds: 250), (Timer timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      setState(() {
+        _cas = CasTicketResult.summarize(List<String>.of(CasTicketProbe.redirects));
+      });
+    });
+
+    // t139：用**可取消的 Completer + Timer**做 10s 超时，而不是 `Future.delayed`
+    //（后者在 widget 测试里会留下 pending timer，也会在取消后继续悬挂）。
+    final Completer<void> done = Completer<void>();
+    _casDone = done;
+    Timer? timeout;
+    timeout = Timer(const Duration(seconds: 10), () {
+      if (!done.isCompleted) {
+        done.complete();
+      }
+    });
+    unawaited(navigate(loginUrl).whenComplete(() {
+      if (!done.isCompleted) {
+        done.complete();
+      }
+    }));
+
     try {
-      await navigate(loginUrl);
-      // 给重定向链一点时间收敛（CAS 通常是 2~4 跳）
-      await Future<void>.delayed(const Duration(seconds: 6));
+      await done.future;
     } finally {
+      timeout.cancel();
+      _casDone = null;
       CasTicketProbe.stop();
+      _casTicker?.cancel();
+      _casTicker = null;
+      // 自动返回原页面（先在记录里保留链，再导航回去）
+      final List<String> chain = List<String>.of(CasTicketProbe.redirects);
+      try {
+        await navigate(origin);
+      } on Object {
+        // 回不去也不影响判读
+      }
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _cas = CasTicketResult.summarize(chain);
+        _busy = false;
+        _casRunning = false;
+      });
     }
-    if (!mounted) {
-      return;
+  }
+
+  void _cancelCasProbe() {
+    // 先完成等待中的 future，让 `_runCasProbe` 的 finally 走完收尾
+    final Completer<void>? done = _casDone;
+    if (done != null && !done.isCompleted) {
+      done.complete();
     }
+    CasTicketProbe.stop();
+    _casTicker?.cancel();
+    _casTicker = null;
     setState(() {
       _cas = CasTicketResult.summarize(List<String>.of(CasTicketProbe.redirects));
       _busy = false;
+      _casRunning = false;
     });
   }
 
@@ -205,10 +295,11 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
       _result = null;
     });
     final SessionProbeResult result = await runSessionProbe(
-      url: _url.text,
+      url: _effectiveUrl().toString(),
       userAgent: _ua.text,
       cookies: _cookies,
       client: widget.client,
+      accept: _effectiveAccept,
     );
     if (!mounted) {
       return;
@@ -281,6 +372,31 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
                 controller: _ua,
                 decoration: const InputDecoration(labelText: 'User-Agent（换一个再试，可判断有无 UA 校验）'),
               ),
+              // t139：页内同款请求（默认开启）——方法/URL 参数/关键头与页面里完全一致
+              SwitchListTile(
+                key: const Key('probe-page-like'),
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                value: _usePageLike,
+                onChanged: (bool value) => setState(() => _usePageLike = value),
+                title: const Text('使用页内同款请求'),
+                subtitle: const Text('GET /api/uppcard/kbsz/queryAWeekSchedule?years=&results=&cardId=&_t='
+                    '（Accept: application/json, text/plain, */*）'),
+              ),
+              if (_usePageLike) ...<Widget>[
+                TextField(
+                  key: const Key('probe-years'),
+                  controller: _years,
+                  decoration: const InputDecoration(labelText: '学期 years（如 2026-2027-1）'),
+                ),
+                TextField(
+                  key: const Key('probe-cardid'),
+                  controller: _cardId,
+                  decoration: const InputDecoration(
+                    labelText: 'cardId（32 位 hex，每人不同；可从课表页的网络请求里复制）',
+                  ),
+                ),
+              ],
               const SizedBox(height: 8),
               // t138：三组请求头对照（裸 / 加浏览器头 / 加浏览器头+同 UA）
               Wrap(
@@ -324,12 +440,30 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
                 decoration: const InputDecoration(labelText: 'service 地址（登录成功后会跳回它并带 ticket）'),
               ),
               const SizedBox(height: 4),
-              OutlinedButton.icon(
-                key: const Key('probe-cas'),
-                onPressed: _busy ? null : _runCasProbe,
-                icon: const Icon(Icons.vpn_key_outlined, size: 18),
-                label: const Text('测试 CAS ticket'),
+              Wrap(
+                spacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: <Widget>[
+                  OutlinedButton.icon(
+                    key: const Key('probe-cas'),
+                    onPressed: _busy ? null : _runCasProbe,
+                    icon: const Icon(Icons.vpn_key_outlined, size: 18),
+                    label: const Text('测试 CAS ticket'),
+                  ),
+                  // t139：10s 超时 + 随时可取消（不再"一直转"）
+                  if (_casRunning)
+                    TextButton(
+                      key: const Key('probe-cas-cancel'),
+                      onPressed: _cancelCasProbe,
+                      child: const Text('取消（保留已记录的跳转）'),
+                    ),
+                ],
               ),
+              if (_casRunning)
+                Text(
+                  '进行中…已记录 ${CasTicketProbe.redirects.length} 跳（10 秒后自动结束并返回原页面）',
+                  style: theme.textTheme.bodySmall,
+                ),
               if (_cas != null) ...<Widget>[
                 Text(
                   '是否拿到 ticket：${_cas!.ticketFound ? '是（ST-${_cas!.prefix}****）' : '否'} · '
@@ -423,6 +557,17 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
           _kv('响应体长度', '${run.bodyLength}'),
           _kv('学号片段', run.studentIdMasked ?? '未命中'),
           _kv('页面标题', run.title.isEmpty ? '—' : run.title),
+          // t139：非 2xx 的 JSON 响应体（前 300 字符）——直接告诉我们是哪个参数不对
+          if (run.bodySnippet != null) ...<Widget>[
+            const Padding(
+              padding: EdgeInsets.only(top: 4),
+              child: Text('响应体（前 300 字符，仅 JSON）', style: TextStyle(fontWeight: FontWeight.w600)),
+            ),
+            SelectableText(
+              run.bodySnippet!,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+            ),
+          ],
           _kv('含「登录」字样', run.loginHint ? '是（多半是登录页）' : '否'),
           _kv('前 200 字哈希', run.bodyHash.isEmpty ? '—' : run.bodyHash),
           _kv('耗时', '${run.elapsedMs} ms'),

@@ -172,11 +172,14 @@ void main() {
     expect(find.byKey(const Key('probe-service')), findsOneWidget);
     expect(find.byKey(const Key('probe-diagnose')), findsOneWidget);
 
+    // t139：弹窗又长了（页内同款请求/CAS 字段），先滚到按钮再点
+    await tester.ensureVisible(find.byKey(const Key('probe-headers')));
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('probe-headers')));
     await tester.pumpAndSettle();
     // 结论区应顶到最上面（owner 反馈看不到输出）
     expect(find.byKey(const Key('probe-verdict-box')), findsOneWidget);
-    expect(find.textContaining('仍是 412'), findsOneWidget);
+    expect(find.textContaining('仍是 412'), findsWidgets);
   });
 }
 

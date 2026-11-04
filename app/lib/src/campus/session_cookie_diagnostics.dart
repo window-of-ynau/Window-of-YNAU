@@ -196,6 +196,9 @@ class CasTicketProbe {
   static bool recording = false;
   static final List<String> redirects = <String>[];
 
+  /// t139：探针开始前记下"原页面"，结束后自动导航回去（避免把课表页留在 CAS 上）。
+  static String? returnUrl;
+
   static const String defaultCasBase = 'https://cas.ynau.edu.cn';
   static const String defaultServiceUrl = 'https://example.com/';
 
