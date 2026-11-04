@@ -7,6 +7,8 @@
 //
 /// 安全：只暴露 Cookie 的**名字与域**（数量/名称），**值一律不采集、不展示、不外传**。
 
+import 'session_probe.dart';
+
 /// 一条 Cookie 的可见元信息（**没有值**）。
 class CookieRef {
   const CookieRef({required this.name, required this.domain});
@@ -24,27 +26,11 @@ typedef CookieRefSource = Future<List<CookieRef>> Function(Uri url);
 /// JS 侧对照：返回 `document.cookie.length`（拿不到 = null）。
 typedef JsCookieLengthProbe = Future<int?> Function();
 
-/// 单个域的扫描结果。
-class DomainScan {
-  const DomainScan({required this.domain, required this.cookies, this.error});
-
-  final String domain;
-  final List<CookieRef> cookies;
-  final String? error;
-
-  int get count => cookies.length;
-
-  @override
-  String toString() =>
-      'DomainScan($domain, count=$count, names=${cookies.map((CookieRef c) => c.name).join(',')})';
-}
-
-/// 三步诊断的汇总结果。
+/// 三步诊断的汇总结果（t140：**只查目标 URL 的精确域**，不再做跨域扫描）。
 class CookieDiagnostics {
   const CookieDiagnostics({
     required this.targetUrl,
     required this.exact,
-    required this.scans,
     required this.jsCookieLength,
     this.exactError,
   });
@@ -55,9 +41,6 @@ class CookieDiagnostics {
   final List<CookieRef> exact;
   final String? exactError;
 
-  /// 跨域扫描。
-  final List<DomainScan> scans;
-
   /// `document.cookie.length`（null = WebView 不可用/未注入）。
   final int? jsCookieLength;
 
@@ -65,73 +48,36 @@ class CookieDiagnostics {
   String get diagnosis {
     final bool exactEmpty = exact.isEmpty;
     final bool jsHasCookies = (jsCookieLength ?? 0) > 0;
-    final int otherDomains = scans
-        .where((DomainScan scan) => scan.domain != Uri.parse(targetUrl).host)
-        .fold<int>(0, (int sum, DomainScan scan) => sum + scan.count);
-
     if (!exactEmpty) {
-      return '✅ CookieManager 能取到 ${exact.length} 条（域/名称见下）→ 之前取不到可能是“按域猜”导致域不匹配';
+      return '✅ CookieManager 能取到 ${exact.length} 条（域/名称见下）';
     }
     if (jsHasCookies) {
-      return '⚠️ 强烈指向 HttpOnly：CookieManager 0 条，但 JS 侧 document.cookie 有 $jsCookieLength 字符'
-          '（非 HttpOnly 的能读到）→ 会话 Cookie 很可能带 HttpOnly，插件取不到';
-    }
-    if (otherDomains > 0) {
-      return '⚠️ 域不匹配：目标 URL 下 0 条，但其它校方域共 $otherDomains 条 → 改成按目标 URL 精确查/切换目标域';
+      return '⚠️ CookieManager 0 条、JS document.cookie 有 $jsCookieLength 字符'
+          ' → 非 HttpOnly 的能读到；若会话仍未生效，注意动态 JS 挑战（t140）';
     }
     if (jsCookieLength == null) {
-      return '⚠️ 无法判定：CookieManager 0 条，且 WebView 未就绪（拿不到 document.cookie）→ 先确保课表 WebView 打开过/已登录';
+      return '⚠️ 无法判定：CookieManager 0 条，且 WebView 未就绪（拿不到 document.cookie）';
     }
-    return '⚠️ 无会话或时序/实例问题：CookieManager 0 条、JS 侧也为 0 → 先确认已在同一个 WebView 实例里登录，再重试';
+    return '⚠️ 无会话：CookieManager 0 条、JS 侧也为 0 → 先在同一 WebView 里登录一次再试';
   }
 
   /// 只输出名字与域，**不含任何 Cookie 值**。
   @override
-  String toString() => 'CookieDiagnostics(target=$targetUrl, exact=${exact.length}, '
-      'js=$jsCookieLength, scans=${scans.map((DomainScan s) => '${s.domain}:${s.count}').join(',')})';
+  String toString() => 'CookieDiagnostics(target=$targetUrl, exact=${exact.length}, js=$jsCookieLength)';
 }
 
-/// 默认扫描域（按目标 URL + 已知校方域）。
-List<String> defaultScanDomains(String targetHost) => <String>[
-      targetHost,
-      'one.ynau.edu.cn',
-      'jwxt.ynau.edu.cn',
-      'cas.ynau.edu.cn',
-      'ynau.edu.cn',
-    ]..removeWhere((String host) => host.isEmpty);
-
-/// 跑三步诊断。
+/// 只查**目标 URL** 的 Cookie（t140：上一版会跨 4 个域各查一次，属于多余探测，已删除）。
 Future<CookieDiagnostics> diagnoseCookies({
   required Uri target,
   required CookieRefSource source,
   JsCookieLengthProbe? jsProbe,
-  List<String>? scanDomains,
 }) async {
-  final String host = target.host;
-  final List<String> domains = defaultScanDomains(host);
-  if (scanDomains != null && scanDomains.isNotEmpty) {
-    domains
-      ..clear()
-      ..addAll(scanDomains);
-  }
-
   final List<CookieRef> exact = <CookieRef>[];
   String? exactError;
   try {
     exact.addAll(await source(target));
   } on Object catch (failure) {
     exactError = failure.runtimeType.toString();
-  }
-
-  final List<DomainScan> scans = <DomainScan>[];
-  for (final String domain in domains) {
-    try {
-      final List<CookieRef> cookies =
-          await source(Uri.parse('https://$domain/'));
-      scans.add(DomainScan(domain: domain, cookies: cookies));
-    } on Object catch (failure) {
-      scans.add(DomainScan(domain: domain, cookies: const <CookieRef>[], error: failure.runtimeType.toString()));
-    }
   }
 
   int? jsLength;
@@ -147,11 +93,9 @@ Future<CookieDiagnostics> diagnoseCookies({
     targetUrl: target.toString(),
     exact: exact,
     exactError: exactError,
-    scans: scans,
     jsCookieLength: jsLength,
   );
 }
-
 /// 把 `document.cookie.length` 的结果解析成 int（非数字/空 → null）。
 int? parseJsCookieLength(String raw) {
   final String trimmed = raw.trim();
@@ -178,6 +122,13 @@ class SessionProbeJsBridge {
   const SessionProbeJsBridge._();
 
   static Future<int?> Function()? documentCookieLength;
+
+  /// 【t140】在 WebView 内用 `fetch` 取一次（真实浏览器环境，能过动态 JS 挑战）。
+  ///
+  /// 只回传**摘要**：状态码 / 长度 / 是否含学号片段 / Content-Type —— 不回传响应体、不回传 Cookie。
+  /// `withCredentials == false` 表示匿名对照（页面侧用 `credentials: 'omit'`）。
+  static Future<InPageFetchSummary?> Function(String url, {required bool withCredentials})?
+      inPageFetch;
 }
 
 /// 【临时诊断 t138】CAS service ticket 探针（方案 E）。
