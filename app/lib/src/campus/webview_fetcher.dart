@@ -23,7 +23,8 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import '../core/timetable_service.dart';
 import 'campus_bridge.dart';
 import 'portal_api.dart';
-import 'session_cookie_diagnostics.dart'; // 【临时诊断 t137】验证后删除
+import 'session_cookie_diagnostics.dart';
+import 'session_probe.dart'; // 【临时诊断 t137】验证后删除
 import 'webview_session.dart';
 
 /// 取数模式：旧的 DOM 抓取 / W6 的门户接口。
@@ -551,6 +552,34 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       // 【临时诊断 t138】CAS ticket 探针：用这个 WebView 导航，并记录重定向链。
                       CasTicketProbe.navigate = (String target) async {
                         await controller.loadUrl(urlRequest: URLRequest(url: WebUri(target)));
+                      };
+                      // 【临时诊断 t140】校方域名只在 WebView 内用 fetch 取：
+                      // 页面里是真实浏览器环境，能过动态 JS 挑战；只回传摘要，不回传响应体/Cookie。
+                      SessionProbeJsBridge.inPageFetch =
+                          (String url, {required bool withCredentials}) async {
+                        final String credentials = withCredentials ? 'include' : 'omit';
+                        final String script = '''
+(async () => {
+  try {
+    const r = await fetch(${jsonEncode(url)}, {
+      credentials: '$credentials',
+      headers: {'Accept': 'application/json, text/plain, */*'},
+    });
+    const t = await r.text();
+    const m = t.match(/\\b\\d{10,12}\\b/);
+    return JSON.stringify({
+      status: r.status,
+      length: t.length,
+      hasStudentId: !!m,
+      contentType: r.headers.get('content-type') || '',
+    });
+  } catch (e) {
+    return JSON.stringify({status: 0, length: 0, hasStudentId: false, error: String(e)});
+  }
+})()
+''';
+                        final Object? raw = await controller.evaluateJavascript(source: script);
+                        return InPageFetchSummary.fromJsonString('${raw ?? ''}');
                       };
                       controller.addJavaScriptHandler(
                         handlerName: 'yunongBridge',
