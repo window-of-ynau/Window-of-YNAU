@@ -1,4 +1,3 @@
-import 'package:flutter/material.dart' show Icons;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/main.dart';
 
@@ -13,8 +12,7 @@ void main() {
   testWidgets('侧栏能进入课表页', (WidgetTester tester) async {
     await tester.pumpWidget(const YunongApp());
     // 用图标而不是 tooltip 定位（tooltip 文案随 MaterialLocalizations 变，图标更稳）
-    await tester.tap(find.byIcon(Icons.menu));
-    await tester.pumpAndSettle();
+    // t117：侧栏常驻（可折叠），入口直接可见，无需先开抽屉
     await tester.tap(find.text('我的课表'));
     await tester.pumpAndSettle();
     // W2b 起课表是真实页面（WebView 抓取 / 调试导入 → Rust 解析 → SQLite → 列表）。

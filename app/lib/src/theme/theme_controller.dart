@@ -109,6 +109,9 @@ class ThemeController extends ChangeNotifier {
         _glassMode = initialGlass;
 
   final SettingsStore _store;
+
+  /// 其它 UI 偏好（如侧栏折叠状态）复用同一个 store（t117）。
+  SettingsStore get store => _store;
   AppThemeId _themeId;
 
   GlassMode _glassMode;

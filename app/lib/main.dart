@@ -159,14 +159,27 @@ class _HomeShellState extends State<HomeShell> {
   void initState() {
     super.initState();
     _initSharedServices();
+    // t117：恢复侧栏折叠状态（窄窗未手动设置时默认折叠）
+    unawaited(_loadSidebarState());
   }
 
   int _selected = 0;
+
+  /// t117：侧栏折叠状态。
+  ///
+  /// `null` = 用户从未手动设置过 → 窄窗（< 600）自动折叠；手动设置过则一直尊重它。
+  bool? _collapsedOverride;
+  static const String _collapsedKey = 'sidebar.collapsed';
+  static const double kSidebarWidth = 256;
+  static const double kRailWidth = 64;
+  static const double kNarrowBreakpoint = 600;
 
   @override
   Widget build(BuildContext context) {
     const entries = CampusEntry.values;
     final destination = _selected == 0 ? null : entries[_selected - 1];
+    final bool narrow = MediaQuery.sizeOf(context).width < kNarrowBreakpoint;
+    final bool collapsed = _collapsedOverride ?? narrow;
 
     return Scaffold(
       // 玻璃主题：AppBar 底下垫一层玻璃（全屏只有这一层会真模糊）；
@@ -182,68 +195,70 @@ class _HomeShellState extends State<HomeShell> {
                 borderRadius: BorderRadius.zero,
                 child: SizedBox.expand(),
               ),
-        title: Text(destination?.label ?? '云农之窗'),
-        // t112：设置入口移到侧栏底部（见下方 drawer），顶栏不再放齿轮。
-      ),
-      drawer: Drawer(
-        // 分组侧栏（t76 视觉新增）：上组「功能」、下组「校园 · N」。
-        // t112：「设置」固定在抽屉**底部**、整行横格，不随列表滚动。
-        child: Column(
-          children: <Widget>[
-            Expanded(
-              child: ListView(
-                padding: const EdgeInsets.only(top: 8),
-                children: <Widget>[
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(18, 20, 18, 8),
-                    child: Text('云农之窗', style: Theme.of(context).textTheme.headlineSmall),
-                  ),
-                  const _DrawerSectionLabel(text: '功能'),
-                  ListTile(
-                    dense: true,
-                    leading: const Icon(Icons.chat_bubble_outline),
-                    title: const Text('对话'),
-                    selected: _selected == 0,
-                    onTap: () => _select(0),
-                  ),
-                  _DrawerSectionLabel(text: '校园 · ${entries.length}'),
-                  for (var i = 0; i < entries.length; i++)
-                    ListTile(
-                      dense: true,
-                      leading: const Icon(Icons.school_outlined),
-                      title: Text(entries[i].label),
-                      selected: _selected == i + 1,
-                      onTap: () => _select(i + 1),
-                    ),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            // 底部固定格：撑满整行、图标 + 文字
-            SizedBox(
-              width: double.infinity,
-              child: ListTile(
-                key: const Key('drawer-settings'),
-                leading: const Icon(Icons.settings_outlined),
-                title: const Text('设置'),
-                onTap: _openSettings,
-              ),
-            ),
-          ],
+        leading: IconButton(
+          key: const Key('sidebar-toggle'),
+          tooltip: collapsed ? '展开侧栏' : '折叠侧栏',
+          onPressed: _toggleSidebar,
+          icon: Icon(collapsed ? Icons.menu : Icons.menu_open),
         ),
+        title: Text(destination?.label ?? '云农之窗'),
       ),
-      // t94：用 IndexedStack 保留各栏状态——切到课表再切回来，对话（消息 + 输入草稿）不能丢。
-      body: IndexedStack(
-        index: destination == null ? 0 : 1,
-        children: <Widget>[
-          _ChatPane(chatSettings: _chatSettings, secrets: _secrets, auth: _auth),
-          if (destination == null)
-            const SizedBox.shrink()
-          else
-            _CampusPane(entry: destination),
-        ],
-      ),
+      // t117：侧栏改为**常驻可折叠**（B 方案）——不再用抽屉，避免两套导航。
+      // t117：侧栏改为**常驻可折叠**（B 方案）——不再用抽屉，避免两套导航。
+      // 窄窗 + 折叠：rail 浮在内容之上（不挤占 480px 内容宽度，避免横向溢出）；
+      // 宽窗或展开态：侧栏与内容并排（正常文档流）。
+      body: <Widget>[
+        () {
+          final Widget panes = IndexedStack(
+            index: destination == null ? 0 : 1,
+            children: <Widget>[
+              _ChatPane(chatSettings: _chatSettings, secrets: _secrets, auth: _auth),
+              if (destination == null) const SizedBox.shrink() else _CampusPane(entry: destination),
+            ],
+          );
+          final Widget sidebar = _Sidebar(
+            collapsed: collapsed,
+            selected: _selected,
+            entries: entries,
+            onSelect: _select,
+            onToggle: _toggleSidebar,
+            onOpenSettings: _openSettings,
+          );
+          if (narrow && collapsed) {
+            return Stack(
+              children: <Widget>[
+                Positioned.fill(child: panes),
+                Positioned(left: 0, top: 0, bottom: 0, child: Material(elevation: 2, child: sidebar)),
+              ],
+            );
+          }
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[sidebar, const VerticalDivider(width: 1), Expanded(child: panes)],
+          );
+        }(),
+      ].single,
     );
+  }
+
+  void _toggleSidebar() {
+    final bool next = !(_collapsedOverride ??
+        (MediaQuery.sizeOf(context).width < kNarrowBreakpoint));
+    setState(() => _collapsedOverride = next);
+    // 持久化：与主题同级（settings.json）
+    unawaited(widget.themeController.store.set(_collapsedKey, next ? 'true' : 'false'));
+  }
+
+  Future<void> _loadSidebarState() async {
+    try {
+      final String? raw = await widget.themeController.store.get(_collapsedKey);
+      if (!mounted || raw == null) {
+        return;
+      }
+      setState(() => _collapsedOverride = raw == 'true');
+    } on Object {
+      // 读不到就用默认（宽窗展开 / 窄窗自动折叠），不影响启动。
+    }
   }
 
   /// 对话设置与设置页**共享**同一个状态源（t86：一处改，两处立即见）
@@ -357,6 +372,146 @@ class _EntryPlaceholder extends StatelessWidget {
 }
 
 /// 抽屉里的分组小标题（overline 层：10px + 字距）。
+/// 可折叠侧栏（t117，B 方案）。
+///
+/// 展开 256 / 折叠 64（rail 只留图标 + tooltip），用 `AnimatedContainer` 做平滑过渡。
+/// 底部「设置」在两种形态下都可用（rail 态是带 tooltip 的图标按钮）。
+class _Sidebar extends StatelessWidget {
+  const _Sidebar({
+    required this.collapsed,
+    required this.selected,
+    required this.entries,
+    required this.onSelect,
+    required this.onToggle,
+    required this.onOpenSettings,
+  });
+
+  final bool collapsed;
+  final int selected;
+  final List<CampusEntry> entries;
+  final ValueChanged<int> onSelect;
+  final VoidCallback onToggle;
+  final VoidCallback onOpenSettings;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    return AnimatedContainer(
+      key: const Key('app-sidebar'),
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOutCubic,
+      width: collapsed ? _HomeShellState.kRailWidth : _HomeShellState.kSidebarWidth,
+      // 宽度动画期间内容始终按展开宽度布局再裁切：避免 ListTile 在中间宽度触发横向溢出。
+      child: ClipRect(
+        child: OverflowBox(
+          alignment: Alignment.centerLeft,
+          minWidth: _HomeShellState.kSidebarWidth,
+          maxWidth: _HomeShellState.kSidebarWidth,
+          child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          if (!collapsed)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 16, 12, 8),
+              child: Row(
+                children: <Widget>[
+                  Expanded(child: Text('云农之窗', style: theme.textTheme.titleMedium)),
+                  IconButton(
+                    tooltip: '折叠侧栏',
+                    onPressed: onToggle,
+                    icon: const Icon(Icons.chevron_left, size: 18),
+                  ),
+                ],
+              ),
+            )
+          else
+            const SizedBox(height: 8),
+          Expanded(
+            child: ListView(
+              padding: EdgeInsets.zero,
+              children: <Widget>[
+                if (!collapsed) const _DrawerSectionLabel(text: '功能'),
+                _SidebarItem(
+                  collapsed: collapsed,
+                  icon: Icons.chat_bubble_outline,
+                  label: '对话',
+                  selected: selected == 0,
+                  onTap: () => onSelect(0),
+                ),
+                if (!collapsed) _DrawerSectionLabel(text: '校园 · ${entries.length}'),
+                for (var i = 0; i < entries.length; i++)
+                  _SidebarItem(
+                    collapsed: collapsed,
+                    icon: Icons.school_outlined,
+                    label: entries[i].label,
+                    selected: selected == i + 1,
+                    onTap: () => onSelect(i + 1),
+                  ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          // 底部固定：rail 态是图标按钮（tooltip），展开态是整行 ListTile
+          if (collapsed)
+            IconButton(
+              key: const Key('sidebar-settings'),
+              tooltip: '设置',
+              onPressed: onOpenSettings,
+              icon: const Icon(Icons.settings_outlined),
+            )
+          else
+            ListTile(
+              key: const Key('sidebar-settings'),
+              dense: true,
+              leading: const Icon(Icons.settings_outlined),
+              title: const Text('设置'),
+              onTap: onOpenSettings,
+            ),
+          ],
+        ),
+      ),
+    ),
+    );
+  }
+}
+
+/// 侧栏的一项：展开是 ListTile，折叠是带 tooltip 的图标。
+class _SidebarItem extends StatelessWidget {
+  const _SidebarItem({
+    required this.collapsed,
+    required this.icon,
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final bool collapsed;
+  final IconData icon;
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    if (collapsed) {
+      return Tooltip(
+        message: label,
+        child: IconButton(
+          onPressed: onTap,
+          icon: Icon(icon),
+          isSelected: selected,
+        ),
+      );
+    }
+    return ListTile(
+      dense: true,
+      leading: Icon(icon),
+      title: Text(label),
+      selected: selected,
+      onTap: onTap,
+    );
+  }
+}
 class _DrawerSectionLabel extends StatelessWidget {
   const _DrawerSectionLabel({required this.text});
 
