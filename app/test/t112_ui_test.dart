@@ -25,6 +25,7 @@ void main() {
         onLocalSearch: () {},
         onMemory: () {},
         onDiagnostics: () {},
+        onInfo: () {},
         onClearConversation: () {},
       )));
       await tester.pumpAndSettle();

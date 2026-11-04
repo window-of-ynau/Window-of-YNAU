@@ -103,7 +103,8 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byKey(const Key('model-selector-button')), findsOneWidget);
-      expect(find.textContaining('effort'), findsWidgets);
+      // t132：摘要改为 provider · 模型 · 推理等级（不再带 "effort" 英文前缀）
+      expect(find.textContaining('deepseek-flash'), findsWidgets);
 
       await tester.tap(find.byKey(const Key('model-selector-button')));
       await tester.pumpAndSettle();

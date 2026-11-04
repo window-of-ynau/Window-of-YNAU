@@ -401,12 +401,17 @@ class _Sidebar extends StatelessWidget {
       duration: const Duration(milliseconds: 180),
       curve: Curves.easeOutCubic,
       width: collapsed ? _HomeShellState.kRailWidth : _HomeShellState.kSidebarWidth,
-      // 宽度动画期间内容始终按展开宽度布局再裁切：避免 ListTile 在中间宽度触发横向溢出。
+      // 宽度动画期间内容始终按**当前目标宽度**布局再裁切，避免 ListTile 在中间宽度触发横向溢出。
+      //
+      // t132（阻塞一）根因：这里曾经固定把内容按 256 布局、rail 态（容器 64）再裁切 ——
+      // `IconButton` 在 256 宽度里**居中**，图标落在 x≈128，被 64px 裁切区切掉，
+      // 视觉上只剩一个纯色块（与主题无关，所以换主题也一样）。
+      // 现在 rail 态内容按 64 布局，图标回到可视区中央。
       child: ClipRect(
         child: OverflowBox(
           alignment: Alignment.centerLeft,
-          minWidth: _HomeShellState.kSidebarWidth,
-          maxWidth: _HomeShellState.kSidebarWidth,
+          minWidth: collapsed ? _HomeShellState.kRailWidth : _HomeShellState.kSidebarWidth,
+          maxWidth: collapsed ? _HomeShellState.kRailWidth : _HomeShellState.kSidebarWidth,
           child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[

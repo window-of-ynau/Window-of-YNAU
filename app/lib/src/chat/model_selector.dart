@@ -69,15 +69,17 @@ class ModelSelector extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
-    return Align(
-      alignment: Alignment.centerLeft,
+    // t132：放在输入框右下角（发送按钮左侧）——必须可收缩：
+    // 图标始终可见，文字在窄窗省略（480/320 都不溢出）。
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 190),
       child: TextButton.icon(
         key: const Key('model-selector-button'),
         onPressed: () => _openSheet(context),
         icon: const Icon(Icons.tune, size: 16),
         // 一行摘要：provider · 模型 · effort（窄窗靠 ellipsis，不溢出）
         label: Text(
-          '$_providerName · $model · effort ${effortText(effort)}',
+          '$_providerName · $model · ${effortText(effort)}',
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: theme.textTheme.bodySmall,

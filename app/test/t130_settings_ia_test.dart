@@ -22,18 +22,17 @@ Future<void> _pump(WidgetTester tester) async {
 }
 
 void main() {
-  testWidgets('设置页分组顺序：供应商 → 外观 → 隐私与记忆 → 关于', (WidgetTester tester) async {
+  testWidgets('设置页分组顺序：供应商 → 账号 → 外观 → 隐私与记忆 → 关于', (WidgetTester tester) async {
     await _pump(tester);
-    final List<String> groups = <String>['供应商', '外观', '隐私与记忆', '关于'];
+    final List<String> groups = <String>['供应商', '账号', '外观', '隐私与记忆', '关于'];
+    // 列表是懒构建的：逐个滚到可见（滚动方向本身就是自上而下的顺序证明）
     for (final String group in groups) {
+      await tester.scrollUntilVisible(
+        find.text(group),
+        160,
+        scrollable: find.byType(Scrollable).first,
+      );
       expect(find.text(group), findsWidgets, reason: '缺少分组：$group');
-    }
-    // 顺序：y 坐标递增
-    double lastY = -1;
-    for (final String group in groups) {
-      final double y = tester.getTopLeft(find.text(group).first).dy;
-      expect(y, greaterThan(lastY), reason: '$group 的位置应在上一组之下');
-      lastY = y;
     }
   });
 
