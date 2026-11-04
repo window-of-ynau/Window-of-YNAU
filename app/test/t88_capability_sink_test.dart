@@ -87,7 +87,7 @@ void main() {
 
     // 账号行存在且可点「登录」（能力已下沉：不依赖对话页）
     expect(find.textContaining('套餐账号：未登录'), findsOneWidget);
-    await tester.tap(find.widgetWithText(TextButton, '登录'));
+      await tester.tap(find.widgetWithText(TextButton, '登录').last);
     await tester.pumpAndSettle();
     expect(find.widgetWithText(TextField, '邮箱'), findsOneWidget);
     expect(find.widgetWithText(TextField, '密码'), findsOneWidget);

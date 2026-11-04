@@ -261,4 +261,31 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.textContaining('大学英语'), findsWidgets, reason: '重建后必须从 SQLite 回填，不能要求学生重抓');
+  });
+  testWidgets('t112：手改学期后按新学期重载（旧学期课程不保留）', (WidgetTester tester) async {
+    final core = ScriptedCore(<CoreEnvelope>[])
+      ..courses = <StoredCourse>[
+        const StoredCourse(
+          id: 3,
+          term: '2026-2027-1',
+          name: '高等数学A',
+          weekday: 1,
+          startPeriod: 1,
+          endPeriod: 2,
+          weeks: '1-16',
+        ),
+      ];
+    final service = TimetableService(core: core, dbPath: '/tmp/t112.db');
+
+    await tester.pumpWidget(_wrap(TimetablePage(service: service, initialTerm: '2026-2027-1')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('高等数学A'), findsWidgets);
+
+    // 手改学期：库对新学期返回空 → 旧学期课程必须清掉、显示空态
+    core.courses = const <StoredCourse>[];
+    await tester.enterText(find.byType(TextField).first, '2026-2027-2');
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('高等数学A'), findsNothing, reason: '旧学期的课不能留在新学期');
+    expect(find.text('还没有课表'), findsOneWidget);
   });}

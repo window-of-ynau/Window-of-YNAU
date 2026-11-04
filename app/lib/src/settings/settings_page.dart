@@ -11,6 +11,7 @@ import '../chat/chat_settings_section.dart';
 import '../core/build_info.dart';
 import '../core/auth_service.dart';
 import '../core/secret_service.dart';
+import 'key_account_group.dart';
 
 import '../theme/theme_controller.dart';
 import '../theme/glass_panel.dart';
@@ -169,12 +170,9 @@ class SettingsPage extends StatelessWidget {
               _Group(
                 title: '模型与凭据',
                 children: <Widget>[
-                  _Row(
-                    icon: Icons.key_outlined,
-                    title: 'BYOK 密钥 / 套餐',
-                    subtitle: '在对话页右上角的设置里配置；密钥只存本机安全存储',
-                    trailing: Icon(Icons.chevron_right, color: t.inkFaint),
-                  ),
+                  // t112：Key 与套餐账号的“状态 / 删除 / 登录退出”统一在这里，
+                  // 对话设置只负责通道/模型/协议/Key 输入（不再重复放状态与账号按钮）。
+                  KeyAccountGroup(auth: authService, secrets: secretService),
                 ],
               ),
               _Group(
