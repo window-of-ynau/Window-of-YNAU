@@ -11,6 +11,7 @@ import '../chat/chat_settings_section.dart';
 import '../core/build_info.dart';
 import '../core/auth_service.dart';
 import '../core/secret_service.dart';
+import '../campus/session_probe_dialog.dart'; // 【临时诊断】验证后删除
 import 'provider_card.dart';
 import '../core/provider_store.dart';
 
@@ -196,6 +197,19 @@ class SettingsPage extends StatelessWidget {
               _Group(
                 title: '关于',
                 children: <Widget>[
+                  // 【临时诊断】验证「校方会话能否脱离 WebView 使用」，验证后删除。
+                  InkWell(
+                    onTap: () => showDialog<void>(
+                      context: context,
+                      builder: (BuildContext context) => const SessionProbeDialog(),
+                    ),
+                    child: const _Row(
+                      icon: Icons.science_outlined,
+                      title: '[临时] 会话校验探针',
+                      subtitle: '验证后删除 · 用纯 HTTP 带会话 Cookie 打一次 GET，判断云端校验是否可行',
+                      trailing: Icon(Icons.chevron_right, size: 18),
+                    ),
+                  ),
                   _Row(
                     icon: Icons.info_outline,
                     title: '版本',
