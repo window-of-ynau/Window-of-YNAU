@@ -205,6 +205,96 @@ pub fn fallback_event_json(choice: &Choice, reason: &str) -> String {
     .to_string()
 }
 
+/// 上游是不是在明确说"这套协议/端点不存在"？返回原因（`None` = 不该回退）。
+///
+/// 判定规则（严格，宁可少回退）：
+/// - **只看 [`crate::error::CoreError::Remote`]**：传输层/超时/取消都不算；
+/// - 401/403/429/402/超时 → **绝不回退**（换协议也没用）；
+/// - message 以 `HTTP 404` / `HTTP 405` 开头（`gateway::remote_error` 的固定前缀）→ 回退；
+/// - 4xx 且正文明确提到协议/端点不支持（`unsupported protocol` 等）→ 回退；
+/// - 5xx 一律不回退（服务端故障，换协议同样是错的）。
+pub fn unsupported_signal(err: &crate::error::CoreError) -> Option<String> {
+    use yunong_shared::ErrorCode;
+
+    let crate::error::CoreError::Remote { code, message, .. } = err else {
+        return None;
+    };
+    if matches!(
+        code,
+        ErrorCode::Unauthorized
+            | ErrorCode::Forbidden
+            | ErrorCode::RateLimited
+            | ErrorCode::QuotaExceeded
+            | ErrorCode::TokenExpired
+            | ErrorCode::UpstreamTimeout
+    ) {
+        return None;
+    }
+    let lower = message.to_lowercase();
+    if lower.starts_with("http 404") || lower.starts_with("http 405") {
+        return Some(format!(
+            "上游返回 {}（端点不存在，可能不支持该协议）",
+            if lower.starts_with("http 404") {
+                "HTTP 404"
+            } else {
+                "HTTP 405"
+            }
+        ));
+    }
+    // 只有 4xx 才考虑"正文说协议不支持"
+    if lower.starts_with("http 4")
+        && (lower.contains("unsupported protocol")
+            || lower.contains("protocol not supported")
+            || lower.contains("no such endpoint")
+            || lower.contains("unknown endpoint")
+            || lower.contains("not supported"))
+    {
+        return Some(format!("上游明确表示不支持该协议：{}", clip(message, 120)));
+    }
+    None
+}
+
+/// 运行时回退的下一个候选（不含已试过的协议；未知 host 也能回退）。
+pub fn next_runtime_candidate(
+    provider: &str,
+    failed: Protocol,
+    tried: &[Protocol],
+) -> Option<Protocol> {
+    let supported = supported_protocols(provider);
+    FALLBACK_ORDER.iter().copied().find(|protocol| {
+        supported.contains(protocol) && *protocol != failed && !tried.contains(protocol)
+    })
+}
+
+/// 运行时回退事件（在 `protocol_fallback` 上补 `retried` / `attempt`）。
+pub fn retried_event_json(
+    requested_name: &str,
+    provider: &str,
+    effective: Protocol,
+    reason: &str,
+    attempt: u32,
+) -> String {
+    serde_json::json!({
+        "type": "protocol_fallback",
+        "requested_protocol": requested_name,
+        "effective_protocol": protocol_name(effective),
+        "provider": provider,
+        "reason": reason,
+        "retried": true,
+        "attempt": attempt,
+    })
+    .to_string()
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
