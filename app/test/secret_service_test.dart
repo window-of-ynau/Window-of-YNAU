@@ -155,14 +155,17 @@ void main() {
       expect(find.textContaining('仅内存生效'), findsOneWidget);
     });
 
-    testWidgets('未设置时显示“未设置”，且没有明文', (WidgetTester tester) async {
+    testWidgets('未设置时 ⓘ 里显示“未设置”，且没有明文', (WidgetTester tester) async {
       final secrets = SecretService(backend: FakeSecretBackend(), dbPath: '/tmp/x.db');
       final chats = ChatService(backend: _NoopChatBackend());
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(body: ChatPage(service: chats, secretService: secrets)),
       ));
       await tester.pumpAndSettle();
-      expect(find.byTooltip(RegExp('未设置')), findsOneWidget);
+      // t132：Key 状态不再挂在顶栏 tooltip 上，统一在 ⓘ 弹窗里
+      await tester.tap(find.byKey(const Key('chat-info')));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Key：未设置'), findsOneWidget);
       expect(find.text(_plain), findsNothing);
     });
   });

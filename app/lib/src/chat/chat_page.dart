@@ -515,6 +515,33 @@ class ChatPageState extends State<ChatPage> {
   ///
   /// P0-1 观测口径：`delta_count` / `last_delta_len` / `merged_chars` 能直接回答
   /// “收到几条 delta、第几条之后停止、是否收到 done/error”。
+  /// t132：ⓘ 弹窗 —— 状态 / 联网搜索来源 / Key 状态（原「未配置联网搜索」横幅内容）。
+  Future<void> _showInfoDialog() async {
+    final String searchLine = _searchStatus.available
+        ? '联网搜索：已配置（${_searchStatus.display}）'
+        : '联网搜索：未配置（${_searchStatus.hint.isEmpty ? '模型无法获取实时信息' : _searchStatus.hint}）';
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: const Text('状态'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text('通道：${_channel == 'cloud' ? '套餐' : '直连（BYOK）'}'),
+            Text('模型：$_model · 推理等级：${ModelSelector.effortText(_effort)}'),
+            Text('服务商：${_providers.active.name}'),
+            Text(searchLine),
+            Text('Key：${_keyStatus.display}'),
+          ],
+        ),
+        actions: <Widget>[
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('关闭')),
+        ],
+      ),
+    );
+  }
+
   Future<void> _showDiagnostics() async {
     final diag = _diagnostics;
     final keyLine =
@@ -693,6 +720,8 @@ class ChatPageState extends State<ChatPage> {
           onLocalSearch: () => setState(() => _localPanelOpen = !_localPanelOpen),
           onMemory: () => unawaited(_openMemory()),
           onDiagnostics: () => unawaited(_showDiagnostics()),
+          // t132：ⓘ 取代原来的「未配置联网搜索」横幅
+          onInfo: () => unawaited(_showInfoDialog()),
           // t112：Key 与套餐账号入口已移到设置页
           onClearConversation: () => unawaited(_clearConversation()),
         ),
@@ -741,31 +770,8 @@ class ChatPageState extends State<ChatPage> {
               ],
             ),
           ),
-        // 顶部提示条：**颜色一律取主题 token**。
-        // 旧写法用 colorScheme.surfaceContainerHighest + tertiary，在深蓝玻璃（深色画布）上
-        // 会渲染成一块浅色底，和画布反色、非常突兀（owner 反馈的 P1）。
-        if (!_searchStatus.available)
-          Builder(
-            builder: (BuildContext context) {
-              final YunongTokens t = context.tokens;
-              return Container(
-                width: double.infinity,
-                decoration: BoxDecoration(
-                  color: t.surfaceAlt,
-                  border: Border(
-                    bottom: BorderSide(color: t.hairline, width: t.borderWidth),
-                  ),
-                ),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                child: Text(
-                  _searchStatus.hint.isEmpty
-                      ? '未配置联网搜索，模型无法获取实时信息'
-                      : _searchStatus.hint,
-                  style: theme.textTheme.bodySmall?.copyWith(color: t.inkSoft),
-                ),
-              );
-            },
-          ),
+        // t132：原本这里是一条「未配置联网搜索」横幅（占一整条高度）。
+        // 现在移除横幅，信息收进顶栏 ⓘ 弹窗（见 `_showInfoDialog`）。
         if (_localPanelOpen)
           Container(
             width: double.infinity,
@@ -875,6 +881,10 @@ class ChatPageState extends State<ChatPage> {
 
         // B（深蓝玻璃）下输入条是一块玻璃：这是**全屏第二层也是最后一层** BackdropFilter。
         // A/C 没有玻璃 token，这里退回普通 Padding，不产生任何模糊。
+        //
+        // t132：**两条分支结构必须一致** —— 之前玻璃分支只放 `_composer()`，
+        // 导致深蓝玻璃主题缺少 provider/模型/effort 选择器（阻塞问题二）。
+        // 现在选择器与发送按钮一起放进 `_composer()` 自己的 Row，两条分支都不会漏。
         if (context.tokens.glass != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
@@ -887,27 +897,7 @@ class ChatPageState extends State<ChatPage> {
         else
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-            // t115：输入框上方是模型与 effort（设置页只负责供应商）
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                ModelSelector(
-                  providers: _providers.providers,
-                  activeProviderId: _providers.activeId,
-                  models: _models,
-                  model: _model,
-                  effort: _effort,
-                  signedIn: _auth.signedIn,
-                  accountLabel: _auth.signedIn ? _auth.maskedEmail : '',
-                  onProviderChanged: (String id) => unawaited(_providers.setActive(id)),
-                  onModelChanged: (String value) => setState(() => _model = value),
-                  onEffortChanged: (String value) => setState(() => _effort = value),
-                  onUseCloud: () => unawaited(_signInCloud()),
-                ),
-                _composer(),
-              ],
-            ),
+            child: _composer(),
           ),
       ],
     );
@@ -941,6 +931,25 @@ class ChatPageState extends State<ChatPage> {
           ),
         ),
         const SizedBox(width: 8),
+        // t132：provider / 模型 / effort 放到输入框右下角（发送按钮左侧），
+        // 并在窄窗收成可收缩的按钮（文字省略，弹层从该位置向上展开）。
+        Flexible(
+          flex: 0,
+          child: ModelSelector(
+            providers: _providers.providers,
+            activeProviderId: _providers.activeId,
+            models: _models,
+            model: _model,
+            effort: _effort,
+            signedIn: _auth.signedIn,
+            accountLabel: _auth.signedIn ? _auth.maskedEmail : '',
+            onProviderChanged: (String id) => unawaited(_providers.setActive(id)),
+            onModelChanged: (String value) => setState(() => _model = value),
+            onEffortChanged: (String value) => setState(() => _effort = value),
+            onUseCloud: () => unawaited(_signInCloud()),
+          ),
+        ),
+        const SizedBox(width: 4),
         if (_streaming)
           OutlinedButton.icon(
             onPressed: _stop,

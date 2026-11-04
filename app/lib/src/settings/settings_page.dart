@@ -79,7 +79,32 @@ class SettingsPage extends StatelessWidget {
                   ProviderCard(store: providerStore ?? _fallbackProviders, secrets: secretService),
                 ],
               ),
-              // t130：设置页只保留「供应商 / 外观 / 隐私与记忆 / 关于」。
+              // t132：账号分区（结构先立起来；第三/四条是**显式占位**，标「即将支持」，
+              // 不做成点了没反应的假按钮）。
+              const _Group(
+                title: '账号',
+                children: <Widget>[
+                  const _Row(
+                    icon: Icons.school_outlined,
+                    title: '学校登录态（课表导入获得）',
+                    subtitle: '当前使用：从校务 WebView 会话取出，只存本机',
+                    trailing: Icon(Icons.check_circle_outline, size: 18),
+                  ),
+                  const _Row(
+                    icon: Icons.person_outline,
+                    title: '云农账号（自有账号体系）',
+                    subtitle: '即将支持 · 用云农账号登录后同步消息与记忆',
+                    trailing: Icon(Icons.schedule, size: 18),
+                  ),
+                  const _Row(
+                    icon: Icons.card_membership_outlined,
+                    title: '套餐登录',
+                    subtitle: '即将支持 · 现可在对话页「模型选择器 → 套餐通道」登录',
+                    trailing: Icon(Icons.schedule, size: 18),
+                  ),
+                ],
+              ),
+              // t130：设置页保留「供应商 / 账号 / 外观 / 隐私与记忆 / 关于」。
               // 「对话」组已删除：通道、模型、effort、套餐登录全部在对话页的模型选择器里。
               _Group(
                 title: '外观',

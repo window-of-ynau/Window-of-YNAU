@@ -94,8 +94,8 @@ void main() {
     });
   });
 
-  group('UI：未配置时必须常驻提示', () {
-    testWidgets('BYOK 无 Key → 出现“未配置联网搜索”提示', (WidgetTester tester) async {
+  group('UI：未配置时的提示收进 ⓘ（t132）', () {
+    testWidgets('BYOK 无 Key → ⓘ 弹窗里显示“未配置联网搜索”', (WidgetTester tester) async {
       final search = SearchService(backend: FakeSearchBackend());
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(
@@ -107,8 +107,11 @@ void main() {
       ));
       await tester.pumpAndSettle();
 
+      // t132：横幅已移除，信息在 ⓘ 里
+      expect(find.textContaining('未配置联网搜索'), findsNothing);
+      await tester.tap(find.byKey(const Key('chat-info')));
+      await tester.pumpAndSettle();
       expect(find.textContaining('未配置联网搜索'), findsOneWidget);
-      // 顶栏已改为图标 + tooltip；用 Tooltip 文案断言搜索来源可见\n      expect(find.byTooltip(RegExp('搜索：未配置')), findsOneWidget);
       // 不谎称已搜索
       expect(find.textContaining('已搜索'), findsNothing);
     });
@@ -127,7 +130,10 @@ void main() {
       await tester.pumpAndSettle();
 
       // 默认协议是 openai_completions → 我方代理；切到 Responses 才是内置
-      expect(find.byTooltip(RegExp('搜索：我方代理')), findsOneWidget);
+      // t132：提示收进 ⓘ，弹窗里能看到搜索来源
+      await tester.tap(find.byKey(const Key('chat-info')));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('联网搜索：已配置'), findsOneWidget);
       expect(find.textContaining('未配置联网搜索'), findsNothing);
     });
   });

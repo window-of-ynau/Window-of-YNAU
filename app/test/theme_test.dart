@@ -10,6 +10,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:yunong/src/chat/chat_top_bar.dart';
 import 'package:yunong/main.dart';
 import 'support/test_window.dart';
 import 'package:yunong/src/campus/timetable/course_palette.dart';
@@ -406,7 +407,8 @@ void main() {
       final double clusterBottom = tester.getBottomLeft(find.text('这学期一共几门课？')).dy;
       final double clusterCenter = (clusterTop + clusterBottom) / 2;
 
-      final double areaTop = tester.getBottomLeft(find.textContaining('未配置联网搜索')).dy;
+      // t132：横幅已移除（信息收进 ⓘ）→ 内容区上沿改用顶栏下沿
+      final double areaTop = tester.getBottomLeft(find.byType(ChatTopBar)).dy;
       final double areaBottom = tester.getTopLeft(find.byType(TextField).last).dy;
       final double areaCenter = (areaTop + areaBottom) / 2;
 

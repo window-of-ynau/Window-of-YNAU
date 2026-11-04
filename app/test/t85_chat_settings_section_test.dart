@@ -1,8 +1,6 @@
 // t85：对话设置纯搬迁到 `chat_settings_section.dart` 后的冒烟测试。
 // 只验证「弹窗还能打开、五个字段都在、保存不崩」——行为不变的最小证据。
 
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/src/chat/chat_settings_section.dart';

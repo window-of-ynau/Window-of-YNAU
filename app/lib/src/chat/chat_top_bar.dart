@@ -27,6 +27,7 @@ class ChatTopBar extends StatelessWidget {
     required this.onLocalSearch,
     required this.onMemory,
     required this.onDiagnostics,
+    required this.onInfo,
     required this.onClearConversation,
   });
 
@@ -47,6 +48,9 @@ class ChatTopBar extends StatelessWidget {
   /// 对话诊断（**始终可达**：不是只在失败时出现）
   final VoidCallback onDiagnostics;
 
+  /// t132：ⓘ 按钮 —— 显示状态 / 联网搜索来源 / Key 状态（原横幅内容收进来）。
+  final VoidCallback onInfo;
+
   /// 清空当前对话历史（t112：二次确认在页面里做）
   final VoidCallback onClearConversation;
 
@@ -61,43 +65,32 @@ class ChatTopBar extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
       child: Row(
         children: <Widget>[
-          // t127：用 Expanded + Align 占满左侧剩余空间（内容仍左对齐）。
-          // 之前是 Flexible(FittedBox) + Spacer：Flexible 的 loose slot 会留下未分配空间，
-          // 把 ⋮ 挤到离右边缘 363px 的位置（实测 gap=363.5）。
+          // t132：顶栏不再放「直连/套餐」切换（与模型选择器里的「套餐通道」重复）。
+          // 通道选择只保留在模型选择器弹层里；顶栏左侧用标题占位，右侧是 ⓘ 与 ⋮。
           Expanded(
             child: Align(
               alignment: Alignment.centerLeft,
-              child: FittedBox(
-                fit: BoxFit.scaleDown,
-                alignment: Alignment.centerLeft,
-                child: SegmentedButton<String>(
-            segments: const <ButtonSegment<String>>[
-              ButtonSegment<String>(value: 'byok', label: Text('直连')),
-              ButtonSegment<String>(value: 'cloud', label: Text('套餐')),
-            ],
-            selected: <String>{channel},
-            showSelectedIcon: false,
-            style: const ButtonStyle(
-              visualDensity: VisualDensity.compact,
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-                onSelectionChanged: (Set<String> value) => onChannelChanged(value.first),
+              child: Text(
+                statusLabel,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
               ),
-            ),
             ),
           ),
           const SizedBox(width: 4),
-          // 状态：图标 + tooltip（不占横向空间，480px 也放得下）
-          Tooltip(
-            key: const Key('chat-status-tooltip'),
-            message: '$statusLabel\n搜索：$searchLabel\nKey：$keyLabel',
-            child: Icon(
+          // t132：搜索/Key/状态信息统一收进 ⓘ（不再占一整条横幅）。
+          IconButton(
+            key: const Key('chat-info'),
+            tooltip: '状态与联网搜索',
+            onPressed: onInfo,
+            iconSize: 20,
+            icon: Icon(
               keyDegraded ? Icons.warning_amber_outlined : Icons.info_outline,
-              size: 20,
               color: keyDegraded ? theme.colorScheme.tertiary : theme.hintColor,
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 4),
           PopupMenuButton<String>(
             key: const Key('chat-menu'),
             tooltip: '更多',
