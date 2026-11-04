@@ -131,7 +131,7 @@ fn chat_body(round: u8, estimated_input_tokens: u32) -> Value {
         "session_id": "s_1",
         "turn_id": "t_1",
         "round": round,
-        "model": "deepseek-chat",
+        "model": "deepseek-flash",
         "protocol": "openai_completions",
         "messages": [{ "role": "user", "content": "下周三下午有课吗" }],
         "tools": [],

@@ -375,7 +375,7 @@ mod tests {
             session_id: "s_1".into(),
             turn_id: "t_1".into(),
             round: 1,
-            model: "deepseek-chat".into(),
+            model: "deepseek-flash".into(),
             protocol: Protocol::OpenaiCompletions,
             messages: vec![ChatMessage::user("下周三下午有课吗")],
             tools: vec![],

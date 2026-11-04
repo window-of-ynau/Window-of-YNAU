@@ -160,7 +160,7 @@ mod tests {
     use crate::error::ErrorCode;
 
     fn asm() -> ChunkAssembler {
-        ChunkAssembler::new(Channel::Plan, "req_1", "deepseek-chat")
+        ChunkAssembler::new(Channel::Plan, "req_1", "deepseek-flash")
     }
 
     fn delta(text: &str) -> Chunk {

@@ -105,7 +105,7 @@ curl -sS http://127.0.0.1:8080/readyz        # DB 可用 + 上游配置存在才
 # SSE 流式接口（-N 关掉 curl 自己的缓冲；带鉴权的环境补 -H 'Authorization: Bearer ...'）
 curl -N -X POST http://127.0.0.1:8080/api/v1/chat/stream \
   -H 'Content-Type: application/json' \
-  -d '{"session_id":"s_demo","turn_id":"t_demo","round":1,"model":"deepseek-chat","protocol":"openai_completions","messages":[{"role":"user","content":"下周三下午有课吗"}],"tools":[],"max_output_tokens":512,"stream":true,"estimated_input_tokens":16}'
+  -d '{"session_id":"s_demo","turn_id":"t_demo","round":1,"model":"deepseek-flash","protocol":"openai_completions","messages":[{"role":"user","content":"下周三下午有课吗"}],"tools":[],"max_output_tokens":512,"stream":true,"estimated_input_tokens":16}'
 ```
 
 期望看到 `event: meta` → `delta` → `usage` → `done`；异常是 `event: error` 且带 `code`。想看量化指标直接跑 `python bench/run.py`。
