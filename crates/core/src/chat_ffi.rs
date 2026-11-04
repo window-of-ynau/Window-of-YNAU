@@ -154,7 +154,13 @@ impl ChatRunConfig {
             model: self.model.clone(),
             protocol: parse_protocol(&self.protocol),
             messages: self.messages.clone(),
-            tools: Vec::new(),
+            // t113：**必须把工具广告给上游**，否则模型不知道端侧能查课表/记忆
+            //（事故现场：问「第 8 周哪天最累」，模型回"我没有你的课表上下文"）
+            tools: if self.db_path.is_some() {
+                crate::tools::builtin_specs()
+            } else {
+                Vec::new()
+            },
             max_output_tokens: self.max_output_tokens.unwrap_or(1024),
             stream: true,
             estimated_input_tokens: 0,
@@ -288,7 +294,12 @@ pub fn run_stream_with_registry(
         (None, Some(value)) => value,
         (None, None) => String::new(),
     };
-    let request = config.to_request();
+    let mut request = config.to_request();
+    // 广告的 tools 必须**正好等于**注册了处理器的工具（见 `tools::specs_for`）
+    let registered: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
+    if !registered.is_empty() {
+        request.tools = crate::tools::specs_for(&registered);
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -314,11 +325,14 @@ pub fn run_stream_with_registry(
         Channel::Byok
     };
     let early_request_id = format!("{}_{}", channel.as_str(), uuid::Uuid::new_v4().simple());
-    let meta_cancelled = emit(chunk_json(&Chunk::Meta {
-        request_id: early_request_id,
-        model: config.model.clone(),
+    // 诊断（t113）：客户端/老板一眼看出"这次有没有挂工具"
+    let tool_names: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
+    let meta_cancelled = emit(meta_json(
+        &early_request_id,
+        &config.model,
         channel,
-    }));
+        &tool_names,
+    ));
 
     let use_tools = !registry.names().is_empty();
     let mut guard = crate::tool_events::PairGuard::new();
@@ -564,6 +578,25 @@ struct StreamSummary {
     usage_reported: bool,
 }
 
+/// `meta` 帧（首帧）：在契约字段之外**多加两个诊断字段**。
+///
+/// - `tools_enabled`：这次有没有挂端侧工具（false = 模型根本不知道有课表/记忆可查）；
+/// - `tools`：挂上的工具名列表。
+///
+/// 不加进 `crates/shared::Chunk`（那是共享契约，改它要过 captain）：这里手写 JSON，
+/// 老客户端按已知字段解析、多出来的字段自然忽略。
+fn meta_json(request_id: &str, model: &str, channel: Channel, tools: &[String]) -> String {
+    serde_json::json!({
+        "type": "meta",
+        "request_id": request_id,
+        "model": model,
+        "channel": channel,
+        "tools_enabled": !tools.is_empty(),
+        "tools": tools,
+    })
+    .to_string()
+}
+
 fn chunk_json(chunk: &Chunk) -> String {
     serde_json::to_string(chunk)
         .unwrap_or_else(|_| error_chunk_json(ErrorCode::Internal, "序列化失败"))
@@ -798,12 +831,16 @@ mod tests {
     /// 能按**连接顺序**回放脚本的假上游（工具循环每轮一个连接）。
     struct ScriptedServer {
         port: u16,
+        /// 收到的请求体（按连接顺序），用来断言"tools 到底有没有广告给上游"
+        bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl ScriptedServer {
         fn start(responses: Vec<String>) -> Self {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
+            let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let recorder = std::sync::Arc::clone(&bodies);
             std::thread::spawn(move || {
                 for body in responses {
                     let Ok((mut socket, _)) = listener.accept() else {
@@ -812,15 +849,37 @@ mod tests {
                     // 读完请求头，避免上游比客户端先关
                     let mut buffer = [0_u8; 4096];
                     let mut seen = Vec::new();
+                    let mut header_end = None;
                     loop {
                         let read = socket.read(&mut buffer).unwrap_or(0);
                         if read == 0 {
                             break;
                         }
                         seen.extend_from_slice(&buffer[..read]);
-                        if seen.windows(4).any(|window| window == b"\r\n\r\n") {
+                        if let Some(position) =
+                            seen.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            header_end = Some(position + 4);
                             break;
                         }
+                    }
+                    // 再把 body 读全（Content-Length），便于断言请求体
+                    if let Some(start) = header_end {
+                        let head = String::from_utf8_lossy(&seen[..start]).to_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        while seen.len() < start + length {
+                            let read = socket.read(&mut buffer).unwrap_or(0);
+                            if read == 0 {
+                                break;
+                            }
+                            seen.extend_from_slice(&buffer[..read]);
+                        }
+                        let body = String::from_utf8_lossy(&seen[start..]).into_owned();
+                        recorder.lock().unwrap().push(body);
                     }
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -831,7 +890,7 @@ mod tests {
                     let _ = socket.flush();
                 }
             });
-            Self { port }
+            Self { port, bodies }
         }
 
         fn base_url(&self) -> String {
@@ -969,6 +1028,139 @@ mod tests {
         assert!(results[0].get("code").is_none(), "{}", results[0]);
         // 流仍以 done 结尾
         assert_eq!(events.last().unwrap()["type"], "done");
+    }
+
+    // ---------------------------------------------------------------------
+    // t113：工具定义必须真的广告给上游（否则模型只会说"我没有你的课表上下文"）
+    // ---------------------------------------------------------------------
+
+    fn config_with_request(extra: serde_json::Value) -> ChatRunConfig {
+        let mut request = serde_json::json!({
+            "channel": "byok",
+            "protocol": "openai_completions",
+            "model": "deepseek-chat",
+            "api_key": "sk-test",
+            "messages": [{ "role": "user", "content": "第 8 周哪天最累？" }]
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            request[key] = value.clone();
+        }
+        ChatRunConfig::parse(&request.to_string()).unwrap()
+    }
+
+    /// 有 `db_path` → 请求体里必须有两个内置工具的**定义**（中文描述 + schema）。
+    #[test]
+    fn request_advertises_builtin_tools_when_db_path_is_set() {
+        let config = config_with_request(serde_json::json!({ "db_path": "/tmp/app.db" }));
+        let request = config.to_request();
+        let names: Vec<&str> = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(names.contains(&"timetable_query"), "{names:?}");
+        assert!(names.contains(&"memory_search"), "{names:?}");
+        for tool in &request.tools {
+            assert!(!tool.description.is_empty(), "{} 没有描述", tool.name);
+            assert!(
+                tool.description
+                    .chars()
+                    .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "{} 的描述应该是中文（模型按语义匹配中文提问）：{}",
+                tool.name,
+                tool.description
+            );
+            assert_eq!(
+                tool.parameters["type"], "object",
+                "{} 的参数必须是 JSON Schema",
+                tool.name
+            );
+            assert!(
+                tool.parameters["properties"].is_object(),
+                "{} 缺少 properties",
+                tool.name
+            );
+        }
+        // 课表工具要能指定周次
+        let timetable = request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "timetable_query")
+            .unwrap();
+        assert!(timetable.parameters["properties"]["week"].is_object());
+    }
+
+    /// 没有 `db_path` → 不带任何 tools（老行为，纯聊天）。
+    #[test]
+    fn request_has_no_tools_without_db_path() {
+        let config = config_with_request(serde_json::json!({}));
+        assert!(config.to_request().tools.is_empty());
+    }
+
+    /// 端到端：上游真的收到了 `tools`（第一轮请求体），并且 meta 帧报了 tools_enabled。
+    #[test]
+    fn upstream_receives_tools_in_the_request_body() {
+        let server = ScriptedServer::start(vec![
+            tool_round("timetable_query", "call_t", "{\"week\":8}"),
+            final_round("好"),
+        ]);
+        let db = std::env::temp_dir().join(format!("ynad-t113-{}.db", std::process::id()));
+        let registry = crate::tools::builtin_registry(Some(db.to_string_lossy().into_owned()));
+        let config = byok_config(&server.base_url(), Some(2_000));
+        // 带 db_path 才会挂工具；这里用真实的 builtin 注册表（不是空壳）
+        let mut config = config;
+        config.db_path = Some("/tmp/app.db".to_owned());
+        config.messages = vec![ChatMessage::user("第 8 周哪天最累？")];
+        let chunks = run_collect(config, registry);
+        let events = parse_all(&chunks);
+
+        // 1) 请求体里必须有 tools，且含两个内置工具名
+        let bodies = server.bodies.lock().unwrap().clone();
+        assert!(!bodies.is_empty(), "上游没收到请求");
+        let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let tools = first["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("请求体里没有 tools：{first}"));
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"timetable_query"), "{names:?}");
+        assert!(names.contains(&"memory_search"), "{names:?}");
+        assert_eq!(tools[0]["type"], "function");
+
+        // 2) meta 帧报出 tools_enabled 与工具名
+        let meta = events.first().unwrap();
+        assert_eq!(meta["type"], "meta");
+        assert_eq!(meta["tools_enabled"], true, "{meta}");
+        let meta_tools: Vec<&str> = meta["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(meta_tools.contains(&"timetable_query"), "{meta}");
+    }
+
+    /// 直连路径（没有工具）：meta 里 `tools_enabled=false`，上游请求体里没有 tools。
+    #[test]
+    fn no_tools_means_meta_says_false_and_body_has_no_tools_field() {
+        let server = ScriptedServer::start(vec![final_round("你好")]);
+        let config = byok_config(&server.base_url(), None); // 不带 db_path
+        let chunks = run_collect(config, crate::tools::ToolRegistry::new());
+        let events = parse_all(&chunks);
+        assert_eq!(
+            events.first().unwrap()["tools_enabled"],
+            false,
+            "{:?}",
+            events[0]
+        );
+        let bodies = server.bodies.lock().unwrap().clone();
+        let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert!(
+            first.get("tools").is_none(),
+            "没有工具时不该带 tools：{first}"
+        );
     }
 
     /// t109 回归：**空结果**与**有结果**两条工具路径都必须收到 `done`。

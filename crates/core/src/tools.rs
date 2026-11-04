@@ -62,6 +62,70 @@ impl ToolOutcome {
 /// （见 [`crate::tool_loop`]），`Arc<dyn Fn>` 能在不借用整个注册表的前提下克隆一份可调用句柄。
 pub type Handler = Arc<dyn Fn(&serde_json::Value) -> CoreResult<ToolOutcome> + Send + Sync>;
 
+/// 内置工具的 **wire 定义**（广告给上游的 `tools[]`）。
+///
+/// 没有这一步，模型根本不知道"端侧有课表/记忆可查"——它只会回"我没有你的课表上下文"
+/// （t113 的真实事故）。`description` 用**中文**写清楚"什么时候该调"，
+/// 因为用户是中文提问，模型按语义匹配。
+pub fn builtin_specs() -> Vec<yunong_shared::ToolSpec> {
+    use serde_json::json;
+
+    vec![
+        yunong_shared::ToolSpec {
+            name: "timetable_query".to_owned(),
+            description: "查询云农之窗本地课表：返回本学期各门课的星期、节次、地点与周次。\
+                          用户问“哪天有课 / 哪节课最累 / 第 N 周上什么 / 某门课在哪上”时调用。"
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "week": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 30,
+                        "description": "第几周（从 1 开始）；不传则返回整学期"
+                    }
+                },
+                "required": []
+            }),
+        },
+        yunong_shared::ToolSpec {
+            name: "memory_search".to_owned(),
+            description: "在本地记忆与压缩存档里按关键词检索（例如“雨伞放哪了”“宿舍楼几栋”）。\
+                          用户问起以前记过的事情、而当前上下文里没有时调用。"
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "关键词，例如“雨伞”"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "最多返回几条（默认 5）"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+    ]
+}
+
+/// 只保留**实际注册了处理器**的工具定义。
+///
+/// 为什么：广告出去但没注册的工具有害无益——模型会调它，然后拿到 `NOT_ALLOWED`
+/// （用户看到一张失败卡片）。生产路径 `builtin_registry` 与 `builtin_specs` 一致；
+/// 但测试/联调会传自定义注册表，这里按名字过滤，做到"广告的 = 能执行的"。
+pub fn specs_for(names: &[String]) -> Vec<yunong_shared::ToolSpec> {
+    builtin_specs()
+        .into_iter()
+        .filter(|spec| names.iter().any(|name| name == &spec.name))
+        .collect()
+}
+
 /// 端侧内置工具：对话流里模型可以调用的**真实**能力。
 ///
 /// 目前只有两个，因为"能改数据"的工具要非常克制（写错了用户就得手动收拾）：
