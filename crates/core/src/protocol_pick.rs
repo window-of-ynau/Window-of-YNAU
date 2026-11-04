@@ -3,12 +3,15 @@
 //! 背景：设置页里用户只能选 **provider**（DeepSeek / Anthropic / 自建…），
 //! 但每个 provider 支持哪套协议并不一样：
 //!
-//! | host | 支持 | 说明 |
+//! | host | 支持 | 端点路径（见 `gateway::wire::endpoint`） |
 //! |---|---|---|
-//! | `api.deepseek.com` | completions | 只有 OpenAI 兼容端点，`/v1/responses` 会 404 |
-//! | `api.anthropic.com` | messages | 原生 Messages API |
-//! | `api.openai.com` | responses + completions | 两套都在 |
-//! | 其它（自建/局域网/中转） | 全支持 | 不擅自替用户降级 |
+//! | `api.deepseek.com` | responses + messages + completions | `/responses`、`/anthropic/v1/messages`、`/chat/completions` |
+//! | `api.anthropic.com` | messages | `/v1/messages` |
+//! | `api.openai.com` | responses + completions | `/v1/responses`、`/v1/chat/completions` |
+//! | 其它（自建/局域网/中转） | 全支持 | base_url + 标准 `/v1` 后缀 |
+//!
+//! 依据是 owner 提供的官方文档（DeepSeek 三种 API 都支持，只是 **base_url/路径不同**）。
+//! 早先"deepseek 只支持 completions"的静态映射是**错的**，已撤销（t118）。
 //!
 //! 回退顺序（owner 指定）：`openai_responses` → `anthropic_messages` → `openai_completions`。
 //!
@@ -109,7 +112,9 @@ pub fn supported_protocols(host: &str) -> Vec<Protocol> {
     let host = host.trim().to_ascii_lowercase();
     let matches = |suffix: &str| host == suffix || host.ends_with(&format!(".{suffix}"));
     if matches("api.deepseek.com") || matches("deepseek.com") {
-        return vec![Protocol::OpenaiCompletions];
+        // DeepSeek 三种协议都支持（Responses / Anthropic 兼容层 / OpenAI 兼容），
+        // 只是**端点路径不同**——见 `gateway::wire::endpoint`。
+        return FALLBACK_ORDER.to_vec();
     }
     if matches("api.anthropic.com") || matches("anthropic.com") {
         return vec![Protocol::AnthropicMessages];
@@ -317,9 +322,10 @@ mod tests {
 
     #[test]
     fn known_providers_support_what_we_think() {
+        // DeepSeek 三种都支持（t118 更正）
         assert_eq!(
             supported_protocols("api.deepseek.com"),
-            vec![Protocol::OpenaiCompletions]
+            FALLBACK_ORDER.to_vec()
         );
         assert_eq!(
             supported_protocols("api.anthropic.com"),
@@ -337,16 +343,12 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_with_responses_falls_back_to_completions() {
-        let choice = resolve("https://api.deepseek.com/v1", Protocol::OpenaiResponses);
-        assert!(choice.fallback());
-        assert_eq!(choice.effective, Protocol::OpenaiCompletions);
+    fn deepseek_keeps_all_three_protocols() {
+        // t118：DeepSeek 三种协议都支持，**不应**再被静态降级
+        let choice = resolve("https://api.deepseek.com", Protocol::OpenaiResponses);
+        assert!(!choice.fallback(), "{choice:?}");
+        assert_eq!(choice.effective, Protocol::OpenaiResponses);
         assert_eq!(choice.provider, "api.deepseek.com");
-        assert!(choice
-            .fallback_reason
-            .as_deref()
-            .unwrap()
-            .contains("不支持 openai_responses"));
     }
 
     #[test]
@@ -370,13 +372,15 @@ mod tests {
 
     #[test]
     fn fallback_event_has_the_contract_fields() {
-        let choice = resolve("https://api.deepseek.com/v1", Protocol::OpenaiResponses);
+        // 用一个**静态表里不支持**的组合触发回退：Anthropic 主机 + completions
+        let choice = resolve("https://api.anthropic.com", Protocol::OpenaiCompletions);
+        assert!(choice.fallback(), "{choice:?}");
         let event: serde_json::Value =
             serde_json::from_str(&fallback_event_json(&choice, "原因")).unwrap();
         assert_eq!(event["type"], "protocol_fallback");
-        assert_eq!(event["requested_protocol"], "openai_responses");
-        assert_eq!(event["effective_protocol"], "openai_completions");
-        assert_eq!(event["provider"], "api.deepseek.com");
+        assert_eq!(event["requested_protocol"], "openai_completions");
+        assert_eq!(event["effective_protocol"], "anthropic_messages");
+        assert_eq!(event["provider"], "api.anthropic.com");
         assert_eq!(event["reason"], "原因");
     }
 }

@@ -365,6 +365,8 @@ pub fn run_stream_with_registry(
     let use_tools = !registry.names().is_empty();
     let mut guard = crate::tool_events::PairGuard::new();
 
+    // 最终实际用的协议（运行时回退成功后会变）——写进 done 帧（t118）
+    let mut final_protocol = effective_protocol;
     let outcome: Option<crate::error::CoreResult<StreamSummary>> = if stop_early {
         None
     } else {
@@ -523,6 +525,14 @@ pub fn run_stream_with_registry(
                             if matches!(chunk, Chunk::Meta { .. }) {
                                 return crate::gateway::Flow::Continue;
                             }
+                            // done 帧补 `effective_protocol`（t118：最终实际用的协议）
+                            if let Chunk::Done { finish } = chunk {
+                                return if emit(done_json_with_protocol(finish, protocol)) {
+                                    crate::gateway::Flow::Stop
+                                } else {
+                                    crate::gateway::Flow::Continue
+                                };
+                            }
                             if emit(chunk_json(&chunk)) {
                                 crate::gateway::Flow::Stop
                             } else {
@@ -541,6 +551,14 @@ pub fn run_stream_with_registry(
                             if matches!(chunk, Chunk::Meta { .. }) {
                                 return crate::gateway::Flow::Continue;
                             }
+                            // done 帧补 `effective_protocol`（t118：最终实际用的协议）
+                            if let Chunk::Done { finish } = chunk {
+                                return if emit(done_json_with_protocol(finish, protocol)) {
+                                    crate::gateway::Flow::Stop
+                                } else {
+                                    crate::gateway::Flow::Continue
+                                };
+                            }
                             if emit(chunk_json(&chunk)) {
                                 crate::gateway::Flow::Stop
                             } else {
@@ -556,6 +574,7 @@ pub fn run_stream_with_registry(
                     usage_reported: true,
                 })
             };
+            final_protocol = protocol;
             match summary {
                 Ok(summary) => {
                     result = Ok(summary);
@@ -612,7 +631,7 @@ pub fn run_stream_with_registry(
             {
                 emit(json);
             }
-            emit(done_json());
+            emit(done_json_with_protocol(FinishReason::Stop, final_protocol));
             Ok(())
         }
         Some(Ok(summary)) => {
@@ -633,9 +652,7 @@ pub fn run_stream_with_registry(
                         estimated: summary.usage.estimated,
                     }));
                 }
-                emit(chunk_json(&Chunk::Done {
-                    finish: summary.finish,
-                }));
+                emit(done_json_with_protocol(summary.finish, final_protocol));
             } else if summary.cancelled {
                 // R5-F7：取消后补终帧，否则客户端停在"加载中"
                 emit(done_json());
@@ -696,10 +713,26 @@ fn chunk_json(chunk: &Chunk) -> String {
         .unwrap_or_else(|_| error_chunk_json(ErrorCode::Internal, "序列化失败"))
 }
 
+/// `done` 帧：在契约字段之外补一个 **`effective_protocol`**（t118）。
+///
+/// 语义分工：
+/// - `meta`（首帧）：出发时的 `requested_protocol` / `effective_protocol`（初判）；
+/// - `protocol_fallback`：发生过回退的事实（`retried` / `attempt`）；
+/// - `done`（末帧）：**最终实际成功**的协议——运行时回退成功后就以它为准。
+///
+/// 不改 `crates/shared::Chunk`（共享契约），这里手写 JSON 注入字段，老客户端忽略即可。
+fn done_json_with_protocol(finish: FinishReason, protocol: Protocol) -> String {
+    let base = serde_json::to_value(Chunk::Done { finish }).unwrap_or(serde_json::Value::Null);
+    let mut object = base.as_object().cloned().unwrap_or_default();
+    object.insert(
+        "effective_protocol".to_owned(),
+        serde_json::Value::String(crate::protocol_pick::protocol_name(protocol).to_owned()),
+    );
+    serde_json::Value::Object(object).to_string()
+}
+
 fn done_json() -> String {
-    chunk_json(&Chunk::Done {
-        finish: FinishReason::Stop,
-    })
+    done_json_with_protocol(FinishReason::Stop, Protocol::OpenaiCompletions)
 }
 
 /// `CoreError` → 契约错误码（UI 走同一套文案）。
@@ -1324,9 +1357,10 @@ mod tests {
     /// 回退必须**可观测**：meta 里 requested/effective 都写出来，且发一条 protocol_fallback。
     #[test]
     fn protocol_fallback_is_visible_in_meta_and_as_an_event() {
-        // 用 deepseek 的 host + responses：一定回退到 completions
+        // 静态表里确实不支持的组合：Anthropic 主机 + completions → 回退到 messages
+        // （DeepSeek 三种协议现在都支持，t118 起不再用它触发回退）
         let choice =
-            crate::protocol_pick::resolve_raw("https://api.deepseek.com/v1", "openai_responses");
+            crate::protocol_pick::resolve_raw("https://api.anthropic.com", "openai_completions");
         assert!(choice.fallback(), "{choice:?}");
         let event: serde_json::Value =
             serde_json::from_str(&crate::protocol_pick::fallback_event_json(
@@ -1336,11 +1370,11 @@ mod tests {
             .unwrap();
         println!("[fallback] {event}");
         assert_eq!(event["type"], "protocol_fallback");
-        assert_eq!(event["requested_protocol"], "openai_responses");
-        assert_eq!(event["effective_protocol"], "openai_completions");
+        assert_eq!(event["requested_protocol"], "openai_completions");
+        assert_eq!(event["effective_protocol"], "anthropic_messages");
 
         // 认不出的协议名：按 completions 处理，但**说明原因**（以前是静默的）
-        let typo = crate::protocol_pick::resolve_raw("https://api.deepseek.com/v1", "responses_v2");
+        let typo = crate::protocol_pick::resolve_raw("https://api.deepseek.com", "responses_v2");
         assert_eq!(typo.effective, yunong_shared::Protocol::OpenaiCompletions);
         assert!(typo
             .fallback_reason
@@ -1495,13 +1529,13 @@ mod tests {
     /// 这里 `base_url` 指向 1 号端口（连不上），但 meta 与回退事件在联网**之前**就发出去了，
     /// 所以正好能验证"回退决策 + 可观测性"这段接线。
     #[test]
-    fn deepseek_responses_falls_back_in_a_real_stream() {
+    fn anthropic_host_with_completions_falls_back_in_a_real_stream() {
         let config = config_with_request(serde_json::json!({
             "db_path": "/tmp/app.db",
-            "protocol": "openai_responses",
-            "base_url": "http://api.deepseek.com:1/v1",
+            "protocol": "openai_completions",
+            "base_url": "http://api.anthropic.com:1/v1",
         }));
-        // 收到回退事件就让回调返回 false（模拟客户端叫停），不必真的去连 deepseek
+        // 收到回退事件就让回调返回 false（模拟客户端叫停），不必真的去连 anthropic
         let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = std::sync::Arc::clone(&chunks);
         std::thread::spawn(move || {
@@ -1519,13 +1553,83 @@ mod tests {
         let events = parse_all(&chunks);
         let meta = &events[0];
         assert_eq!(meta["type"], "meta", "{meta}");
-        assert_eq!(meta["requested_protocol"], "openai_responses", "{meta}");
-        assert_eq!(meta["effective_protocol"], "openai_completions", "{meta}");
+        assert_eq!(meta["requested_protocol"], "openai_completions", "{meta}");
+        assert_eq!(meta["effective_protocol"], "anthropic_messages", "{meta}");
         // 第二条必须是回退事件（紧跟 meta，不许静默）
         let fallback = &events[1];
         assert_eq!(fallback["type"], "protocol_fallback", "{fallback}");
-        assert_eq!(fallback["provider"], "api.deepseek.com", "{fallback}");
+        assert_eq!(fallback["provider"], "api.anthropic.com", "{fallback}");
         assert!(fallback["reason"].as_str().unwrap().contains("不支持"));
+    }
+
+    /// t118：deepseek 三种协议都支持——**不再**被静态降级，meta 里 effective 就是 requested。
+    #[test]
+    fn deepseek_keeps_responses_without_static_fallback() {
+        let config = config_with_request(serde_json::json!({
+            "db_path": "/tmp/app.db",
+            "protocol": "openai_responses",
+            "base_url": "http://api.deepseek.com:1/v1",
+        }));
+        // 只取 meta（第一个 chunk），随后让回调叫停，避免真的联网
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&chunks);
+        std::thread::spawn(move || {
+            run_stream_with_registry(config, crate::tools::ToolRegistry::new(), move |json| {
+                sink.lock().unwrap().push(json);
+                false
+            })
+            .unwrap();
+        })
+        .join()
+        .unwrap();
+        let events = parse_all(&chunks.lock().unwrap().clone());
+        let meta = &events[0];
+        assert_eq!(meta["requested_protocol"], "openai_responses", "{meta}");
+        assert_eq!(meta["effective_protocol"], "openai_responses", "{meta}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "protocol_fallback"),
+            "deepseek + responses 不该静态回退：{events:?}"
+        );
+    }
+
+    /// t118：`done` 帧带 `effective_protocol`——**最终实际成功**的协议（权威值）。
+    #[test]
+    fn done_frame_carries_the_final_effective_protocol() {
+        // 正常路径：等于 meta 里的值
+        let server = ScriptedServer::start(vec![final_round("你好")]);
+        let config = byok_config(&server.base_url(), None);
+        let events = parse_all(&run_collect(config, crate::tools::ToolRegistry::new()));
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "done")
+            .expect("必须有 done");
+        println!("[done] {done}");
+        assert_eq!(done["effective_protocol"], "openai_completions", "{done}");
+
+        // 运行时回退后再成功：done 必须反映**回退后**的协议（不是 meta 里的初判）
+        let server = ScriptedServer::start_with_status(vec![
+            (
+                404,
+                "{\"error\":{\"message\":\"no such endpoint\"}}".to_owned(),
+            ),
+            (200, responses_body("下午没课")),
+        ]);
+        let config = config_with_protocol(&server.base_url(), "openai_completions");
+        let events = parse_all(&run_collect(config, crate::tools::ToolRegistry::new()));
+        let meta = &events[0];
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "done")
+            .expect("必须有 done");
+        println!("[meta] {meta}");
+        println!("[done] {done}");
+        assert_eq!(meta["effective_protocol"], "openai_completions", "{meta}");
+        assert_eq!(
+            done["effective_protocol"], "openai_responses",
+            "done 必须是最终成功的协议：{done}"
+        );
     }
 
     /// meta 帧在真实流里带上 requested/effective 两个字段。
