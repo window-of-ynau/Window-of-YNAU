@@ -9,6 +9,7 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import 'campus_entries.dart';
 import 'session_probe.dart';
+import 'session_cookie_diagnostics.dart';
 
 /// 读取校务域当前会话 Cookie（可能为空：还没登录过）。
 Future<List<ProbeCookie>> loadCampusCookies() async {
@@ -34,12 +35,30 @@ Future<List<ProbeCookie>> loadCampusCookies() async {
   return cookies;
 }
 
+/// 【临时诊断 t137】按**精确 URL** 取 Cookie 元信息（只有名字/域，**没有值**）。
+Future<List<CookieRef>> loadCampusCookieRefs(Uri url) async {
+  final List<Cookie> found = await CookieManager.instance().getCookies(url: WebUri(url.toString()));
+  return found
+      .map((Cookie cookie) => CookieRef(name: '${cookie.name}', domain: '${cookie.domain ?? ''}'))
+      .toList(growable: false);
+}
+
 class SessionProbeDialog extends StatefulWidget {
-  const SessionProbeDialog({super.key, this.cookieLoader, this.client});
+  const SessionProbeDialog({
+    super.key,
+    this.cookieLoader,
+    this.client,
+    this.cookieRefSource,
+    this.jsProbe,
+  });
 
   /// 测试注入；默认走真实 CookieManager。
   final Future<List<ProbeCookie>> Function()? cookieLoader;
   final ProbeClient? client;
+
+  /// t137：三步诊断的注入点（默认走 CookieManager + WebView JS 桥）。
+  final CookieRefSource? cookieRefSource;
+  final JsCookieLengthProbe? jsProbe;
 
   @override
   State<SessionProbeDialog> createState() => _SessionProbeDialogState();
@@ -49,6 +68,7 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
   final TextEditingController _url = TextEditingController(text: kProbeDefaultUrl);
   final TextEditingController _ua = TextEditingController(text: kProbeDefaultUserAgent);
   SessionProbeResult? _result;
+  CookieDiagnostics? _diagnostics;
   List<ProbeCookie> _cookies = const <ProbeCookie>[];
   bool _busy = false;
   String? _notice;
@@ -83,6 +103,23 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
         setState(() => _busy = false);
       }
     }
+  }
+
+  /// t137：三步诊断（精确 URL / JS 对照 / 跨域扫描）。
+  Future<void> _runDiagnostics() async {
+    setState(() => _busy = true);
+    final CookieDiagnostics diagnostics = await diagnoseCookies(
+      target: Uri.parse(_url.text),
+      source: widget.cookieRefSource ?? loadCampusCookieRefs,
+      jsProbe: widget.jsProbe ?? SessionProbeJsBridge.documentCookieLength,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _diagnostics = diagnostics;
+      _busy = false;
+    });
   }
 
   Future<void> _run() async {
@@ -134,6 +171,44 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
                 decoration: const InputDecoration(labelText: 'User-Agent（换一个再试，可判断有无 UA 校验）'),
               ),
               const SizedBox(height: 8),
+              // t137：三步诊断（精确 URL / JS 对照 / 跨域扫描）
+              Wrap(
+                spacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: <Widget>[
+                  OutlinedButton.icon(
+                    key: const Key('probe-diagnose'),
+                    onPressed: _busy ? null : _runDiagnostics,
+                    icon: const Icon(Icons.bug_report_outlined, size: 18),
+                    label: const Text('运行三步诊断'),
+                  ),
+                  if (_diagnostics != null)
+                    Text(
+                      'JS document.cookie 长度：${_diagnostics!.jsCookieLength ?? '拿不到'}',
+                      style: theme.textTheme.bodySmall,
+                    ),
+                ],
+              ),
+              if (_diagnostics != null) ...<Widget>[
+                const SizedBox(height: 6),
+                Text(_diagnostics!.diagnosis, style: theme.textTheme.titleSmall),
+                const SizedBox(height: 4),
+                Text(
+                  '精确 URL（${_diagnostics!.targetUrl}）可见 Cookie：${_diagnostics!.exact.length} 条'
+                  '${_diagnostics!.exactError == null ? '' : '（查询失败：${_diagnostics!.exactError}）'}',
+                  style: theme.textTheme.bodySmall,
+                ),
+                if (_diagnostics!.exact.isNotEmpty)
+                  Text(describeCookieRefs(_diagnostics!.exact), style: theme.textTheme.bodySmall),
+                const SizedBox(height: 4),
+                for (final DomainScan scan in _diagnostics!.scans)
+                  Text(
+                    '${scan.domain}：${scan.count} 条'
+                    '${scan.cookies.isEmpty ? '' : '（${scan.cookies.map((CookieRef c) => c.name).join(', ')}）'}',
+                    style: theme.textTheme.bodySmall,
+                  ),
+                const Divider(),
+              ],
               if (_notice != null) Text(_notice!, style: theme.textTheme.bodySmall),
               Wrap(
                 spacing: 8,
