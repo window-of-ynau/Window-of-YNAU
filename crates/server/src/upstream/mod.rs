@@ -326,10 +326,15 @@ impl UpstreamClient {
     }
 
     /// 发请求并等到响应头。之后用 [`UpstreamStream::next_chunks`] 逐条取事件。
+    ///
+    /// `tool_choice` 是**本次请求**的工具选择策略（t129）：服务端只把它按协议映射后
+    /// 塞进上游请求体（映射只有一份，在 `yunong_core::tool_choice`），
+    /// 不做工具白名单、不改写参数、也不在这里跑工具循环——工具的定义与执行都在端侧。
     pub async fn open(
         &self,
         protocol: Protocol,
         request: &ChatRequest,
+        tool_choice: yunong_core::tool_choice::ToolChoice,
     ) -> Result<UpstreamStream, UpstreamError> {
         let Some(provider) = self.providers.provider(protocol) else {
             return Err(UpstreamError::unavailable(format!(
@@ -348,7 +353,17 @@ impl UpstreamClient {
         // `build_body` 以入参为准，所以这里传一份改过的副本，而不是依赖端侧声明。
         let mut streaming = request.clone();
         streaming.stream = true;
-        let body = yunong_core::protocols::build_body(protocol, &streaming);
+        // `build_body_with` 而不是 `build_body`：后者用默认 `BuildOptions`（`tool_choice: None`），
+        // 客户端的「强制/禁止调用工具」会在这一层被静默丢掉。
+        //
+        // `tools` 不需要单独处理：`ChatRequest.tools` 已经由 core 的三个 builder 按协议编码进
+        // `tools` 字段（`encode_tools`），服务端保持**原样转发**、不做任何增删。
+        let options = yunong_core::protocols::BuildOptions {
+            // 与 `build_body` 的默认一致：让上游在流里回报 usage（记账口径要用真实值）
+            report_usage: true,
+            tool_choice: Some(tool_choice),
+        };
+        let body = yunong_core::protocols::build_body_with(protocol, &streaming, &options);
         // 自己序列化而不是 reqwest 的 `.json()`：那条路径要开 `json` feature，
         // 这里只需要把 `serde_json::Value` 写进 body，没必要多开一个 feature。
         let body = serde_json::to_vec(&body)
@@ -641,7 +656,11 @@ mod tests {
 
         let client = client_for(addr, test_timeouts(Duration::from_secs(5)));
         let mut stream = client
-            .open(Protocol::OpenaiCompletions, &request())
+            .open(
+                Protocol::OpenaiCompletions,
+                &request(),
+                yunong_core::tool_choice::ToolChoice::Auto,
+            )
             .await
             .expect("开流应成功");
 
@@ -680,7 +699,11 @@ mod tests {
             },
         );
         let mut stream = client
-            .open(Protocol::OpenaiCompletions, &request())
+            .open(
+                Protocol::OpenaiCompletions,
+                &request(),
+                yunong_core::tool_choice::ToolChoice::Auto,
+            )
             .await
             .expect("响应头已到，开流应成功");
 
@@ -730,7 +753,11 @@ mod tests {
 
         let client = client_for(addr, test_timeouts(Duration::from_secs(5)));
         let mut stream = client
-            .open(Protocol::OpenaiCompletions, &request())
+            .open(
+                Protocol::OpenaiCompletions,
+                &request(),
+                yunong_core::tool_choice::ToolChoice::Auto,
+            )
             .await
             .expect("开流应成功");
         let first = stream
@@ -766,7 +793,11 @@ mod tests {
             test_timeouts(Duration::from_secs(1)),
         );
         let error = client
-            .open(Protocol::OpenaiCompletions, &request())
+            .open(
+                Protocol::OpenaiCompletions,
+                &request(),
+                yunong_core::tool_choice::ToolChoice::Auto,
+            )
             .await
             .expect_err("连不上应报错");
         // https 是受支持的：失败原因必须是传输层，而不是「scheme 不支持」
