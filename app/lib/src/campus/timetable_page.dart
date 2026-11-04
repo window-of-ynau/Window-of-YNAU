@@ -78,6 +78,45 @@ class _TimetablePageState extends State<TimetablePage> {
     // 只对"人工验证过的学期"给建议值；其它学期留空，等用户确认。
     _termStartDraft = suggestedTermStart(_currentTerm);
     unawaited(_loadTermStart());
+    // t111：页面被重建（切栏目再切回）时必须从 SQLite 回填已有课表，
+    // 否则用户会以为“抓到的课表丢了”，被迫重抓一次。
+    unawaited(_loadCoursesFromDb());
+  }
+
+  /// 从本地 SQLite 读取当前学期的课表（t111）。
+  ///
+  /// 读库失败时**不把失败伪装成“没课”**：保留已有内存数据，并给出可读提示。
+  Future<void> _loadCoursesFromDb() async {
+    final String term = _currentTerm;
+    if (term.isEmpty) {
+      return;
+    }
+    try {
+      final List<StoredCourse> courses = await widget.service.listCourses(term: term);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _courses = courses;
+        _failure = null;
+      });
+    } on TimetableException catch (failure) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _warnings = <String>[..._warnings, '读取本地课表失败：${failure.userHint}'];
+      });
+    } on Object catch (failure) {
+      // 端侧核心不可用（无 DLL / 平台不支持）时页面必须仍可用：只记提示，不崩。
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _warnings = <String>[..._warnings, '端侧核心不可用，暂时无法读取本地课表'];
+      });
+      debugPrint('[timetable] 读取本地课表失败：$failure');
+    }
   }
 
   @override
@@ -418,7 +457,7 @@ class _TimetablePageState extends State<TimetablePage> {
               color: theme.colorScheme.onSurfaceVariant,
             ),
             const SizedBox(height: 12),
-            Text('还没有导入课表', style: theme.textTheme.titleMedium),
+            Text('还没有课表', style: theme.textTheme.titleMedium),
             const SizedBox(height: 8),
             Text(
               '在校务系统登录一次，或在调试环境导入一份课表 HTML。\n'
@@ -426,6 +465,13 @@ class _TimetablePageState extends State<TimetablePage> {
               textAlign: TextAlign.center,
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 16),
+            // t111：明确空态——“没数据”而不是“数据丢了”，并给出下一步操作
+            FilledButton.icon(
+              onPressed: _busy ? null : () => unawaited(_fetchFromCampus()),
+              icon: const Icon(Icons.login, size: 18),
+              label: const Text('登录抓取'),
             ),
           ],
         ),
