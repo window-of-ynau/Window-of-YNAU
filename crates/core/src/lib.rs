@@ -32,6 +32,7 @@ pub mod search;
 pub mod secret;
 pub mod store;
 pub mod titlebar;
+pub mod tool_choice;
 pub mod tool_events;
 pub mod tool_loop;
 pub mod tools;

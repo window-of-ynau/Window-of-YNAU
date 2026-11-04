@@ -17,9 +17,12 @@
 //! - 参数分片无状态（缺口 C7）：完整 JSON 才解析；不完整片段原样给调用方拼接。
 
 use serde_json::{json, Map, Value};
-use yunong_shared::{ChatMessage, ChatRequest, Chunk, Role, ToolCallRef, ToolSpec};
+use yunong_shared::{ChatMessage, ChatRequest, Chunk, Protocol, Role, ToolCallRef, ToolSpec};
 
-use super::{call_index, finish_reason, openai_usage, partial_json, system_prompt, BuildOptions};
+use super::{
+    apply_tool_choice, call_index, finish_reason, openai_usage, partial_json, system_prompt,
+    BuildOptions,
+};
 
 /// 构造请求体（默认开关，测试与普通调用方用）。
 pub(super) fn build(request: &ChatRequest) -> Value {
@@ -54,6 +57,8 @@ pub(super) fn build_with(request: &ChatRequest, options: &BuildOptions) -> Value
     if !request.tools.is_empty() {
         body.insert("tools".into(), encode_tools(&request.tools));
     }
+    // 本次请求的「强制/禁止调用工具」策略（三协议形状不同，见 crate::tool_choice）
+    apply_tool_choice(&mut body, Protocol::OpenaiCompletions, options);
     Value::Object(body)
 }
 
