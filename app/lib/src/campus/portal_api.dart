@@ -14,6 +14,103 @@
 
 import 'dart:convert';
 
+/// 【t142】cardId 自动探测脚本（**纯本地读取，不发任何网络请求**）。
+///
+/// 为什么需要它：owner 的课表页是 React SPA，`cardId` 既不在 `[data-cardid]` 上，
+/// 也不一定在 `__INITIAL_STATE__` 里；而 WebView 里又没法开 F12 手动复制。
+///
+/// 扫描顺序（命中的来源会一起返回，便于判断可信度）：
+///  1. `window` 自有属性（字符串，32 位 hex；以及一层浅对象的字符串值）；
+///  2. 我们自己的 XHR 记录（`window.__yunongXhrLog`：url + 响应体片段）；
+///  3. 当前文档 `documentElement.outerHTML`；
+///  4. `localStorage` / `sessionStorage` 的所有键值。
+///
+/// 返回：`JSON.stringify([{v: "<完整值>", s: "<来源>"}, …])`（最多 12 条，已去重）。
+/// 【t142】cardId 自动探测脚本（**纯本地读取，不发任何网络请求**）。
+///
+/// 为什么需要：owner 的课表页是 React SPA，cardId 既不在 `[data-cardid]` 上，
+/// 也不一定在 `__INITIAL_STATE__` 里，WebView 里又开不了 F12。
+///
+/// 扫描顺序（每个候选都带来源，便于判断可信度）：
+///  1. `window` 自有属性（字符串，32 位 hex；再浅扫一层对象的字符串值）；
+///  2. 我们自己的 XHR 记录（`window.__yunongXhrLog`：url + 响应片段）；
+///  3. 当前文档 `documentElement.outerHTML`；
+///  4. `localStorage` / `sessionStorage` 的所有键值。
+///
+/// 安装为 `window.__yunongProbeCardIdsRaw`，返回 `JSON.stringify([{v,s}, …])`（最多 12 条，去重）。
+const String kCardIdProbeInstallScript = r'''
+(function () {
+  if (window.__yunongProbeCardIdsRaw) { return; }
+  window.__yunongProbeCardIdsRaw = function () {
+    try {
+      var HEX = /^[0-9a-fA-F]{32}$/;
+      var HEX_ANY = /[0-9a-fA-F]{32}/g;
+      var out = [];
+      var seen = {};
+      function push(v, s) {
+        if (!v || !HEX.test(v) || seen[v]) { return; }
+        seen[v] = 1;
+        out.push({ v: v, s: s });
+      }
+      function scanText(text, tag) {
+        if (!text || typeof text !== 'string') { return; }
+        var m = text.match(HEX_ANY);
+        if (!m) { return; }
+        for (var i = 0; i < m.length && i < 6; i++) { push(m[i], tag); }
+      }
+      try {
+        var keys = Object.keys(window);
+        for (var k = 0; k < keys.length; k++) {
+          var name = keys[k];
+          var val;
+          try { val = window[name]; } catch (e) { continue; }
+          if (typeof val === 'string') { push(val, 'window.' + name); continue; }
+          if (!val || typeof val !== 'object') { continue; }
+          try {
+            var subKeys = Object.keys(val).slice(0, 40);
+            for (var s = 0; s < subKeys.length; s++) {
+              var sv = val[subKeys[s]];
+              if (typeof sv === 'string') { push(sv, 'window.' + name + '.' + subKeys[s]); }
+            }
+          } catch (e2) {}
+        }
+      } catch (e) {}
+      try {
+        var log = window.__yunongXhrLog || [];
+        for (var i2 = 0; i2 < log.length; i2++) {
+          scanText(log[i2].url, 'xhr:' + String(log[i2].url || '').slice(0, 60));
+          scanText(log[i2].body, 'xhrbody:' + String(log[i2].url || '').slice(0, 40));
+        }
+      } catch (e3) {}
+      try {
+        scanText(document.documentElement.outerHTML || '', 'html');
+      } catch (e4) {}
+      try {
+        var stores = [['localStorage', window.localStorage], ['sessionStorage', window.sessionStorage]];
+        for (var a = 0; a < stores.length; a++) {
+          var label = stores[a][0];
+          var store = stores[a][1];
+          if (!store) { continue; }
+          for (var b = 0; b < store.length; b++) {
+            var key = store.key(b);
+            var raw = '';
+            try { raw = store.getItem(key) || ''; } catch (e5) {}
+            push(raw, label + '.' + key);
+            scanText(raw, label + '.' + key);
+          }
+        }
+      } catch (e6) {}
+      return JSON.stringify(out.slice(0, 12));
+    } catch (e) {
+      return '[]';
+    }
+  };
+})();
+''';
+
+/// 供 Dart 侧 `evaluateJavascript` 调用：返回上一步安装好的探测结果（未安装则 `[]`）。
+const String kCardIdProbeScript =
+    '(window.__yunongProbeCardIdsRaw ? window.__yunongProbeCardIdsRaw() : "[]")';
 /// 接口路径（用于脚本匹配；改版时只改这里）。
 const String kScheduleApiPath = '/api/uppcard/kbsz/queryAWeekSchedule';
 
@@ -488,7 +585,10 @@ class ScheduleTemplate {
         cardIdSource: message['card_id_source'] as String?,
       );
 
-  bool get isValid => cardId.isNotEmpty && years.isNotEmpty;
+  // t142：只要拿到 cardId 就算有效 —— 学期可由 Dart 侧（用户所选学期/校历）补上。
+  // 旧实现要求"cardId 与 years 同时有"，SPA 还没渲染学期下拉时整条模板会被丢弃，
+  // 诊断因此一直显示「cardId 无」。
+  bool get isValid => cardId.isNotEmpty;
 }
 
 /// 批量取数的结果（原样交给 Rust 合并）。
@@ -670,6 +770,13 @@ const String kPortalScheduleScript = r'''
 
   function capture(rawUrl) {
     DIAG.xhrSeen += 1;
+    // t142：把见过的请求 URL 记到有限长度的环形日志里，
+    // 供「自动探测 cardId」在**不发新请求**的前提下从历史请求里找 32 位 hex。
+    try {
+      window.__yunongXhrLog = window.__yunongXhrLog || [];
+      window.__yunongXhrLog.push({ url: String(rawUrl || ''), body: '' });
+      if (window.__yunongXhrLog.length > 20) { window.__yunongXhrLog.shift(); }
+    } catch (e0) {}
     var url = parseUrl(rawUrl);
     if (!url || url.pathname.indexOf(API) < 0) { return; }
     var cardId = url.searchParams.get('cardId') || '';
@@ -819,6 +926,18 @@ const String kPortalScheduleScript = r'''
   }
 
   function cardIdFromPage() {
+    // t142：先用**通用扫描**（window 自有属性 / XHR 历史 / HTML / storage），
+    // 这一步覆盖了"React SPA 把 cardId 放在闭包或 storage 里"的情况 —— 旧实现只看
+    // `[data-cardid]` 和 `__INITIAL_STATE__`，所以 owner 那边一直显示「cardId 无」。
+    var hints = [];
+    try { hints = JSON.parse(window.__yunongProbeCardIdsRaw ? window.__yunongProbeCardIdsRaw() : '[]'); } catch (e0) {}
+    if (hints && hints.length) {
+      for (var h = 0; h < hints.length; h++) {
+        if (hints[h] && hints[h].v) {
+          return { cardId: hints[h].v, source: String(hints[h].s || 'scan') };
+        }
+      }
+    }
     try {
       var el = document.querySelector('[data-cardid]');
       if (el) {
@@ -864,19 +983,22 @@ const String kPortalScheduleScript = r'''
     if (TEMPLATE) { return true; }
     var found = cardIdFromPage();
     if (!found) { return false; }
+    // t142：学期可能还没渲染出来（SPA 先出卡片再出学期下拉）。
+    // 不再因为 years 为空就放弃整条模板 —— 先把 cardId 交给 Dart，学期由用户所选学期补。
     var years = termFromDom();
-    if (!years) { return false; }
-    TEMPLATE = { cardId: found.cardId, years: years, weekcount: 20, weekcountFromApi: false };
+    TEMPLATE = { cardId: found.cardId, years: years || '', weekcount: 20, weekcountFromApi: false };
     DIAG.cardIdPrefix = found.cardId.slice(0, 8);
     DIAG.cardIdSource = found.source;
     post({
       type: 'schedule_template',
       card_id: found.cardId,
-      years: years,
+      years: years || '',
       weekcount: 20,
       card_id_source: found.source
     });
-    setTimeout(function () { window.__yunongFetchSchedule(); }, 300);
+    if (years) {
+      setTimeout(function () { window.__yunongFetchSchedule(); }, 300);
+    }
     return true;
   }
 

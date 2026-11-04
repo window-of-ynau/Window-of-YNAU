@@ -7,6 +7,7 @@
 //
 /// 安全：只暴露 Cookie 的**名字与域**（数量/名称），**值一律不采集、不展示、不外传**。
 
+import 'card_id_hints.dart';
 import 'session_probe.dart';
 
 /// 一条 Cookie 的可见元信息（**没有值**）。
@@ -129,6 +130,11 @@ class SessionProbeJsBridge {
   /// `withCredentials == false` 表示匿名对照（页面侧用 `credentials: 'omit'`）。
   static Future<InPageFetchSummary?> Function(String url, {required bool withCredentials})?
       inPageFetch;
+
+  /// 【t142】在页面内**纯本地**探测 cardId 候选（不发网络请求）。
+  ///
+  /// 由 `webview_fetcher.dart` 用 `kCardIdProbeScript` 注入；返回候选（值 + 来源）。
+  static Future<List<CardIdHint>> Function()? probeCardIds;
 }
 
 /// 【临时诊断 t138】CAS service ticket 探针（方案 E）。
