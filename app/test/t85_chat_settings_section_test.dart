@@ -5,20 +5,9 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:yunong/src/chat/chat_page.dart';
 import 'package:yunong/src/chat/chat_settings_section.dart';
-import 'package:yunong/src/core/chat_service.dart';
 import 'package:yunong/src/core/secret_service.dart';
-import 'package:yunong/src/settings/settings_page.dart';
-import 'package:yunong/src/theme/theme_controller.dart';
-
-class _NoopChatBackend implements ChatBackend {
-  @override
-  int start(String requestJson, bool Function(String chunkJson) onChunk) => 1;
-
-  @override
-  void cancel(int handle) {}
-}
+import 'package:yunong/src/settings/settings_page.dart' show openChatSettingsDialog;
 
 class _Secrets implements SecretBackend {
   @override
@@ -37,31 +26,22 @@ class _Secrets implements SecretBackend {
 }
 
 Future<void> _openSettings(WidgetTester tester) async {
-  // t89：对话页已无设置入口——走真实路径：设置页 →「对话设置」
+  // t130：设置页已删掉「对话设置」入口 —— 直接打开同一个对话框，
+  // 这样验证的是**面板本身**（字段齐全、保存后关闭），不依赖入口位置。
   final secrets = SecretService(backend: _Secrets(), dbPath: '/tmp/t85.db');
   final shared = ChatSettingsController();
   await tester.pumpWidget(MaterialApp(
     home: Scaffold(
-      body: ChatPage(
-        service: ChatService(backend: _NoopChatBackend()),
-        secretService: secrets,
-        chatSettings: shared,
-        dbPath: '/tmp/t85.db',
+      body: Builder(
+        builder: (BuildContext context) => TextButton(
+          onPressed: () => openChatSettingsDialog(context, shared, secrets: secrets),
+          child: const Text('open-settings'),
+        ),
       ),
     ),
   ));
   await tester.pumpAndSettle();
-
-  final NavigatorState navigator = tester.state<NavigatorState>(find.byType(Navigator));
-  unawaited(navigator.push(MaterialPageRoute<void>(
-    builder: (BuildContext context) => SettingsPage(
-      controller: ThemeController(store: MemorySettingsStore()),
-      chatSettings: shared,
-      secretService: secrets,
-    ),
-  )));
-  await tester.pumpAndSettle();
-  await tester.tap(find.text('对话设置').first);
+  await tester.tap(find.text('open-settings'));
   await tester.pumpAndSettle();
 }
 

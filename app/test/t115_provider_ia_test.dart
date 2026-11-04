@@ -87,8 +87,9 @@ void main() {
       ));
       await tester.pumpAndSettle();
 
-      expect(find.text('供应商'), findsOneWidget);
-      expect(find.text('套餐账号'), findsOneWidget);
+      expect(find.text('供应商'), findsWidgets);
+      // t130：套餐账号状态不再出现在设置页（只在对话页的模型选择器里）
+      expect(find.text('套餐账号'), findsNothing);
       // Key 行已从「模型与凭据」里移除（Key 只在供应商卡里）
       expect(find.text('BYOK 密钥'), findsNothing);
       // 协议只读：不可选

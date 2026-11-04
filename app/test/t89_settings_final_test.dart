@@ -3,6 +3,8 @@
 // 2) 设置页有「对话设置」卡片且能打开；
 // 3) 外部保存 Key 后，对话页通过共享源监听刷新状态（用 Tooltip.message 稳定断言）。
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/src/chat/chat_page.dart';
@@ -76,7 +78,7 @@ void main() {
     expect(find.text('登录套餐账号'), findsNothing);
   });
 
-  testWidgets('设置页有「对话设置」卡片，能打开同一个面板', (WidgetTester tester) async {
+  testWidgets('设置页不再有「对话设置」卡片；面板本身仍可打开（t130）', (WidgetTester tester) async {
     final chat = ChatSettingsController();
     await tester.pumpWidget(MaterialApp(
       home: SettingsPage(
@@ -87,8 +89,12 @@ void main() {
     ));
     await tester.pumpAndSettle();
 
-    expect(find.text('对话设置'), findsOneWidget);
-    await tester.tap(find.text('对话设置'));
+    // t130：设置页 IA 合并到「供应商」，旧入口不再出现
+    expect(find.text('对话设置'), findsNothing);
+
+    // 面板本身仍可打开（直接调用 opener，不依赖设置页入口）
+    final BuildContext context = tester.element(find.byType(SettingsPage));
+    unawaited(openChatSettingsDialog(context, chat));
     await tester.pumpAndSettle();
     expect(find.widgetWithText(AlertDialog, '对话设置'), findsOneWidget);
     expect(find.widgetWithText(TextField, 'BYOK API Key'), findsOneWidget);

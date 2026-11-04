@@ -1,5 +1,7 @@
 // t88：账号 / Key 能力下沉到 ChatSettingsSection 的验证（入口保持原样）。
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/src/chat/chat_settings_section.dart';
@@ -72,7 +74,7 @@ void main() {
     );
   });
 
-  testWidgets('设置页 →「对话设置」里账号能力可用：能打开套餐登录对话框', (WidgetTester tester) async {
+  testWidgets('设置页不再有「对话设置」入口；面板本身账号能力仍可用（t130）', (WidgetTester tester) async {
     final theme = ThemeController(store: MemorySettingsStore());
     final chat = ChatSettingsController();
     final auth = AuthService(api: _FakeAuthApi(), vault: MemoryTokenVault());
@@ -82,7 +84,12 @@ void main() {
     ));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('对话设置'));
+    // t130：设置页已删掉「对话设置」入口（IA 合并到供应商）
+    expect(find.text('对话设置'), findsNothing);
+
+    // 面板能力本身仍在：直接打开同一个对话框验证（不依赖入口位置）
+    final BuildContext context = tester.element(find.byType(SettingsPage));
+    unawaited(openChatSettingsDialog(context, chat, auth: auth));
     await tester.pumpAndSettle();
 
     // 账号行存在且可点「登录」（能力已下沉：不依赖对话页）
