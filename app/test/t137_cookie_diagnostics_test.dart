@@ -112,10 +112,14 @@ void main() {
     ));
     await tester.pumpAndSettle();
 
+    // t138：弹窗里新增了「请求头对照 / CAS」两段，诊断按钮可能被推到可视区外
+    await tester.ensureVisible(find.byKey(const Key('probe-diagnose')));
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('probe-diagnose')));
     await tester.pumpAndSettle();
-    expect(find.textContaining('HttpOnly'), findsOneWidget);
-    expect(find.textContaining('document.cookie 长度'), findsOneWidget);
+    // 结论区（顶部）+ 明细区都会出现「HttpOnly」，所以用 findsWidgets
+    expect(find.textContaining('HttpOnly'), findsWidgets);
+    expect(find.textContaining('document.cookie 长度'), findsWidgets);
     expect(find.textContaining('jwxt.ynau.edu.cn：0 条'), findsWidgets);
   });
 }
