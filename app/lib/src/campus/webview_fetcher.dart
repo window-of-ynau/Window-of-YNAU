@@ -23,6 +23,7 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import '../core/timetable_service.dart';
 import 'campus_bridge.dart';
 import 'portal_api.dart';
+import 'session_cookie_diagnostics.dart'; // 【临时诊断 t137】验证后删除
 import 'webview_session.dart';
 
 /// 取数模式：旧的 DOM 抓取 / W6 的门户接口。
@@ -539,6 +540,14 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                     ]),
                     onWebViewCreated: (InAppWebViewController controller) {
                       _controller = controller;
+                      // 【临时诊断 t137】把 `document.cookie.length` 挂到当前 WebView，
+                      // 用于判断「CookieManager 取不到、但 JS 能读到」= HttpOnly。验证后删除。
+                      SessionProbeJsBridge.documentCookieLength = () async {
+                        final Object? raw = await controller.evaluateJavascript(
+                          source: 'document.cookie.length',
+                        );
+                        return parseJsCookieLength('${raw ?? ''}');
+                      };
                       controller.addJavaScriptHandler(
                         handlerName: 'yunongBridge',
                         callback: (List<dynamic> args) {
