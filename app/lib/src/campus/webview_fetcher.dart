@@ -548,6 +548,10 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                         );
                         return parseJsCookieLength('${raw ?? ''}');
                       };
+                      // 【临时诊断 t138】CAS ticket 探针：用这个 WebView 导航，并记录重定向链。
+                      CasTicketProbe.navigate = (String target) async {
+                        await controller.loadUrl(urlRequest: URLRequest(url: WebUri(target)));
+                      };
                       controller.addJavaScriptHandler(
                         handlerName: 'yunongBridge',
                         callback: (List<dynamic> args) {
@@ -555,6 +559,10 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                           return null;
                         },
                       );
+                    },
+                    // 【临时诊断 t138】记录导航链（CAS ticket 探针）：只在 recording 时写入。
+                    onLoadStart: (_, WebUri? url) async {
+                      CasTicketProbe.record(url?.toString());
                     },
                     onLoadStop: (_, WebUri? url) async {
                       if (mounted) {

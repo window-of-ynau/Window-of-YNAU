@@ -242,6 +242,136 @@ ProbeRun _errorRun(int elapsedMs, String error) => ProbeRun(
       error: error,
     );
 
+/// 请求头档位（t138：412 很可能是反爬/WAF，先看"纯粹差请求头"是否成立）。
+enum ProbeHeaderMode {
+  /// 裸请求：只带 UA 与 Accept。
+  bare('裸请求'),
+
+  /// 浏览器化请求头（UA 用 WebView 的桌面 UA）。
+  browser('加浏览器头'),
+
+  /// 浏览器化请求头 + 与 WebView 同 UA（本档的 UA 与 browser 档一致，便于单独对比）。
+  browserWithUa('加浏览器头 + 同 UA');
+
+  const ProbeHeaderMode(this.label);
+
+  final String label;
+}
+
+/// 浏览器化请求头（t138）。
+Map<String, String> browserLikeHeaders({
+  required String userAgent,
+  required Uri target,
+  required ProbeHeaderMode mode,
+}) {
+  if (mode == ProbeHeaderMode.bare) {
+    return <String, String>{
+      'User-Agent': userAgent,
+      'Accept': 'text/html,application/json,*/*;q=0.8',
+    };
+  }
+  final String origin = '${target.scheme}://${target.host}';
+  return <String, String>{
+    'User-Agent': userAgent,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,'
+        'image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Referer': '$origin/',
+    'Origin': origin,
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Ch-Ua': '"Chromium";v="120", "Microsoft Edge";v="120", "Not-A.Brand";v="99"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Connection': 'keep-alive',
+  };
+}
+
+/// 一组"请求头档位"的观测结果。
+class HeaderTrial {
+  const HeaderTrial({required this.mode, required this.run});
+
+  final ProbeHeaderMode mode;
+  final ProbeRun run;
+
+  String get label => mode.label;
+}
+
+/// 三组对照的判读（t138）。
+String headerMatrixVerdict(List<HeaderTrial> trials) {
+  if (trials.isEmpty) {
+    return '尚未运行';
+  }
+  final HeaderTrial bare = trials.first;
+  final HeaderTrial browser = trials.length > 1 ? trials[1] : bare;
+  final HeaderTrial withUa = trials.length > 2 ? trials[2] : browser;
+  final bool bareBlocked = bare.run.statusCode == 412;
+  final bool browserOk = browser.run.ok;
+  final bool browserNeedsAuth = browser.run.statusCode == 401 ||
+      browser.run.statusCode == 403 ||
+      browser.run.statusCode == 302 ||
+      browser.run.statusCode == 301;
+
+  if (browserOk) {
+    return '✅ 只差请求头：裸请求 ${bare.run.statusCode} → 加浏览器头 200，'
+        '说明反爬只校验请求头，云端仍有机会（但需长期维护头集合）';
+  }
+  if (bareBlocked && browserNeedsAuth) {
+    return '⚠️ 反爬过了但仍需登录：裸请求 412 → 加浏览器头 ${browser.run.statusCode}，'
+        '说明还差有效会话（Cookie/令牌）';
+  }
+  if (browser.run.statusCode == 412 && withUa.run.statusCode == 412) {
+    return '❌ 仍是 412：加浏览器头（含同 UA）也被拦截 → 反爬不止校验请求头'
+        '（指纹 / JS 挑战 / TLS 特征），纯 HTTP 方案基本不可行';
+  }
+  return '⚠️ 结果混合：裸 ${bare.run.statusCode} / 加头 ${browser.run.statusCode} / '
+      '加头同UA ${withUa.run.statusCode} —— 请把三行一起判读';
+}
+
+/// 跑三组请求头对照（同一 URL、同一 Cookie）。
+Future<List<HeaderTrial>> runHeaderMatrix({
+  required String url,
+  required String userAgent,
+  required List<ProbeCookie> cookies,
+  ProbeClient? client,
+  Duration timeout = const Duration(seconds: 15),
+}) async {
+  final Uri parsed;
+  try {
+    parsed = Uri.parse(url.trim());
+  } on FormatException {
+    return const <HeaderTrial>[];
+  }
+  final ProbeClient probeClient = client ?? IoProbeClient();
+  final List<HeaderTrial> trials = <HeaderTrial>[];
+  for (final ProbeHeaderMode mode in ProbeHeaderMode.values) {
+    final Map<String, String> headers = browserLikeHeaders(
+      // 裸请求档故意不用浏览器 UA：先看"最坏情况"
+      userAgent: mode == ProbeHeaderMode.bare ? 'Dart/HttpClient' : userAgent,
+      target: parsed,
+      mode: mode,
+    );
+    if (cookies.isNotEmpty) {
+      headers['Cookie'] = cookies.map((ProbeCookie c) => '${c.name}=${c.value}').join('; ');
+    }
+    final Stopwatch watch = Stopwatch()..start();
+    try {
+      final ProbeResponse response =
+          await probeClient.get(url: parsed, headers: headers, timeout: timeout);
+      trials.add(HeaderTrial(mode: mode, run: _toRun(response, watch.elapsedMilliseconds)));
+    } on Object catch (failure) {
+      trials.add(HeaderTrial(
+        mode: mode,
+        run: _errorRun(watch.elapsedMilliseconds, failure.runtimeType.toString()),
+      ));
+    }
+    watch.stop();
+  }
+  return trials;
+}
+
 /// 跑一次探针：**同一 URL 先带 Cookie、再匿名对照**。
 ///
 /// `cookies` 只用于拼 `Cookie` 请求头，**不会**出现在返回结果里；匿名请求不带任何会话信息。

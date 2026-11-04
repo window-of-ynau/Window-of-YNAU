@@ -179,3 +179,117 @@ class SessionProbeJsBridge {
 
   static Future<int?> Function()? documentCookieLength;
 }
+
+/// 【临时诊断 t138】CAS service ticket 探针（方案 E）。
+///
+/// 思路：CAS 登录成功后浏览器会被重定向到 `serviceUrl?ticket=ST-...`。
+/// 只要在**重定向链**里观察到 `ticket=ST-`，就说明"WebView 走 CAS 能换到一次性票据"，
+/// 这条路不依赖 Cookie、也不需要读 HttpOnly。
+///
+/// 安全：只记录 URL；ticket 只展示 `ST-` 后**前 4 位前缀**，其余一律遮蔽。
+class CasTicketProbe {
+  const CasTicketProbe._();
+
+  /// 由 `webview_fetcher.dart` 注入：用现有 WebView 导航到某个 URL。
+  static Future<void> Function(String url)? navigate;
+
+  static bool recording = false;
+  static final List<String> redirects = <String>[];
+
+  static const String defaultCasBase = 'https://cas.ynau.edu.cn';
+  static const String defaultServiceUrl = 'https://example.com/';
+
+  static void start() {
+    redirects.clear();
+    recording = true;
+  }
+
+  static void stop() {
+    recording = false;
+  }
+
+  /// 由 WebView 的 `onLoadStart` 调用（只在 recording 时记录）。
+  static void record(String? url) {
+    if (!recording || url == null || url.isEmpty || redirects.length >= 30) {
+      return;
+    }
+    redirects.add(url);
+  }
+
+  /// 拼 `casBase + /cas/login?service=...`（casBase 已带 `/cas` 时不重复）。
+  static String loginUrl({required String casBase, required String serviceUrl}) {
+    final String base = casBase.trim().replaceAll(RegExp(r'/+$'), '');
+    final String path = base.endsWith('/cas') ? '/login' : '/cas/login';
+    return '$base$path?service=${Uri.encodeComponent(serviceUrl.trim())}';
+  }
+}
+
+/// 展示导航链时每跳截断到 120 字符。
+String shortUrl(String url) => url.length <= 120 ? url : '${url.substring(0, 120)}…';
+
+/// 遮蔽 ticket：只保留 `ST-` 后 4 位。
+String maskTicketInUrl(String url) => url.replaceAllMapped(
+      RegExp(r'ticket=([^&\s]{3,})'),
+      (Match match) {
+        final String value = match.group(1) ?? '';
+        // 形如 `ST-1234567890-...`：保留 `ST-` + 后 4 位，其余遮蔽
+        final String head = value.startsWith('ST-')
+            ? 'ST-${value.substring(3, value.length >= 7 ? 7 : value.length)}'
+            : (value.length > 4 ? value.substring(0, 4) : value);
+        return 'ticket=$head****';
+      },
+    );
+
+/// CAS 探针的判读结果（**不含完整 ticket**）。
+class CasTicketResult {
+  const CasTicketResult({
+    required this.hops,
+    required this.redirects,
+    required this.prefix,
+    required this.finalUrl,
+  });
+
+  final int hops;
+  final List<String> redirects;
+
+  /// `ST-` 后前 4 位（没拿到 = null）。
+  final String? prefix;
+  final String finalUrl;
+
+  bool get ticketFound => prefix != null;
+
+  String get finalHost => finalUrl.isEmpty ? '' : (Uri.tryParse(finalUrl)?.host ?? '');
+
+  String get verdict {
+    if (ticketFound) {
+      return '✅ CAS ticket 可用：重定向链里出现 ST-$prefix****（$hops 跳，终点域 $finalHost）'
+          '→ 可用「端侧换票 + 云端自建校验」路线';
+    }
+    if (hops == 0) {
+      return '⚠️ 没有观察到任何重定向：WebView 未就绪，或 CAS 需要人工登录（先手动登录一次再试）';
+    }
+    return '❌ 未拿到 ticket：$hops 跳后停在 ${finalHost.isEmpty ? '未知' : finalHost}'
+        '（多半停在登录页，需要人工输入）';
+  }
+
+  /// 从导航链提取 ticket 前缀（其余一律遮蔽）。
+  static CasTicketResult summarize(List<String> chain) {
+    String? prefix;
+    for (final String url in chain) {
+      final int index = url.indexOf('ticket=ST-');
+      if (index >= 0) {
+        final String after = url.substring(index + 'ticket=ST-'.length);
+        final String value = after.split('&').first;
+        prefix = value.length > 4 ? value.substring(0, 4) : value;
+        break;
+      }
+    }
+    final List<String> safeChain = chain.map(maskTicketInUrl).toList(growable: false);
+    return CasTicketResult(
+      hops: chain.length,
+      redirects: safeChain,
+      prefix: prefix,
+      finalUrl: chain.isEmpty ? '' : maskTicketInUrl(chain.last),
+    );
+  }
+}

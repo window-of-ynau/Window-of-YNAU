@@ -10,18 +10,29 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'campus_entries.dart';
 import 'session_probe.dart';
 import 'session_cookie_diagnostics.dart';
+import 'webview_session.dart';
 
 /// 读取校务域当前会话 Cookie（可能为空：还没登录过）。
+///
+/// t138 关键修复：**必须传 `webViewEnvironment`**。
+/// 插件 Windows 实现（`flutter_inappwebview_windows-0.6.0/windows/cookie_manager.cpp:26-29`）
+/// 在缺省环境下把 `webViewEnvironment` 解析成 `nullptr`，随后 `getCookies()`（同文件 :211/:224）
+/// 调用 `webViewEnvironment->getWebView()` 失败 → **静默返回空列表**。
+/// 这就是「Cookie 恒为 0」的根因，与 HttpOnly 无关（CDP `Network.getCookies` 本身能返回 HttpOnly Cookie）。
 Future<List<ProbeCookie>> loadCampusCookies() async {
   final List<ProbeCookie> cookies = <ProbeCookie>[];
+  // t138：带上我们自己的 WebViewEnvironment，否则插件静默返回空列表（见下方注释）。
+  final WebViewEnvironment? environment = await WebViewSession.ensureEnvironment();
   // 门户与统一身份认证两个域都取一遍（登录态通常落在其一）。
   for (final String url in <String>[
     CampusEntry.portal.url,
     'https://ssoo.ynau.edu.cn/',
     'https://jwxt.ynau.edu.cn/',
+    'https://one.ynau.edu.cn/',
   ]) {
     try {
-      final List<Cookie> found = await CookieManager.instance().getCookies(url: WebUri(url));
+      final List<Cookie> found = await CookieManager.instance(webViewEnvironment: environment)
+          .getCookies(url: WebUri(url));
       for (final Cookie cookie in found) {
         if (cookies.any((ProbeCookie item) => item.name == '${cookie.name}')) {
           continue;
@@ -37,7 +48,9 @@ Future<List<ProbeCookie>> loadCampusCookies() async {
 
 /// 【临时诊断 t137】按**精确 URL** 取 Cookie 元信息（只有名字/域，**没有值**）。
 Future<List<CookieRef>> loadCampusCookieRefs(Uri url) async {
-  final List<Cookie> found = await CookieManager.instance().getCookies(url: WebUri(url.toString()));
+  final WebViewEnvironment? environment = await WebViewSession.ensureEnvironment();
+  final List<Cookie> found = await CookieManager.instance(webViewEnvironment: environment)
+      .getCookies(url: WebUri(url.toString()));
   return found
       .map((Cookie cookie) => CookieRef(name: '${cookie.name}', domain: '${cookie.domain ?? ''}'))
       .toList(growable: false);
@@ -50,6 +63,7 @@ class SessionProbeDialog extends StatefulWidget {
     this.client,
     this.cookieRefSource,
     this.jsProbe,
+    this.navigate,
   });
 
   /// 测试注入；默认走真实 CookieManager。
@@ -60,6 +74,9 @@ class SessionProbeDialog extends StatefulWidget {
   final CookieRefSource? cookieRefSource;
   final JsCookieLengthProbe? jsProbe;
 
+  /// t138：CAS 探针的导航注入点（默认用课表页的 WebView）。
+  final Future<void> Function(String url)? navigate;
+
   @override
   State<SessionProbeDialog> createState() => _SessionProbeDialogState();
 }
@@ -67,8 +84,13 @@ class SessionProbeDialog extends StatefulWidget {
 class _SessionProbeDialogState extends State<SessionProbeDialog> {
   final TextEditingController _url = TextEditingController(text: kProbeDefaultUrl);
   final TextEditingController _ua = TextEditingController(text: kProbeDefaultUserAgent);
+  final TextEditingController _casBase = TextEditingController(text: CasTicketProbe.defaultCasBase);
+  final TextEditingController _serviceUrl =
+      TextEditingController(text: CasTicketProbe.defaultServiceUrl);
   SessionProbeResult? _result;
   CookieDiagnostics? _diagnostics;
+  List<HeaderTrial> _headers = const <HeaderTrial>[];
+  CasTicketResult? _cas;
   List<ProbeCookie> _cookies = const <ProbeCookie>[];
   bool _busy = false;
   String? _notice;
@@ -83,6 +105,8 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
   void dispose() {
     _url.dispose();
     _ua.dispose();
+    _casBase.dispose();
+    _serviceUrl.dispose();
     super.dispose();
   }
 
@@ -103,6 +127,59 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
         setState(() => _busy = false);
       }
     }
+  }
+
+  /// t138：三组请求头对照（裸 / 加浏览器头 / 加浏览器头+同 UA）。
+  Future<void> _runHeaderMatrix() async {
+    setState(() => _busy = true);
+    final List<HeaderTrial> trials = await runHeaderMatrix(
+      url: _url.text,
+      userAgent: _ua.text,
+      cookies: _cookies,
+      client: widget.client,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _headers = trials;
+      _busy = false;
+    });
+  }
+
+  /// t138：CAS ticket 探针（方案 E）——导航 + 记录重定向链，只看是否有 `ticket=ST-`。
+  Future<void> _runCasProbe() async {
+    setState(() {
+      _busy = true;
+      _cas = null;
+    });
+    final String loginUrl = CasTicketProbe.loginUrl(
+      casBase: _casBase.text,
+      serviceUrl: _serviceUrl.text,
+    );
+    final Future<void> Function(String url)? navigate = widget.navigate ?? CasTicketProbe.navigate;
+    if (navigate == null) {
+      setState(() {
+        _busy = false;
+        _notice = '当前没有可用的 WebView：请先打开「我的课表」再回来试 CAS 探针。';
+      });
+      return;
+    }
+    CasTicketProbe.start();
+    try {
+      await navigate(loginUrl);
+      // 给重定向链一点时间收敛（CAS 通常是 2~4 跳）
+      await Future<void>.delayed(const Duration(seconds: 6));
+    } finally {
+      CasTicketProbe.stop();
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _cas = CasTicketResult.summarize(List<String>.of(CasTicketProbe.redirects));
+      _busy = false;
+    });
   }
 
   /// t137：三步诊断（精确 URL / JS 对照 / 跨域扫描）。
@@ -160,6 +237,40 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
                 style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
               ),
               const SizedBox(height: 8),
+              // t138：把「结论区」顶到最上面（owner 反馈：诊断输出藏在下面看不到）
+              if (_diagnostics != null || _headers.isNotEmpty || _cas != null)
+                Container(
+                  key: const Key('probe-verdict-box'),
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.errorContainer.withValues(alpha: 0.35),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      if (_diagnostics != null) ...<Widget>[
+                        Text('Cookie 诊断：${_diagnostics!.diagnosis}', style: theme.textTheme.titleSmall),
+                        Text(
+                          'CookieManager 精确 URL：${_diagnostics!.exact.length} 条 · '
+                          'JS document.cookie 长度：${_diagnostics!.jsCookieLength ?? '拿不到'}',
+                          style: theme.textTheme.bodySmall,
+                        ),
+                      ],
+                      if (_headers.isNotEmpty) ...<Widget>[
+                        const SizedBox(height: 6),
+                        Text('请求头对照：${headerMatrixVerdict(_headers)}',
+                            style: theme.textTheme.titleSmall),
+                      ],
+                      if (_cas != null) ...<Widget>[
+                        const SizedBox(height: 6),
+                        Text('CAS ticket：${_cas!.verdict}', style: theme.textTheme.titleSmall),
+                      ],
+                    ],
+                  ),
+                ),
               TextField(
                 key: const Key('probe-url'),
                 controller: _url,
@@ -170,6 +281,64 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
                 controller: _ua,
                 decoration: const InputDecoration(labelText: 'User-Agent（换一个再试，可判断有无 UA 校验）'),
               ),
+              const SizedBox(height: 8),
+              // t138：三组请求头对照（裸 / 加浏览器头 / 加浏览器头+同 UA）
+              Wrap(
+                spacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: <Widget>[
+                  OutlinedButton.icon(
+                    key: const Key('probe-headers'),
+                    onPressed: _busy ? null : _runHeaderMatrix,
+                    icon: const Icon(Icons.travel_explore, size: 18),
+                    label: const Text('运行请求头对照（3 组）'),
+                  ),
+                  if (_headers.isNotEmpty)
+                    Text(
+                      _headers
+                          .map((HeaderTrial t) => '${t.label}=${t.run.statusCode}')
+                          .join(' · '),
+                      style: theme.textTheme.bodySmall,
+                    ),
+                ],
+              ),
+              if (_headers.isNotEmpty) ...<Widget>[
+                for (final HeaderTrial trial in _headers)
+                  Text(
+                    '${trial.label}：${trial.run.statusCode} · ${trial.run.bodyLength} 字节 · '
+                    '${trial.run.elapsedMs} ms · 哈希 ${trial.run.bodyHash.isEmpty ? '—' : trial.run.bodyHash}',
+                    style: theme.textTheme.bodySmall,
+                  ),
+              ],
+              const SizedBox(height: 8),
+              // t138：CAS service ticket 探针（方案 E）
+              Text('CAS ticket 探针（方案 E）', style: theme.textTheme.titleSmall),
+              TextField(
+                key: const Key('probe-cas-base'),
+                controller: _casBase,
+                decoration: const InputDecoration(labelText: 'CAS 基址'),
+              ),
+              TextField(
+                key: const Key('probe-service'),
+                controller: _serviceUrl,
+                decoration: const InputDecoration(labelText: 'service 地址（登录成功后会跳回它并带 ticket）'),
+              ),
+              const SizedBox(height: 4),
+              OutlinedButton.icon(
+                key: const Key('probe-cas'),
+                onPressed: _busy ? null : _runCasProbe,
+                icon: const Icon(Icons.vpn_key_outlined, size: 18),
+                label: const Text('测试 CAS ticket'),
+              ),
+              if (_cas != null) ...<Widget>[
+                Text(
+                  '是否拿到 ticket：${_cas!.ticketFound ? '是（ST-${_cas!.prefix}****）' : '否'} · '
+                  '跳转 ${_cas!.hops} 次 · 终点域 ${_cas!.finalHost.isEmpty ? '—' : _cas!.finalHost}',
+                  style: theme.textTheme.bodySmall,
+                ),
+                for (final String hop in _cas!.redirects.take(12))
+                  Text('· ${shortUrl(hop)}', style: theme.textTheme.bodySmall),
+              ],
               const SizedBox(height: 8),
               // t137：三步诊断（精确 URL / JS 对照 / 跨域扫描）
               Wrap(
