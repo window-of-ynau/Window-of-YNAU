@@ -334,7 +334,6 @@ impl UpstreamClient {
         &self,
         protocol: Protocol,
         request: &ChatRequest,
-        tool_choice: yunong_core::tool_choice::ToolChoice,
     ) -> Result<UpstreamStream, UpstreamError> {
         let Some(provider) = self.providers.provider(protocol) else {
             return Err(UpstreamError::unavailable(format!(
@@ -358,6 +357,9 @@ impl UpstreamClient {
         //
         // `tools` 不需要单独处理：`ChatRequest.tools` 已经由 core 的三个 builder 按协议编码进
         // `tools` 字段（`encode_tools`），服务端保持**原样转发**、不做任何增删。
+        // 客户端给的值在这里归一（认不出的 → auto，与端侧同一套规则；warn 在 api 层打过）
+        let (tool_choice, _) =
+            yunong_core::tool_choice::ToolChoice::parse(request.tool_choice.as_deref());
         let options = yunong_core::protocols::BuildOptions {
             // 与 `build_body` 的默认一致：让上游在流里回报 usage（记账口径要用真实值）
             report_usage: true,
@@ -656,11 +658,7 @@ mod tests {
 
         let client = client_for(addr, test_timeouts(Duration::from_secs(5)));
         let mut stream = client
-            .open(
-                Protocol::OpenaiCompletions,
-                &request(),
-                yunong_core::tool_choice::ToolChoice::Auto,
-            )
+            .open(Protocol::OpenaiCompletions, &request())
             .await
             .expect("开流应成功");
 
@@ -699,11 +697,7 @@ mod tests {
             },
         );
         let mut stream = client
-            .open(
-                Protocol::OpenaiCompletions,
-                &request(),
-                yunong_core::tool_choice::ToolChoice::Auto,
-            )
+            .open(Protocol::OpenaiCompletions, &request())
             .await
             .expect("响应头已到，开流应成功");
 
@@ -753,11 +747,7 @@ mod tests {
 
         let client = client_for(addr, test_timeouts(Duration::from_secs(5)));
         let mut stream = client
-            .open(
-                Protocol::OpenaiCompletions,
-                &request(),
-                yunong_core::tool_choice::ToolChoice::Auto,
-            )
+            .open(Protocol::OpenaiCompletions, &request())
             .await
             .expect("开流应成功");
         let first = stream
@@ -793,11 +783,7 @@ mod tests {
             test_timeouts(Duration::from_secs(1)),
         );
         let error = client
-            .open(
-                Protocol::OpenaiCompletions,
-                &request(),
-                yunong_core::tool_choice::ToolChoice::Auto,
-            )
+            .open(Protocol::OpenaiCompletions, &request())
             .await
             .expect_err("连不上应报错");
         // https 是受支持的：失败原因必须是传输层，而不是「scheme 不支持」

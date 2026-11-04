@@ -32,7 +32,6 @@ use axum::{
     Json,
 };
 use futures_core::Stream;
-use serde::Deserialize;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use yunong_core::tool_choice::ToolChoice;
@@ -70,33 +69,6 @@ fn encode_event(chunk: &Chunk) -> Bytes {
     Bytes::from(format!("event: {}\ndata: {data}\n\n", event_name(chunk)))
 }
 
-/// 只反序列化 `tool_choice` 的探针（t129）。
-///
-/// 为什么用探针而不是给 `ChatRequest` 加字段：`ChatRequest` 属于 `crates/shared`，
-/// 改接口要先走提案（shared 是单写者）。而**协议映射只有一份**
-/// （`yunong_core::tool_choice::wire_value`：completions/responses 用 `"required"`，
-/// messages 用 `{"type":"any"}`），这里只负责把客户端那个值读出来，不做任何改写。
-///
-/// 客户端可能发字符串（`"required"`，Dart 侧就是这么发的）或对象（`{"type":"any"}`，
-/// 直接照抄 Anthropic 形状的调用方），两种都认；其他形状按"没给"处理。
-#[derive(Debug, Deserialize)]
-struct ToolChoiceProbe {
-    #[serde(default)]
-    tool_choice: Option<serde_json::Value>,
-}
-
-fn peek_tool_choice(body: &[u8]) -> Option<String> {
-    let probe: ToolChoiceProbe = serde_json::from_slice(body).ok()?;
-    match probe.tool_choice? {
-        serde_json::Value::String(text) => Some(text),
-        serde_json::Value::Object(map) => map
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        _ => None,
-    }
-}
-
 /// 审计里的工具摘要（t129）：**只记数量与策略**。
 ///
 /// `tools` 的内容可能很长（端侧 JSON Schema），而且属于端侧数据；审计只保留可聚合的短码。
@@ -127,14 +99,14 @@ pub async fn chat_stream(
         .validate()
         .map_err(|(code, message)| AppError::new(code, message, &req_id.0))?;
 
-    // t129：`tools` 已经在 `ChatRequest` 里（原样转发）；`tool_choice` 还没有字段，
-    // 用探针从原始体里取，认不出的值按 auto 处理并打 warn（与端侧 `ToolChoice::parse` 同一套规则）。
-    let raw_tool_choice = peek_tool_choice(&body);
-    let (tool_choice, tool_choice_warn) = ToolChoice::parse(raw_tool_choice.as_deref());
+    // t129/t131：`tools` 与 `tool_choice` 都已是 `ChatRequest` 的正式字段（原样转发）。
+    // 语义归一仍交给 `yunong_core::tool_choice`：认不出的值 → auto + warn，**不 422**
+    // （端侧升级比服务端快是常态，一个未知取值不该让整次提问失败）。
+    let (tool_choice, tool_choice_warn) = ToolChoice::parse(request.tool_choice.as_deref());
     if let Some(warn) = &tool_choice_warn {
         tracing::warn!(
             request_id = %req_id.0,
-            raw = ?raw_tool_choice,
+            raw = ?request.tool_choice,
             "{warn}"
         );
     }
@@ -226,11 +198,7 @@ pub async fn chat_stream(
     };
 
     // 2) 上游开流：连不上/超时/非 2xx/不是 SSE 都在这里变成 502/504 信封
-    let upstream = match state
-        .upstream
-        .open(request.protocol, &request, tool_choice)
-        .await
-    {
+    let upstream = match state.upstream.open(request.protocol, &request).await {
         Ok(upstream) => upstream,
         Err(error) => {
             // 细节（内网上游地址、缺哪个环境变量、上游响应片段）**只进日志**（评审 F3）
@@ -665,29 +633,62 @@ impl Stream for SseBody {
 mod tool_choice_tests {
     use super::*;
 
+    /// 老客户端（不带 `tool_choice`）必须能正常反序列化 → `None`，**不报错**。
+    ///
+    /// 这是向后兼容的硬要求：端侧发版比服务端慢是常态，多一个必填字段就等于让旧版本全挂。
     #[test]
-    fn probe_reads_string_and_object_forms() {
-        // Dart 侧发的是字符串
+    fn old_client_without_tool_choice_deserializes_to_none() {
+        let old = r#"{
+            "session_id":"s","turn_id":"t","round":1,"model":"m",
+            "protocol":"openai_completions","messages":[],
+            "tools":[],"max_output_tokens":1024,"stream":true,"estimated_input_tokens":0
+        }"#;
+        let parsed: ChatRequest = serde_json::from_str(old).expect("老客户端请求不能报错");
+        assert_eq!(parsed.tool_choice, None);
+        // 归一结果与"没给"一致（auto，不发字段）
         assert_eq!(
-            peek_tool_choice(br#"{"tool_choice":"required"}"#).as_deref(),
-            Some("required")
+            ToolChoice::parse(parsed.tool_choice.as_deref()).0,
+            ToolChoice::Auto
         );
-        // 直接照抄 Anthropic 形状的调用方发对象
+    }
+
+    /// `skip_serializing_if` 生效：`None` 时序列化出来的 JSON 里**完全没有**该键
+    /// （服务端若回显/转发 ChatRequest，老上游不该看到一个陌生字段）。
+    #[test]
+    fn none_tool_choice_is_not_serialized() {
+        let mut request: ChatRequest = serde_json::from_str(
+            r#"{
+                "session_id":"s","turn_id":"t","round":1,"model":"m",
+                "protocol":"openai_completions","messages":[],
+                "tools":[],"max_output_tokens":1024,"stream":true,"estimated_input_tokens":0
+            }"#,
+        )
+        .expect("最小请求");
+
+        let json = serde_json::to_string(&request).expect("序列化");
+        assert!(!json.contains("tool_choice"), "None 时不该出现该键：{json}");
+
+        request.tool_choice = Some("required".to_owned());
+        let json = serde_json::to_string(&request).expect("序列化");
+        assert!(json.contains(r#""tool_choice":"required""#), "{json}");
+    }
+
+    /// 取值的归一规则（与端侧同一套）：大小写/别名都认，未知值 → auto + warn，**不 422**。
+    #[test]
+    fn values_normalize_like_the_client() {
+        assert_eq!(ToolChoice::parse(Some("auto")).0, ToolChoice::Auto);
+        assert_eq!(ToolChoice::parse(Some("none")).0, ToolChoice::None);
+        assert_eq!(ToolChoice::parse(Some("required")).0, ToolChoice::Required);
         assert_eq!(
-            peek_tool_choice(br#"{"tool_choice":{"type":"any"}}"#).as_deref(),
-            Some("any")
+            ToolChoice::parse(Some(" REQUIRED ")).0,
+            ToolChoice::Required
         );
-        // 没给 / 给 null / 给别的类型 → None（不当作错误）
-        for body in [
-            br#"{"messages":[]}"#.as_slice(),
-            br#"{"tool_choice":null}"#.as_slice(),
-            br#"{"tool_choice":123}"#.as_slice(),
-            br#"{"tool_choice":{"foo":"bar"}}"#.as_slice(),
-        ] {
-            assert_eq!(peek_tool_choice(body), None, "不该被识别：{body:?}");
-        }
-        // 非法 JSON 也只是"没给"，不能在这里报错（契约校验另有其人）
-        assert_eq!(peek_tool_choice(b"not json"), None);
+        // Anthropic 形状的别名也算 required
+        assert_eq!(ToolChoice::parse(Some("any")).0, ToolChoice::Required);
+        // 未知值：不报错，按 auto 处理并给出 warn（服务端选择继续放行）
+        let (choice, warn) = ToolChoice::parse(Some("tool_use_required_v2"));
+        assert_eq!(choice, ToolChoice::Auto);
+        assert!(warn.is_some(), "未知取值必须留 warn，不能静默改语义");
     }
 
     #[test]
