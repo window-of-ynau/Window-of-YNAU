@@ -395,7 +395,7 @@ class _Sidebar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final ThemeData theme = Theme.of(context);
+
     return AnimatedContainer(
       key: const Key('app-sidebar'),
       duration: const Duration(milliseconds: 180),
@@ -410,22 +410,8 @@ class _Sidebar extends StatelessWidget {
           child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          if (!collapsed)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(18, 16, 12, 8),
-              child: Row(
-                children: <Widget>[
-                  Expanded(child: Text('云农之窗', style: theme.textTheme.titleMedium)),
-                  IconButton(
-                    tooltip: '折叠侧栏',
-                    onPressed: onToggle,
-                    icon: const Icon(Icons.chevron_left, size: 18),
-                  ),
-                ],
-              ),
-            )
-          else
-            const SizedBox(height: 8),
+          // t123：侧栏头部不再重复应用名，也不再放第二个「<」——顶栏汉堡就是唯一的折叠开关。
+
           Expanded(
             child: ListView(
               padding: EdgeInsets.zero,

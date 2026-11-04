@@ -96,15 +96,19 @@ void main() {
     });
   });
 
-  group('对话页：模型与 effort 选择器', () {
-    testWidgets('选择条有两个下拉，且能改值', (WidgetTester tester) async {
+  group('对话页：模型选择器（t123 改为三段弹层）', () {
+    testWidgets('按钮显示 provider · 模型 · effort，点击弹出三段菜单', (WidgetTester tester) async {
       await tester.pumpWidget(const MaterialApp(home: Scaffold(body: ModelSelector())));
       await tester.pumpAndSettle();
 
-      expect(find.byKey(const Key('chat-model-selector')), findsOneWidget);
-      expect(find.byKey(const Key('chat-effort-selector')), findsOneWidget);
-      expect(find.text('deepseek-chat'), findsWidgets);
-      expect(find.text('effort 自动'), findsWidgets);
+      expect(find.byKey(const Key('model-selector-button')), findsOneWidget);
+      expect(find.textContaining('effort'), findsWidgets);
+
+      await tester.tap(find.byKey(const Key('model-selector-button')));
+      await tester.pumpAndSettle();
+      expect(find.text('供应商'), findsWidgets);
+      expect(find.text('模型'), findsWidgets);
+      expect(find.text('推理等级'), findsWidgets);
+      expect(find.text('套餐通道'), findsWidgets);
     });
-  });
-}
+  });}
