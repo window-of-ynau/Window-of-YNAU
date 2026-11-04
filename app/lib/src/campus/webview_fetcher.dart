@@ -560,8 +560,12 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                         },
                       );
                     },
-                    // 【临时诊断 t138】记录导航链（CAS ticket 探针）：只在 recording 时写入。
+                    // 【临时诊断 t138/t139】记录导航链（CAS ticket 探针）：只在 recording 时写入；
+                    // 非 recording 时顺便记住"当前页面"，探针结束后据此导航回去。
                     onLoadStart: (_, WebUri? url) async {
+                      if (!CasTicketProbe.recording) {
+                        CasTicketProbe.returnUrl = url?.toString();
+                      }
                       CasTicketProbe.record(url?.toString());
                     },
                     onLoadStop: (_, WebUri? url) async {

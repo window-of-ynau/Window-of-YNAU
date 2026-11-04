@@ -43,6 +43,7 @@ class ProbeRun {
     this.studentIdMasked,
     this.title = '',
     this.loginHint = false,
+    this.bodySnippet,
     this.error,
   });
 
@@ -60,6 +61,13 @@ class ProbeRun {
 
   /// 页面里出现「登录」/「统一身份认证」等字样（几乎一定说明会话无效）。
   final bool loginHint;
+
+  /// 【t139】非 2xx 且 Content-Type 含 json 时，响应体前 300 字符。
+  ///
+  /// 只对 JSON 生效：接口错误信息不敏感，而且**是判断"请求哪里不合法"的唯一线索**；
+  /// HTML 一律不展示正文（避免整页内容泄露）。
+  final String? bodySnippet;
+
   final String? error;
 
   bool get ok => error == null && statusCode >= 200 && statusCode < 300;
@@ -230,6 +238,7 @@ ProbeRun _toRun(ProbeResponse response, int elapsedMs) {
     studentIdMasked: sid == null ? null : maskStudentId(sid.group(0) ?? ''),
     title: title.length > 80 ? title.substring(0, 80) : title,
     loginHint: _loginPattern.hasMatch(body) || _loginPattern.hasMatch(title),
+    bodySnippet: jsonErrorSnippet(body, response.contentType, response.statusCode),
   );
 }
 
@@ -297,6 +306,18 @@ class HeaderTrial {
   final ProbeRun run;
 
   String get label => mode.label;
+}
+
+/// 【t139】非 2xx 且 Content-Type 是 JSON 时，取响应体前 [max] 字符。
+///
+/// HTML 一律返回 null（不展示正文）；成功响应也不返回（没必要，且减少泄露面）。
+String? jsonErrorSnippet(String body, String contentType, int statusCode, {int max = 300}) {
+  final bool isJson = contentType.toLowerCase().contains('json');
+  final bool failed = statusCode < 200 || statusCode >= 300;
+  if (!isJson || !failed || body.isEmpty) {
+    return null;
+  }
+  return body.length > max ? body.substring(0, max) : body;
 }
 
 /// 三组对照的判读（t138）。
@@ -381,6 +402,8 @@ Future<SessionProbeResult> runSessionProbe({
   required List<ProbeCookie> cookies,
   ProbeClient? client,
   Duration timeout = const Duration(seconds: 15),
+  /// t139：Accept 头。对齐页内抓取请传 `kScheduleAcceptHeader`。
+  String accept = 'text/html,application/json,application/xhtml+xml,*/*;q=0.8',
 }) async {
   final Uri parsed;
   try {
@@ -395,7 +418,8 @@ Future<SessionProbeResult> runSessionProbe({
   final ProbeClient probeClient = client ?? IoProbeClient();
   final Map<String, String> baseHeaders = <String, String>{
     'User-Agent': userAgent,
-    'Accept': 'text/html,application/json,application/xhtml+xml,*/*;q=0.8',
+    // t139：页内抓取用的就是这份 Accept；对齐后服务端不会再因为"形状不对"报 500。
+    'Accept': accept,
   };
 
   // ① 带 Cookie

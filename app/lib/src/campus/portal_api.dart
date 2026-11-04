@@ -17,6 +17,43 @@ import 'dart:convert';
 /// 接口路径（用于脚本匹配；改版时只改这里）。
 const String kScheduleApiPath = '/api/uppcard/kbsz/queryAWeekSchedule';
 
+/// 【t139】页内抓取用的**同款请求形状**：URL 构造 + 关键请求头。
+///
+/// 页内脚本（`kPortalScheduleScript`，见本文件末尾的 `API + '?years=' + ...` 段）用的是：
+/// ```
+/// GET {origin}/api/uppcard/kbsz/queryAWeekSchedule
+///     ?years=<encodeURIComponent(学期)>&results=<周>&cardId=<32hex>&_t=<Date.now()>
+/// credentials: 'include'
+/// Accept: application/json, text/plain, */*
+/// ```
+/// 探针必须**照抄这份**，否则服务端会返回 500（参数不全/形状不对）。
+const String kScheduleAcceptHeader = 'application/json, text/plain, */*';
+
+/// 拼课表接口 URL（与页内脚本一致的参数顺序与编码）。
+///
+/// - `years` 形如 `2026-2027-1`（学年-学期）；
+/// - `week` 从 1 开始；
+/// - `cardId` 是每人不同的 32 位 hex（页内从 DOM/网络里抓到，探针里由用户填）；
+/// - `timestampMs` 对应页内的 `Date.now()`（默认当前时间）。
+Uri buildScheduleApiUrl({
+  required String origin,
+  required String years,
+  required int week,
+  required String cardId,
+  int? timestampMs,
+}) {
+  final String base = origin.replaceAll(RegExp(r'/+$'), '');
+  final int ts = timestampMs ?? DateTime.now().millisecondsSinceEpoch;
+  return Uri.parse('$base$kScheduleApiPath').replace(
+    queryParameters: <String, String>{
+      'years': years,
+      'results': '$week',
+      'cardId': cardId,
+      '_t': '$ts',
+    },
+  );
+}
+
 /// 人工验证过的学期锚点（**仅作建议值，不是真值**），来源：云南农业大学
 /// 2026—2027 学年校历。
 ///
