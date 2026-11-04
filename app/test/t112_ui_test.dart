@@ -53,18 +53,16 @@ void main() {
       // 顶栏齿轮已移除
       expect(find.byTooltip('设置'), findsNothing);
 
-      // 打开抽屉
-      await tester.tap(find.byIcon(Icons.menu));
-      await tester.pumpAndSettle();
+      // t117：侧栏改为常驻可折叠（不再有抽屉），设置入口在侧栏底部
 
-      final Finder settingsTile = find.byKey(const Key('drawer-settings'));
+      final Finder settingsTile = find.byKey(const Key('sidebar-settings'));
       expect(settingsTile, findsOneWidget);
       expect(find.descendant(of: settingsTile, matching: find.text('设置')), findsOneWidget);
 
-      // 整行撑满：宽度接近抽屉宽度
-      final Size drawerSize = tester.getSize(find.byType(Drawer));
+      // 整行撑满：宽度接近侧栏宽度
+      final Size sidebarSize = tester.getSize(find.byKey(const Key('app-sidebar')));
       final Size tileSize = tester.getSize(settingsTile);
-      expect(tileSize.width, greaterThan(drawerSize.width * 0.9));
+      expect(tileSize.width, greaterThan(sidebarSize.width * 0.9));
     });
   });
 }

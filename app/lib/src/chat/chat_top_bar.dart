@@ -57,7 +57,12 @@ class ChatTopBar extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
       child: Row(
         children: <Widget>[
-          SegmentedButton<String>(
+          // t117：窄窗（480）下侧栏 rail 占 64px，顶栏必须可收缩，否则横向溢出。
+          Flexible(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: SegmentedButton<String>(
             segments: const <ButtonSegment<String>>[
               ButtonSegment<String>(value: 'byok', label: Text('直连')),
               ButtonSegment<String>(value: 'cloud', label: Text('套餐')),
@@ -68,7 +73,9 @@ class ChatTopBar extends StatelessWidget {
               visualDensity: VisualDensity.compact,
               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
             ),
-            onSelectionChanged: (Set<String> value) => onChannelChanged(value.first),
+                onSelectionChanged: (Set<String> value) => onChannelChanged(value.first),
+              ),
+            ),
           ),
           const SizedBox(width: 4),
           // 状态：图标 + tooltip（不占横向空间，480px 也放得下）
