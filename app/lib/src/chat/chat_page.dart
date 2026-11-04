@@ -137,6 +137,16 @@ class ChatPageState extends State<ChatPage> {
   late final MemoryService _memory =
       widget.memoryService ?? MemoryService(dbPath: widget.dbPath);
   bool _localPanelOpen = false;
+
+  /// t122：对话内模型（与 `ModelSelector` 同源，请求就用它，避免“显示 A 发 B”）。
+  String _model = 'deepseek-chat';
+
+  /// t122：强制工具调用（诊断弹窗可切）。开启后请求带 `tool_choice=required`。
+  bool _toolChoiceRequired = false;
+
+  /// t122：meta 帧回报的工具状态（诊断里显示，区分“没挂工具”与“模型不调用”）。
+  bool? _toolsEnabled;
+  List<String>? _tools;
   bool _localBusy = false;
   String? _localError;
   List<LocalSearchHit> _localHits = const <LocalSearchHit>[];
@@ -274,7 +284,9 @@ class ChatPageState extends State<ChatPage> {
 
     final request = ChatRequestDto(
       channel: _channel == 'cloud' ? ChatChannel.cloud : ChatChannel.byok,
-      model: _settings.model,
+      // t122：发出去的 model 必须与界面上显示的一致（此前 UI 独立状态、请求走 _settings，
+      // 存在“显示 A 实际发 B”的风险）。现在两者都读 `_model`。
+      model: _model,
       protocol: ChatProtocol.values.firstWhere(
         (ChatProtocol value) => value.wire == _settings.protocol,
         orElse: () => ChatProtocol.completions,
@@ -286,6 +298,11 @@ class ChatPageState extends State<ChatPage> {
       // Rust 侧把 data_dir 当**目录**用（secrets 子目录）：必须传目录，不能传 .db 文件路径，
       // 否则 set_secret（按 db_path 的父目录）与 chat（按 data_dir）各看一个目录 → 读不到 Key（t54 之后的新根因）。
       dataDir: _dataDir,
+      // t122：`db_path` 是**数据库文件**路径，也是“启用内置工具”的开关。
+      // provider 化改造时这里漏传 → Rust 不挂工具 → 模型无从调用（本次工具不触发的直接原因）。
+      dbPath: widget.dbPath,
+      // 调试开关：required = 强制模型至少调用一个工具（区分“模型不调用”与“链路问题”）
+      toolChoice: _toolChoiceRequired ? 'required' : null,
       cloudToken: _settings.cloudToken,
     );
 
@@ -327,6 +344,14 @@ class ChatPageState extends State<ChatPage> {
         }
         setState(() {
           switch (event.kind) {
+            case ChatEventKind.meta:
+              // t122：meta 里带工具状态，用于诊断“没挂工具”还是“模型不调用”。
+              if (event.toolsEnabled != null || event.tools != null) {
+                setState(() {
+                  _toolsEnabled = event.toolsEnabled ?? _toolsEnabled;
+                  _tools = event.tools ?? _tools;
+                });
+              }
             case ChatEventKind.delta:
               _bubbles.last.text += event.text ?? '';
             case ChatEventKind.toolCall:
@@ -449,7 +474,22 @@ class ChatPageState extends State<ChatPage> {
       builder: (BuildContext context) => AlertDialog(
         title: const Text('对话诊断'),
         scrollable: true,
-        content: SelectableText(text, style: const TextStyle(fontSize: 12)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            SelectableText(text, style: const TextStyle(fontSize: 12)),
+            const Divider(height: 16),
+            SwitchListTile(
+              key: const Key('tool-choice-required'),
+              dense: true,
+              title: const Text('强制工具调用（兜底排查）'),
+              subtitle: const Text('开启后本次请求带 tool_choice=required，模型必须调用至少一个工具'),
+              value: _toolChoiceRequired,
+              onChanged: (bool value) => setState(() => _toolChoiceRequired = value),
+            ),
+          ],
+        ),
         actions: <Widget>[
           TextButton(
             onPressed: () async {
@@ -793,7 +833,13 @@ class ChatPageState extends State<ChatPage> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[const ModelSelector(), _composer()],
+              children: <Widget>[
+                ModelSelector(
+                  value: _model,
+                  onChanged: (String value) => setState(() => _model = value),
+                ),
+                _composer(),
+              ],
             ),
           ),
       ],

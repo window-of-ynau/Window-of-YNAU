@@ -75,6 +75,7 @@ class ChatRequestDto {
     this.secretKey,
     this.dataDir,
     this.dbPath,
+    this.toolChoice,
     this.cloudToken,
     this.baseUrl,
     this.cloudBaseUrl,
@@ -103,6 +104,9 @@ class ChatRequestDto {
   /// `SQLITE_CANTOPEN: unable to open database file`（曾按“目录”理解踩过一次）。
   final String? dbPath;
 
+  /// t122：调试开关 —— `required` 时模型被迫调用至少一个工具（DeepSeek 支持）。
+  final String? toolChoice;
+
   /// 套餐通道的访问令牌
   final String? cloudToken;
   final String? baseUrl;
@@ -120,6 +124,7 @@ class ChatRequestDto {
         if (dataDir != null && dataDir!.isNotEmpty) 'data_dir': dataDir,
     // 注意：必须是目录（传 .db 文件路径会让 Rust 把它当目录用）
     if (dbPath != null && dbPath!.isNotEmpty) 'db_path': dbPath,
+    if (toolChoice != null && toolChoice!.isNotEmpty) 'tool_choice': toolChoice,
         // 仅测试/命令行用；App 正常路径不会带明文
         if (apiKey != null && apiKey!.isNotEmpty) 'api_key': apiKey,
         if (cloudToken != null && cloudToken!.isNotEmpty) 'cloud_token': cloudToken,
@@ -152,6 +157,8 @@ class ChatEvent {
     this.toolArgs,
     this.toolOk,
     this.toolSummary,
+    this.toolsEnabled,
+    this.tools,
   });
 
   final ChatEventKind kind;
@@ -176,6 +183,10 @@ class ChatEvent {
   final bool? toolOk;
   /// 结果的一句话摘要（如「5 条结果」），不含大段 JSON。
   final String? toolSummary;
+
+  /// meta 帧里的工具状态（t122：判断“没挂工具”还是“模型不调用”）。
+  final bool? toolsEnabled;
+  final List<String>? tools;
 
   bool get isTerminal => kind == ChatEventKind.done || kind == ChatEventKind.error;
 
@@ -210,6 +221,14 @@ class ChatEvent {
       toolArgs: _toolArgsText(decoded['args'] ?? decoded['arguments']),
       toolOk: decoded['ok'] is bool ? decoded['ok'] as bool : null,
       toolSummary: decoded['summary'] as String?,
+      toolsEnabled: decoded['tools_enabled'] is bool ? decoded['tools_enabled'] as bool : null,
+      // 元素可能是字符串，也可能是 {"name": "..."} 对象 —— 两种都归一成工具名。
+      tools: decoded['tools'] is List
+          ? (decoded['tools'] as List<dynamic>)
+              .map((dynamic item) => item is Map ? '${item['name'] ?? ''}' : '$item')
+              .where((String name) => name.isNotEmpty)
+              .toList(growable: false)
+          : null,
     );
   }
 
@@ -527,4 +546,13 @@ String? _toolArgsText(Object? raw) {
   } on Object {
     return raw.toString();
   }
+}
+
+/// 工具状态的诊断文案（t122）：一眼判断“没挂工具”还是“模型不调用”。
+String toolDiagnosticsText({bool? toolsEnabled, List<String>? tools}) {
+  if (toolsEnabled == null && tools == null) {
+    return 'tools_enabled=未知';
+  }
+  final String names = (tools == null || tools.isEmpty) ? '[]' : '[${tools.join(', ')}]';
+  return 'tools_enabled=${toolsEnabled ?? '未知'} | tools=$names';
 }
