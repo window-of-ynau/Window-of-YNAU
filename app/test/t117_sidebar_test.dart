@@ -3,6 +3,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/main.dart';
+import 'support/test_window.dart';
 import 'package:yunong/src/theme/theme_controller.dart';
 
 const Key _sidebar = Key('app-sidebar');
@@ -13,10 +14,7 @@ MemorySettingsStore _store() => MemorySettingsStore();
 double _width(WidgetTester tester) => tester.getSize(find.byKey(_sidebar)).width;
 
 Future<void> _pumpApp(WidgetTester tester, {required Size size, required SettingsStore store}) async {
-  // 用 view 尺寸（setSurfaceSize 不改变 MediaQuery 的 view 尺寸时不可靠）
-  tester.view.physicalSize = size;
-  tester.view.devicePixelRatio = 1.0;
-  addTearDown(tester.view.reset);
+  setTestWindow(tester, size.width, size.height);
   await tester.pumpWidget(YunongApp(themeController: ThemeController(store: store)));
   await tester.pumpAndSettle();
 }
