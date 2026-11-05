@@ -30,6 +30,11 @@ android {
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "cn.ynau.yunong"
+        // 只打包 arm64-v8a：体积可控（单个 .so 约 6 MB），且 2018 年后的真机基本都是 arm64。
+        // 需要模拟器联调时可把 x86_64 加进来，并在 scripts/build-android-core.ps1 里多编一个 ABI。
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -61,7 +66,11 @@ android {
             } else {
                 signingConfigs.getByName("debug")
             }
+            // Flutter 默认给 release 打开 shrinkResources；它与 minify 必须同时开/关，
+            // 否则 Gradle 直接报 "Removing unused resources requires unused code shrinking"。
+            // 这里两个都关（我们的体积主要来自 Flutter 引擎与 .so，资源收缩收益有限）。
             isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }
