@@ -395,7 +395,7 @@ mod tests {
             )
             .await
             .expect_err("空邀请码必须被拒");
-        assert_eq!(error.code, yunong_shared::ErrorCode::Forbidden);
+        assert_eq!(error.code, yunong_shared::ErrorCode::InviteInvalid);
         assert_eq!(error.message, "邀请码无效或已不可用");
     }
 

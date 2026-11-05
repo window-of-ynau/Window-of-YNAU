@@ -639,7 +639,7 @@ async fn invite_registration_requires_a_usable_code() {
         .register_with_invite("a@ynau.edu.cn", PASSWORD, invite_use("ynau-unknown"))
         .await
         .expect_err("不存在的邀请码必须拒绝");
-    assert_eq!(unknown.code, ErrorCode::Forbidden);
+    assert_eq!(unknown.code, ErrorCode::InviteInvalid);
 
     // 过期
     issue_invite(
@@ -678,7 +678,7 @@ async fn invite_registration_requires_a_usable_code() {
         assert_eq!(error.code, unknown.code);
         assert_eq!(error.message, unknown.message);
     }
-    assert_eq!(unknown.code, ErrorCode::Forbidden);
+    assert_eq!(unknown.code, ErrorCode::InviteInvalid);
 
     // 失败路径不能建号
     assert_eq!(
@@ -710,7 +710,7 @@ async fn invite_is_single_use_under_concurrency() {
     assert_eq!(successes, 1, "一次性邀请码必须只有一个请求成功");
 
     let failure = first.err().or_else(|| second.err()).expect("必有一个失败");
-    assert_eq!(failure.code, ErrorCode::Forbidden);
+    assert_eq!(failure.code, ErrorCode::InviteInvalid);
 
     // 用量收敛到 1（不是 2）：靠 `UPDATE ... WHERE used_count < max_uses RETURNING`
     assert_eq!(

@@ -530,7 +530,7 @@ mod invite_tests {
         let used_again = redeem(&mut state, "b@x.com", "ynau-once").expect_err("第二次必须失败");
         let unknown = redeem(&mut state, "c@x.com", "ynau-nope").expect_err("不存在的码必须失败");
 
-        assert_eq!(used_again.code, ErrorCode::Forbidden);
+        assert_eq!(used_again.code, ErrorCode::InviteInvalid);
         assert_eq!(used_again.message, unknown.message, "失败原因不能区分");
         // 已用 1 / 容量 1 / 1 张
         assert_eq!(state.invite_batch_stats("b1"), (1, 1, 1));
