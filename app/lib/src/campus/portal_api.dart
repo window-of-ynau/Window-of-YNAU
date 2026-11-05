@@ -26,6 +26,33 @@ import 'dart:convert';
 ///  4. `localStorage` / `sessionStorage` 的所有键值。
 ///
 /// 返回：`JSON.stringify([{v: "<完整值>", s: "<来源>"}, …])`（最多 12 条，已去重）。
+/// 【t148】页面侧**可重复调用**的抓取入口：`window.__yunongGrabHtml()`。
+///
+/// - 幂等：任意时刻可调，重复调用不产生副作用（只读 DOM）；
+/// - 返回：合格 HTML 字符串；页面还没渲染出课表容器时返回 `null`；
+/// - 供 bridge 在收到"空壳 html"时**重取一次**（不重新导航、不发网络请求）。
+const String kGrabHtmlInstallScript = r'''
+(function () {
+  if (window.__yunongGrabHtml) { return; }
+  window.__yunongGrabHtml = function () {
+    try {
+      var table = document.querySelector('table#timetable')
+        || document.querySelector('#timetable')
+        || document.querySelector('table.timetable');
+      var html = table ? table.outerHTML
+        : (document.documentElement ? document.documentElement.outerHTML : '');
+      if (!html || typeof html !== 'string' || html.length < 200) { return null; }
+      return html;
+    } catch (e) {
+      return null;
+    }
+  };
+})();
+''';
+
+/// 调用上面的入口（供 `evaluateJavascript` 直接使用）。
+const String kGrabHtmlScript = '(window.__yunongGrabHtml ? window.__yunongGrabHtml() : null)';
+
 /// 【t142】cardId 自动探测脚本（**纯本地读取，不发任何网络请求**）。
 ///
 /// 为什么需要：owner 的课表页是 React SPA，cardId 既不在 `[data-cardid]` 上，

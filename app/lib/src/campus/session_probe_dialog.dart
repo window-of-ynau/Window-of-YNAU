@@ -520,6 +520,7 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
                 const Divider(),
               ],
               if (_notice != null) Text(_notice!, style: theme.textTheme.bodySmall),
+              _envDiagnostics(theme),
               Wrap(
                 spacing: 8,
                 children: <Widget>[
@@ -583,9 +584,56 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
     );
   }
 
+  /// 【t148】只读环境排查（不发请求）：当前页面浮层 surface 是否不透明，
+  /// 以及 `MaterialApp.builder` 的 solid-surface 包裹层是否生效（`Key('app-solid-surface')`）。
+  ///
+  /// 目的：owner 说"右键菜单又透明了"，但测试里复现不出来 —— 真机截图时能直接看到数字，不必靠猜。
+  Widget _envDiagnostics(ThemeData theme) {
+    final ColorScheme scheme = theme.colorScheme;
+    final bool builderApplied = _hasSolidSurfaceAncestor(context);
+    final bool opaque = scheme.surface.a == 1.0 && scheme.surfaceContainerHigh.a == 1.0;
+    return Padding(
+      padding: const EdgeInsets.only(top: 6, bottom: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text('环境排查（只读，不发请求）', style: theme.textTheme.titleSmall),
+          Text(
+            'surface.alpha=${scheme.surface.a.toStringAsFixed(2)} · '
+            'surfaceContainerHigh.alpha=${scheme.surfaceContainerHigh.a.toStringAsFixed(2)}',
+            key: const Key('probe-env-alpha'),
+            style: theme.textTheme.bodySmall,
+          ),
+          Text(
+            builderApplied
+                ? 'builder 生效：solid-surface 包裹层存在'
+                : "builder 可能未生效：未找到 Key('app-solid-surface') 包裹层",
+            key: const Key('probe-env-builder'),
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: builderApplied && opaque ? null : theme.colorScheme.error,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  bool _hasSolidSurfaceAncestor(BuildContext context) {
+    bool found = false;
+    context.visitAncestorElements((Element element) {
+      final Widget widget = element.widget;
+      if (widget is Theme && widget.key == const Key('app-solid-surface')) {
+        found = true;
+        return false;
+      }
+      return true;
+    });
+    return found;
+  }
   Widget _runCard(String label, InPageFetchSummary run, ThemeData theme) => Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
+          // t148 环境排查见下方 _envDiagnostics（在 build 里内联调用）
           Padding(
             padding: const EdgeInsets.only(top: 10, bottom: 2),
             child: Text('$label：${run.verdict}', style: theme.textTheme.titleSmall),
