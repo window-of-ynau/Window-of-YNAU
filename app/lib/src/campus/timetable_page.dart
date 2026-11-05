@@ -12,6 +12,7 @@ import 'dart:async';
 
 import 'campus_entries.dart';
 import '../core/timetable_service.dart';
+import '../theme/context_menu.dart';
 import 'timetable/course_palette.dart';
 import 'timetable/timetable_grid.dart';
 import 'timetable/timetable_notices.dart';
@@ -160,7 +161,10 @@ class _TimetablePageState extends State<TimetablePage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Column(
+    // t149：课表页的「学期」输入框会弹文本选择菜单，它读的是**本页 context 的主题**。
+    // 用 OpaqueMenuScope 兜一层，保证菜单表面一定不透明（透底会让菜单文字与课程块混色）。
+    return OpaqueMenuScope(
+      child: Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
         Padding(
@@ -293,6 +297,7 @@ class _TimetablePageState extends State<TimetablePage> {
           ),
         Expanded(child: _buildBody(theme)),
       ],
+      ),
     );
   }
 
