@@ -118,8 +118,16 @@ try {
             $ccVar = "CC_" + ($info.Target -replace '-', '_')
             $arVar = "AR_" + ($info.Target -replace '-', '_')
             Set-Item -Path "Env:$ccVar" -Value $clang
-            $llvmAr = Join-Path $binDir "llvm-ar.exe"
-            if (Test-Path $llvmAr) { Set-Item -Path "Env:$arVar" -Value $llvmAr }
+            # NDK 27+ 只带 llvm-ar（没有按 target 前缀命名的 ar），cc-rs 默认会去找
+            # aarch64-linux-android-ar 而失败（CI 上 ring 的 build script 就卡在这）。
+            $arName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "llvm-ar.exe" } else { "llvm-ar" }
+            $llvmAr = Join-Path $binDir $arName
+            if (-not (Test-Path $llvmAr)) { Fail "找不到 $llvmAr" }
+            Set-Item -Path "Env:$arVar" -Value $llvmAr
+            $ranlibVar = "RANLIB_" + ($info.Target -replace '-', '_')
+            $ranlibName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "llvm-ranlib.exe" } else { "llvm-ranlib" }
+            $llvmRanlib = Join-Path $binDir $ranlibName
+            if (Test-Path $llvmRanlib) { Set-Item -Path "Env:$ranlibVar" -Value $llvmRanlib; $script:arVars += $ranlibVar }
             $script:ccVars += $ccVar
             $script:arVars += $arVar
             cargo build -p yunong-core --target $($info.Target) $profileFlag
