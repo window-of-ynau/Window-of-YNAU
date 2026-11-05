@@ -12,6 +12,7 @@ import '../core/build_info.dart';
 import '../core/auth_service.dart';
 import '../core/secret_service.dart';
 import '../campus/session_probe_dialog.dart';
+import '../core/app_paths.dart';
 import '../core/debug_flags.dart'; // 【临时诊断】验证后删除
 import 'provider_card.dart';
 import '../core/provider_store.dart';
@@ -224,6 +225,22 @@ class SettingsPage extends StatelessWidget {
                         trailing: Icon(Icons.chevron_right, size: 18),
                       ),
                     ),
+                  // t156：当前数据根（覆盖时标注来源）—— 干净环境验证时一眼确认用的是哪份数据。
+                  _Row(
+                    key: const Key('settings-data-dir'),
+                    icon: Icons.folder_outlined,
+                    title: '数据目录',
+                    subtitle: AppPaths.isOverridden
+                        ? '${AppPaths.dataDir}（覆盖：${AppPaths.overrideSource.label}）'
+                        : '${AppPaths.dataDir}（默认）',
+                  ),
+                  if (AppPaths.isOverridden)
+                    _Row(
+                      key: const Key('settings-portable-mode'),
+                      icon: Icons.luggage_outlined,
+                      title: '便携/隔离模式',
+                      subtitle: '数据在 ${AppPaths.dataDir}',
+                    ),
                   _Row(
                     icon: Icons.info_outline,
                     title: '版本',
@@ -402,12 +419,16 @@ class _Group extends StatelessWidget {
 
 class _Row extends StatelessWidget {
   const _Row(
-      {required this.icon, required this.title, this.subtitle, this.trailing});
+      {super.key,
+      required this.icon,
+      required this.title,
+      this.subtitle,
+      this.trailing});
+  final Widget? trailing;
 
   final IconData icon;
   final String title;
   final String? subtitle;
-  final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
