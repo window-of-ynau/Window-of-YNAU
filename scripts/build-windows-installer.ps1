@@ -120,10 +120,25 @@ Write-Host ("暂存目录：{0} 个文件，{1} MB" -f $stagingFiles.Count, $sta
 Step "编译安装包"
 $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue)?.Source
 if (-not $iscc) {
+    # 自定义安装目录很常见（本机就装在 D:\Program Files\Inno Setup 6）：先查注册表的 InstallLocation
+    foreach ($key in @(
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )) {
+        $entry = Get-ItemProperty $key -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*Inno Setup*" } | Select-Object -First 1
+        if ($entry -and $entry.InstallLocation) {
+            $cand = Join-Path $entry.InstallLocation "ISCC.exe"
+            if (Test-Path $cand) { $iscc = $cand; break }
+        }
+    }
+}
+if (-not $iscc) {
     foreach ($p in @(
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
         "C:\Program Files\Inno Setup 6\ISCC.exe",
-        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+        "D:\Program Files\Inno Setup 6\ISCC.exe"
     )) { if (Test-Path $p) { $iscc = $p; break } }
 }
 if (-not $iscc) {
@@ -134,7 +149,14 @@ Write-Host "ISCC：$iscc"
 $outDir = if ([System.IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $repo $OutputDir }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $iss = Join-Path $repo "deploy/windows/installer.iss"
-& $iscc "/DMyAppVersion=$Version" "/DSourceDir=$stagingDir" "/DOutputDir=$outDir" "/Qp" $iss
+
+# t160：安装向导/卸载列表的图标 = 应用图标。用**绝对路径**传进去，不依赖 .iss 的相对路径基准
+# （.iss 会在 deploy/windows/ 下被编译，但将来若有人把 iss 复制到暂存目录，相对路径就废了）。
+$iconPath = Join-Path $repo "app/windows/runner/resources/app_icon.ico"
+if (-not (Test-Path $iconPath)) { throw "找不到应用图标：$iconPath" }
+Write-Host "图标：$iconPath ($([math]::Round((Get-Item $iconPath).Length/1KB,1)) KB)"
+
+& $iscc "/DMyAppVersion=$Version" "/DSourceDir=$stagingDir" "/DOutputDir=$outDir" "/DSetupIconFile=$iconPath" "/Qp" $iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC 失败（exit $LASTEXITCODE）" }
 
 # ---- 5. 护栏 C：体积与校验和 ----
@@ -145,6 +167,29 @@ Write-Host "`nOK: $setup ($sizeMb MB)"
 if ($sizeMb -ge 40) {
     throw "安装包体积异常：$sizeMb MB（阈值 40 MB）——检查暂存目录是否混入了用户数据/调试符号。"
 }
+
+# 护栏 D（t160）：安装包图标必须是自己那张 ICO，不能是 Inno 默认图标。
+# 做法：从 setup.exe 与 yunong.exe 各取出"关联图标"，比对像素哈希；不一致就说明 SetupIconFile 没生效。
+Add-Type -AssemblyName System.Drawing
+function Get-IconHash([string]$exePath) {
+    $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath)
+    if (-not $icon) { return $null }
+    $bmp = $icon.ToBitmap()
+    $ms = New-Object System.IO.MemoryStream
+    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $hash = [BitConverter]::ToString($sha.ComputeHash($ms.ToArray())) -replace '-', ''
+    $ms.Dispose(); $bmp.Dispose(); $icon.Dispose()
+    return $hash
+}
+$setupIconHash = Get-IconHash $setup
+$appExe = Join-Path $stagingDir "yunong.exe"
+$appIconHash = if (Test-Path $appExe) { Get-IconHash $appExe } else { $null }
+if (-not $setupIconHash) { throw "护栏 D：读不出 setup.exe 的图标资源" }
+if ($appIconHash -and ($setupIconHash -ne $appIconHash)) {
+    throw "护栏 D：setup.exe 的图标与应用不一致（setup=$setupIconHash app=$appIconHash）——SetupIconFile 可能没生效"
+}
+Write-Host "护栏 D OK：setup.exe 图标 = 应用图标（sha256=${setupIconHash}）"
 
 Push-Location $outDir
 try {

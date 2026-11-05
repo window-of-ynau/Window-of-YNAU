@@ -43,6 +43,12 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\yunong.exe
+; 安装向导/卸载列表的图标 = 应用自己的图标（t160）。路径由 scripts/build-windows-installer.ps1
+; 用 /DSetupIconFile=<绝对路径> 传入；直接用 .iss 手编时回退到相对路径（基准 = 本文件所在目录）。
+#ifndef SetupIconFile
+  #define SetupIconFile "..\..\app\windows\runner\resources\app_icon.ico"
+#endif
+SetupIconFile={#SetupIconFile}
 ; 暂无代码签名证书：明确不签卸载器，避免 ISCC 去找签名工具。
 SignedUninstaller=no
 PrivilegesRequired=lowest
