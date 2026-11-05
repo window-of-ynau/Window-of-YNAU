@@ -20,6 +20,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import '../core/app_paths.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
@@ -239,8 +241,7 @@ class WebViewSession {
 
   /// 是否需要在创建 WebView 之前显式建环境（只有 Windows/WebView2 需要）。
   static bool get needsEnvironment => Platform.isWindows;
-  static const String _appDirName = 'yunong';
-  static const String _profileDirName = 'webview';
+
 
   static String? _userDataDir;
   static Future<WebViewEnvironment?>? _environment;
@@ -254,12 +255,12 @@ class WebViewSession {
     if (cached != null) {
       return cached;
     }
-    final env = Platform.environment;
-    final base = env['LOCALAPPDATA'] ??
-        env['APPDATA'] ??
-        // 极端情况下（无环境变量的服务账户）退到可执行文件目录，**不用临时目录**。
-        File(Platform.resolvedExecutable).parent.path;
-    final dir = <String>[base, _appDirName, _profileDirName].join(Platform.pathSeparator);
+    // t155：**显式**指定 user data folder = `<数据根>/webview2`。
+    //   · 不能留在 exe 同级（WebView2 默认会建 `<exe>.WebView2/EBWebView/`，
+    //     含 Login Data / Cookie，会被"整目录打包"带进安装包）；
+    //   · 装到 Program Files 时 exe 同级不可写，WebView 会开不起来；
+    //   · 与数据根联动后，dev（yunong-dev）与 release（yunong）的 WebView 会话互不干扰。
+    final String dir = AppPaths.webViewDataDir;
     Directory(dir).createSync(recursive: true);
     _userDataDir = dir;
     return dir;
@@ -267,7 +268,7 @@ class WebViewSession {
 
   /// 当前平台的会话存放说明（给 UI/日志用的**文字**，不含任何 Cookie 值）。
   static String get storageDescription => switch (defaultTargetPlatform) {
-        TargetPlatform.windows => 'Windows：WebView2 用户数据目录 $userDataDir()',
+        TargetPlatform.windows => 'Windows：WebView2 用户数据目录 ${userDataDir()}',
         TargetPlatform.android => 'Android：应用私有目录（系统管理）',
         _ => '当前平台无持久化会话',
       };
