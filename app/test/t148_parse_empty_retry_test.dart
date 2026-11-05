@@ -23,7 +23,8 @@ void main() {
       final CampusBridge bridge = CampusBridge(
         onFetched: fetched.add,
         onError: errors.add,
-        retryDelay: const Duration(milliseconds: 1),
+        pollInterval: const Duration(milliseconds: 1),
+        pollTimeout: const Duration(seconds: 5),
         grabHtml: () async {
           grabCalls += 1;
           return _goodHtml; // 第二次（重取）是合格 HTML
@@ -32,9 +33,7 @@ void main() {
 
       // 第一次上报空壳
       bridge.handle(<String, dynamic>{'type': 'timetable', 'html': '<html></html>', 'path': '/x'});
-      expect(errors, isEmpty, reason: '空壳不应立刻失败');
-      expect(fetched, isEmpty);
-      expect(grabCalls, 0, reason: '重取要等 800ms 之后才发生');
+      // t150 起是"轮询等待就绪"：第一次探测会立即发生，所以这里不假设"还没取"
 
       // 等重取完成
       await Future<void>.delayed(const Duration(milliseconds: 30));
@@ -51,15 +50,17 @@ void main() {
       final CampusBridge bridge = CampusBridge(
         onFetched: (_) {},
         onError: errors.add,
-        retryDelay: const Duration(milliseconds: 1),
+        pollInterval: const Duration(milliseconds: 1),
+        pollTimeout: const Duration(milliseconds: 20),
         grabHtml: () async => '<html></html>',
       );
       bridge.handle(<String, dynamic>{'type': 'timetable', 'html': '<html></html>'});
       await Future<void>.delayed(const Duration(milliseconds: 30));
       expect(errors.length, 1);
+      // t150：轮询结束后报 HTML_CHANGED（不是登录页），消息里带每次诊断
       expect(errors.single.code, 'HTML_CHANGED');
-      expect(errors.single.message, contains('（第 1 次）'));
-      expect(errors.single.message, contains('（第 2 次）'));
+      expect(errors.single.message, contains('html 长度='));
+      expect(errors.single.message, contains('首次：'));
     });
 
     test('第一次就合格 → 不触发重取', () async {

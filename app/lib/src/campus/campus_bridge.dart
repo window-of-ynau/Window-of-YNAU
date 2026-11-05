@@ -10,6 +10,8 @@ import 'dart:async';
 import 'dart:convert';
 
 import '../core/timetable_service.dart';
+import 'capture_cache.dart';
+import 'capture_readiness.dart';
 import 'portal_api.dart';
 import 'webview_session.dart';
 
@@ -28,6 +30,9 @@ class CampusBridge {
     this.onStageChange,
     this.grabHtml,
     this.retryDelay = const Duration(milliseconds: 800),
+    this.pollInterval = const Duration(milliseconds: 500),
+    this.pollTimeout = const Duration(seconds: 6),
+    this.metaProbe,
     this.minHtmlLength = 2000,
     this.requireTimetableKeyword = true,
   });
@@ -39,8 +44,15 @@ class CampusBridge {
   /// 首次收到的 html 若是"空壳"，用它**重取一次**（不重新导航），再判失败。
   final Future<String?> Function()? grabHtml;
 
-  /// 重取前的等待（默认 800ms）。
+  /// 重取前的等待（默认 800ms；t150 起仅用于兼容旧调用）。
   final Duration retryDelay;
+
+  /// t150：等待页面就绪的轮询间隔与总超时。
+  final Duration pollInterval;
+  final Duration pollTimeout;
+
+  /// t150：页面元信息（URL/标题）探测；为空时诊断里对应字段显示"（空）"。
+  final PageMetaProbe? metaProbe;
 
   /// "空壳"判定阈值（默认 2000 字符；测试可调小）。
   final int minHtmlLength;
@@ -151,6 +163,11 @@ class CampusBridge {
       case 'schedule_template':
         final template = ScheduleTemplate.fromMessage(message);
         if (template.isValid) {
+          // t150：抓取成功即缓存 cardId/学期 —— 抓完 WebView 会关闭，探针只能靠这份缓存。
+          CampusCaptureCache.instance.rememberTemplate(
+            cardId: template.cardId,
+            years: template.years,
+          );
           onScheduleTemplate?.call(template);
         }
         return true;
@@ -222,24 +239,31 @@ class CampusBridge {
     onFetched(FetchedPage(html: attempt.html, url: path));
   }
 
-  /// t148：空壳 → 等 [retryDelay] 后用页面侧入口重取一次。
+  /// t150：空壳 → **轮询等待页面就绪**（每 500ms 一次，最多 6s），而不是固定等 800ms 再取一次。
+  ///
+  /// 失败时把每次探测的诊断（html 长度 / 标题 / URL / 是否登录页 / 是否含课表关键字）全带进消息，
+  /// 这样下次真机失败能直接看出是"还停在登录页"还是"页面里没有课表"。
   Future<void> _retryHtml(String path, {required HtmlFetchAttempt first}) async {
-    await Future<void>.delayed(retryDelay);
-    String? html;
-    try {
-      html = await grabHtml?.call();
-    } on Object {
-      html = null;
-    }
-    final HtmlFetchAttempt second = HtmlFetchAttempt(html: html ?? '', tries: 2);
-    if (!_isHollow(html ?? '')) {
-      _deliver(second, path);
+    final CaptureWaitResult result = await waitForTimetableReady(
+      html: () async => (await grabHtml?.call()) ?? '',
+      meta: metaProbe,
+      interval: pollInterval,
+      timeout: pollTimeout,
+      minLength: 0, // 阈值统一交给 _isHollow（含关键字判断）
+    );
+    final String html = result.last.html;
+    if (!_isHollow(html)) {
+      _deliver(HtmlFetchAttempt(html: html, tries: result.last.tries + 1), path);
       return;
     }
+    final bool loginPage = result.last.looksLikeLoginPage;
     _fail(FetchException(
-      code: 'HTML_CHANGED',
-      userHint: '学校页面可能已更新，请反馈',
-      message: '重试后仍是空表格：${first.diagnostics} → ${second.diagnostics}',
+      // 登录页 → 明确说明"没登录"，不要用 PARSE_EMPTY/HTML_CHANGED 混淆
+      code: loginPage ? 'NOT_LOGGED_IN' : 'HTML_CHANGED',
+      userHint: loginPage
+          ? '登录未完成：请在弹出的校务页面里完成登录后再试'
+          : '学校页面可能已更新，请反馈',
+      message: '${result.failureMessage}；首次：${first.diagnostics}',
     ));
   }
 
