@@ -269,8 +269,14 @@ jobs:
       # flutter_inappwebview 的 Windows 实现要 nuget 拉 nlohmann.json，缺了会 MSB3073
       - name: 安装 nuget 与 Inno Setup 6
         run: choco install nuget.commandline innosetup -y --no-progress
+      - name: 构建应用（Flutter Windows + Rust core DLL）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          pwsh scripts/build-windows-app.ps1
+
       # 护栏（t154 P0）：在 Release 目录里跑过一次 App 就会生成 yunong.exe.WebView2/EBWebView，
-      # 里面是本机 Cookie / Login Data。这一步显式把脏产物挡在打包之前（脚本内部还会再断言一次）。
+      # 里面是本机 Cookie / Login Data。必须在打包**之前**挡住（脚本内部还会再断言一次）。
       - name: 护栏 A：产物目录不得含 WebView2 用户数据 / 数据库 / 密钥 / 调试符号
         shell: pwsh
         run: |
@@ -288,13 +294,15 @@ jobs:
           }
           Write-Host "OK：Release 目录干净（无 WebView2/DB/secrets/pdb/.env）"
 
-      - name: 构建应用 + 安装包
+      - name: 构建安装包（白名单暂存 + ISCC）
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           Write-Host "version=$version"
-          pwsh scripts/build-windows-installer.ps1 -Version $version -OutputDir dist
+          pwsh scripts/build-windows-installer.ps1 -Version $version -SkipAppBuild -OutputDir dist
           Get-ChildItem dist | Format-Table Name,Length
+
       # 端到端验证：静默装到临时目录 → 三个 DLL 与 data\ 都在 → 静默卸载 → 用户数据仍保留
       - name: 从零安装验证（静默安装/卸载 + 用户数据保留）
         shell: pwsh
