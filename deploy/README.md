@@ -252,6 +252,37 @@ CI 在 `app/android/key.properties` 里还原（该文件已 gitignore）：有 
 `app/android/app/src/main/AndroidManifest.xml`，本项目**不需要**存储写入权限（课表走 WebView 抓取 + 本地 SQLite），
 只需 `INTERNET`——Android 13+ 的分区存储/通知权限变化对我们无影响。
 
+### 干净环境验证（安装包真装真跑，不污染真身）
+
+在没有 Windows Sandbox / Hyper-V 的机器上（**Windows 11 家庭版不提供**：`Containers-DisposableClientVM`
+与 Hyper-V 都要专业版/企业版），用**改写环境变量**的方式做安装验证：
+
+```powershell
+# 先打一个安装包（或直接拿 CI 的 artifact：yunong-windows-setup-<run>）
+pwsh scripts/build-windows-installer.ps1 -Version 0.9.0
+pwsh scripts/verify-install-clean.ps1 -Root D:\verify -KeepArtifacts
+```
+
+脚本做的事（13 条断言，全自动、不需要点界面）：
+
+1. 建空目录 `D:\verify\profile-<时间戳>` 当"假用户配置"、`D:\verify\app-<时间戳>` 当安装目录；
+2. `setup.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=<安装目录>` 静默安装，断言 exe / 三个 DLL / `data\` / 卸载程序都在，且**不含** `.WebView2`、`*.db`、`secrets`；
+3. `$env:LOCALAPPDATA = "<假用户配置>"` 后启动已安装的 `yunong.exe`，断言进程没崩、假配置下创建了 `yunong\`；
+4. 断言**真实** `%LOCALAPPDATA%\yunong` 的文件数/字节数/修改时间**完全没变**（证明没污染真身），且运行后安装目录里**没有**冒出 `.WebView2`；
+5. 静默卸载：断言 `yunong.exe` 已删除、**用户数据仍保留**、真实目录依旧没被碰过。
+
+**原理**：应用的数据根来自 `LOCALAPPDATA ?? APPDATA ?? USERPROFILE`（`app/lib/src/core/app_paths.dart`），
+所以给进程换一个 `LOCALAPPDATA`，它就看到一个"空的可写根"。不需要改应用代码，也不引入 Profile 概念。
+
+**局限（必须说清，别把它当安全边界）**：
+- 这不是沙盒：**注册表**（HKCU）、开始菜单/桌面快捷方式、Program Files 写入仍然是真实系统的；
+- 只覆盖"应用把数据放在环境变量指向的目录"这一件事；
+- 验证的是本机环境下的行为，不代表另一台 Windows 的差异（缺 WebView2 Runtime、无权限等）。
+
+**要"系统级干净"的验证，两个选项**：
+- **新建一个本地 Windows 用户**（`设置 → 账户 → 其他用户`，标准用户即可），切过去装一遍——隔离注册表与用户目录，成本最低；
+- **虚拟机**（VirtualBox/VMware 装干净 Win11），能顺带验证"没装 WebView2 Runtime 会不会挂"这类全新系统问题。
+
 ### 干跑发布流水线
 
 ```bash
