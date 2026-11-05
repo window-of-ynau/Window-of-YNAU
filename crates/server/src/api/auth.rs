@@ -6,6 +6,7 @@
 use axum::{
     body::Bytes,
     extract::{Extension, State},
+    http::{header, HeaderMap},
     response::Response,
 };
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,7 @@ use uuid::Uuid;
 use yunong_shared::ErrorCode;
 
 use crate::api::{client_ip::ClientIp, envelope, error::AppError, request_id::ReqId};
-use crate::auth::{token, Principal};
+use crate::auth::{token, InviteUse, Principal};
 use crate::limiter::AuthRoute;
 use crate::state::AppState;
 
@@ -64,6 +65,19 @@ struct CredentialsRequest {
     password: String,
 }
 
+/// 注册请求体（t141：多一个可选 `invite_code`）。
+///
+/// 为什么单独一个结构体而不是给 `CredentialsRequest` 加字段：登录**不该**接受邀请码，
+/// 共用结构体会让"登录顺手带个码"变成可能的路径（虽然被忽略，但读代码的人会误会）。
+#[derive(Debug, Deserialize)]
+struct RegisterRequest {
+    email: String,
+    password: String,
+    /// 邀请制注册必须带；`AUTH_INVITE_REQUIRED=false` 时可不带（仅本地开发/测试）
+    #[serde(default)]
+    invite_code: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RefreshRequest {
     refresh_token: String,
@@ -89,9 +103,10 @@ pub async fn register(
     State(state): State<AppState>,
     Extension(req_id): Extension<ReqId>,
     Extension(client): Extension<ClientIp>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let credentials: CredentialsRequest = parse_body(&body, &req_id)?;
+    let credentials: RegisterRequest = parse_body(&body, &req_id)?;
     // security 复核 F1：**先卡长度再进限流**（顺序不能反，否则长邮箱已经进了桶表）
     check_email_shape(&credentials.email, &req_id.0)?;
     // 红队 H1 + R2-F6：注册按**客户端 IP** 分桶（原来是全局桶：一个班 40 人同时注册会 30 个 429，
@@ -106,11 +121,31 @@ pub async fn register(
         .acquire_hash_slot(AuthRoute::Register, HASH_SLOT_WAIT)
         .await
         .map_err(|error| error.with_request_id(&req_id.0))?;
-    let session = state
-        .auth
-        .register(&credentials.email, &credentials.password)
-        .await
-        .map_err(|err| AppError::from_auth(err, &req_id.0))?;
+    // t141 / ADR-11 1.0：邀请制。核销、建号、发令牌在同一个事务里（PG 后端）。
+    //
+    // IP / UA 只以 **SHA-256** 形式落 `invite_redemptions`：能定位"同一个码被同一台机器反复用"，
+    // 但库里拿不到可读的 IP/UA（与 ADR-19 的隐私口径一致）。
+    let session = if state.config.auth_invite_required {
+        let user_agent = headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok());
+        let invite = InviteUse {
+            code: credentials.invite_code.as_deref().unwrap_or_default(),
+            ip: Some(client.0.as_str()),
+            user_agent,
+        };
+        state
+            .auth
+            .register_with_invite(&credentials.email, &credentials.password, invite)
+            .await
+            .map_err(|err| AppError::from_auth(err, &req_id.0))?
+    } else {
+        state
+            .auth
+            .register(&credentials.email, &credentials.password)
+            .await
+            .map_err(|err| AppError::from_auth(err, &req_id.0))?
+    };
 
     Ok(envelope::created(
         SessionBody {

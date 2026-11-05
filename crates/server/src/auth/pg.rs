@@ -41,6 +41,155 @@ pub(crate) async fn register(
     issue_session(pool, user_id, None).await
 }
 
+/// 发放一个邀请码（只落哈希）。脚本与运维复用这一条 SQL。
+pub(crate) async fn insert_invite(
+    pool: &PgPool,
+    code_hash: &str,
+    batch: &str,
+    issued_by: &str,
+    expires_at: Option<OffsetDateTime>,
+    max_uses: i32,
+    note: Option<&str>,
+) -> Result<(), AuthError> {
+    sqlx::query(
+        "INSERT INTO invite_codes (code_hash, batch, issued_by, expires_at, max_uses, note) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(code_hash)
+    .bind(batch)
+    .bind(issued_by)
+    .bind(expires_at)
+    .bind(max_uses)
+    .bind(note)
+    .execute(pool)
+    .await
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// 按批次撤销（返回本次真正撤销的张数；已撤销的不重复计数）。
+pub(crate) async fn revoke_invite_batch(pool: &PgPool, batch: &str) -> Result<u64, AuthError> {
+    let affected = sqlx::query(
+        "UPDATE invite_codes SET revoked_at = now() \
+         WHERE batch = $1 AND revoked_at IS NULL",
+    )
+    .bind(batch)
+    .execute(pool)
+    .await
+    .map_err(db_error)?
+    .rows_affected();
+    Ok(affected)
+}
+
+/// 某批次的用量：`(已用, 总容量, 张数)`。
+pub(crate) async fn invite_batch_stats(
+    pool: &PgPool,
+    batch: &str,
+) -> Result<(i64, i64, i64), AuthError> {
+    let row = sqlx::query(
+        "SELECT coalesce(sum(used_count), 0)::bigint AS used, \
+                coalesce(sum(max_uses), 0)::bigint AS capacity, \
+                count(*)::bigint AS codes \
+         FROM invite_codes WHERE batch = $1",
+    )
+    .bind(batch)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+    let used = row.try_get("used").map_err(row_error)?;
+    let capacity = row.try_get("capacity").map_err(row_error)?;
+    let codes = row.try_get("codes").map_err(row_error)?;
+    Ok((used, capacity, codes))
+}
+
+/// 一次邀请码核销的上下文（哈希已在 service 层算好，明文不进这一层）。
+pub(crate) struct InviteUse<'a> {
+    pub code_hash: &'a str,
+    pub ip_hash: Option<&'a str>,
+    pub ua_hash: Option<&'a str>,
+}
+
+/// 带邀请码的注册：**核销与建号在同一个事务里**（t141）。
+///
+/// 原子性体现在三处：
+/// 1. 核销用一条 `UPDATE ... WHERE used_count < max_uses RETURNING` 完成
+///    "存在 / 未撤销 / 未过期 / 未用完"四道检查与自增——不是"先查后写"；
+/// 2. 邮箱撞唯一约束时**整个事务回滚**，邀请码不会被白吃（否则攻击者用已注册邮箱就能烧掉别人的码）；
+/// 3. 令牌与核销记录同事务提交，不会出现"账号建了但没记账"或"记账了但没建号"。
+pub(crate) async fn register_with_invite(
+    pool: &PgPool,
+    email: &str,
+    password_hash: &str,
+    invite: InviteUse<'_>,
+) -> Result<AuthSession, AuthError> {
+    let mut tx = pool.begin().await.map_err(db_error)?;
+
+    let batch: Option<String> = sqlx::query_scalar(
+        "UPDATE invite_codes SET used_count = used_count + 1 \
+         WHERE code_hash = $1 \
+           AND revoked_at IS NULL \
+           AND (expires_at IS NULL OR expires_at > now()) \
+           AND used_count < max_uses \
+         RETURNING batch",
+    )
+    .bind(invite.code_hash)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    let Some(batch) = batch else {
+        // 不存在 / 已撤销 / 已过期 / 用量已满 —— 对客户端**合并成同一个错误**（防枚举）
+        tx.rollback().await.ok();
+        return Err(AuthError::invite_invalid());
+    };
+
+    let inserted = sqlx::query(
+        "INSERT INTO users (email, password_hash, auth_method) VALUES ($1, $2, 'invite') \
+         RETURNING id",
+    )
+    .bind(email)
+    .bind(password_hash)
+    .fetch_one(&mut *tx)
+    .await;
+
+    let user_id: Uuid = match inserted {
+        Ok(row) => row.try_get("id").map_err(row_error)?,
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            tx.rollback().await.ok();
+            return Err(AuthError::validation("该邮箱已注册"));
+        }
+        Err(error) => return Err(db_error(error)),
+    };
+
+    sqlx::query(
+        "INSERT INTO invite_redemptions (user_id, code_hash, ip_hash, ua_hash) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(invite.code_hash)
+    .bind(invite.ip_hash)
+    .bind(invite.ua_hash)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    let issued = insert_pair(&mut tx, user_id, None).await?;
+    tx.commit().await.map_err(db_error)?;
+
+    tracing::info!(
+        batch = %batch,
+        user_id = %user_id,
+        "邀请码注册成功"
+    );
+
+    Ok(AuthSession {
+        user_id,
+        access_token: issued.access_token,
+        refresh_token: issued.refresh_token,
+        expires_in: ACCESS_TOKEN_TTL_SECS,
+    })
+}
+
 /// 登录第一步：只查"这个邮箱的哈希串"，**不做** Argon2 校验。
 ///
 /// 为什么拆开：Argon2 是同步的 CPU/内存密集计算，直接在 async fn 里做会占住 runtime

@@ -24,7 +24,7 @@ mod store;
 pub(crate) mod token;
 
 pub use error::AuthError;
-pub use service::AuthService;
+pub use service::{AuthService, InviteUse};
 pub use store::{AuthBackend, MemoryState};
 
 use uuid::Uuid;

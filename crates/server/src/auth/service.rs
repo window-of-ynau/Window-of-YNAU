@@ -7,12 +7,26 @@ use std::sync::{Mutex, MutexGuard};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use time::{Duration, OffsetDateTime};
+
 use crate::auth::{
     error::AuthError,
     password, pg,
     store::{AuthBackend, MemoryState},
     token, AuthSession, Principal,
 };
+
+/// 邀请码最长字节数：超过直接判无效（省一次哈希与查库）。
+pub const MAX_INVITE_BYTES: usize = 128;
+
+/// 邀请码注册的入参。
+///
+/// 明文码与客户端指纹都在**这一层**就地哈希：明文不进后端，日志里也不打明文。
+pub struct InviteUse<'a> {
+    pub code: &'a str,
+    pub ip: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+}
 
 /// 账号鉴权。`AppState` 持有 `Arc<AuthService>`，所有请求共用同一份状态。
 pub struct AuthService {
@@ -48,6 +62,130 @@ impl AuthService {
         match &self.backend {
             AuthBackend::Memory(state) => lock(state).register(email, password_hash),
             AuthBackend::Pg(pool) => pg::register(pool, &email, &password_hash).await,
+        }
+    }
+
+    /// 邀请制注册（t141 / ADR-11 1.0）：邮箱 + 密码 + **邀请码**。
+    ///
+    /// 校验顺序（贵的那步放最后）：格式 → 密码策略 → 邀请码形态 → **Argon2 哈希** →
+    /// 「原子核销 + 建号 + 核销记录 + 发令牌」一个事务。
+    ///
+    /// 为什么把 Argon2 放在核销之前：核销要占着行锁，而 Argon2 是 19 MiB / ~50ms 的同步计算，
+    /// 放事务里会把行锁与连接一起拖住。代价是"错码也会付一次哈希成本"——注册端点本来就有
+    /// 每 IP 10 次/分 的限流，这个放大量可以接受。
+    pub async fn register_with_invite(
+        &self,
+        email: &str,
+        raw_password: &str,
+        invite: InviteUse<'_>,
+    ) -> Result<AuthSession, AuthError> {
+        let email =
+            normalize_email(email).ok_or_else(|| AuthError::validation("邮箱格式不正确"))?;
+        password::validate_new(raw_password)?;
+
+        let code = invite.code.trim();
+        if code.is_empty() || code.len() > MAX_INVITE_BYTES {
+            // 形态不对与"不存在"用同一个错误：不给枚举留信号
+            return Err(AuthError::invite_invalid());
+        }
+
+        let password_hash = hash_blocking(raw_password.to_owned()).await?;
+        let code_hash = token::hash(code);
+        let ip_hash = invite.ip.map(token::hash);
+        let ua_hash = invite.user_agent.map(token::hash);
+
+        match &self.backend {
+            AuthBackend::Memory(state) => lock(state).register_with_invite(
+                email,
+                password_hash,
+                &code_hash,
+                ip_hash.as_deref(),
+                ua_hash.as_deref(),
+            ),
+            AuthBackend::Pg(pool) => {
+                pg::register_with_invite(
+                    pool,
+                    &email,
+                    &password_hash,
+                    pg::InviteUse {
+                        code_hash: &code_hash,
+                        ip_hash: ip_hash.as_deref(),
+                        ua_hash: ua_hash.as_deref(),
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    /// 发放一个邀请码（**只落哈希**；调用方负责把明文交给发放对象）。
+    ///
+    /// 只支持数据库后端：没有库的时候"邀请码"没有任何意义（重启即丢），
+    /// 内存后端直接报错，而不是假装成功。
+    pub async fn insert_invite(
+        &self,
+        code: &str,
+        batch: &str,
+        issued_by: &str,
+        expires_at: Option<OffsetDateTime>,
+        max_uses: i32,
+        note: Option<&str>,
+    ) -> Result<(), AuthError> {
+        let code = code.trim();
+        if code.is_empty() || code.len() > MAX_INVITE_BYTES {
+            return Err(AuthError::validation("邀请码长度不合法"));
+        }
+        if batch.trim().is_empty() || issued_by.trim().is_empty() {
+            return Err(AuthError::validation("batch / issued_by 不能为空"));
+        }
+        match &self.backend {
+            AuthBackend::Pg(pool) => {
+                pg::insert_invite(
+                    pool,
+                    &token::hash(code),
+                    batch,
+                    issued_by,
+                    expires_at,
+                    max_uses.max(1),
+                    note,
+                )
+                .await
+            }
+            AuthBackend::Memory(_) => Err(AuthError::internal("邀请码管理需要数据库后端")),
+        }
+    }
+
+    /// **仅内存后端**：登记一个邀请码（测试与本地调试用）。
+    ///
+    /// 生产请用 [`Self::insert_invite`]（落库）；这个函数在 PG 后端上是空操作，
+    /// 存在只是为了 API 级集成测试能在无数据库模式下走完整注册流程。
+    pub fn add_memory_invite_for_tests(
+        &self,
+        code: &str,
+        batch: &str,
+        max_uses: u32,
+        expires_in: Option<std::time::Duration>,
+    ) {
+        if let AuthBackend::Memory(state) = &self.backend {
+            let expires_at = expires_in
+                .map(|ttl| OffsetDateTime::now_utc() + Duration::seconds(ttl.as_secs() as i64));
+            lock(state).add_invite(code, batch, max_uses, expires_at);
+        }
+    }
+
+    /// 按批次撤销。
+    pub async fn revoke_invite_batch(&self, batch: &str) -> Result<u64, AuthError> {
+        match &self.backend {
+            AuthBackend::Pg(pool) => pg::revoke_invite_batch(pool, batch).await,
+            AuthBackend::Memory(_) => Err(AuthError::internal("邀请码管理需要数据库后端")),
+        }
+    }
+
+    /// 某批次用量：`(已用, 总容量, 张数)`。
+    pub async fn invite_batch_stats(&self, batch: &str) -> Result<(i64, i64, i64), AuthError> {
+        match &self.backend {
+            AuthBackend::Pg(pool) => pg::invite_batch_stats(pool, batch).await,
+            AuthBackend::Memory(_) => Err(AuthError::internal("邀请码管理需要数据库后端")),
         }
     }
 
@@ -239,6 +377,26 @@ mod tests {
         );
         // 点号不合并（`a.b@x.com` 与 `ab@x.com` 在多数邮件系统里并不等价）
         assert_eq!(normalize_email("a.b@x.com").as_deref(), Some("a.b@x.com"));
+    }
+
+    /// t141：空邀请码在**进入 Argon2 之前**就被拒（不给"错码烧 CPU"留口子）。
+    #[tokio::test]
+    async fn blank_invite_code_is_rejected_before_hashing() {
+        let service = AuthService::new(None);
+        let error = service
+            .register_with_invite(
+                "student@ynau.edu.cn",
+                "correct-horse-battery",
+                InviteUse {
+                    code: "   ",
+                    ip: Some("1.2.3.4"),
+                    user_agent: None,
+                },
+            )
+            .await
+            .expect_err("空邀请码必须被拒");
+        assert_eq!(error.code, yunong_shared::ErrorCode::Forbidden);
+        assert_eq!(error.message, "邀请码无效或已不可用");
     }
 
     #[test]

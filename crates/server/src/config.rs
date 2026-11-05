@@ -100,6 +100,11 @@ pub struct Config {
     pub rag_fetch_doi_allowed_hosts: Vec<String>,
     /// `/api/v1/rag/referrals` 的每分钟上报次数上限（t81 / M6）。0 = 关闭。
     pub rag_report_per_min: u32,
+    /// 注册是否必须带邀请码（t141 / ADR-11 1.0 方案）。**默认开**。
+    ///
+    /// 关掉只用于"本地开发/自动化测试"：线上关掉等于回到开放注册，
+    /// 而校方身份又无法在云端校验，等于任何人都能拿学号占坑。
+    pub auth_invite_required: bool,
     /// `rag_known_docs` 保留月数（0 = 不清理）。与盐的保留期**分开配置**：
     /// "语料保留多久"和"盐保留多久"是两类不同决策。
     pub rag_known_docs_retention_months: u32,
@@ -159,6 +164,8 @@ impl Config {
             rag_fetch_max_body_bytes: env_parse("RAG_FETCH_MAX_BODY_BYTES", 2 * 1024 * 1024),
             rag_fetch_doi_allowed_hosts: env_list("RAG_FETCH_DOI_ALLOWED_HOSTS", DEFAULT_DOI_HOSTS),
             rag_report_per_min: env_parse("RAG_REPORT_PER_MIN", 30),
+            // 缺省为真：不写这个变量时就是邀请制（安全默认）
+            auth_invite_required: env_flag_default_true("AUTH_INVITE_REQUIRED"),
             rag_known_docs_retention_months: env_parse("RAG_KNOWN_DOCS_RETENTION_MONTHS", 3),
             rag_salts_retention_months: env_parse("RAG_SALTS_RETENTION_MONTHS", 3),
             trust_proxy: env::var("YUNONG_TRUST_PROXY")
@@ -219,6 +226,8 @@ impl Config {
                 .map(|host| (*host).to_owned())
                 .collect(),
             rag_report_per_min: 1_000, // 测试默认不挡路；需要断言限流的用例自己调小
+            // 既有测试大量直接注册；需要验证邀请制的用例自己打开
+            auth_invite_required: false,
 
             rag_known_docs_retention_months: 3,
             rag_salts_retention_months: 3,
@@ -343,6 +352,22 @@ pub const DEFAULT_DOI_HOSTS: &[&str] = &[
     "www.biorxiv.org",
     "www.cambridge.org",
 ];
+
+/// 布尔开关，**缺省为真**（安全默认）。
+///
+/// 与 [`env_flag`] 的区别：那里缺省是假（可选功能），这里缺省是真（安全前提）。
+/// 显式 `0/false/no/off` 才关闭。
+fn env_flag_default_true(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
 
 /// 从环境读一个逗号分隔的列表（空值/缺失 → 默认值）。
 fn env_list(key: &str, default: &[&str]) -> Vec<String> {
