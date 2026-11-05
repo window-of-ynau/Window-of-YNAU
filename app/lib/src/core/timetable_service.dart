@@ -260,6 +260,56 @@ class FetchException implements Exception {
   String toString() => 'FetchException($code): ${message ?? userHint}';
 }
 
+/// 【t146】抓取重试：HTML 太短 / 不含课表关键字时，**间隔 [delay] 自动重试一次**。
+///
+/// 背景：每次构建后第一次抓取必报 `PARSE_EMPTY`，重试就正常 —— 首次构建后 WebView 缓存为空、
+/// 页面渲染更慢，抓取窗口里拿到的是空壳 HTML。按内容判断 + 重试一次，比固定延时靠谱。
+///
+/// - [minLength]：低于它视为"空壳"（默认 2000 字符；真实课表页远大于此）；
+/// - 第二次仍不合格就**返回最后一次结果**，由上游照常报错（不掩盖问题）。
+Future<HtmlFetchAttempt> fetchHtmlWithRetry({
+  required Future<String> Function() fetch,
+  Duration delay = const Duration(milliseconds: 800),
+  int minLength = 2000,
+  int maxAttempts = 2,
+}) async {
+  HtmlFetchAttempt attempt = const HtmlFetchAttempt(html: '', tries: 0);
+  for (int i = 0; i < maxAttempts; i++) {
+    final String html = await fetch();
+    attempt = HtmlFetchAttempt(html: html, tries: i + 1);
+    if (!attempt.looksEmpty(minLength: minLength)) {
+      return attempt;
+    }
+    if (i + 1 < maxAttempts) {
+      await Future<void>.delayed(delay);
+    }
+  }
+  return attempt;
+}
+
+/// 一次 HTML 抓取的结果（含诊断信息，**不记录原始 HTML**）。
+class HtmlFetchAttempt {
+  const HtmlFetchAttempt({required this.html, required this.tries});
+
+  final String html;
+
+  /// 第几次尝试（1 = 首次）。
+  final int tries;
+
+  int get length => html.length;
+
+  /// 是否含课表关键字（既用于诊断，也用于判断是否需要重试）。
+  bool get hasTimetableMark =>
+      RegExp(r'timetable|课程|节次|课表|周次', caseSensitive: false).hasMatch(html);
+
+  /// "空壳"：太短或不含课表关键字。
+  bool looksEmpty({int minLength = 2000}) => length < minLength || !hasTimetableMark;
+
+  /// 诊断行：`html 长度=N / 是否含课表关键字=true|false（第 N 次）`
+  String get diagnostics =>
+      'html 长度=$length / 是否含课表关键字=$hasTimetableMark（第 $tries 次）';
+}
+
 /// 课表服务：HTML → Rust 核心（解析 + SQLite）→ 列表。
 class TimetableService {
   TimetableService({

@@ -41,6 +41,28 @@ import 'secret_service.dart';
 class DeepSeekPreset {
   const DeepSeekPreset._();
 
+  /// 【t146】合并模型列表：**按名字去重，预设优先**。
+  ///
+  /// 旧实现是 `[...active.models, ...DeepSeekPreset.models]` 直接拼接 ——
+  /// DeepSeek 供应商自带的正是这两个名字，于是每个模型出现两次：
+  /// 列表重复 + 两处都显示勾（`option.value == current` 命中两条）。
+  static List<String> mergeModelNames({
+    required List<String> presets,
+    required List<String> custom,
+  }) {
+    final Set<String> seen = <String>{};
+    final List<String> out = <String>[];
+    for (final String raw in <String>[...presets, ...custom]) {
+      final String name = raw.trim();
+      if (name.isEmpty || seen.contains(name)) {
+        continue;
+      }
+      seen.add(name);
+      out.add(name);
+    }
+    return out;
+  }
+
   static const String name = 'DeepSeek';
   static const String baseUrl = 'https://api.deepseek.com';
 

@@ -18,6 +18,7 @@ import 'dart:convert';
 import 'dart:collection';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../core/timetable_service.dart';
@@ -559,10 +560,24 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       CasTicketProbe.navigate = (String target) async {
                         await controller.loadUrl(urlRequest: URLRequest(url: WebUri(target)));
                       };
-                      // 【临时诊断 t142/t143】页面内纯本地探测 cardId：
-                      // 直接返回 `evaluateJavascript` 的值（不走 JS→Dart 桥，避免导航后桥失效导致卡死）。
-                      SessionProbeJsBridge.evaluate = (String source) async =>
-                          controller.evaluateJavascript(source: source);
+                      // 【临时诊断 t142/t143/t146】页面内纯本地探测 cardId：
+                      // 直接返回 `evaluateJavascript` 的值（不走 JS→Dart 桥）。
+                      // t146：控制器失效（MissingPluginException）→ 转成明确的
+                      // `WebViewUnavailableException`，让 UI 提示"重新进入课表页"，而不是抛原生异常。
+                      SessionProbeJsBridge.evaluate = (String source) async {
+                        if (_controller == null) {
+                          throw const WebViewUnavailableException(
+                            'WebView 未就绪：请先进入「我的课表」并等页面加载完成',
+                          );
+                        }
+                        try {
+                          return await _controller!.evaluateJavascript(source: source);
+                        } on MissingPluginException {
+                          throw const WebViewUnavailableException(
+                            'WebView 已失效（控制器已销毁）：请重新进入「我的课表」再回来探测',
+                          );
+                        }
+                      };
                       // 【临时诊断 t140】校方域名只在 WebView 内用 fetch 取：
                       // 页面里是真实浏览器环境，能过动态 JS 挑战；只回传摘要，不回传响应体/Cookie。
                       SessionProbeJsBridge.inPageFetch =

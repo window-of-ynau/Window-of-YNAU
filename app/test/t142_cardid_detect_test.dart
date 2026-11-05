@@ -128,8 +128,11 @@ void main() {
     // 点第一个「用这个」 → 输入框被填成完整值
     await tester.tap(find.text('用这个').first);
     await tester.pumpAndSettle();
-    final TextField field = tester.widget<TextField>(find.byKey(const Key('probe-cardid')));
-    expect(field.controller!.text, _a);
+    // t146：手动 cardId 输入框已删除，改为断言状态行显示脱敏值
+    expect(
+      tester.widget<Text>(find.byKey(const Key('probe-cardid-status'))).data,
+      contains('012345…cdef'),
+    );
     expect(find.textContaining('已填入 012345…cdef'), findsOneWidget);
   });
 
