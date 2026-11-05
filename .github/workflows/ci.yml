@@ -685,6 +685,13 @@ jobs:
         with:
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
+      # runner 默认 JDK 已是 25，而 Gradle 8.13 只支持到 Java 23（会报
+      # "Gradle build failed due to Java/Gradle incompatibility"）→ 固定 JDK 21。
+      - name: 固定 JDK 21（Gradle 8.13 不支持 runner 默认的 JDK 25）
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
