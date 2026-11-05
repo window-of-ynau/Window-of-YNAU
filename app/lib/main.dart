@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 // 云农之窗 · 客户端骨架（W1）
 //
@@ -29,9 +30,73 @@ import 'src/theme/glass_performance.dart';
 import 'src/theme/themes.dart';
 import 'src/theme/yunong_tokens.dart';
 
-void main() {
+void main(List<String> args) {
   WidgetsFlutterBinding.ensureInitialized();
+  // t156：数据根覆盖（命令行 > 环境变量 > 默认）。
+  //
+  // 为什么两处都收：Flutter Windows 的 `main(List<String> args)` 在 release 里通常拿不到
+  // 启动参数，`Platform.executableArguments` 才是可靠的；`args` 只是测试/调试时的补充。
+  AppPaths.initDataRoot(
+    args: <String>[...Platform.executableArguments, ...args],
+  );
+  final String? dataRootError = AppPaths.dataRootError;
+  if (dataRootError != null) {
+    // **明确报错并拒绝启动业务**：绝不能静默回退默认目录（否则又会复用本地数据库）
+    runApp(DataRootErrorApp(
+      message: dataRootError,
+      path: AppPaths.dataDir,
+      sourceLabel: AppPaths.overrideSource.label,
+    ));
+    return;
+  }
   runApp(const YunongApp());
+}
+
+/// 数据目录非法时的兜底界面：只说明问题与解决方式，不进入业务（避免写错目录还不自知）。
+class DataRootErrorApp extends StatelessWidget {
+  const DataRootErrorApp({
+    super.key,
+    required this.message,
+    required this.path,
+    required this.sourceLabel,
+  });
+
+  final String message;
+  final String path;
+  final String sourceLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: Scaffold(
+        body: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 560),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Text('数据目录不可用',
+                      style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 12),
+                  SelectableText(message, key: const Key('data-root-error')),
+                  const SizedBox(height: 8),
+                  SelectableText('数据目录（$sourceLabel）：$path',
+                      style: const TextStyle(fontSize: 12)),
+                  const SizedBox(height: 16),
+                  const Text('请确认路径存在且可写，或用 --data-dir 指定其它目录后重新启动。',
+                      style: TextStyle(fontSize: 12)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// 应用根：**唯一**持有 [ThemeController] 的地方。
