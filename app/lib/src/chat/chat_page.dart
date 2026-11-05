@@ -149,10 +149,12 @@ class ChatPageState extends State<ChatPage> {
 
   /// t123：供应商列表（与设置页共用同一份存储；对话里可直接切换）。
   late final ProviderStore _providers = ProviderStore();
-  List<String> get _models => <String>[
-        ..._providers.active.models,
-        ...DeepSeekPreset.models,
-      ];
+  /// t146：预设 + 自定义**按名字去重、预设优先**。
+  /// 旧实现是直接拼接 → 同名模型出现两次、两处都打勾（`option.value == current` 命中两条）。
+  List<String> get _models => DeepSeekPreset.mergeModelNames(
+        presets: DeepSeekPreset.models,
+        custom: _providers.active.models,
+      );
 
   /// t122：强制工具调用（诊断弹窗可切）。开启后请求带 `tool_choice=required`。
   bool _toolChoiceRequired = false;

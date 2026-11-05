@@ -108,9 +108,10 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
   static const Duration kCasTimeout = Duration(seconds: 15);
   static const int kCasMaxHops = 5;
 
-  final TextEditingController _url = TextEditingController(text: kProbeDefaultUrl);
-  final TextEditingController _years = TextEditingController(text: '2026-2027-1');
-  final TextEditingController _cardId = TextEditingController();
+  /// t146：不再提供"目标 URL / 学期 / cardId"的手动输入（那是旧的 Dart HTTP 入口）。
+  /// 现在请求固定走页内同款形状；cardId 由「自动探测」填入（内部状态，不展示输入框）。
+  String _cardIdValue = '';
+  String _yearsValue = '2026-2027-1';
   final TextEditingController _casBase = TextEditingController(text: CasTicketProbe.defaultCasBase);
   final TextEditingController _serviceUrl =
       TextEditingController(text: CasTicketProbe.defaultServiceUrl);
@@ -147,9 +148,7 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
 
   @override
   void dispose() {
-    _url.dispose();
-    _years.dispose();
-    _cardId.dispose();
+
     _casBase.dispose();
     _serviceUrl.dispose();
     _cooldownTicker?.cancel();
@@ -180,15 +179,15 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
 
   /// 目标 URL：若填的是课表接口路径，则用 `years/cardId` 按页内同款形状拼好。
   Uri _target() {
-    final Uri parsed = Uri.parse(_url.text.trim());
+    final Uri parsed = Uri.parse(kProbeDefaultUrl);
     if (!parsed.path.contains(kScheduleApiPath)) {
       return parsed;
     }
     return buildScheduleApiUrl(
       origin: '${parsed.scheme}://${parsed.host}',
-      years: _years.text.trim(),
+      years: _yearsValue,
       week: 1,
-      cardId: _cardId.text.trim(),
+      cardId: _cardIdValue,
     );
   }
 
@@ -269,6 +268,11 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
         _cardIdHints = outcome.hints;
         _cardIdHintMessage = outcome.ok && outcome.hints.isNotEmpty ? null : outcome.message;
       });
+    } on WebViewUnavailableException catch (failure) {
+      // t146：控制器失效（MissingPluginException）→ 明确提示，而不是抛原生异常
+      if (mounted) {
+        setState(() => _cardIdHintMessage = '探测失败：${failure.message}');
+      }
     } on Object catch (failure) {
       // 兜底：runCardIdProbe 自身不抛，这里防御未来改动
       if (mounted) {
@@ -283,7 +287,7 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
 
   void _useCardId(CardIdHint hint) {
     setState(() {
-      _cardId.text = hint.value;
+      _cardIdValue = hint.value;
       _cardIdHintMessage = '已填入 ${hint.masked}（来源 ${hint.source}）';
     });
   }
@@ -411,20 +415,13 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
               ),
               const SizedBox(height: 8),
               _verdictBox(theme),
-              TextField(
-                key: const Key('probe-url'),
-                controller: _url,
-                decoration: const InputDecoration(labelText: '目标 URL（只在 WebView 内请求）'),
-              ),
-              TextField(
-                key: const Key('probe-years'),
-                controller: _years,
-                decoration: const InputDecoration(labelText: '学期 years（如 2026-2027-1）'),
-              ),
-              TextField(
-                key: const Key('probe-cardid'),
-                controller: _cardId,
-                decoration: const InputDecoration(labelText: 'cardId（32 位 hex，可点下面「自动探测」）'),
+              // t146：删除「目标 URL / 学期 / cardId」手动输入（旧 Dart HTTP 入口已按 t140 移除）。
+              // 现在只保留两件事：页内取一次（按钮）与 CAS 探针。
+              Text(
+                'cardId：${_cardIdValue.isEmpty ? '未探测（先点下面「自动探测 cardId」）' : maskCardIdValue(_cardIdValue)}'
+                ' · 学期：$_yearsValue',
+                key: const Key('probe-cardid-status'),
+                style: theme.textTheme.bodySmall,
               ),
               // t142/t143：自动探测 cardId（页面内纯本地扫描，不发请求）
               Wrap(

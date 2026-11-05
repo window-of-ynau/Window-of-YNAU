@@ -115,6 +115,19 @@ String describeCookieRefs(List<CookieRef> cookies) =>
 const String kCookieValuesNeverCollected = 'true';
 // 说明：这个常量只是给评审一个显式信号；真正的保证来自 CookieRef 结构本身。
 
+/// 【t146】WebView 控制器不可用（页面未挂载 / 已销毁 / 是过期实例）。
+///
+/// 典型表现：`MissingPluginException(No implementation found for method evaluateJavascript…)`
+/// —— 原生 WebView 已经不在了，方法通道自然没有实现。这不是"页面没就绪"。
+class WebViewUnavailableException implements Exception {
+  const WebViewUnavailableException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
 /// 【临时】JS 侧对照的桥：由课表 WebView 在创建时注入（见 `webview_fetcher.dart`）。
 ///
 /// 用途：执行 `document.cookie.length`。它与 CookieManager 的差异就是判断 HttpOnly 的关键。

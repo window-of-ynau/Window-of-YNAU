@@ -108,8 +108,11 @@ void main() {
 
       await tester.tap(find.text('用这个').first);
       await tester.pumpAndSettle();
-      final TextField field = tester.widget<TextField>(find.byKey(const Key('probe-cardid')));
-      expect(field.controller!.text, _a);
+      // t146：输入框已删除 → 断言状态行显示脱敏值
+      expect(
+        tester.widget<Text>(find.byKey(const Key('probe-cardid-status'))).data,
+        contains('012345…cdef'),
+      );
     });
 
     testWidgets('返回 null：显示错误，按钮恢复可用', (WidgetTester tester) async {
