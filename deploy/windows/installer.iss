@@ -57,8 +57,11 @@ PrivilegesRequiredOverridesAllowed=dialog
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: unchecked
 
 [Files]
-; 整个 Release 目录（含 data\ 与全部 DLL）——DLL 必须与 exe 同目录，不能拆。
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; SourceDir 由 scripts/build-windows-installer.ps1 指向**白名单暂存目录** build/installer-staging，
+; 不是原始 Release 目录（t154：后者可能含运行期生成的 WebView2 用户数据 = Cookie/Login Data）。
+; 这里仍保留 Excludes 作为第二道保险：即使将来有人误把 SourceDir 指回 Release，也不会打出用户数据。
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion; \
+    Excludes: "*.WebView2,EBWebView,*.db,*.db-journal,*.db-wal,*.db-shm,secrets,*.pdb,.env,*.jks,*.keystore"
 
 [Icons]
 Name: "{group}\云农之窗"; Filename: "{app}\yunong.exe"

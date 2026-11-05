@@ -269,6 +269,25 @@ jobs:
       # flutter_inappwebview 的 Windows 实现要 nuget 拉 nlohmann.json，缺了会 MSB3073
       - name: 安装 nuget 与 Inno Setup 6
         run: choco install nuget.commandline innosetup -y --no-progress
+      # 护栏（t154 P0）：在 Release 目录里跑过一次 App 就会生成 yunong.exe.WebView2/EBWebView，
+      # 里面是本机 Cookie / Login Data。这一步显式把脏产物挡在打包之前（脚本内部还会再断言一次）。
+      - name: 护栏 A：产物目录不得含 WebView2 用户数据 / 数据库 / 密钥 / 调试符号
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "app/build/windows/x64/runner/Release"
+          if (-not (Test-Path $dir)) { throw "产物目录不存在：$dir" }
+          $bad = @(Get-ChildItem $dir -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {
+              $_.Name -like "*.WebView2" -or $_.Name -eq "EBWebView" -or
+              $_.Name -like "*.db" -or $_.Name -eq "secrets" -or
+              $_.Name -like "*.pdb" -or $_.Name -eq ".env" -or
+              $_.Name -like "*.jks" -or $_.Name -like "*.keystore" })
+          if ($bad.Count -gt 0) {
+            $list = ($bad | Select-Object -First 20 | ForEach-Object { $_.FullName }) -join "`n"
+            throw "Release 目录含不该发布的内容（$($bad.Count) 项）：`n$list"
+          }
+          Write-Host "OK：Release 目录干净（无 WebView2/DB/secrets/pdb/.env）"
+
       - name: 构建应用 + 安装包
         shell: pwsh
         run: |
@@ -295,6 +314,11 @@ jobs:
               Write-Host ("OK {0} = {1:N1} MB" -f $f, ((Get-Item $p).Length / 1MB))
           }
           if (-not (Test-Path (Join-Path $target "data"))) { throw "安装后缺少 data\ 目录" }
+          # 护栏 B（t154 最终验收点）：装出来的目录里不许有 WebView2 用户数据 / 数据库
+          $leaked = @(Get-ChildItem $target -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {
+              $_.Name -like "*.WebView2" -or $_.Name -eq "EBWebView" -or $_.Name -like "*.db" -or $_.Name -eq "secrets" })
+          if ($leaked.Count -gt 0) { throw "安装包内含用户数据：$(($leaked | ForEach-Object { $_.FullName }) -join ', ')" }
+          Write-Host "OK：安装目录内无 WebView2 用户数据 / 数据库"
 
           $unins = Get-ChildItem $target -Filter "unins*.exe" | Select-Object -First 1
           if (-not $unins) { throw "安装包没有卸载程序" }

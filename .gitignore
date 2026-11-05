@@ -52,3 +52,6 @@ Thumbs.db
 # Rust 交叉编译产物（scripts/build-android-core.ps1 生成，不入库）
 app/android/app/src/main/jniLibs/
 app/android/build/
+
+# 安装包白名单暂存目录（scripts/build-windows-installer.ps1 生成，不入库）
+build/installer-staging/
