@@ -669,6 +669,70 @@ jobs:
       - name: 端到端闭环（mock 上游 + PG + 服务端容器 + 脚本客户端）
         run: python3 scripts/e2e-chat.py --image yunong-server:ci
 
+  # Android 可侧载 APK：交叉编译 Rust 核心成 libyunong_core.so → 打进 APK → 解包确认 .so 在里面。
+  #
+  # 为什么单独一个 job：它需要 NDK + rust android target + Gradle，与桌面端/服务端链路完全不同。
+  # **暂不进分支保护必需检查**：Android 现在不阻塞桌面端 alpha 发布，但红了必须看得见。
+  android-apk:
+    name: Android APK（含 libyunong_core.so）
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      # 多数 runner 镜像已带 NDK；没有就装一个（NDK 很大，只在缺的时候装）
+      - name: 确保 NDK 可用
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          if [ -n "${ANDROID_NDK_HOME:-}" ] && [ -d "${ANDROID_NDK_HOME:-}" ]; then
+            echo "NDK: $ANDROID_NDK_HOME"; exit 0
+          fi
+          if [ -d "$sdk/ndk" ] && [ -n "$(ls -A "$sdk/ndk" 2>/dev/null)" ]; then
+            echo "NDK: $(ls -A "$sdk/ndk")"; exit 0
+          fi
+          echo "::notice::runner 无预装 NDK，安装 ndk;27.2.12479018"
+          yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" > /dev/null
+      # 脚本本身带 NDK/target 检查与清晰的错误提示；Linux 上 pwsh 由 runner 预装
+      - name: 交叉编译 Rust 核心（arm64-v8a）
+        run: pwsh scripts/build-android-core.ps1 -Abi arm64-v8a
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+      # 没有 key.properties 时 gradle 自动回退 debug 签名（本 PR 已加），所以能直接侧载
+      - name: 构建 APK
+        working-directory: app
+        run: flutter build apk --release --target-platform android-arm64
+      - name: 验证 APK 内含 lib/arm64-v8a/libyunong_core.so
+        run: |
+          set -euo pipefail
+          apk=app/build/app/outputs/flutter-apk/app-release.apk
+          [ -f "$apk" ] || { echo "::error::APK 未产出：$apk"; exit 1; }
+          ls -l "$apk"
+          echo "--- APK 里的 lib/ ---"
+          unzip -l "$apk" | awk '$4 ~ /^lib\// {print}' || true
+          if ! unzip -l "$apk" | grep -q 'lib/arm64-v8a/libyunong_core.so'; then
+            echo "::error::APK 里没有 lib/arm64-v8a/libyunong_core.so —— 装上去 FFI 会加载失败"
+            exit 1
+          fi
+          echo "OK：APK 内含 lib/arm64-v8a/libyunong_core.so"
+      - name: 上传 APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: yunong-apk-ci-${{ github.run_number }}
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 7
+
   # 密钥泄露防护：owner 的真实 API Key 曾被写进测试代码并推到 GitHub（已吊销 + 脱敏）。
   # 这道闸让"把密钥写进代码"在提交前（pre-commit 钩子）和合并前（CI）都直接失败。
   # 规则只有一份：scripts/secret-scan.py —— 钩子脚本装的也是它，不要写第二份。
