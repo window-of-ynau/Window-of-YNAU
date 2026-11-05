@@ -6,6 +6,7 @@
 // 白名单（隐私）：只接受 `type` / `state` / `reason` / `path` / `html` / `code` / `message`，
 // **不接受也不解析任何 Cookie、表单值、完整 URL**。
 
+import 'dart:async';
 import 'dart:convert';
 
 import '../core/timetable_service.dart';
@@ -25,9 +26,45 @@ class CampusBridge {
     this.onScheduleTemplate,
     this.onScheduleApi,
     this.onStageChange,
+    this.grabHtml,
+    this.retryDelay = const Duration(milliseconds: 800),
+    this.minHtmlLength = 2000,
+    this.requireTimetableKeyword = true,
   });
 
   final void Function(FetchedPage page) onFetched;
+
+  /// 【t148】页面侧可重复调用的抓取入口（`window.__yunongGrabHtml()`）。
+  ///
+  /// 首次收到的 html 若是"空壳"，用它**重取一次**（不重新导航），再判失败。
+  final Future<String?> Function()? grabHtml;
+
+  /// 重取前的等待（默认 800ms）。
+  final Duration retryDelay;
+
+  /// "空壳"判定阈值（默认 2000 字符；测试可调小）。
+  final int minHtmlLength;
+
+  /// 是否要求 HTML 含课表关键字（测试可关掉）。
+  final bool requireTimetableKeyword;
+
+  /// 按当前配置判断一条 html 是否算"空壳"。
+  bool _isHollow(String html) {
+    final HtmlFetchAttempt attempt = HtmlFetchAttempt(html: html, tries: 1);
+    if (html.trim().isEmpty) {
+      return true;
+    }
+    if (html.length < minHtmlLength) {
+      return true;
+    }
+    return requireTimetableKeyword && !attempt.hasTimetableMark;
+  }
+
+  /// 是否已经用过那一次重取机会（每次抓取只重试一次）。
+  bool _htmlRetryUsed = false;
+
+  /// 最近一次交付/失败的 html 诊断行（`html 长度=N / 是否含课表关键字=…（第 N 次）`）。
+  String? lastHtmlDiagnostics;
   final void Function(FetchException error) onError;
   final void Function(LoginProbe probe)? onLoginState;
   final void Function(FetchStage stage)? onStage;
@@ -138,22 +175,24 @@ class CampusBridge {
         return true;
       case 'timetable':
         final html = message['html'];
-        if (html is! String || html.trim().isEmpty) {
-          _fail(const FetchException(
-            code: 'HTML_CHANGED',
-            userHint: '学校页面可能已更新，请反馈',
-            message: '抓到空表格',
-          ));
+        final String path = (message['path'] as String?) ?? '';
+        final String htmlText = html is String ? html : '';
+        final HtmlFetchAttempt attempt = HtmlFetchAttempt(html: htmlText, tries: 1);
+        if (!_isHollow(htmlText)) {
+          _deliver(attempt, path);
           return true;
         }
-        if (_delivered) {
+        // t148：空壳不再立刻失败 —— 先用页面侧的可重复入口**重取一次**（800ms 后），
+        // 仍不合格才报 HTML_CHANGED（诊断里带上次数与长度，便于定位）。
+        if (!_htmlRetryUsed && grabHtml != null) {
+          _htmlRetryUsed = true;
+          unawaited(_retryHtml(path, first: attempt));
           return true;
         }
-        _delivered = true;
-        onStage?.call(FetchStage.grabbed);
-        onFetched(FetchedPage(
-          html: html,
-          url: (message['path'] as String?) ?? '',
+        _fail(FetchException(
+          code: 'HTML_CHANGED',
+          userHint: '学校页面可能已更新，请反馈',
+          message: '抓到空表格（${attempt.diagnostics}）',
         ));
         return true;
 
@@ -170,6 +209,38 @@ class CampusBridge {
         // 未知消息直接忽略（脚本可以演化，端侧不能因此崩）
         return false;
     }
+  }
+
+  /// 交付一次合格的 HTML（只交付一次）。
+  void _deliver(HtmlFetchAttempt attempt, String path) {
+    if (_delivered) {
+      return;
+    }
+    _delivered = true;
+    lastHtmlDiagnostics = attempt.diagnostics;
+    onStage?.call(FetchStage.grabbed);
+    onFetched(FetchedPage(html: attempt.html, url: path));
+  }
+
+  /// t148：空壳 → 等 [retryDelay] 后用页面侧入口重取一次。
+  Future<void> _retryHtml(String path, {required HtmlFetchAttempt first}) async {
+    await Future<void>.delayed(retryDelay);
+    String? html;
+    try {
+      html = await grabHtml?.call();
+    } on Object {
+      html = null;
+    }
+    final HtmlFetchAttempt second = HtmlFetchAttempt(html: html ?? '', tries: 2);
+    if (!_isHollow(html ?? '')) {
+      _deliver(second, path);
+      return;
+    }
+    _fail(FetchException(
+      code: 'HTML_CHANGED',
+      userHint: '学校页面可能已更新，请反馈',
+      message: '重试后仍是空表格：${first.diagnostics} → ${second.diagnostics}',
+    ));
   }
 
   void _fail(FetchException error) {

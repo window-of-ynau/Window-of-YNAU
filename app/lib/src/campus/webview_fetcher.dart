@@ -221,6 +221,15 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     onScheduleTemplate: _onScheduleTemplate,
     onScheduleApi: widget.onFetchedSchedule,
     onStageChange: _onStageChange,
+    // t148：空壳 html 时用页面侧可重复入口重取一次（不重新导航、不发请求）
+    grabHtml: () async {
+      final InAppWebViewController? controller = _controller;
+      if (controller == null) {
+        return null;
+      }
+      final Object? raw = await controller.evaluateJavascript(source: kGrabHtmlScript);
+      return raw is String ? raw : null;
+    },
     onStage: (FetchStage stage) {
       widget.onStage?.call(stage);
       if (stage == FetchStage.grabbed) {
@@ -535,6 +544,12 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       // 【临时诊断 t142】页面内 cardId 探测器（纯本地，不发请求）
                       UserScript(
                         source: kCardIdProbeInstallScript,
+                        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+                        forMainFrameOnly: false,
+                      ),
+                      // 【t148】可重复调用的抓取入口：`window.__yunongGrabHtml()`
+                      UserScript(
+                        source: kGrabHtmlInstallScript,
                         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
                         forMainFrameOnly: false,
                       ),

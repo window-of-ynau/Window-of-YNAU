@@ -121,7 +121,11 @@ class _YunongAppState extends State<YunongApp> {
               final YunongTokens tokens = context.tokens;
               // t96：文本选择菜单/浮层必须不透明（glass 主题下默认会透底），这里统一抬高 surface alpha
               Widget content = child ?? const SizedBox.shrink();
-              content = Theme(data: solidSurfaceTheme(Theme.of(context)), child: content);
+              content = Theme(
+                key: const Key('app-solid-surface'),
+                data: solidSurfaceTheme(Theme.of(context)),
+                child: content,
+              );
               if (tokens.canvasGradient != null) {
                 content = DecoratedBox(
                   decoration: BoxDecoration(gradient: tokens.canvasGradient),
