@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>云农之窗 · 图标</title>
+<style>
+  html,body{margin:0;padding:0;background:transparent;overflow:hidden}
+  svg{display:block}
+</style>
+</head>
+<body>
+<script>
+  const p = new URLSearchParams(location.search);
+  const v = p.get('v') || '1';
+  const s = parseInt(p.get('s') || '1024', 10);
+
+  // 统一色板（与三套主题同源）
+  const INK = '#141413';        // C 的墨黑 / A 的近黑
+  const PAPER = '#FAF9F5';      // 纸色瓦片（浅色任务栏靠它，深色任务栏靠它显形）
+  const CORAL = '#A9583E';      // C 的强调色（赤陶）
+  const BLUE = '#3F68E4';       // B 的深蓝（备用）
+
+  // 瓦片：圆角方块 + 1px 环（深色任务栏上靠亮瓦片，浅色任务栏靠环 + 墨色图形）
+  const tile = (fill) => `
+    <rect x="32" y="32" width="960" height="960" rx="208" fill="${fill}"/>
+    <rect x="33.5" y="33.5" width="957" height="957" rx="206.5"
+          fill="none" stroke="rgba(20,20,19,0.10)" stroke-width="8"/>`;
+
+  // 窗格：2×2 十字窗（笔画全部 ≥ 96px，16px 时仍有 1.5px 线宽）
+  const winGrid = (color, accent, accentCell) => {
+    const L = 224, T = 224, W = 576, H = 576, B = 104, R = 64;
+    // 外框（用四条实心矩形拼，避免 stroke 在小尺寸下变细）
+    const frame = `
+      <rect x="${L}" y="${T}" width="${W}" height="${B}" rx="${R}" fill="${color}"/>
+      <rect x="${L}" y="${T + H - B}" width="${W}" height="${B}" rx="${R}" fill="${color}"/>
+      <rect x="${L}" y="${T}" width="${B}" height="${H}" rx="${R}" fill="${color}"/>
+      <rect x="${L + W - B}" y="${T}" width="${B}" height="${H}" rx="${R}" fill="${color}"/>`;
+    // 十字
+    const cross = `
+      <rect x="${L + W / 2 - B / 2}" y="${T}" width="${B}" height="${H}" fill="${color}"/>
+      <rect x="${L}" y="${T + H / 2 - B / 2}" width="${W}" height="${B}" fill="${color}"/>`;
+    // 一格填色（右下）
+    const cell = accentCell
+      ? `<rect x="${L + W / 2 + B / 2}" y="${T + H / 2 + B / 2}"
+               width="${W / 2 - B / 2}" height="${H / 2 - B / 2}" fill="${accent}"/>`
+      : '';
+    return frame + cross + cell;
+  };
+
+  // V2：田垄（三条水平带 + 窗框）
+  const furrows = (color, accent) => {
+    const x = 224, w = 576, h = 120, gap = 68, r = 60;
+    const rows = [224, 224 + h + gap, 224 + 2 * (h + gap)];
+    return rows
+      .map((y, i) => `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" fill="${i === 1 ? accent : color}"/>`)
+      .join('');
+  };
+
+  // V3：窗 + 窗棂（反转：墨瓦片 + 纸色窗格）
+  const lightWin = (color, accent) => {
+    const L = 232, T = 232, W = 560, H = 560, B = 100, R = 56;
+    return `
+      <rect x="${L}" y="${T}" width="${W}" height="${B}" rx="${R}" fill="${color}"/>
+      <rect x="${L}" y="${T + H - B}" width="${W}" height="${B}" rx="${R}" fill="${color}"/>
+      <rect x="${L}" y="${T}" width="${B}" height="${H}" rx="${R}" fill="${color}"/>
+      <rect x="${L + W - B}" y="${T}" width="${B}" height="${H}" rx="${R}" fill="${color}"/>
+      <rect x="${L + W / 2 - B / 2}" y="${T}" width="${B}" height="${H}" fill="${color}"/>
+      <rect x="${L}" y="${T + H / 2 - B / 2}" width="${W}" height="${B}" fill="${color}"/>
+      <rect x="${L + W / 2 + B / 2}" y="${T + H / 2 + B / 2}"
+            width="${W / 2 - B / 2}" height="${H / 2 - B / 2}" fill="${accent}"/>`;
+  };
+
+  // Android 自适应图标：前景层 = 只有标记（透明底），落在 66% 安全区内
+  const fgMark = () => {
+    const L = 96, T = 96, W = 240, H = 240, B = 44, R = 26;
+    return 
+      <rect x="{L}" y="{T}" width="{W}" height="{B}" rx="{R}" fill="{INK}"/>
+      <rect x="{L}" y="{T + H - B}" width="{W}" height="{B}" rx="{R}" fill="{INK}"/>
+      <rect x="{L}" y="{T}" width="{B}" height="{H}" rx="{R}" fill="{INK}"/>
+      <rect x="{L + W - B}" y="{T}" width="{B}" height="{H}" rx="{R}" fill="{INK}"/>
+      <rect x="{L + W / 2 - B / 2}" y="{T}" width="{B}" height="{H}" fill="{INK}"/>
+      <rect x="{L}" y="{T + H / 2 - B / 2}" width="{W}" height="{B}" fill="{INK}"/>
+      <rect x="{L + W / 2 + B / 2}" y="{T + H / 2 + B / 2}"
+            width="{W / 2 - B / 2}" height="{H / 2 - B / 2}" fill="{CORAL}"/>;
+  };
+
+  let inner = '';
+  if (v === 'fg') {
+    // 432 画布 + 标记缩放到安全区（内容沿 viewBox 0 0 432 432 绘制）
+    document.body.innerHTML = <svg width="{s}" height="{s}" viewBox="0 0 432 432"
+      xmlns="http://www.w3.org/2000/svg">{fgMark()}</svg>;
+    throw new Error('done');
+  }
+  if (v === '1') inner = tile(PAPER) + winGrid(INK, CORAL, true);
+  else if (v === '2') inner = tile(PAPER) + furrows(INK, CORAL);
+  else inner = `<rect x="32" y="32" width="960" height="960" rx="208" fill="${INK}"/>` +
+               lightWin(PAPER, CORAL);
+
+  document.body.innerHTML =
+    `<svg width="${s}" height="${s}" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">${inner}</svg>`;
+</script>
+</body>
+</html>
