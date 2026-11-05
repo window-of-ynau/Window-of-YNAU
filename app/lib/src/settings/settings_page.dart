@@ -11,7 +11,8 @@ import '../chat/chat_settings_section.dart';
 import '../core/build_info.dart';
 import '../core/auth_service.dart';
 import '../core/secret_service.dart';
-import '../campus/session_probe_dialog.dart'; // 【临时诊断】验证后删除
+import '../campus/session_probe_dialog.dart';
+import '../core/debug_flags.dart'; // 【临时诊断】验证后删除
 import 'provider_card.dart';
 import '../core/provider_store.dart';
 
@@ -30,10 +31,12 @@ class SettingsPage extends StatelessWidget {
       this.providerStore,
       this.keyValidator,
       this.onKeySaved,
+      this.showDebugEntries,
       this.version = '0.9.0（W2b）'});
 
-  final ThemeController controller;
 
+  /// 主题控制器（设置页改主题立即生效）
+  final ThemeController controller;
   /// 对话设置的共享状态源（与对话页同一实例）：本页改了对话页立即生效
   final ChatSettingsController? chatSettings;
 
@@ -51,6 +54,13 @@ class SettingsPage extends StatelessWidget {
   final Future<String?> Function(String apiKey)? keyValidator;
   final void Function(SecretStatus status)? onKeySaved;
   final String version;
+
+  /// t153：是否显示调试/诊断入口（null = 跟随构建模式：debug 显示、release 隐藏）。
+  ///
+  /// 显式参数是为了**可测**：widget 测试里没法改 `kDebugMode`，只能注入。
+  final bool? showDebugEntries;
+
+  bool get _showDebug => showDebugEntries ?? DebugFlags.showDebugEntries;
 
   @override
   Widget build(BuildContext context) {
@@ -198,18 +208,22 @@ class SettingsPage extends StatelessWidget {
                 title: '关于',
                 children: <Widget>[
                   // 【临时诊断】验证「校方会话能否脱离 WebView 使用」，验证后删除。
-                  InkWell(
-                    onTap: () => showDialog<void>(
-                      context: context,
-                      builder: (BuildContext context) => const SessionProbeDialog(),
+                  // t153：**release 构建里不显示**（这一项会真的从 WebView 请求校方页面，
+                  // alpha 被校方看到代价很大）；代码保留，debug 构建仍可排障。
+                  if (_showDebug)
+                    InkWell(
+                      key: const Key('settings-session-probe'),
+                      onTap: () => showDialog<void>(
+                        context: context,
+                        builder: (BuildContext context) => const SessionProbeDialog(),
+                      ),
+                      child: const _Row(
+                        icon: Icons.science_outlined,
+                        title: '[临时] 会话校验探针',
+                        subtitle: '验证后删除 · 用纯 HTTP 带会话 Cookie 打一次 GET，判断云端校验是否可行',
+                        trailing: Icon(Icons.chevron_right, size: 18),
+                      ),
                     ),
-                    child: const _Row(
-                      icon: Icons.science_outlined,
-                      title: '[临时] 会话校验探针',
-                      subtitle: '验证后删除 · 用纯 HTTP 带会话 Cookie 打一次 GET，判断云端校验是否可行',
-                      trailing: Icon(Icons.chevron_right, size: 18),
-                    ),
-                  ),
                   _Row(
                     icon: Icons.info_outline,
                     title: '版本',

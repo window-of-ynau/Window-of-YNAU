@@ -12,6 +12,8 @@
 
 import 'package:flutter/material.dart';
 
+import '../core/debug_flags.dart';
+
 /// 顶栏。
 class ChatTopBar extends StatelessWidget {
   const ChatTopBar({
@@ -28,6 +30,7 @@ class ChatTopBar extends StatelessWidget {
     required this.onMemory,
     required this.onDiagnostics,
     required this.onInfo,
+    this.showDebugEntries,
     required this.onClearConversation,
   });
 
@@ -48,6 +51,12 @@ class ChatTopBar extends StatelessWidget {
   /// 对话诊断（**始终可达**：不是只在失败时出现）
   final VoidCallback onDiagnostics;
 
+  /// t153：是否显示诊断入口（null = 跟随构建模式：debug 显示、release 隐藏）。
+  final bool? showDebugEntries;
+
+  /// t153：诊断入口是否显示（null = 跟随构建模式）。
+  bool get _showDebug => showDebugEntries ?? DebugFlags.showDebugEntries;
+
   /// t132：ⓘ 按钮 —— 显示状态 / 联网搜索来源 / Key 状态（原横幅内容收进来）。
   final VoidCallback onInfo;
 
@@ -57,6 +66,7 @@ class ChatTopBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+
     return _buildBar(context, theme);
   }
 
@@ -110,7 +120,9 @@ class ChatTopBar extends StatelessWidget {
             itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
               const PopupMenuItem<String>(value: 'local', child: Text('搜索本地资料（不联网）')),
               const PopupMenuItem<String>(value: 'memory', child: Text('记忆')),
-              const PopupMenuItem<String>(value: 'diagnostics', child: Text('对话诊断')),
+              // t153：诊断入口在 **release 构建里隐藏**（调试用途），代码保留。
+              if (_showDebug)
+                const PopupMenuItem<String>(value: 'diagnostics', child: Text('对话诊断')),
               const PopupMenuDivider(),
               const PopupMenuItem<String>(value: 'clear', child: Text('清空当前对话历史')),
             ],
