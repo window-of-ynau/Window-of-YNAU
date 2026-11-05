@@ -21,6 +21,7 @@ class CaptureSnapshot {
     this.title = '',
     required this.tries,
     required this.atMs,
+    this.rowCount = -1,
   });
 
   final String html;
@@ -32,6 +33,10 @@ class CaptureSnapshot {
 
   /// 从开始等待到这次探测的毫秒数。
   final int atMs;
+
+  /// t151：课程行数（-1 = 不知道/没探测）。就绪判定要用它 ——
+  /// "有课表框架但课程行还没渲染"是 PARSE_EMPTY 的真正中间态。
+  final int rowCount;
 
   int get htmlLength => html.length;
 
@@ -48,14 +53,21 @@ class CaptureSnapshot {
   bool get hasTimetableMark =>
       RegExp(r'timetable|课程|节次|课表|周次', caseSensitive: false).hasMatch(html);
 
-  /// 就绪 = 不是登录页 + 有课表关键字 + 长度够（1000 字符以上基本就有内容了）。
-  bool isReady({int minLength = 1000}) =>
-      !looksLikeLoginPage && hasTimetableMark && htmlLength >= minLength;
+  /// 就绪 = 不是登录页 + 有课表关键字 + 长度够 + **课程行数 > 0**（t151）。
+  ///
+  /// [minRows] 默认 1：只要出现课程行就算有内容；探测不到行数（-1）时视为未就绪，
+  /// 因为那正是"框架有了、行还没渲染"的状态（Rust 会解析出 0 门课 → PARSE_EMPTY）。
+  bool isReady({int minLength = 1000, int minRows = 1}) =>
+      !looksLikeLoginPage &&
+      hasTimetableMark &&
+      htmlLength >= minLength &&
+      (minRows <= 0 || rowCount >= minRows);
 
   /// 诊断行（写进失败消息 / 日志，不含页面原文）。
   String get diagnostics =>
-      '第 $tries 次（${atMs}ms）：html 长度=$htmlLength / 标题="${_clip(title)}" / '
-      'URL="${_clip(url)}" / 含登录字样=$looksLikeLoginPage / 含课表关键字=$hasTimetableMark';
+      '第 $tries 次（${atMs}ms）：html 长度=$htmlLength / 课程行数=${rowCount < 0 ? '未知' : rowCount} / '
+      '标题="${_clip(title)}" / URL="${_clip(url)}" / 含登录字样=$looksLikeLoginPage / '
+      '含课表关键字=$hasTimetableMark';
 
   static String _clip(String value) {
     if (value.isEmpty) {
@@ -74,16 +86,20 @@ typedef HtmlProbe = Future<String?> Function();
 /// 一次"页面元信息"探测：URL 与标题（拿不到返回 null/空）。
 typedef PageMetaProbe = Future<({String url, String title})?> Function();
 
+/// t151：课程行数探测（页面侧轻量计数，不返回 DOM；拿不到返回 -1）。
+typedef CourseRowProbe = Future<int> Function();
+
 /// 等待页面就绪的结果。
 @immutable
 class CaptureWaitResult {
-  const CaptureWaitResult({required this.snapshots, required this.last});
+  const CaptureWaitResult({required this.snapshots, required this.last, required this.ready});
 
   /// 每次探测的快照（按时间顺序，最多 20 条以免消息过长）。
   final List<CaptureSnapshot> snapshots;
   final CaptureSnapshot last;
 
-  bool get ready => last.isReady();
+  /// 是否就绪（用**等待时**的阈值算出来的结果，避免结果对象再用默认阈值误判）。
+  final bool ready;
 
   /// 失败消息：带上每一次的诊断（最多前 3 条 + 最后一条，避免刷屏）。
   String get failureMessage {
@@ -97,6 +113,10 @@ class CaptureWaitResult {
     if (!last.hasTimetableMark) {
       return '页面里找不到课表（可能不是课表页）：$detail';
     }
+    if (last.rowCount >= 0 && last.rowCount < 1) {
+      return '课表框架在，但**课程行还没渲染出来**（行数=${last.rowCount < 0 ? '未知' : last.rowCount}）'
+          '→ 再等一会儿重试：$detail';
+    }
     return '页面内容过短，可能还没渲染完：$detail';
   }
 }
@@ -105,9 +125,11 @@ class CaptureWaitResult {
 Future<CaptureWaitResult> waitForTimetableReady({
   required HtmlProbe html,
   PageMetaProbe? meta,
+  CourseRowProbe? rows,
   Duration interval = const Duration(milliseconds: 500),
   Duration timeout = const Duration(seconds: 6),
   int minLength = 1000,
+  int minRows = 1,
   bool Function()? isCancelled,
 }) async {
   final Stopwatch watch = Stopwatch()..start();
@@ -119,13 +141,17 @@ Future<CaptureWaitResult> waitForTimetableReady({
     String? fetched;
     String url = '';
     String title = '';
+    int rowCount = -1;
     try {
       fetched = await html();
       final ({String url, String title})? info = await meta?.call();
       url = info?.url ?? '';
       title = info?.title ?? '';
+      if (rows != null) {
+        rowCount = await rows();
+      }
     } on Object {
-      fetched = null;
+      fetched ??= null;
     }
     last = CaptureSnapshot(
       html: fetched ?? '',
@@ -133,19 +159,32 @@ Future<CaptureWaitResult> waitForTimetableReady({
       title: title,
       tries: tries,
       atMs: watch.elapsedMilliseconds,
+      rowCount: rowCount,
     );
     if (snapshots.length < 20) {
       snapshots.add(last);
     }
-    if (last.isReady(minLength: minLength)) {
-      return CaptureWaitResult(snapshots: snapshots, last: last);
+    if (last.isReady(minLength: minLength, minRows: rows == null ? 0 : minRows)) {
+      return CaptureWaitResult(snapshots: snapshots, last: last, ready: true);
     }
     if (watch.elapsedMilliseconds >= timeout.inMilliseconds) {
-      return CaptureWaitResult(snapshots: snapshots, last: last);
+      return CaptureWaitResult(snapshots: snapshots, last: last, ready: false);
     }
     if (isCancelled?.call() ?? false) {
-      return CaptureWaitResult(snapshots: snapshots, last: last);
+      return CaptureWaitResult(snapshots: snapshots, last: last, ready: false);
     }
     await Future<void>.delayed(interval);
   }
+}
+/// 【t151】从 HTML 里数课程行（**纯本地、与 `kCourseRowSelector` 语义一致**：`table#timetable` 的 `<tr>`）。
+///
+/// 用途：PARSE_EMPTY 重试的诊断（`行数`）与测试；页面内则用 `window.__yunongCourseRowCount()`。
+int countTableRowsInHtml(String html) {
+  if (html.isEmpty) {
+    return 0;
+  }
+  final RegExp tablePattern = RegExp(r'<table[^>]*id="timetable"[\s\S]*?</table>', caseSensitive: false);
+  final RegExpMatch? table = tablePattern.firstMatch(html);
+  final String scope = table?.group(0) ?? html;
+  return RegExp(r'<tr\b', caseSensitive: false).allMatches(scope).length;
 }

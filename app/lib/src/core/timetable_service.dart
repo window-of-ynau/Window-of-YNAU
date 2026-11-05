@@ -13,6 +13,7 @@ import 'dart:io';
 
 import 'package:flutter/services.dart' show rootBundle;
 
+import '../campus/capture_cache.dart';
 import '../campus/portal_api.dart';
 import 'ffi_bindings.dart';
 
@@ -308,6 +309,80 @@ class HtmlFetchAttempt {
   /// 诊断行：`html 长度=N / 是否含课表关键字=true|false（第 N 次）`
   String get diagnostics =>
       'html 长度=$length / 是否含课表关键字=$hasTimetableMark（第 $tries 次）';
+}
+
+/// 【t151】`PARSE_EMPTY`（解析出 0 门课）也要可重试：最多 3 次（首发 + 2 次重试），间隔 800ms。
+///
+/// 背景：页面可能处于"课表框架已渲染、课程行还没填"的中间态 —— HTML 够长、含课表字样，
+/// 但 Rust 解析出 0 门课。用户手动重试就好，说明只是**时机**问题。
+///
+/// 每次尝试都记录：`html 长度 / 课程行数 / 是否 PARSE_EMPTY`，失败消息一并带给用户。
+Future<ParseRetryResult> importHtmlWithParseRetry({
+  required Future<String> Function() fetchHtml,
+  required Future<ImportOutcome> Function(String html) importHtml,
+  int maxAttempts = 3,
+  Duration delay = const Duration(milliseconds: 800),
+  int Function(String html)? rowCountOf,
+}) async {
+  final List<ParseAttempt> attempts = <ParseAttempt>[];
+  String html = '';
+  ImportOutcome? lastOutcome;
+  for (int i = 1; i <= maxAttempts; i++) {
+    try {
+      html = await fetchHtml();
+    } on Object {
+      // 取不到就用上一次的 html 再解析一次（比直接失败更有用）
+    }
+    lastOutcome = await importHtml(html);
+    attempts.add(ParseAttempt(
+      index: i,
+      htmlLength: html.length,
+      rowCount: rowCountOf?.call(html) ?? -1,
+      parseEmpty: lastOutcome.imported == 0,
+    ));
+    if (lastOutcome.imported > 0) {
+      return ParseRetryResult(outcome: lastOutcome, attempts: attempts);
+    }
+    if (i < maxAttempts) {
+      await Future<void>.delayed(delay);
+    }
+  }
+  return ParseRetryResult(outcome: lastOutcome!, attempts: attempts);
+}
+
+/// 一次解析尝试的记录（诊断用，不含 HTML 原文）。
+class ParseAttempt {
+  const ParseAttempt({
+    required this.index,
+    required this.htmlLength,
+    required this.rowCount,
+    required this.parseEmpty,
+  });
+
+  final int index;
+  final int htmlLength;
+  final int rowCount;
+  final bool parseEmpty;
+
+  String get diagnostics =>
+      '第 $index 次：html 长度=$htmlLength / 课程行数=${rowCount < 0 ? '未知' : rowCount} / '
+      'PARSE_EMPTY=${parseEmpty ? '是' : '否'}';
+}
+
+/// 带重试的导入结果。
+class ParseRetryResult {
+  const ParseRetryResult({required this.outcome, required this.attempts});
+
+  final ImportOutcome outcome;
+  final List<ParseAttempt> attempts;
+
+  bool get ok => outcome.imported > 0;
+
+  String get diagnostics {
+    final String detail = attempts.map((ParseAttempt a) => a.diagnostics).join('；');
+    final String cardId = describeCachedCardId();
+    return '$detail；$cardId';
+  }
 }
 
 /// 课表服务：HTML → Rust 核心（解析 + SQLite）→ 列表。

@@ -12,6 +12,8 @@ import 'dart:async';
 
 import 'campus_entries.dart';
 import '../core/timetable_service.dart';
+import 'capture_cache.dart';
+import 'capture_readiness.dart';
 import '../theme/context_menu.dart';
 import 'timetable/course_palette.dart';
 import 'timetable/timetable_grid.dart';
@@ -51,6 +53,7 @@ class _TimetablePageState extends State<TimetablePage> {
   List<StoredCourse> _courses = const <StoredCourse>[];
   List<String> _warnings = const <String>[];
   TimetableException? _failure;
+
 
   /// 最近一次 ICS 导出结果（成功时显示路径与事件数）。
   IcsExportResult? _exportResult;
@@ -666,10 +669,26 @@ class _TimetablePageState extends State<TimetablePage> {
   /// 兜底路径：抓 `table#timetable` 的 HTML（接口改版/抓不到模板时用）。
   Future<void> _fetchFromCampusHtml(SchoolFetcher fetcher, {String? hint}) async {
     await _run(() async {
-      final page = await fetcher.fetchTimetablePage(
-        entryUrl: CampusEntry.timetable.url,
+      // t151：PARSE_EMPTY 也要可重试（最多 3 次、间隔 800ms）。
+      // 页面常见"框架在、课程行还没渲染"的中间态：HTML 够长但解析 0 门课，重试即好。
+      final ParseRetryResult result = await importHtmlWithParseRetry(
+        fetchHtml: () async {
+          final page = await fetcher.fetchTimetablePage(
+            entryUrl: CampusEntry.timetable.url,
+          );
+          return page.html;
+        },
+        importHtml: (String html) => widget.service.importHtml(html: html, term: _currentTerm),
+        rowCountOf: countTableRowsInHtml,
       );
-      return widget.service.importHtml(html: page.html, term: _currentTerm);
+      if (!result.ok) {
+        throw TimetableException(
+          code: 'PARSE_EMPTY',
+          userHint: '课表解析出 0 门课，已自动重试 ${result.attempts.length} 次仍失败',
+          message: result.diagnostics,
+        );
+      }
+      return result.outcome;
     }, notice: hint ?? '已从校务系统页面抓取');
   }
   Future<void> _importFixture({required bool revamped}) async {
@@ -945,7 +964,9 @@ class _TimetablePageState extends State<TimetablePage> {
       setState(() {
         _courses = courses;
         _warnings = outcome.warnings;
-        _notice = '$notice，本学期 ${outcome.imported} 门课';
+        // t151：抓取成功的诊断行里也带上 cardId（缓存）——
+        // "抓不到 cardId"到底指抓取诊断里没有，还是探针里看不见，一眼能分清。
+        _notice = '$notice，本学期 ${outcome.imported} 门课 · ${describeCachedCardId()}';
       });
     } on TimetableException catch (failure) {
       if (!mounted) {
