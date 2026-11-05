@@ -26,6 +26,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import socket
@@ -170,6 +171,20 @@ def psql(db_container: str, sql: str) -> str:
     )
 
 
+def invite_code_hash(code: str) -> str:
+    """与 Rust 侧 `token::hash` 一致：sha256 的小写 hex（邀请码只以哈希落库）。"""
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def insert_invite(db_container: str, code: str, batch: str = "e2e", max_uses: int = 1) -> None:
+    """插一张邀请码（只落哈希）。E2E 用真实 SQL，验证的是**同一份**契约。"""
+    psql(
+        db_container,
+        "INSERT INTO invite_codes (code_hash, batch, issued_by, expires_at, max_uses) "
+        f"VALUES ('{invite_code_hash(code)}', '{batch}', 'e2e', now() + interval '1 hour', {max_uses})",
+    )
+
+
 def wait_for_value(db_container: str, sql: str, what: str, budget: float = 10.0) -> str:
     deadline = time.monotonic() + budget
     last = ""
@@ -302,13 +317,50 @@ def main() -> int:
         wait_http(f"{base}/healthz", 60, "服务端 /healthz")
         wait_http(f"{base}/readyz", 30, "服务端 /readyz")
 
-        log("5/7 注册 → 登录")
+        log("5/7 邀请码 → 注册 → 登录")
         email = f"e2e-{suffix}@example.com"
         password = "e2e-Passw0rd!"
-        status, _, raw, payload = http_json("POST", f"{base}/api/v1/auth/register", {"email": email, "password": password})
-        check(status == 201, f"注册应返回 201，实际 {status}: {raw[:300]!r}")
+
+        # t141：服务端默认邀请制。先验"不带码必须 403"（闸门真实生效），再插一张码走正常流程。
+        status, _, raw, _ = http_json(
+            "POST", f"{base}/api/v1/auth/register", {"email": email, "password": password}
+        )
+        check(
+            status == 403,
+            f"不带邀请码注册应返回 403，实际 {status}: {raw[:300]!r}",
+        )
+
+        invite = f"ynau-e2e-{suffix}"
+        insert_invite(db_container, invite)
+        status, _, raw, payload = http_json(
+            "POST",
+            f"{base}/api/v1/auth/register",
+            {"email": email, "password": password, "invite_code": invite},
+        )
+        check(status == 201, f"带邀请码注册应返回 201，实际 {status}: {raw[:300]!r}")
         # 成功信封：{"ok": true, "data": {...}, "request_id": "req_..."}
         check(bool((payload.get("data") or {}).get("access_token")), f"注册响应里没有 access_token：{payload}")
+
+        # 落库形态：账号来源是 invite，核销记录里只有哈希（没有明文码/IP/UA）
+        check(
+            wait_for_value(
+                db_container,
+                f"SELECT auth_method FROM users WHERE email = '{email}'",
+                "users.auth_method",
+            )
+            == "invite",
+            "新账号的 auth_method 应为 invite",
+        )
+        check(
+            wait_for_value(
+                db_container,
+                "SELECT count(*) FROM invite_redemptions "
+                f"WHERE code_hash = '{invite_code_hash(invite)}'",
+                "invite_redemptions",
+            )
+            == "1",
+            "应有一条核销记录",
+        )
 
         status, _, raw, payload = http_json("POST", f"{base}/api/v1/auth/login", {"email": email, "password": password})
         check(status == 200, f"登录应返回 200，实际 {status}: {raw[:300]!r}")
