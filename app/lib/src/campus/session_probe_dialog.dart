@@ -72,7 +72,8 @@ class SessionProbeDialog extends StatefulWidget {
     this.jsProbe,
     this.inPageFetch,
     this.navigate,
-    this.probeCardIds,
+    this.evaluateScript,
+    this.cardIdProbeTimeout = const Duration(seconds: 5),
   });
 
   /// 测试注入；默认走真实 CookieManager。
@@ -86,8 +87,11 @@ class SessionProbeDialog extends StatefulWidget {
   /// CAS 探针的导航注入点（默认用课表页 WebView）。
   final Future<void> Function(String url)? navigate;
 
-  /// t142：cardId 自动探测的注入点（默认用页面内 JS 桥）。
-  final Future<List<CardIdHint>> Function()? probeCardIds;
+  /// t143：`evaluateJavascript` 直接取值的注入点（默认用课表 WebView）。
+  final ScriptEvaluator? evaluateScript;
+
+  /// t143：探测超时（默认 5s；测试里可缩短）。
+  final Duration cardIdProbeTimeout;
 
   @override
   State<SessionProbeDialog> createState() => _SessionProbeDialogState();
@@ -131,6 +135,9 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
   /// t142：cardId 候选（页面内纯本地探测，最多 10 个）。
   List<CardIdHint> _cardIdHints = const <CardIdHint>[];
   String? _cardIdHintMessage;
+
+  /// t143：探测进行中（只影响探测按钮，不复用 `_busy`，避免与其它按钮互相干扰）。
+  bool _probing = false;
 
   @override
   void initState() {
@@ -233,25 +240,45 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
     });
   }
 
-  /// t142：自动探测 cardId（**纯本地 JS，不发任何网络请求**）。
+  /// t142/t143：自动探测 cardId —— **纯本地 JS、零网络请求**。
+  ///
+  /// t143 修「按钮卡死」：改用 `evaluateJavascript` 的**直接返回值**（不走 JS→Dart 桥），
+  /// 5s 超时 + try/catch，并且**无论成功/失败/超时都在 finally 里复位 `_probing`**，
+  /// 失败时把明确错误显示出来（不再只是变灰）。
   Future<void> _probeCardIds() async {
-    setState(() => _busy = true);
-    final Future<List<CardIdHint>> Function()? probe =
-        widget.probeCardIds ?? SessionProbeJsBridge.probeCardIds;
-    List<CardIdHint> hints = const <CardIdHint>[];
-    if (probe == null) {
-      _cardIdHintMessage = '当前没有可用的 WebView：请先打开「我的课表」再回来探测。';
-    } else {
-      hints = await probe();
-      _cardIdHintMessage = hints.isEmpty ? kNoCardIdHintMessage : null;
-    }
-    if (!mounted) {
+    if (_probing) {
       return;
     }
     setState(() {
-      _cardIdHints = hints;
-      _busy = false;
+      _probing = true;
+      _cardIdHintMessage = null;
+      _cardIdHints = const <CardIdHint>[];
     });
+    try {
+      final ScriptEvaluator? evaluate = widget.evaluateScript ?? SessionProbeJsBridge.evaluate;
+      if (evaluate == null) {
+        _cardIdHintMessage = '当前没有可用的 WebView：请先打开「我的课表」再回来探测。';
+        return;
+      }
+      final CardIdProbeOutcome outcome =
+          await runCardIdProbe(evaluate: evaluate, timeout: widget.cardIdProbeTimeout);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _cardIdHints = outcome.hints;
+        _cardIdHintMessage = outcome.ok && outcome.hints.isNotEmpty ? null : outcome.message;
+      });
+    } on Object catch (failure) {
+      // 兜底：runCardIdProbe 自身不抛，这里防御未来改动
+      if (mounted) {
+        setState(() => _cardIdHintMessage = '探测失败：${failure.runtimeType}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _probing = false);
+      }
+    }
   }
 
   void _useCardId(CardIdHint hint) {
@@ -399,22 +426,33 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
                 controller: _cardId,
                 decoration: const InputDecoration(labelText: 'cardId（32 位 hex，可点下面「自动探测」）'),
               ),
-              // t142：自动探测 cardId（页面内纯本地扫描，不发请求）
+              // t142/t143：自动探测 cardId（页面内纯本地扫描，不发请求）
               Wrap(
                 spacing: 8,
                 crossAxisAlignment: WrapCrossAlignment.center,
                 children: <Widget>[
                   TextButton.icon(
                     key: const Key('probe-cardid-detect'),
-                    onPressed: _busy ? null : _probeCardIds,
-                    icon: const Icon(Icons.search, size: 18),
-                    label: const Text('自动探测 cardId'),
+                    onPressed: _probing ? null : _probeCardIds,
+                    icon: _probing
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.search, size: 18),
+                    label: Text(_probing ? '探测中…' : '自动探测 cardId'),
                   ),
-                  const Text('纯本地扫描，不发请求', style: TextStyle(fontSize: 11)),
+                  const Text('需在课表页执行 · 纯本地扫描，不发请求',
+                      key: Key('probe-cardid-hint'), style: TextStyle(fontSize: 11)),
                 ],
               ),
               if (_cardIdHintMessage != null)
-                Text(_cardIdHintMessage!, style: theme.textTheme.bodySmall),
+                Text(
+                  _cardIdHintMessage!,
+                  key: const Key('probe-cardid-message'),
+                  style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.error),
+                ),
               if (_cardIdHints.isNotEmpty) ...<Widget>[
                 Text('候选（${_cardIdHints.length}）：', style: theme.textTheme.bodySmall),
                 for (final CardIdHint hint in _cardIdHints)
