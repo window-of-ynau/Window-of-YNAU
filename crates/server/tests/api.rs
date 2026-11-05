@@ -646,7 +646,7 @@ async fn call(state: &AppState, request: Request<Body>) -> Res {
 
 /// 不带邀请码 → 403；带一个乱码也是同一个 403（不泄露"码存不存在"）。
 #[tokio::test]
-async fn register_without_invite_is_forbidden_and_indistinguishable() {
+async fn register_without_invite_is_invite_invalid_and_indistinguishable() {
     let state = invite_only_app();
 
     let missing = call(&state, register_request(EMAIL, None)).await;
@@ -658,8 +658,9 @@ async fn register_without_invite_is_forbidden_and_indistinguishable() {
     let expired = call(&state, register_request(EMAIL, Some("ynau-expired"))).await;
 
     for res in [&missing, &bogus] {
+        // t147：专用错误码（403 + INVITE_INVALID），客户端可据此给针对性提示
         assert_eq!(res.status, StatusCode::FORBIDDEN);
-        assert_eq!(res.body["error"]["code"], "FORBIDDEN");
+        assert_eq!(res.body["error"]["code"], "INVITE_INVALID");
         assert_eq!(res.body["error"]["message"], "邀请码无效或已不可用");
     }
     // 信封里的 `request_id` 每次都不同，所以比"错误码 + 文案"这两项对外可见的判据
@@ -672,6 +673,7 @@ async fn register_without_invite_is_forbidden_and_indistinguishable() {
         "失败文案必须一致"
     );
     assert_eq!(expired.status, StatusCode::FORBIDDEN);
+    assert_eq!(expired.body["error"]["code"], "INVITE_INVALID");
 }
 
 /// 有可用邀请码 → 201；同一个一次性码第二次用 → 403。
@@ -698,7 +700,7 @@ async fn valid_invite_registers_once() {
     )
     .await;
     assert_eq!(again.status, StatusCode::FORBIDDEN, "一次性码不能复用");
-    assert_eq!(again.body["error"]["code"], "FORBIDDEN");
+    assert_eq!(again.body["error"]["code"], "INVITE_INVALID");
 }
 
 /// 关掉开关（本地开发/测试）时仍然可以不带走码注册——行为与旧版一致。
