@@ -221,6 +221,20 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     onScheduleTemplate: _onScheduleTemplate,
     onScheduleApi: widget.onFetchedSchedule,
     onStageChange: _onStageChange,
+    // t151：课程行数（就绪判定要求 > 0，避免"框架在、行还没渲染"→ PARSE_EMPTY）
+    rowProbe: () async {
+      final InAppWebViewController? controller = _controller;
+      if (controller == null) {
+        return -1;
+      }
+      try {
+        final Object? raw = await controller.evaluateJavascript(source: kCourseRowCountScript);
+        final int? count = int.tryParse('${raw ?? ''}'.replaceAll('"', '').trim());
+        return count ?? -1;
+      } on Object {
+        return -1;
+      }
+    },
     // t150：页面元信息（URL/标题）—— 抓取失败时用来判断"是不是还停在登录页"
     metaProbe: () async {
       final InAppWebViewController? controller = _controller;
@@ -565,6 +579,12 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       // 【临时诊断 t142】页面内 cardId 探测器（纯本地，不发请求）
                       UserScript(
                         source: kCardIdProbeInstallScript,
+                        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+                        forMainFrameOnly: false,
+                      ),
+                      // 【t151】课程行计数（就绪判定用；只回数字，不回 DOM）
+                      UserScript(
+                        source: kCourseRowCountInstallScript,
                         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
                         forMainFrameOnly: false,
                       ),

@@ -33,6 +33,7 @@ class CampusBridge {
     this.pollInterval = const Duration(milliseconds: 500),
     this.pollTimeout = const Duration(seconds: 6),
     this.metaProbe,
+    this.rowProbe,
     this.minHtmlLength = 2000,
     this.requireTimetableKeyword = true,
   });
@@ -53,6 +54,9 @@ class CampusBridge {
 
   /// t150：页面元信息（URL/标题）探测；为空时诊断里对应字段显示"（空）"。
   final PageMetaProbe? metaProbe;
+
+  /// t151：课程行数探测（就绪判定必须要求行数 > 0，否则会出现"框架在、行还没渲染"）。
+  final CourseRowProbe? rowProbe;
 
   /// "空壳"判定阈值（默认 2000 字符；测试可调小）。
   final int minHtmlLength;
@@ -247,6 +251,7 @@ class CampusBridge {
     final CaptureWaitResult result = await waitForTimetableReady(
       html: () async => (await grabHtml?.call()) ?? '',
       meta: metaProbe,
+      rows: rowProbe,
       interval: pollInterval,
       timeout: pollTimeout,
       minLength: 0, // 阈值统一交给 _isHollow（含关键字判断）

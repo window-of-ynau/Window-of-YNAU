@@ -52,6 +52,33 @@ const String kGrabHtmlInstallScript = r'''
 
 /// 调用上面的入口（供 `evaluateJavascript` 直接使用）。
 const String kGrabHtmlScript = '(window.__yunongGrabHtml ? window.__yunongGrabHtml() : null)';
+/// 【t151】课程行计数选择器 —— **必须与抓取/解析用的表一致**（`table#timetable`）。
+///
+/// 解析侧（Rust）读的是这张表的行，所以"就绪"必须要求表里**有课程行**：
+/// 否则会出现"框架在、行还没渲染"的中间态 —— HTML 够长、含课表字样，但解析出 0 门课（PARSE_EMPTY）。
+const String kCourseRowSelector = 'table#timetable tr';
+
+/// 安装轻量计数入口（只回数字、不回 DOM）：`window.__yunongCourseRowCount()`。
+const String kCourseRowCountInstallScript = r'''
+(function () {
+  if (window.__yunongCourseRowCount) { return; }
+  window.__yunongCourseRowCount = function () {
+    try {
+      var rows = document.querySelectorAll('table#timetable tr');
+      if (!rows || rows.length === 0) {
+        rows = document.querySelectorAll('#timetable tr, table.timetable tr');
+      }
+      return rows ? rows.length : 0;
+    } catch (e) {
+      return 0;
+    }
+  };
+})();
+''';
+
+/// 调用计数入口（拿不到返回 -1）。
+const String kCourseRowCountScript =
+    '(window.__yunongCourseRowCount ? window.__yunongCourseRowCount() : -1)';
 
 /// 【t142】cardId 自动探测脚本（**纯本地读取，不发任何网络请求**）。
 ///
