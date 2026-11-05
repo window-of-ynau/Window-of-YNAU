@@ -18,6 +18,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
+import '../core/debug_flags.dart';
 import 'campus_entries.dart';
 import 'capture_cache.dart';
 import 'card_id_hints.dart';
@@ -75,6 +76,7 @@ class SessionProbeDialog extends StatefulWidget {
     this.navigate,
     this.evaluateScript,
     this.cardIdProbeTimeout = const Duration(seconds: 5),
+    this.showDebugEntries,
   });
 
   /// 测试注入；默认走真实 CookieManager。
@@ -93,6 +95,9 @@ class SessionProbeDialog extends StatefulWidget {
 
   /// t143：探测超时（默认 5s；测试里可缩短）。
   final Duration cardIdProbeTimeout;
+
+  /// t153：是否显示调试/诊断内容（null = 跟随构建模式）。
+  final bool? showDebugEntries;
 
   @override
   State<SessionProbeDialog> createState() => _SessionProbeDialogState();
@@ -402,6 +407,8 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
+    // t153：调试/诊断开关（null = 跟随构建模式：debug 显示、release 隐藏）。
+    final bool showDebugEntries = widget.showDebugEntries ?? DebugFlags.showDebugEntries;
     return AlertDialog(
       title: const Text('[临时] 会话校验探针'),
       content: SizedBox(
@@ -524,7 +531,7 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
                 const Divider(),
               ],
               if (_notice != null) Text(_notice!, style: theme.textTheme.bodySmall),
-              _envDiagnostics(theme),
+              if (showDebugEntries) _envDiagnostics(theme),
               Wrap(
                 spacing: 8,
                 children: <Widget>[
