@@ -23,7 +23,6 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import '../core/timetable_service.dart';
 import 'campus_bridge.dart';
 import 'portal_api.dart';
-import 'card_id_hints.dart'; // 【临时诊断 t142】cardId 候选解析
 import 'session_cookie_diagnostics.dart';
 import 'session_probe.dart'; // 【临时诊断 t137】验证后删除
 import 'webview_session.dart';
@@ -560,13 +559,10 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       CasTicketProbe.navigate = (String target) async {
                         await controller.loadUrl(urlRequest: URLRequest(url: WebUri(target)));
                       };
-                      // 【临时诊断 t142】页面内纯本地探测 cardId 候选（不发请求、不读 Cookie）
-                      SessionProbeJsBridge.probeCardIds = () async {
-                        final Object? raw = await controller.evaluateJavascript(
-                          source: kCardIdProbeScript,
-                        );
-                        return parseCardIdHints('${raw ?? ''}');
-                      };
+                      // 【临时诊断 t142/t143】页面内纯本地探测 cardId：
+                      // 直接返回 `evaluateJavascript` 的值（不走 JS→Dart 桥，避免导航后桥失效导致卡死）。
+                      SessionProbeJsBridge.evaluate = (String source) async =>
+                          controller.evaluateJavascript(source: source);
                       // 【临时诊断 t140】校方域名只在 WebView 内用 fetch 取：
                       // 页面里是真实浏览器环境，能过动态 JS 挑战；只回传摘要，不回传响应体/Cookie。
                       SessionProbeJsBridge.inPageFetch =

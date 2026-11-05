@@ -108,10 +108,9 @@ void main() {
           jsProbe: () async => 0,
           inPageFetch: (String url, {required bool withCredentials}) async => null,
           navigate: (String url) async {},
-          probeCardIds: () async => const <CardIdHint>[
-            CardIdHint(value: _a, source: 'window.__STATE__.cardId'),
-            CardIdHint(value: _b, source: 'localStorage.yunong_cache'),
-          ],
+          // t143：探测改为 evaluateJavascript 直接返回值
+          evaluateScript: (String source) async =>
+              '[{"v":"$_a","s":"window.__STATE__.cardId"},{"v":"$_b","s":"localStorage.yunong_cache"}]',
         ),
       ),
     ));
@@ -143,7 +142,7 @@ void main() {
           jsProbe: () async => 0,
           inPageFetch: (String url, {required bool withCredentials}) async => null,
           navigate: (String url) async {},
-          probeCardIds: () async => const <CardIdHint>[],
+          evaluateScript: (String source) async => '[]',
         ),
       ),
     ));
