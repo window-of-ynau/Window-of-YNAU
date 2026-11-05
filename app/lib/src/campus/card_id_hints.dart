@@ -7,6 +7,8 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'session_cookie_diagnostics.dart';
+
 /// 一个候选 cardId 及其来源。
 class CardIdHint {
   const CardIdHint({required this.value, required this.source});
@@ -82,10 +84,17 @@ typedef ScriptEvaluator = Future<Object?> Function(String source);
 
 /// 探测结果：要么有候选，要么有一条**能显示给用户**的错误。
 class CardIdProbeOutcome {
-  const CardIdProbeOutcome({this.hints = const <CardIdHint>[], this.error});
+  const CardIdProbeOutcome({
+    this.hints = const <CardIdHint>[],
+    this.error,
+    this.webViewClosed = false,
+  });
 
   final List<CardIdHint> hints;
   final String? error;
+
+  /// 【t150】没有打开的课表页面（抓取完会自动关闭）——这是**正常状态**，不该当错误。
+  final bool webViewClosed;
 
   bool get ok => error == null;
 
@@ -233,6 +242,12 @@ Future<CardIdProbeOutcome> runCardIdProbe({
     return parseCardIdProbeReturn(raw);
   } on TimeoutException {
     return CardIdProbeOutcome(error: '探测超时（${timeout.inSeconds}s，可能页面未就绪），可重试');
+  } on WebViewUnavailableException {
+    return const CardIdProbeOutcome(
+      webViewClosed: true,
+      error: '当前没有打开的课表页面（正常：抓取完成后会自动关闭）。已显示上次抓取的缓存；'
+          '如需重新扫描，请先进入「我的课表」再回来。',
+    );
   } on Object catch (failure) {
     return CardIdProbeOutcome(error: '探测失败：${failure.runtimeType}（$failure）');
   } finally {

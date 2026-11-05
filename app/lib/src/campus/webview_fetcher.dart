@@ -221,6 +221,27 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     onScheduleTemplate: _onScheduleTemplate,
     onScheduleApi: widget.onFetchedSchedule,
     onStageChange: _onStageChange,
+    // t150：页面元信息（URL/标题）—— 抓取失败时用来判断"是不是还停在登录页"
+    metaProbe: () async {
+      final InAppWebViewController? controller = _controller;
+      if (controller == null) {
+        return null;
+      }
+      String url = '';
+      String title = '';
+      try {
+        url = (await controller.getUrl())?.toString() ?? '';
+      } on Object {
+        url = '';
+      }
+      try {
+        final Object? raw = await controller.evaluateJavascript(source: 'document.title');
+        title = raw is String ? raw : '';
+      } on Object {
+        title = '';
+      }
+      return (url: url, title: title);
+    },
     // t148：空壳 html 时用页面侧可重复入口重取一次（不重新导航、不发请求）
     grabHtml: () async {
       final InAppWebViewController? controller = _controller;

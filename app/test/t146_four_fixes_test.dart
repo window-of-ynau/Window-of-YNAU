@@ -45,7 +45,9 @@ void main() {
       await tester.tap(find.byKey(const Key('probe-cardid-detect')));
       await tester.pumpAndSettle();
 
-      expect(find.textContaining('WebView 已失效'), findsOneWidget);
+      // t150：页面关闭是**正常状态** —— 显示中性提示，而不是"探测失败"
+      expect(find.textContaining('抓取完成后会自动关闭'), findsOneWidget);
+      expect(find.textContaining('探测失败'), findsNothing);
       // 不抛原生 MissingPluginException；按钮仍可用
       final TextButton button =
           tester.widget<TextButton>(find.byKey(const Key('probe-cardid-detect')));

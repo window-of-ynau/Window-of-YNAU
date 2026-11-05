@@ -19,6 +19,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import 'campus_entries.dart';
+import 'capture_cache.dart';
 import 'card_id_hints.dart';
 import 'portal_api.dart';
 import 'session_cookie_diagnostics.dart';
@@ -268,10 +269,12 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
         _cardIdHints = outcome.hints;
         _cardIdHintMessage = outcome.ok && outcome.hints.isNotEmpty ? null : outcome.message;
       });
-    } on WebViewUnavailableException catch (failure) {
-      // t146：控制器失效（MissingPluginException）→ 明确提示，而不是抛原生异常
+    } on WebViewUnavailableException {
+      // t150：抓取完成/页面关闭后**没有活控制器是正常状态**，不该当错误吓用户。
       if (mounted) {
-        setState(() => _cardIdHintMessage = '探测失败：${failure.message}');
+        setState(() => _cardIdHintMessage =
+            '当前没有打开的课表页面（正常：抓取完成后会自动关闭）。已显示上次抓取的缓存；'
+            '如需重新扫描，请先进入「我的课表」再回来。');
       }
     } on Object catch (failure) {
       // 兜底：runCardIdProbe 自身不抛，这里防御未来改动
@@ -417,9 +420,10 @@ class _SessionProbeDialogState extends State<SessionProbeDialog> {
               _verdictBox(theme),
               // t146：删除「目标 URL / 学期 / cardId」手动输入（旧 Dart HTTP 入口已按 t140 移除）。
               // 现在只保留两件事：页内取一次（按钮）与 CAS 探针。
+              // t150：抓取成功后 WebView 会关闭 —— 这里优先显示**上次抓取的缓存**，
+              // 没有缓存才提示"尚未抓取过"；「自动探测」只是可选的重新扫描。
               Text(
-                'cardId：${_cardIdValue.isEmpty ? '未探测（先点下面「自动探测 cardId」）' : maskCardIdValue(_cardIdValue)}'
-                ' · 学期：$_yearsValue',
+                _cardIdValue.isEmpty ? describeCachedCardId() : 'cardId: ${maskCardIdValue(_cardIdValue)}（本次扫描） · 学期：$_yearsValue',
                 key: const Key('probe-cardid-status'),
                 style: theme.textTheme.bodySmall,
               ),
