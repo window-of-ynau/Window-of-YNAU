@@ -1,25 +1,36 @@
 #!/usr/bin/env pwsh
-# 打 Windows 安装包（Inno Setup）：先构建应用产物，再交给 ISCC 编译 setup.exe。
+# 打 Windows 安装包（Inno Setup）：构建应用产物 → **白名单暂存** → ISCC 编译 setup.exe。
+#
+# ⚠️ 为什么不再直接拿 Release 目录打包（t154 P0 事故）：
+#   WebView2 在**运行 App 时**会在 exe 同级创建 `yunong.exe.WebView2/EBWebView/`，里面是
+#   本机的 Cookie、Login Data、缓存、Crashpad。之前 .iss 用 `{SourceDir}\*` 通配打包，
+#   等于把这些用户数据打进了发布安装包。现在改成三道：
+#     A) 打包前断言 Release 目录里**没有** WebView2 数据/数据库/密钥/调试符号；
+#     B) 只把白名单文件复制到 build/installer-staging（干净暂存），.iss 只指向它；
+#     C) 打包后断言体积 < 40 MB（异常增大往往是混进了不该有的东西）。
 #
 # 用法：
-#   pwsh scripts/build-windows-installer.ps1                        # 版本取自 Cargo.toml
+#   pwsh scripts/build-windows-installer.ps1                      # 构建 + 打包，版本取自 Cargo.toml
 #   pwsh scripts/build-windows-installer.ps1 -Version 0.1.0
-#   pwsh scripts/build-windows-installer.ps1 -SkipAppBuild          # 复用已有产物（CI 分步时用）
+#   pwsh scripts/build-windows-installer.ps1 -SkipAppBuild        # 复用已有产物
+#   pwsh scripts/build-windows-installer.ps1 -ReleaseDir <dir>    # 指定产物目录（复现/测试用）
 #
 # 产物：dist/WindowOfYNAU-<version>-setup.exe（+ SHA256SUMS）
-#
-# 前置：Inno Setup 6（CI 用 `choco install innosetup -y`；本机 `winget install JRSoftware.InnoSetup`）。
 
 [CmdletBinding()]
 param(
     [string]$Version,
     [string]$OutputDir = "dist",
+    [string]$ReleaseDir,
     [switch]$SkipAppBuild
 )
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
-$releaseDir = Join-Path $repo "app/build/windows/x64/runner/Release"
+if (-not $ReleaseDir) { $ReleaseDir = Join-Path $repo "app/build/windows/x64/runner/Release" }
+$stagingDir = Join-Path $repo "build/installer-staging"
+
+function Step([string]$text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
 
 if (-not $Version) {
     $cargoToml = Get-Content (Join-Path $repo "Cargo.toml") -Raw
@@ -31,59 +42,110 @@ if (-not $Version) {
 }
 Write-Host "安装包版本：$Version"
 
-# 1) 应用产物（exe + DLL 同目录 + data\）
+# ---- 1. 应用产物 ----
 if (-not $SkipAppBuild) {
     & (Join-Path $PSScriptRoot "build-windows-app.ps1")
     if ($LASTEXITCODE -ne 0) { throw "build-windows-app.ps1 失败" }
 }
 
-# 2) 打包前的硬校验：少一个 DLL 的安装包 = 用户装完打不开
-$required = @("yunong.exe", "yunong_core.dll", "flutter_windows.dll")
-$missing = @()
-foreach ($f in $required) {
-    if (-not (Test-Path (Join-Path $releaseDir $f))) { $missing += $f }
-}
-if (-not (Test-Path (Join-Path $releaseDir "data"))) { $missing += "data\" }
-if ($missing.Count -gt 0) {
-    throw "产物目录缺少：$($missing -join ', ')（目录：$releaseDir）"
-}
-Write-Host "产物校验通过：$($required -join ' + ') + data\"
+# ---- 2. 护栏 A：产物目录里不许有用户数据 / 密钥 / 调试符号 ----
+Step "护栏 A：Release 目录不得含 WebView2 用户数据 / *.db / secrets / *.pdb / .env"
+if (-not (Test-Path $ReleaseDir)) { throw "产物目录不存在：$ReleaseDir" }
 
-# 3) 找 ISCC
+$forbidden = @(Get-ChildItem $ReleaseDir -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -like "*.WebView2" -or $_.Name -eq "EBWebView" -or
+        $_.Name -like "*.db" -or $_.Name -like "*.db-journal" -or $_.Name -like "*.db-wal" -or $_.Name -like "*.db-shm" -or
+        $_.Name -eq "secrets" -or $_.Name -like "*.pdb" -or $_.Name -eq ".env" -or
+        $_.Name -like "*.jks" -or $_.Name -like "*.keystore"
+    })
+if ($forbidden.Count -gt 0) {
+    $list = ($forbidden | Select-Object -First 20 | ForEach-Object { "  " + $_.FullName.Substring($ReleaseDir.Length + 1) }) -join "`n"
+    throw @"
+产物目录里发现不该发布的东西（共 $($forbidden.Count) 项）：
+$list
+
+这通常是在 Release 目录里**跑过一次 App** 留下的（WebView2 用户数据含 Cookie / Login Data）。
+处理：删掉这些文件后重跑，或在干净目录重新 `flutter build windows`。
+"@
+}
+Write-Host "OK：Release 目录干净（无 WebView2 / 数据库 / 密钥 / 调试符号）"
+
+# ---- 3. 护栏 B：白名单暂存 ----
+Step "护栏 B：白名单复制到暂存目录（默认排除一切未列出的文件）"
+if (Test-Path $stagingDir) { Remove-Item $stagingDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
+
+# 白名单：Flutter Windows 运行时必需 + 端侧核心 + WebView2 加载器。
+# 以后加了新的插件 DLL，必须显式加到这里，否则装上去会缺 DLL。
+$whitelistFiles = @(
+    "yunong.exe",
+    "yunong_core.dll",
+    "flutter_windows.dll",
+    "flutter_inappwebview_windows_plugin.dll",
+    "WebView2Loader.dll",
+    "native_assets.json"
+)
+
+foreach ($f in $whitelistFiles) {
+    $src = Join-Path $ReleaseDir $f
+    if (Test-Path $src) {
+        Copy-Item $src (Join-Path $stagingDir $f) -Force
+        Write-Host ("  复制 {0} ({1:N1} MB)" -f $f, ((Get-Item $src).Length / 1MB))
+    } elseif ($f -ne "native_assets.json") {
+        throw "白名单文件在产物目录里找不到：$f"
+    }
+}
+
+# data/ 整目录（Flutter 资源），排除数据库/密钥类
+$dataSrc = Join-Path $ReleaseDir "data"
+if (-not (Test-Path $dataSrc)) { throw "缺少 data\ 目录：$dataSrc" }
+$dataExclude = @("*.db", "*.db-journal", "*.db-wal", "*.db-shm", "secrets", ".env", "*.pdb")
+robocopy $dataSrc (Join-Path $stagingDir "data") /E /NFL /NDL /NJH /NJS /NP /XF @dataExclude | Out-Null
+if ($LASTEXITCODE -ge 8) { throw "robocopy 复制 data\ 失败（exit $LASTEXITCODE）" }
+Write-Host "  复制 data\（排除：$($dataExclude -join ', ')）"
+
+# 暂存目录再断言一次（纵深防御）
+$leaked = @(Get-ChildItem $stagingDir -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like "*.WebView2" -or $_.Name -eq "EBWebView" -or $_.Name -like "*.db" -or
+                   $_.Name -eq "secrets" -or $_.Name -like "*.pdb" -or $_.Name -eq ".env" })
+if ($leaked.Count -gt 0) {
+    throw "暂存目录里仍有不该发布的内容：$(($leaked | ForEach-Object { $_.Name }) -join ', ')"
+}
+$stagingFiles = @(Get-ChildItem $stagingDir -Recurse -File)
+$stagingMb = [math]::Round((($stagingFiles | Measure-Object Length -Sum).Sum / 1MB), 2)
+Write-Host ("暂存目录：{0} 个文件，{1} MB" -f $stagingFiles.Count, $stagingMb)
+
+# ---- 4. 找 ISCC 并编译 ----
+Step "编译安装包"
 $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue)?.Source
 if (-not $iscc) {
     foreach ($p in @(
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
         "C:\Program Files\Inno Setup 6\ISCC.exe",
         "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-    )) {
-        if (Test-Path $p) { $iscc = $p; break }
-    }
+    )) { if (Test-Path $p) { $iscc = $p; break } }
 }
 if (-not $iscc) {
     throw "找不到 ISCC.exe：请安装 Inno Setup 6（winget install JRSoftware.InnoSetup / CI 用 choco install innosetup -y）"
 }
 Write-Host "ISCC：$iscc"
 
-# 4) 编译安装包
 $outDir = if ([System.IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $repo $OutputDir }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $iss = Join-Path $repo "deploy/windows/installer.iss"
-$isccArgs = @(
-    "/DMyAppVersion=$Version",
-    "/DSourceDir=$releaseDir",
-    "/DOutputDir=$outDir",
-    "/Qp",
-    $iss
-)
-& $iscc @isccArgs
+& $iscc "/DMyAppVersion=$Version" "/DSourceDir=$stagingDir" "/DOutputDir=$outDir" "/Qp" $iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC 失败（exit $LASTEXITCODE）" }
 
-# 5) 校验和 + 大小
+# ---- 5. 护栏 C：体积与校验和 ----
 $setup = Join-Path $outDir "WindowOfYNAU-$Version-setup.exe"
 if (-not (Test-Path $setup)) { throw "没找到产物：$setup" }
-$sizeMb = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+$sizeMb = [math]::Round((Get-Item $setup).Length / 1MB, 2)
 Write-Host "`nOK: $setup ($sizeMb MB)"
+if ($sizeMb -ge 40) {
+    throw "安装包体积异常：$sizeMb MB（阈值 40 MB）——检查暂存目录是否混入了用户数据/调试符号。"
+}
+
 Push-Location $outDir
 try {
     Get-ChildItem -Filter "*.exe" | Get-FileHash -Algorithm SHA256 |
