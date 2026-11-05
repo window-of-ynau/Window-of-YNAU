@@ -44,6 +44,16 @@ impl AuthError {
         )
     }
 
+    /// 邀请码不可用（不存在 / 已撤销 / 已过期 / 用量已满）。
+    ///
+    /// **四类原因共用一个错误码与一句文案**（t141）：邀请码是 8~32 位的低熵字符串，
+    /// 一旦按原因区分（"已过期" vs "不存在"），就成了可枚举的预言机。
+    /// 用 403 而不是 422：邀请码是**授权凭据**，不是参数格式问题；客户端据此展示
+    /// "邀请码无效，请联系管理员"。
+    pub fn invite_invalid() -> Self {
+        Self::new(ErrorCode::Forbidden, "邀请码无效或已不可用")
+    }
+
     /// 内部故障（数据库、哈希等）。不把细节暴露给客户端之外的日志。
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
