@@ -26,8 +26,8 @@ class FileSettingsStore implements SettingsStore {
     _loadFromDisk();
   }
 
-  static String _defaultPath() =>
-      <String>[AppPaths.dataDir, 'settings.json'].join(Platform.pathSeparator);
+  // t155：统一走 `AppPaths.settingsPath`（数据根：debug=`yunong-dev`、release=`yunong`）。
+  static String _defaultPath() => AppPaths.settingsPath;
 
   final File _file;
   final Map<String, String> _values = <String, String>{};
