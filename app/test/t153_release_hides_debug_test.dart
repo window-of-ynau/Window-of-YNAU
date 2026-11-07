@@ -1,23 +1,14 @@
-// t153：v0.9 alpha 前收口 —— release 构建（模拟）里调试/诊断入口不出现，debug 里仍在。
+// t153（t161 精简）：release 构建隐藏「对话诊断」，debug 仍可见。
+//
+// 会话校验探针已整体下线（t161 / issue #55），这里只剩对话诊断这一项。
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:yunong/src/campus/session_probe.dart';
-import 'package:yunong/src/chat/chat_settings_section.dart';
+import 'package:yunong/src/campus/campus_guard.dart';
 import 'package:yunong/src/chat/chat_top_bar.dart';
 import 'package:yunong/src/core/debug_flags.dart';
-import 'package:yunong/src/settings/settings_page.dart';
-import 'package:yunong/src/theme/theme_controller.dart';
 
 import 'support/test_window.dart';
-
-Widget _settings({required bool? showDebugEntries}) => MaterialApp(
-      home: SettingsPage(
-        controller: ThemeController(store: MemorySettingsStore()),
-        chatSettings: ChatSettingsController(),
-        showDebugEntries: showDebugEntries,
-      ),
-    );
 
 Widget _topBar({required bool? showDebugEntries, VoidCallback? onDiagnostics}) => MaterialApp(
       home: Scaffold(
@@ -43,23 +34,7 @@ Widget _topBar({required bool? showDebugEntries, VoidCallback? onDiagnostics}) =
 void main() {
   tearDown(DebugFlags.reset);
 
-  group('release（模拟）：调试入口隐藏', () {
-    testWidgets('设置页不含「[临时] 会话校验探针」', (WidgetTester tester) async {
-      setTestWindow(tester, 1280, 900);
-      await tester.pumpWidget(_settings(showDebugEntries: false));
-      await tester.pumpAndSettle();
-      // 滚动到底（「关于」分组在最后）
-      await tester.scrollUntilVisible(
-        find.text('关于'),
-        300,
-        scrollable: find.byType(Scrollable).first,
-      );
-      expect(find.byKey(const Key('settings-session-probe')), findsNothing);
-      expect(find.text('[临时] 会话校验探针'), findsNothing);
-      // 版本行仍在（只隐藏调试入口，不动正常内容）
-      expect(find.text('版本'), findsOneWidget);
-    });
-
+  group('release（模拟）：诊断入口隐藏', () {
     testWidgets('对话页 ⋮ 里不含「对话诊断」', (WidgetTester tester) async {
       setTestWindow(tester, 1280, 900);
       await tester.pumpWidget(_topBar(showDebugEntries: false));
@@ -72,34 +47,19 @@ void main() {
       expect(find.text('记忆'), findsOneWidget);
     });
 
-    testWidgets('DebugFlags.override=false 时默认即隐藏（构建模式开关生效）', (WidgetTester tester) async {
+    testWidgets('DebugFlags.override=false 时默认即隐藏（构建模式开关生效）',
+        (WidgetTester tester) async {
       DebugFlags.override = false;
       setTestWindow(tester, 1280, 900);
-      await tester.pumpWidget(_settings(showDebugEntries: null));
+      await tester.pumpWidget(_topBar(showDebugEntries: null));
       await tester.pumpAndSettle();
-      await tester.scrollUntilVisible(
-        find.text('关于'),
-        300,
-        scrollable: find.byType(Scrollable).first,
-      );
-      expect(find.text('[临时] 会话校验探针'), findsNothing);
+      await tester.tap(find.byIcon(Icons.more_vert));
+      await tester.pumpAndSettle();
+      expect(find.text('对话诊断'), findsNothing);
     });
   });
 
   group('debug：入口仍在', () {
-    testWidgets('设置页有「[临时] 会话校验探针」', (WidgetTester tester) async {
-      setTestWindow(tester, 1280, 900);
-      await tester.pumpWidget(_settings(showDebugEntries: true));
-      await tester.pumpAndSettle();
-      await tester.scrollUntilVisible(
-        find.byKey(const Key('settings-session-probe')),
-        300,
-        scrollable: find.byType(Scrollable).first,
-      );
-      expect(find.byKey(const Key('settings-session-probe')), findsOneWidget);
-      expect(find.text('[临时] 会话校验探针'), findsOneWidget);
-    });
-
     testWidgets('对话页 ⋮ 里有「对话诊断」且可打开', (WidgetTester tester) async {
       setTestWindow(tester, 1280, 900);
       int opened = 0;
@@ -125,9 +85,9 @@ void main() {
     expect(DebugFlags.showDebugEntries, isTrue);
   });
 
-  test('功能必需的东西不在开关范围内（避免误删）', () {
-    // isCampusHost 硬守卫：与调试可见性无关，永远生效
+  test('功能必需的东西不受影响（校方域名硬守卫）', () {
     expect(isCampusHost('one.ynau.edu.cn'), isTrue);
+    expect(isCampusHost('ssoo.ynau.edu.cn'), isTrue);
     expect(isCampusHost('example.com'), isFalse);
   });
 }

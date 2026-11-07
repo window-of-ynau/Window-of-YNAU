@@ -18,14 +18,11 @@ import 'dart:convert';
 import 'dart:collection';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../core/timetable_service.dart';
 import 'campus_bridge.dart';
 import 'portal_api.dart';
-import 'session_cookie_diagnostics.dart';
-import 'session_probe.dart'; // 【临时诊断 t137】验证后删除
 import 'webview_session.dart';
 
 /// 取数模式：旧的 DOM 抓取 / W6 的门户接口。
@@ -231,7 +228,10 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
         final Object? raw = await controller.evaluateJavascript(source: kCourseRowCountScript);
         final int? count = int.tryParse('${raw ?? ''}'.replaceAll('"', '').trim());
         return count ?? -1;
-      } on Object {
+      } on Object catch (failure) {
+        // 【t161】可以吞：行数探测只是**就绪判定的加分项**，拿不到按"未知"处理，
+        // 由 waitForTimetableReady 的其它条件（长度/关键字/URL）兜底；但要留痕便于排障。
+        debugPrint('[capture] courseRowCount 探测失败：${failure.runtimeType} $failure');
         return -1;
       }
     },
@@ -245,13 +245,18 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
       String title = '';
       try {
         url = (await controller.getUrl())?.toString() ?? '';
-      } on Object {
+      } on Object catch (failure) {
+        // 【t161】可以吞：URL 只用于诊断与"是否停在登录页"的辅助判断，
+        // 拿不到时诊断显示"（空）"，不影响抓取主流程。
+        debugPrint('[capture] getUrl 失败：${failure.runtimeType} $failure');
         url = '';
       }
       try {
         final Object? raw = await controller.evaluateJavascript(source: 'document.title');
         title = raw is String ? raw : '';
-      } on Object {
+      } on Object catch (failure) {
+        // 【t161】可以吞：标题同上，仅诊断用；失败时显示"（空）"。
+        debugPrint('[capture] document.title 失败：${failure.runtimeType} $failure');
         title = '';
       }
       return (url: url, title: title);
@@ -576,12 +581,6 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
                         forMainFrameOnly: false,
                       ),
-                      // 【临时诊断 t142】页面内 cardId 探测器（纯本地，不发请求）
-                      UserScript(
-                        source: kCardIdProbeInstallScript,
-                        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
-                        forMainFrameOnly: false,
-                      ),
                       // 【t151】课程行计数（就绪判定用；只回数字，不回 DOM）
                       UserScript(
                         source: kCourseRowCountInstallScript,
@@ -604,64 +603,6 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                     ]),
                     onWebViewCreated: (InAppWebViewController controller) {
                       _controller = controller;
-                      // 【临时诊断 t137】把 `document.cookie.length` 挂到当前 WebView，
-                      // 用于判断「CookieManager 取不到、但 JS 能读到」= HttpOnly。验证后删除。
-                      SessionProbeJsBridge.documentCookieLength = () async {
-                        final Object? raw = await controller.evaluateJavascript(
-                          source: 'document.cookie.length',
-                        );
-                        return parseJsCookieLength('${raw ?? ''}');
-                      };
-                      // 【临时诊断 t138】CAS ticket 探针：用这个 WebView 导航，并记录重定向链。
-                      CasTicketProbe.navigate = (String target) async {
-                        await controller.loadUrl(urlRequest: URLRequest(url: WebUri(target)));
-                      };
-                      // 【临时诊断 t142/t143/t146】页面内纯本地探测 cardId：
-                      // 直接返回 `evaluateJavascript` 的值（不走 JS→Dart 桥）。
-                      // t146：控制器失效（MissingPluginException）→ 转成明确的
-                      // `WebViewUnavailableException`，让 UI 提示"重新进入课表页"，而不是抛原生异常。
-                      SessionProbeJsBridge.evaluate = (String source) async {
-                        if (_controller == null) {
-                          throw const WebViewUnavailableException(
-                            'WebView 未就绪：请先进入「我的课表」并等页面加载完成',
-                          );
-                        }
-                        try {
-                          return await _controller!.evaluateJavascript(source: source);
-                        } on MissingPluginException {
-                          throw const WebViewUnavailableException(
-                            'WebView 已失效（控制器已销毁）：请重新进入「我的课表」再回来探测',
-                          );
-                        }
-                      };
-                      // 【临时诊断 t140】校方域名只在 WebView 内用 fetch 取：
-                      // 页面里是真实浏览器环境，能过动态 JS 挑战；只回传摘要，不回传响应体/Cookie。
-                      SessionProbeJsBridge.inPageFetch =
-                          (String url, {required bool withCredentials}) async {
-                        final String credentials = withCredentials ? 'include' : 'omit';
-                        final String script = '''
-(async () => {
-  try {
-    const r = await fetch(${jsonEncode(url)}, {
-      credentials: '$credentials',
-      headers: {'Accept': 'application/json, text/plain, */*'},
-    });
-    const t = await r.text();
-    const m = t.match(/\\b\\d{10,12}\\b/);
-    return JSON.stringify({
-      status: r.status,
-      length: t.length,
-      hasStudentId: !!m,
-      contentType: r.headers.get('content-type') || '',
-    });
-  } catch (e) {
-    return JSON.stringify({status: 0, length: 0, hasStudentId: false, error: String(e)});
-  }
-})()
-''';
-                        final Object? raw = await controller.evaluateJavascript(source: script);
-                        return InPageFetchSummary.fromJsonString('${raw ?? ''}');
-                      };
                       controller.addJavaScriptHandler(
                         handlerName: 'yunongBridge',
                         callback: (List<dynamic> args) {
@@ -669,14 +610,6 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                           return null;
                         },
                       );
-                    },
-                    // 【临时诊断 t138/t139】记录导航链（CAS ticket 探针）：只在 recording 时写入；
-                    // 非 recording 时顺便记住"当前页面"，探针结束后据此导航回去。
-                    onLoadStart: (_, WebUri? url) async {
-                      if (!CasTicketProbe.recording) {
-                        CasTicketProbe.returnUrl = url?.toString();
-                      }
-                      CasTicketProbe.record(url?.toString());
                     },
                     onLoadStop: (_, WebUri? url) async {
                       if (mounted) {
