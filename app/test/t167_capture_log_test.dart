@@ -58,8 +58,8 @@ void main() {
 
     final String body = File(path).readAsStringSync();
     expect(body, contains('错误码：PARSE_EMPTY'));
-    expect(body, contains('课程行数=0'));
-    expect(body, contains('课程行数=3'));
+    expect(body, contains('数据行=0'));
+    expect(body, contains('数据行=3'));
     expect(body, contains('解析出=0 门课'));
     expect(body, contains('## HTML 前 2000 字符'));
     expect(body, contains('## HTML 后 2000 字符'));

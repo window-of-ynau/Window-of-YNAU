@@ -15,7 +15,7 @@ void main() {
     test('选择器与抓取/解析用的一致：table#timetable tr', () {
       expect(kCourseRowSelector, 'table#timetable tr');
       expect(kGrabHtmlInstallScript.contains("querySelector('table#timetable')"), isTrue);
-      expect(kCourseRowCountInstallScript.contains("querySelectorAll('table#timetable tr')"), isTrue);
+      expect(kCourseRowCountInstallScript.contains("querySelector('table#timetable')"), isTrue);
     });
 
     test('行数 0 → 未就绪（即使长度够、含课表关键字）', () {
@@ -106,7 +106,7 @@ void main() {
       expect(result.attempts.first.parseEmpty, isTrue);
       expect(result.attempts.last.parseEmpty, isFalse);
       expect(result.diagnostics, contains('PARSE_EMPTY=是'));
-      expect(result.diagnostics, contains('课程行数=3'));
+      expect(result.diagnostics, contains('课程行数=2'));
       // t151：诊断里带 cardId（缓存，脱敏）
       expect(result.diagnostics, contains('cardId: 95c8b1…ac18'));
       CampusCaptureCache.instance.clear();

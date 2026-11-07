@@ -19,6 +19,7 @@ class CaptureAttemptRecord {
     required this.index,
     required this.htmlLength,
     this.rowCount = -1,
+    this.headerRowCount,
     this.title = '',
     this.url = '',
     this.looksLikeLoginPage = false,
@@ -28,7 +29,11 @@ class CaptureAttemptRecord {
 
   final int index;
   final int htmlLength;
+  /// 数据行数（含 `<td>` 的行；= Rust 解析器会看的行）。
   final int rowCount;
+
+  /// 表头行数（只含 `<th>` 的行）；null = 没统计。
+  final int? headerRowCount;
   final String title;
   final String url;
   final bool looksLikeLoginPage;
@@ -38,7 +43,9 @@ class CaptureAttemptRecord {
   final int? parsedCourses;
 
   String get line =>
-      '第 $index 次：html 长度=$htmlLength / 课程行数=${rowCount < 0 ? '未知' : rowCount} / '
+      '第 $index 次：html 长度=$htmlLength / '
+      '表头行=${headerRowCount == null ? '未知' : headerRowCount} / '
+      '数据行=${rowCount < 0 ? '未知' : rowCount} / '
       '标题="${title.trim()}" / URL="${url.trim()}" / 含登录字样=$looksLikeLoginPage / '
       '含课表关键字=$hasTimetableMark / 解析出=${parsedCourses == null ? '未解析' : '$parsedCourses 门课'}';
 }
