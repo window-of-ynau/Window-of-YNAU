@@ -80,6 +80,14 @@ python bench/run.py --cases bench/cases/full.jsonl \
 阈值写死在 `bench/run.py` 的 `REGRESSION_TOLERANCE` 与 `compare_with_baseline()` 里，
 **不要靠在 baseline.json 里改数字来放宽**（基线只放"量到的值"）。
 
+### 为什么还有"绝对噪声下限"
+
+mock 上游的延迟是**个位数毫秒**（CI 实测 p50 2.6ms / p95 3.2ms）。这个量级上 +10% 只有 0.3ms，
+一次 CI 的调度抖动就能超过 ⇒ 门禁会变成随机器心情红绿。
+所以判定是「**相对 >10% 且绝对增量超过下限**」才阻断：延迟 5ms、成本 0.01 分
+（`NOISE_FLOOR_MS` / `NOISE_FLOOR_CENTS`）。真实上游是几百毫秒量级，5ms 的噪声下限在那里
+永远不生效，不会掩盖真退化；命中率与错误率不受此影响。
+
 ## 首次采集 / 更新基线
 
 基线必须是**实测**，且标注采集环境：

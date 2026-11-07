@@ -1,17 +1,18 @@
 {
   "version": 2,
-  "bootstrap": true,
-  "_comment": "**首次采集窗口**：这些数字会在 CI（GitHub Actions ubuntu-latest）上第一次跑通后自动替换；在替换之前 bootstrap=true，门禁只记录不阻断（拿占位数字当分母等于把门禁关掉）。替换方式见 bench/README.md 的“首次采集 / 更新基线”。",
-  "collected_at": null,
-  "environment": "pending first CI collection",
+  "collected_at": "2026-11-07T03:58:09Z",
+  "environment": "GitHub Actions ubuntu-latest（run 42336225236 的 bench job）",
+  "source": "bench/cases/full.jsonl + bench/mock_upstream.py（回放固定答案，chunk=64 chars, tokens_in=400）",
+  "note": "实测基线。换机器 / 换上游 / 换价目都要重新采并在 PR 里说明原因。退化判定见 bench/run.py 的 compare_with_baseline()（相对 >10% 且超过绝对噪声下限）。",
   "summary": {
-    "p50_ttft_ms": null,
-    "p95_ttft_ms": null,
-    "p50_total_ms": null,
-    "p95_total_ms": null,
-    "mean_total_ms": null,
-    "est_cost_per_case_cents": null,
-    "hit_rate": null,
-    "error_rate": null
+    "p50_ttft_ms": 2.6,
+    "p95_ttft_ms": 3.2,
+    "p50_total_ms": 2.7,
+    "p95_total_ms": 3.3,
+    "est_cost_per_case_cents": 0.1029,
+    "hit_rate": 1.0,
+    "error_rate": 0.0,
+    "cases": 50,
+    "cases_ok": 50
   }
 }

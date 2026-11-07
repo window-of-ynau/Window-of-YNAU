@@ -415,6 +415,11 @@ def _num(value):
 
 REGRESSION_TOLERANCE = 0.10  # 退化 > 10% 即阻断（延迟 / 成本 / 命中率三个方向都用它）
 
+# 绝对噪声下限（t162）：mock 上游的延迟是个位数毫秒，+10% 只有 0.3ms，CI 调度抖动就能超过它。
+# 所以"相对 >10%"还要**同时**超过下面的绝对增量才阻断。真实上游是几百毫秒量级，这里永远不生效。
+NOISE_FLOOR_MS = 5.0
+NOISE_FLOOR_CENTS = 0.01
+
 
 def compare_with_baseline(summary, baseline):
     """返回退化原因列表；空列表表示通过。
@@ -432,21 +437,28 @@ def compare_with_baseline(summary, baseline):
     base = baseline.get("summary") or {}
     reasons = []
 
-    def worse_high(key, label):
+    def worse_high(key, label, floor=0.0):
         base_value = _num(base.get(key))
         current = _num(summary.get(key))
         if base_value and current is not None and current > base_value * (1.0 + REGRESSION_TOLERANCE):
             delta = current / base_value - 1.0
+            if (current - base_value) < floor:
+                # 相对涨幅够了，但绝对增量小于噪声下限：记一行日志，不阻断
+                print(
+                    "note: %s +%.1f%% 但绝对增量 %.3f < 噪声下限 %.3f，不计为退化"
+                    % (label, delta * 100.0, current - base_value, floor)
+                )
+                return
             reasons.append(
                 "%s %.1f > baseline %.1f (+%.1f%% > +10%%)"
                 % (label, current, base_value, delta * 100.0)
             )
 
-    worse_high("p50_ttft_ms", "p50_ttft_ms")
-    worse_high("p95_ttft_ms", "p95_ttft_ms")
-    worse_high("p50_total_ms", "p50_total_ms")
-    worse_high("p95_total_ms", "p95_total_ms")
-    worse_high("est_cost_per_case_cents", "est_cost_per_case_cents")
+    worse_high("p50_ttft_ms", "p50_ttft_ms", NOISE_FLOOR_MS)
+    worse_high("p95_ttft_ms", "p95_ttft_ms", NOISE_FLOOR_MS)
+    worse_high("p50_total_ms", "p50_total_ms", NOISE_FLOOR_MS)
+    worse_high("p95_total_ms", "p95_total_ms", NOISE_FLOOR_MS)
+    worse_high("est_cost_per_case_cents", "est_cost_per_case_cents", NOISE_FLOOR_CENTS)
 
     base_hit = _num(base.get("hit_rate"))
     current_hit = _num(summary.get("hit_rate"))
