@@ -13,6 +13,7 @@ import 'dart:async';
 import 'campus_entries.dart';
 import '../core/timetable_service.dart';
 import 'capture_cache.dart';
+import 'capture_log.dart';
 import 'capture_readiness.dart';
 import '../theme/context_menu.dart';
 import 'timetable/course_palette.dart';
@@ -53,6 +54,10 @@ class _TimetablePageState extends State<TimetablePage> {
   List<StoredCourse> _courses = const <StoredCourse>[];
   List<String> _warnings = const <String>[];
   TimetableException? _failure;
+
+  /// t167：抓取失败时最近 3 次尝试的诊断行（可展开）与日志文件路径。
+  List<String> _captureDetailLines = const <String>[];
+  String? _captureLogPath;
 
 
   /// 最近一次 ICS 导出结果（成功时显示路径与事件数）。
@@ -293,6 +298,8 @@ class _TimetablePageState extends State<TimetablePage> {
         if (_failure != null)
           _FailureCard(
             failure: _failure!,
+            detailLines: _captureDetailLines,
+            logPath: _captureLogPath,
             onRetry: _retryFailedAction,
             onConfirmTermStart: _failure!.code == 'TERM_START_UNKNOWN'
                 ? () => unawaited(_goToTermStart())
@@ -671,23 +678,66 @@ class _TimetablePageState extends State<TimetablePage> {
     await _run(() async {
       // t151：PARSE_EMPTY 也要可重试（最多 3 次、间隔 800ms）。
       // 页面常见"框架在、课程行还没渲染"的中间态：HTML 够长但解析 0 门课，重试即好。
+      //
+      // t167：失败时把**完整诊断写进 `<数据根>/logs/capture-*.log`**（每次尝试的行数/标题/URL
+      // + HTML 首尾 2000 字符），界面只给一句短消息 + 可展开详情 + 「打开日志目录」；
+      // 成功也记一行结构特征，便于对比成功与失败的差异。
+      final List<String> htmlSeq = <String>[];
+      final List<String> urlSeq = <String>[];
       final ParseRetryResult result = await importHtmlWithParseRetry(
         fetchHtml: () async {
           final page = await fetcher.fetchTimetablePage(
             entryUrl: CampusEntry.timetable.url,
           );
+          htmlSeq.add(page.html);
+          urlSeq.add(page.url);
           return page.html;
         },
         importHtml: (String html) => widget.service.importHtml(html: html, term: _currentTerm),
         rowCountOf: countTableRowsInHtml,
       );
+      final String lastHtml = htmlSeq.isEmpty ? '' : htmlSeq.last;
+      final String lastUrl = urlSeq.isEmpty ? '' : urlSeq.last;
       if (!result.ok) {
+        final List<CaptureAttemptRecord> records = <CaptureAttemptRecord>[
+          for (final ParseAttempt attempt in result.attempts)
+            CaptureAttemptRecord(
+              index: attempt.index,
+              htmlLength: attempt.htmlLength,
+              rowCount: attempt.rowCount,
+              parsedCourses: attempt.parseEmpty ? 0 : null,
+              url: lastUrl,
+              hasTimetableMark: lastHtml.contains('timetable'),
+            ),
+        ];
+        final String? logPath = CaptureLog.writeFailure(
+          code: 'PARSE_EMPTY',
+          html: lastHtml,
+          attempts: records,
+          userHint: '课表解析出 0 门课（已自动重试 ${result.attempts.length} 次）',
+          message: result.diagnostics,
+        );
+        if (mounted) {
+          setState(() {
+            _captureDetailLines = recentAttemptLines(result.attempts);
+            _captureLogPath = logPath;
+          });
+        }
         throw TimetableException(
           code: 'PARSE_EMPTY',
-          userHint: '课表解析出 0 门课，已自动重试 ${result.attempts.length} 次仍失败',
+          // t167：界面只给短消息（完整诊断在日志与可展开面板里）
+          userHint: captureFailureHeadline('PARSE_EMPTY'),
           message: result.diagnostics,
         );
       }
+      // 成功也记一行结构特征（对比成功/失败差异是最快的定位线索）
+      CaptureLog.writeSuccess(
+        htmlLength: lastHtml.length,
+        rowCount: countTableRowsInHtml(lastHtml),
+        title: '',
+        url: lastUrl,
+        parsedCourses: result.outcome.imported,
+      );
       return result.outcome;
     }, notice: hint ?? '已从校务系统页面抓取');
   }
@@ -1014,9 +1064,17 @@ class _FailureCard extends StatelessWidget {
     required this.failure,
     required this.onRetry,
     this.onConfirmTermStart,
+    this.detailLines = const <String>[],
+    this.logPath,
   });
 
   final TimetableException failure;
+
+  /// t167：最近 3 次尝试的诊断行（可展开）。
+  final List<String> detailLines;
+
+  /// t167：失败诊断日志路径（可为空 = 没写成）。
+  final String? logPath;
   final Future<void> Function() onRetry;
   final void Function()? onConfirmTermStart;
 
@@ -1049,6 +1107,62 @@ class _FailureCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 6),
+          if (captureFailureHeadline(failure.code).isNotEmpty)
+            Text(
+              captureFailureHeadline(failure.code),
+              key: const Key('capture-failure-headline'),
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onErrorContainer,
+              ),
+            ),
+          if (detailLines.isNotEmpty)
+            Theme(
+              data: theme.copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                key: const Key('capture-failure-details'),
+                tilePadding: EdgeInsets.zero,
+                childrenPadding: EdgeInsets.zero,
+                title: const Text('查看详情'),
+                children: <Widget>[
+                  for (final String line in detailLines)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: SelectableText(
+                        line,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onErrorContainer,
+                        ),
+                      ),
+                    ),
+                  if (logPath != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: SelectableText(
+                        '日志：$logPath',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onErrorContainer.withValues(alpha: 0.8),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              key: const Key('open-logs-dir'),
+              onPressed: () async {
+                final bool ok = await CaptureLog.openLogsDirectory();
+                if (!ok && context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('日志目录：${CaptureLog.logsDir()}')),
+                  );
+                }
+              },
+              icon: const Icon(Icons.folder_open, size: 18),
+              label: const Text('打开日志目录'),
+            ),
+          ),
           Text(
             '这不是"没有课"：解析失败时我们不会写入空课表，已有课表也不会被覆盖。',
             style: theme.textTheme.bodySmall?.copyWith(
