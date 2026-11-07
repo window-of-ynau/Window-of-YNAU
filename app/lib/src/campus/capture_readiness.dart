@@ -179,12 +179,30 @@ Future<CaptureWaitResult> waitForTimetableReady({
 /// 【t151】从 HTML 里数课程行（**纯本地、与 `kCourseRowSelector` 语义一致**：`table#timetable` 的 `<tr>`）。
 ///
 /// 用途：PARSE_EMPTY 重试的诊断（`行数`）与测试；页面内则用 `window.__yunongCourseRowCount()`。
-int countTableRowsInHtml(String html) {
+/// 表格行统计（t168 修复：区分**表头行**与**数据行**）。
+///
+/// 背景：`<tr>` 既可能是表头（只含 `<th>`）也可能是课程行（含 `<td>`）。
+/// 旧实现把两者一起数，于是"只有表头"被算成 1 行、就绪判定放行，Rust 随后解析出 0 门课
+/// —— 这就是 `PARSE_EMPTY` 的根因。
+({int dataRows, int headerRows, int totalRows}) tableRowCounts(String html) {
   if (html.isEmpty) {
-    return 0;
+    return (dataRows: 0, headerRows: 0, totalRows: 0);
   }
   final RegExp tablePattern = RegExp(r'<table[^>]*id="timetable"[\s\S]*?</table>', caseSensitive: false);
   final RegExpMatch? table = tablePattern.firstMatch(html);
   final String scope = table?.group(0) ?? html;
-  return RegExp(r'<tr\b', caseSensitive: false).allMatches(scope).length;
+  int data = 0;
+  int header = 0;
+  for (final RegExpMatch row in RegExp(r'<tr\b[\s\S]*?(?:</tr>|$)', caseSensitive: false).allMatches(scope)) {
+    final String rowHtml = row.group(0) ?? '';
+    if (RegExp(r'<td\b', caseSensitive: false).hasMatch(rowHtml)) {
+      data += 1;
+    } else if (RegExp(r'<th\b', caseSensitive: false).hasMatch(rowHtml)) {
+      header += 1;
+    }
+  }
+  return (dataRows: data, headerRows: header, totalRows: data + header);
 }
+
+/// 数据行数（= Rust 解析器会看的行；不含表头）。保留旧名字便于调用方迁移。
+int countTableRowsInHtml(String html) => tableRowCounts(html).dataRows;

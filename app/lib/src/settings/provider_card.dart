@@ -167,7 +167,7 @@ class _ProviderCardState extends State<ProviderCard> {
                 Expanded(
                   child: Text(
                     // 协议不可选：Rust 侧自动解析（responses → messages → completions）
-                    protocolAutoLabel(widget.store.active.name),
+                    protocolAutoLabel(widget.store.activeOrNull?.name ?? ProviderStore.placeholderLabel),
                     style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
                   ),
                 ),
