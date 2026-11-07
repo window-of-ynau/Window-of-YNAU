@@ -57,15 +57,29 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _sse_start(self):
+        # 用 chunked 分帧：SSE 没有 Content-Length，只有 chunked 或"关连接"两种合法终止方式。
+        # 关连接会让服务端的连接池复用到已关闭的 socket，下一次请求被迫重连（实测慢 20–100ms，
+        # 且呈现"隔一条慢一次"的假抖动）——所以这里必须 chunked。
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
+        self._chunked = True
+
+    def _write_chunk(self, data):
+        self.wfile.write(b"%x\r\n" % len(data))
+        self.wfile.write(data)
+        self.wfile.write(b"\r\n")
+
+    def _chunked_end(self):
+        # chunked 的终止块：长度为 0 的 chunk + 空行
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def _send_event(self, payload):
         body = "data: %s\n\n" % json.dumps(payload, ensure_ascii=False)
-        self.wfile.write(body.encode("utf-8"))
+        self._write_chunk(body.encode("utf-8"))
         self.wfile.flush()
 
     def do_POST(self):
@@ -128,10 +142,9 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }
         )
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
-        # 主动关连接：SSE 客户端（服务端）读到 [DONE] 就停了，但 curl 会一直等 keep-alive
-        self.close_connection = True
+        self._write_chunk(b"data: [DONE]\n\n")
+        # 终止块：告诉客户端"body 到此为止"，连接仍可复用（这才是真实上游的行为）
+        self._chunked_end()
 
 
 class MockServer(ThreadingHTTPServer):
