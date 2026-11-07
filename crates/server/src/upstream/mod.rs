@@ -282,6 +282,19 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
         .unwrap_or(false)
 }
 
+/// 拼上游完整 URL：`base_url` 与端点路径。
+///
+/// **规范化只有一份实现**：`yunong_shared::normalize_base_url`（修 issue #51）。
+/// 之前这里只 `trim_end_matches('/')`，用户把 `…/v1` 粘进 `base_url` 时会拼成
+/// `/v1/v1/chat/completions` → 上游 404；BYOK 直连那边会剥掉，于是"同一配置、
+/// 一条通道能用、另一条 404"。
+pub fn upstream_url(base_url: &str, protocol: Protocol) -> String {
+    // **唯一实现**：`yunong_shared::provider_url`（base 规范化 + 厂商相关路径）。
+    // BYOK 直连（`yunong_core::gateway::wire::endpoint`）调的是同一个函数——
+    // 同一个配置，两条通道必然给出同一个 URL（issue #51）。
+    yunong_shared::provider_url(base_url, protocol)
+}
+
 /// 协议对应的上游端点（`docs/02` §7.1）。
 pub fn endpoint(protocol: Protocol) -> &'static str {
     match protocol {
@@ -342,11 +355,7 @@ impl UpstreamClient {
             )));
         };
 
-        let url = format!(
-            "{}{}",
-            provider.base_url().trim_end_matches('/'),
-            endpoint(protocol)
-        );
+        let url = upstream_url(provider.base_url(), protocol);
         // 强制 `stream=true`（评审 F4）：这个端点是纯流式代理，端侧若声明 stream=false
         // 上游会回一整个 JSON，我们收不到 SSE 事件，只会变成"空回答"。
         // `build_body` 以入参为准，所以这里传一份改过的副本，而不是依赖端侧声明。
@@ -539,6 +548,31 @@ impl UpstreamStream {
 
 #[cfg(test)]
 mod tests {
+    /// issue #51（服务端一侧）：`base_url` 带 `/v1` 时，最终 URL 必须与
+    /// `yunong_shared::endpoint_url` 完全一致——BYOK 直连调的也是它，
+    /// 所以两条通道不会再次分叉。
+    #[test]
+    fn upstream_url_matches_the_shared_cases() {
+        // 与 BYOK 直连（`yunong_core::gateway::wire::endpoint`）**断言同一张表**：
+        // 两侧调的都是 `yunong_shared::provider_url`，所以同一个配置必然同一个 URL。
+        for (base, protocol, expected) in yunong_shared::url::ENDPOINT_CASES {
+            assert_eq!(
+                upstream_url(base, *protocol),
+                *expected,
+                "base={base} protocol={protocol:?}"
+            );
+            assert!(
+                !upstream_url(base, *protocol).contains("/v1/v1"),
+                "出现了重复 /v1：{base} / {protocol:?}"
+            );
+        }
+        // #51 的现场：用户把文档里的 /v1 粘进 base_url（规范化后不该出现 /v1/v1）
+        assert_eq!(
+            upstream_url("https://api.deepseek.com/v1", Protocol::OpenaiCompletions),
+            "https://api.deepseek.com/chat/completions"
+        );
+    }
+
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
