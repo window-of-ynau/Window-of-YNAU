@@ -1,11 +1,17 @@
 {
-  "version": 1,
-  "_comment": "占位基线：这些数字不是实测结果，只用来把 bench/run.py 的对比流程跑通。首次真实跑通（服务可访问、上游有 Key）后必须整体替换：用 bench/out 里那次的 summary 覆盖下面的 summary，并把 version 加 1。替换前确认那次全部用例 ok、error_rate 为 0。",
+  "version": 2,
+  "bootstrap": true,
+  "_comment": "**首次采集窗口**：这些数字会在 CI（GitHub Actions ubuntu-latest）上第一次跑通后自动替换；在替换之前 bootstrap=true，门禁只记录不阻断（拿占位数字当分母等于把门禁关掉）。替换方式见 bench/README.md 的“首次采集 / 更新基线”。",
+  "collected_at": null,
+  "environment": "pending first CI collection",
   "summary": {
-    "p50_ttft_ms": 900,
-    "p95_ttft_ms": 1800,
-    "mean_total_ms": 6000,
-    "error_rate": 0.0,
-    "est_cost_per_case_cents": 2
+    "p50_ttft_ms": null,
+    "p95_ttft_ms": null,
+    "p50_total_ms": null,
+    "p95_total_ms": null,
+    "mean_total_ms": null,
+    "est_cost_per_case_cents": null,
+    "hit_rate": null,
+    "error_rate": null
   }
 }

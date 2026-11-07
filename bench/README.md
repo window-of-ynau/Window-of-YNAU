@@ -1,17 +1,115 @@
-# bench · 重构效果的裁判
+# bench · 评测门禁（issue #56 / W11）
 
-一句话：**同一批真实问句，重构前后各跑一遍；只盯"变慢、变贵、变错"，不重做正确性测试。**
+一句话：**同一批 50 条问句，每次 PR 与基线对比；TTFT / 总耗时 / 成本 / 命中率任一退化 > 10% 就阻断合并。**
 
-产品需求里写的是固定 50 条问句集、每次 PR 与基线对比、退化超 10% 阻断合并。本目录先落最小可跑集：12 条 smoke + 一套标准化的指标与判定口径。用例集可以长大，口径不要变。
+## 现在是真的门禁（v2，t162 起）
+
+| 项 | v1（之前） | v2（现在） |
+|---|---|---|
+| 用例 | 12 条 smoke | **50 条**：课表 15 / 规章 10 / 知识 15 / 多轮 10 |
+| 指标 | 只有 TTFT / 总耗时 / 错误率 | **五项**：首字延迟、总耗时、tokens（in/out）、估计成本、**要点命中** |
+| 基线 | 自述"不是实测" | **CI 实采**（`environment` 字段记录采集环境与时间） |
+| 生效方式 | 没配 `vars.BENCH_BASE_URL` 就跳过（等于从不跑） | **PR 默认执行**：自建 PG + mock 上游 + 现场编译的服务端 |
+| 判定 | 只有 p95 TTFT / mean 总耗时 | TTFT P50/P95、总耗时 P50/P95、单条成本（+10%）、命中率（−10%）、错误率（+5pp） |
+
+## 诚实边界（先读这一段）
+
+评测跑的是 `bench/mock_upstream.py` **回放固定答案**的假上游：
+
+- 它能证明：流式转发、usage 记账、token 统计、成本折算、错误处理、**延迟/成本的相对退化**；
+- 它**不能**证明：模型回答质量。所以"要点命中率"在这里衡量的是
+  **"上游给的答案有没有被完整、按序送到客户端"**，不是"模型答得对不对"；
+- 换真实上游跑（`--base-url` 指到生产/staging）时，同一套指标与门禁照用，只是基线要重新采。
 
 ## 目录
 
 | 路径 | 作用 |
 |---|---|
-| `bench/cases/smoke.jsonl` | 12 条冒烟用例，一行一个 JSON |
-| `bench/run.py` | 发请求、量指标、写结果、跟基线比（只用标准库） |
-| `bench/baseline.json` | 基线快照；**当前是占位值，首次真实跑通后整体替换** |
-| `bench/out/` | 运行时产物（时间戳 JSON），不要提交 |
+| `bench/cases/full.jsonl` | **50 条门禁用例**（一行一个 JSON；含 question / expect / answer） |
+| `bench/cases/smoke.jsonl` | 12 条冒烟用例（本地快速验证用） |
+| `bench/mock_upstream.py` | 回放标准答案的 mock 上游（`openai_completions` SSE，只用标准库） |
+| `bench/run.py` | 发请求、量五项指标、写结果、生成 Markdown 报告、跟基线比（只用标准库） |
+| `bench/pricing.json` | 成本价目（元/百万 token） |
+| `bench/baseline.json` | 基线快照（CI 实采；`environment` 写清采集环境） |
+| `bench/results/` | 运行时产物（JSON + 报告），已在 .gitignore 里 |
+| `bench/strengthen_expect.py` | 维护脚本：把 `expect.contains` 收敛成"只存在于答案里的事实词" |
+
+> 为什么期望词必须是"答案里有、问题里没有"的事实词：早期版本用"周三""课"这类词，
+> 连"回显问题"的兜底答案都能命中 ⇒ 命中率永远 100%，指标形同虚设（实测踩过）。
+
+## 本地跑（不需要任何 Key）
+
+```bash
+# 1) 起 mock 上游（回放 50 条标准答案）
+python bench/mock_upstream.py --port 18089 --cases bench/cases/full.jsonl &
+
+# 2) 起服务端（三个协议都指到 mock；评测不需要邀请码）
+DATABASE_URL=postgres://… \
+UPSTREAM_COMPLETIONS_URL=http://127.0.0.1:18089 \
+UPSTREAM_RESPONSES_URL=http://127.0.0.1:18089 \
+UPSTREAM_MESSAGES_URL=http://127.0.0.1:18089 \
+UPSTREAM_API_KEY=sk-bench-mock AUTH_INVITE_REQUIRED=false \
+YUNONG_BIND=127.0.0.1:8080 ./target/debug/yunong-server &
+
+# 3) 注册拿 token（评测账号）
+TOKEN=$(curl -fsS -X POST http://127.0.0.1:8080/api/v1/auth/register \
+  -H 'content-type: application/json' \
+  -d '{"email":"bench@ynau.edu.cn","password":"bench-Passw0rd!"}' | python -c 'import json,sys;print(json.load(sys.stdin)["data"]["access_token"])')
+
+# 4) 跑评测（对比基线 + 出报告）
+python bench/run.py --cases bench/cases/full.jsonl \
+  --base-url http://127.0.0.1:8080 --token "$TOKEN" \
+  --baseline bench/baseline.json \
+  --out bench/results/local.json --report bench/results/local.md \
+  --env-note "local dev"
+```
+
+退出码：`0` 通过（或基线还是 bootstrap）／`1` 相对基线退化／`2` 参数、文件或服务不可达。
+
+## 五项指标与判定口径
+
+| 指标 | 定义 | 退化方向 | 阻断阈值 |
+|---|---|---|---|
+| 首字延迟 TTFT | 请求发出 → 第一个 `delta` 帧 | 变大 | P50 或 P95 > +10% |
+| 总耗时 | 请求发出 → 流结束 | 变大 | P50 或 P95 > +10% |
+| tokens | 上游 `usage` 帧的 in/out（没有就是 null，不伪造） | 变大 | 单条成本 > +10% |
+| 估计成本 | 按 `bench/pricing.json` 折算成"分" | 变大 | 同上一行 |
+| 要点命中 | 回答是否包含 `expect.contains` 的全部词 | **变小** | 相对下跌 > 10%（如 100%→<90%） |
+| 错误率 | 失败用例占比 | 变大 | > 基线 + 5pp |
+
+阈值写死在 `bench/run.py` 的 `REGRESSION_TOLERANCE` 与 `compare_with_baseline()` 里，
+**不要靠在 baseline.json 里改数字来放宽**（基线只放"量到的值"）。
+
+## 首次采集 / 更新基线
+
+基线必须是**实测**，且标注采集环境：
+
+```bash
+python bench/run.py --cases bench/cases/full.jsonl --base-url … --token … \
+  --update-baseline bench/baseline.json --env-note "GitHub Actions ubuntu-latest"
+```
+
+写出后**删掉 `bootstrap` 字段**（有它时门禁只记录不阻断，用于首次采集窗口）。
+换机器/换上游/换价目都算"环境变更"，需要重新采基线并在 PR 里说明原因。
+
+## CI 里的耗时
+
+`bench.yml` 从"默认跳过"改成**默认执行**（PR / 每日 / 手动）：
+
+| 步骤 | 约耗时 |
+|---|---|
+| checkout + 装 Python / Rust 工具链 | ~20s |
+| `cargo build -p yunong-server --bin yunong-server`（有 rust-cache） | 1.5–2.5 min |
+| 应用迁移（PG 服务） | ~5s |
+| 起 mock 上游 + 起服务端 + 注册 | ~5s |
+| 50 条评测 + 基线对比 + 报告 | ~2–5s |
+| **合计** | **约 2.5–4 min** |
+
+## 已知限制
+
+1. mock 回放的是固定答案 ⇒ 只测管线，不测模型质量（见上面"诚实边界"）；
+2. 延迟绝对值与 runner 噪声强相关：所以基线**必须**在 CI runner 上采，别拿本地数字当门禁；
+3. `T2` 类并发/长上下文场景不在本集内（由 `chat_stream` 的集成用例覆盖行为，不覆盖延迟曲线）。
 
 ## 怎么跑
 
