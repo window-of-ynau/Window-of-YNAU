@@ -14,18 +14,6 @@
 
 import 'dart:convert';
 
-/// 【t142】cardId 自动探测脚本（**纯本地读取，不发任何网络请求**）。
-///
-/// 为什么需要它：owner 的课表页是 React SPA，`cardId` 既不在 `[data-cardid]` 上，
-/// 也不一定在 `__INITIAL_STATE__` 里；而 WebView 里又没法开 F12 手动复制。
-///
-/// 扫描顺序（命中的来源会一起返回，便于判断可信度）：
-///  1. `window` 自有属性（字符串，32 位 hex；以及一层浅对象的字符串值）；
-///  2. 我们自己的 XHR 记录（`window.__yunongXhrLog`：url + 响应体片段）；
-///  3. 当前文档 `documentElement.outerHTML`；
-///  4. `localStorage` / `sessionStorage` 的所有键值。
-///
-/// 返回：`JSON.stringify([{v: "<完整值>", s: "<来源>"}, …])`（最多 12 条，已去重）。
 /// 【t148】页面侧**可重复调用**的抓取入口：`window.__yunongGrabHtml()`。
 ///
 /// - 幂等：任意时刻可调，重复调用不产生副作用（只读 DOM）；
@@ -80,91 +68,6 @@ const String kCourseRowCountInstallScript = r'''
 const String kCourseRowCountScript =
     '(window.__yunongCourseRowCount ? window.__yunongCourseRowCount() : -1)';
 
-/// 【t142】cardId 自动探测脚本（**纯本地读取，不发任何网络请求**）。
-///
-/// 为什么需要：owner 的课表页是 React SPA，cardId 既不在 `[data-cardid]` 上，
-/// 也不一定在 `__INITIAL_STATE__` 里，WebView 里又开不了 F12。
-///
-/// 扫描顺序（每个候选都带来源，便于判断可信度）：
-///  1. `window` 自有属性（字符串，32 位 hex；再浅扫一层对象的字符串值）；
-///  2. 我们自己的 XHR 记录（`window.__yunongXhrLog`：url + 响应片段）；
-///  3. 当前文档 `documentElement.outerHTML`；
-///  4. `localStorage` / `sessionStorage` 的所有键值。
-///
-/// 安装为 `window.__yunongProbeCardIdsRaw`，返回 `JSON.stringify([{v,s}, …])`（最多 12 条，去重）。
-const String kCardIdProbeInstallScript = r'''
-(function () {
-  if (window.__yunongProbeCardIdsRaw) { return; }
-  window.__yunongProbeCardIdsRaw = function () {
-    try {
-      var HEX = /^[0-9a-fA-F]{32}$/;
-      var HEX_ANY = /[0-9a-fA-F]{32}/g;
-      var out = [];
-      var seen = {};
-      function push(v, s) {
-        if (!v || !HEX.test(v) || seen[v]) { return; }
-        seen[v] = 1;
-        out.push({ v: v, s: s });
-      }
-      function scanText(text, tag) {
-        if (!text || typeof text !== 'string') { return; }
-        var m = text.match(HEX_ANY);
-        if (!m) { return; }
-        for (var i = 0; i < m.length && i < 6; i++) { push(m[i], tag); }
-      }
-      try {
-        var keys = Object.keys(window);
-        for (var k = 0; k < keys.length; k++) {
-          var name = keys[k];
-          var val;
-          try { val = window[name]; } catch (e) { continue; }
-          if (typeof val === 'string') { push(val, 'window.' + name); continue; }
-          if (!val || typeof val !== 'object') { continue; }
-          try {
-            var subKeys = Object.keys(val).slice(0, 40);
-            for (var s = 0; s < subKeys.length; s++) {
-              var sv = val[subKeys[s]];
-              if (typeof sv === 'string') { push(sv, 'window.' + name + '.' + subKeys[s]); }
-            }
-          } catch (e2) {}
-        }
-      } catch (e) {}
-      try {
-        var log = window.__yunongXhrLog || [];
-        for (var i2 = 0; i2 < log.length; i2++) {
-          scanText(log[i2].url, 'xhr:' + String(log[i2].url || '').slice(0, 60));
-          scanText(log[i2].body, 'xhrbody:' + String(log[i2].url || '').slice(0, 40));
-        }
-      } catch (e3) {}
-      try {
-        scanText(document.documentElement.outerHTML || '', 'html');
-      } catch (e4) {}
-      try {
-        var stores = [['localStorage', window.localStorage], ['sessionStorage', window.sessionStorage]];
-        for (var a = 0; a < stores.length; a++) {
-          var label = stores[a][0];
-          var store = stores[a][1];
-          if (!store) { continue; }
-          for (var b = 0; b < store.length; b++) {
-            var key = store.key(b);
-            var raw = '';
-            try { raw = store.getItem(key) || ''; } catch (e5) {}
-            push(raw, label + '.' + key);
-            scanText(raw, label + '.' + key);
-          }
-        }
-      } catch (e6) {}
-      return JSON.stringify(out.slice(0, 12));
-    } catch (e) {
-      return '[]';
-    }
-  };
-})();
-''';
-
-/// 供 Dart 侧 `evaluateJavascript` 调用：返回上一步安装好的探测结果（未安装则 `[]`）。
-const String kCardIdProbeScript =
-    '(window.__yunongProbeCardIdsRaw ? window.__yunongProbeCardIdsRaw() : "[]")';
 /// 接口路径（用于脚本匹配；改版时只改这里）。
 const String kScheduleApiPath = '/api/uppcard/kbsz/queryAWeekSchedule';
 

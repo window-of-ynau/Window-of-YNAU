@@ -1,14 +1,10 @@
 // t150：PARSE_EMPTY 的「轮询等待就绪 + 就绪诊断」与 cardId 缓存。
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/src/campus/campus_bridge.dart';
 import 'package:yunong/src/core/timetable_service.dart';
 import 'package:yunong/src/campus/capture_cache.dart';
 import 'package:yunong/src/campus/capture_readiness.dart';
-import 'package:yunong/src/campus/session_cookie_diagnostics.dart';
-import 'package:yunong/src/campus/session_probe.dart';
-import 'package:yunong/src/campus/session_probe_dialog.dart';
 
 final String _timetableHtml =
     '<html><title>我的课表</title><table id="timetable"><tr><td>课程 节次 周次</td></tr></table>'
@@ -126,59 +122,4 @@ void main() {
     });
   });
 
-  group('探针显示（t150）', () {
-    testWidgets('无缓存 → 显示"尚未抓取过"；不再把无 WebView 当错误', (WidgetTester tester) async {
-      CampusCaptureCache.instance.clear();
-      SessionProbeJsBridge.evaluate = null; // 模拟抓取后页面已关闭（正常状态）
-      await tester.pumpWidget(MaterialApp(
-        home: Scaffold(
-          body: SessionProbeDialog(
-            cookieLoader: () async => const <ProbeCookie>[],
-            cookieRefSource: (Uri url) async => const <CookieRef>[],
-            jsProbe: () async => 0,
-            inPageFetch: (String url, {required bool withCredentials}) async => null,
-            navigate: (String url) async {},
-            // 模拟"页面已关闭"：直接抛 WebViewUnavailableException
-            evaluateScript: (String source) async =>
-                throw const WebViewUnavailableException('WebView 已失效（控制器已销毁）'),
-          ),
-        ),
-      ));
-      await tester.pumpAndSettle();
-      await tester.ensureVisible(find.byKey(const Key('probe-cardid-status')));
-      expect(find.textContaining('尚未抓取过'), findsOneWidget);
-
-      await tester.ensureVisible(find.byKey(const Key('probe-cardid-detect')));
-      await tester.tap(find.byKey(const Key('probe-cardid-detect')));
-      await tester.pumpAndSettle();
-      // 正常状态说明，而不是"探测失败"
-      expect(find.textContaining('抓取完成后会自动关闭'), findsOneWidget);
-      expect(find.textContaining('探测失败'), findsNothing);
-    });
-
-    testWidgets('有缓存 → 显示脱敏值与缓存时间', (WidgetTester tester) async {
-      CampusCaptureCache.instance.clear();
-      CampusCaptureCache.instance.rememberTemplate(
-        cardId: '0123456789abcdef0123456789abcdef',
-        years: '2026-2027-1',
-        now: DateTime(2026, 9, 1, 9, 12),
-      );
-      await tester.pumpWidget(MaterialApp(
-        home: Scaffold(
-          body: SessionProbeDialog(
-            cookieLoader: () async => const <ProbeCookie>[],
-            cookieRefSource: (Uri url) async => const <CookieRef>[],
-            jsProbe: () async => 0,
-            inPageFetch: (String url, {required bool withCredentials}) async => null,
-            navigate: (String url) async {},
-          ),
-        ),
-      ));
-      await tester.pumpAndSettle();
-      await tester.ensureVisible(find.byKey(const Key('probe-cardid-status')));
-      expect(find.textContaining('012345…cdef'), findsOneWidget);
-      expect(find.textContaining('缓存于 09:12'), findsOneWidget);
-      CampusCaptureCache.instance.clear();
-    });
-  });
 }

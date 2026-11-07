@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 // WebView JS bridge 的**纯 Dart** 部分：解析消息 → 驱动取数状态机。
 //
 // 抽出来的原因：WebView 本身在测试里起不来（平台通道），但"消息怎么解释"是逻辑，
@@ -286,6 +287,25 @@ class CampusBridge {
     }
     onError(error);
   }
+
+  /// 【t161 / issue #54】桥接安装失败要**立刻可见**，而不是让页面一直转圈。
+  ///
+  /// 场景：`addJavaScriptHandler('yunongBridge')` 或 UserScript 注入抛异常
+  /// （控制器已销毁 / 平台通道异常 / WebView2 未就绪）。这时页面永远收不到消息，
+  /// 用户只看到「抓取中…」，无法判断是不是自己操作错了。
+  ///
+  /// 处理：写一条诊断 + 通过 `onError` 抛 [FetchException]，
+  /// 页面用**同一套失败卡片**展示原因（不是静默等待）。
+  void reportBridgeFailure(Object failure, {String? where}) {
+    final String detail = '${failure.runtimeType}: $failure';
+    lastHtmlDiagnostics = '桥接安装失败${where == null ? '' : '（$where）'}：$detail';
+    debugPrint('[capture] $lastHtmlDiagnostics');
+    _fail(FetchException(
+      code: 'BRIDGE_UNAVAILABLE',
+      userHint: '内嵌页面通道没建立起来：请重试一次；仍失败就重启应用',
+      message: lastHtmlDiagnostics,
+    ));
+  }
 }
 
 /// 抓取失败码 → 用户看得懂的一句话（不要弹异常栈）。
@@ -294,6 +314,7 @@ String describeFetchFailure(String code) => switch (code) {
       'CARD_NOT_FOUND' => '没抓到课表接口：请先在门户里打开一次课表卡片',
       'CAPTURE_TIMEOUT' => '请在页面里打开「课表」卡片，或切换一次周次后重试',
       'PORTAL_PAGE' => '当前是门户页，需要先打开「课表」卡片',
+      'BRIDGE_UNAVAILABLE' => '内嵌页面通道没建立起来：请重试一次；仍失败就重启应用',
       'AUTH_REQUIRED' => '登录态已失效，请重新登录',
       'LOGIN_TIMEOUT' => '登录超时，请重试',
       'NO_WEBVIEW' => '当前平台不支持内置浏览器',
