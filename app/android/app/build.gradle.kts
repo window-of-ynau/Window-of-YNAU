@@ -27,6 +27,14 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    // t165：让 .so 以**未压缩、安装时解压**的方式打包（AGP 4+ 默认 useLegacyPackaging=false，
+    // 库只留在 APK 里、不落盘；而 Dart 的 DynamicLibrary.open 走 dlopen，只能找到落盘的库）。
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "cn.ynau.yunong"
