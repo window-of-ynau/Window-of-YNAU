@@ -1,16 +1,23 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/main.dart';
 
+import 'package:yunong/src/theme/theme_controller.dart';
+
+import 'support/test_window.dart';
+
 void main() {
   testWidgets('启动后能看到对话主区', (WidgetTester tester) async {
-    await tester.pumpWidget(const YunongApp());
+    await tester.pumpWidget(YunongApp(themeController: ThemeController(store: MemorySettingsStore())));
     // W7 起对话区是真实会话页（流式 UI），不再是 W1 占位文案。
     expect(find.textContaining('问点什么吧'), findsOneWidget);
     expect(find.text('发送'), findsOneWidget);
   });
 
   testWidgets('侧栏能进入课表页', (WidgetTester tester) async {
-    await tester.pumpWidget(const YunongApp());
+    // t165：窄屏改成底部导航（rail 只剩图标）；这里验证侧栏文字入口，固定宽屏。
+    setTestWindow(tester, 1280, 800);
+    await tester.pumpWidget(YunongApp(themeController: ThemeController(store: MemorySettingsStore())));
+    await tester.pumpAndSettle();
     // 用图标而不是 tooltip 定位（tooltip 文案随 MaterialLocalizations 变，图标更稳）
     // t117：侧栏常驻（可折叠），入口直接可见，无需先开抽屉
     await tester.tap(find.text('我的课表'));

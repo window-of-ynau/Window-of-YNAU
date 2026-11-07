@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'src/campus/campus_entries.dart';
 import 'src/campus/timetable_page.dart';
 import 'src/core/app_paths.dart';
+import 'src/core/ffi_bindings.dart';
 import 'src/core/titlebar_service.dart';
 import 'src/chat/chat_settings_section.dart';
 import 'src/core/auth_service.dart';
@@ -48,6 +49,13 @@ void main(List<String> args) {
       sourceLabel: AppPaths.overrideSource.label,
     ));
     return;
+  }
+  // t165：启动时探一次端侧核心（只 dlopen + 读版本，不建表），
+  // 结果供设置页「关于」常驻显示：已就绪（大小）/ 未加载（具体路径与错误）。
+  try {
+    CoreStatus.probe();
+  } on Object {
+    // 探测本身失败不应阻止启动（横幅与设置页会显示"未加载"）
   }
   runApp(const YunongApp());
 }
@@ -241,14 +249,41 @@ class _HomeShellState extends State<HomeShell> {
   static const String _collapsedKey = 'sidebar.collapsed';
   static const double kSidebarWidth = 256;
   static const double kRailWidth = 64;
-  static const double kNarrowBreakpoint = 600;
+  static const double kPhoneBreakpoint = 600;
+  static const double kWideBreakpoint = 840;
+
+  /// 兼容旧名字（t117 起的窄窗断点）
+  static const double kNarrowBreakpoint = kPhoneBreakpoint;
 
   @override
   Widget build(BuildContext context) {
     const entries = CampusEntry.values;
     final destination = _selected == 0 ? null : entries[_selected - 1];
-    final bool narrow = MediaQuery.sizeOf(context).width < kNarrowBreakpoint;
-    final bool collapsed = _collapsedOverride ?? narrow;
+    final double width = MediaQuery.sizeOf(context).width;
+    // t165：三档布局 —— 手机（<600）用底部导航；中宽（600–840）用窄 rail；
+    // 宽屏（≥840）保持「侧栏 + 内容」。手机档**完全不放侧栏**，内容自然不会被压住。
+    final bool phone = width < kPhoneBreakpoint;
+    final bool middle = !phone && width < kWideBreakpoint;
+    final bool collapsed = _collapsedOverride ?? middle;
+
+    final Widget panes = IndexedStack(
+      index: destination == null ? 0 : 1,
+      children: <Widget>[
+        _ChatPane(chatSettings: _chatSettings, secrets: _secrets, auth: _auth),
+        if (destination == null) const SizedBox.shrink() else _CampusPane(entry: destination),
+      ],
+    );
+
+    final Widget? sidebar = phone
+        ? null
+        : _Sidebar(
+            collapsed: collapsed,
+            selected: _selected,
+            entries: entries,
+            onSelect: _select,
+            onToggle: _toggleSidebar,
+            onOpenSettings: _openSettings,
+          );
 
     return Scaffold(
       // 玻璃主题：AppBar 底下垫一层玻璃（全屏只有这一层会真模糊）；
@@ -264,49 +299,46 @@ class _HomeShellState extends State<HomeShell> {
                 borderRadius: BorderRadius.zero,
                 child: SizedBox.expand(),
               ),
-        leading: IconButton(
-          key: const Key('sidebar-toggle'),
-          tooltip: collapsed ? '展开侧栏' : '折叠侧栏',
-          onPressed: _toggleSidebar,
-          icon: Icon(collapsed ? Icons.menu : Icons.menu_open),
-        ),
+        // 手机档没有侧栏，也就不需要折叠按钮（省下左侧 48dp 给标题）
+        leading: phone
+            ? null
+            : IconButton(
+                key: const Key('sidebar-toggle'),
+                tooltip: collapsed ? '展开侧栏' : '折叠侧栏',
+                onPressed: _toggleSidebar,
+                icon: Icon(collapsed ? Icons.menu : Icons.menu_open),
+              ),
         title: Text(destination?.label ?? '云农之窗'),
       ),
-      // t117：侧栏改为**常驻可折叠**（B 方案）——不再用抽屉，避免两套导航。
-      // t117：侧栏改为**常驻可折叠**（B 方案）——不再用抽屉，避免两套导航。
-      // 窄窗 + 折叠：rail 浮在内容之上（不挤占 480px 内容宽度，避免横向溢出）；
-      // 宽窗或展开态：侧栏与内容并排（正常文档流）。
-      body: <Widget>[
-        () {
-          final Widget panes = IndexedStack(
-            index: destination == null ? 0 : 1,
-            children: <Widget>[
-              _ChatPane(chatSettings: _chatSettings, secrets: _secrets, auth: _auth),
-              if (destination == null) const SizedBox.shrink() else _CampusPane(entry: destination),
-            ],
-          );
-          final Widget sidebar = _Sidebar(
-            collapsed: collapsed,
-            selected: _selected,
-            entries: entries,
-            onSelect: _select,
-            onToggle: _toggleSidebar,
-            onOpenSettings: _openSettings,
-          );
-          if (narrow && collapsed) {
-            return Stack(
-              children: <Widget>[
-                Positioned.fill(child: panes),
-                Positioned(left: 0, top: 0, bottom: 0, child: Material(elevation: 2, child: sidebar)),
+      // 手机档：底部导航（内容占满整宽，绝不被遮挡）
+      bottomNavigationBar: phone
+          ? NavigationBar(
+              key: const Key('app-bottom-nav'),
+              selectedIndex: _selected,
+              labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+              onDestinationSelected: _select,
+              destinations: <Widget>[
+                const NavigationDestination(
+                  icon: Icon(Icons.chat_bubble_outline),
+                  selectedIcon: Icon(Icons.chat_bubble),
+                  label: '对话',
+                ),
+                for (final CampusEntry entry in entries)
+                  NavigationDestination(
+                    icon: const Icon(Icons.school_outlined),
+                    selectedIcon: const Icon(Icons.school),
+                    label: entry.label,
+                  ),
               ],
-            );
-          }
-          return Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[sidebar, const VerticalDivider(width: 1), Expanded(child: panes)],
-          );
-        }(),
-      ].single,
+            )
+          : null,
+      body: phone
+          ? panes
+          // 中/宽屏：侧栏与内容并排（正常文档流），内容左边界 = 侧栏右边界
+          : Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[sidebar!, const VerticalDivider(width: 1), Expanded(child: panes)],
+            ),
     );
   }
 
