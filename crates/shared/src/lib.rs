@@ -8,6 +8,7 @@
 pub mod entitlement;
 pub mod error;
 pub mod protocol;
+pub mod sse;
 pub mod stream;
 pub mod url;
 
@@ -16,6 +17,7 @@ pub use error::{ApiError, ErrorBody, ErrorCode, ErrorEnvelope};
 pub use protocol::{
     ChatMessage, ChatRequest, Chunk, FinishReason, Protocol, Role, ToolCallRef, ToolSpec, Usage,
 };
+pub use sse::{InvalidUtf8, SseEvent, SseFramer};
 pub use stream::ChunkAssembler;
 pub use url::{
     endpoint_path, endpoint_url, normalize_base_url, provider_kind, provider_url, ProviderKind,
