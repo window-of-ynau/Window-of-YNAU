@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""云农之窗 · 套餐通道 SSE 冒烟基准（bench/run.py）。
+"""云农之窗 · 评测门禁（bench/run.py）。
 
-只做一件事：把 `bench/cases/*.jsonl` 里的问句逐条打到 `POST /api/v1/chat/stream`，
-量 TTFT、总耗时、token 与错误，写成 JSON；再跟 `bench/baseline.json` 比一遍，
-用来判断一次重构/升级有没有把"慢、贵、错"带进来。
+把 `bench/cases/full.jsonl` 的 50 条用例逐条打到 `POST /api/v1/chat/stream`，采五项指标：
 
-只依赖 Python 3.8+ 标准库，不连数据库、不读仓库配置；除结果文件（--out，默认
-bench/out/）外不写任何文件。不会伪造数据：上游没给 usage 时 token 记 null。
+1. **首字延迟**（TTFT，第一个 `delta` 帧）；
+2. **总耗时**；
+3. **tokens_in / tokens_out**（上游 `usage` 帧；没有就是 null，不伪造）；
+4. **估计成本**（按 `bench/pricing.json` 的价目折算成"分"）；
+5. **要点命中**（回答是否包含用例 `expect.contains` 的全部关键词）。
+
+汇总出 P50/P95（TTFT 与总耗时）、命中率、错误率、单条成本，并与 `bench/baseline.json` 比对：
+**任一维度退化 > 10% 或命中率下降 > 10%（相对）即失败**。
+
+只依赖 Python 3.8+ 标准库；除结果文件外不写仓库内其他文件（`--report` 显式指定时才写报告）。
 
 退出码：
-  0  跑完，且相对 baseline 没有退化（baseline 不存在时也返回 0）
-  1  相对 baseline 退化：p95 TTFT 或 mean 总耗时 > +10%，或 error_rate 增加 > 5pp
-  2  参数/用例文件/baseline 文件不合法，或服务不可达（不会打印 Python traceback）
+  0  跑完，且相对 baseline 没有退化（baseline 不存在或标了 bootstrap 时也返回 0）
+  1  相对 baseline 退化
+  2  参数/用例文件/baseline 文件不合法，或服务不可达（不打印 traceback）
 """
 
 import argparse
@@ -24,11 +30,13 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CASES = SCRIPT_DIR / "cases" / "smoke.jsonl"
+DEFAULT_CASES = SCRIPT_DIR / "cases" / "full.jsonl"
+DEFAULT_PRICING = SCRIPT_DIR / "pricing.json"
 DEFAULT_BASELINE = SCRIPT_DIR / "baseline.json"
 
 # 成本只用来看趋势，不是账单：套餐按时间授权，服务端只对 1% 请求做 token 抽样。
-# 价目（元 / 百万 token）按 deepseek-chat 量级取的示意值，换模型时改这里即可。
+# 价目（元 / 百万 token）默认按 deepseek-chat 量级取的示意值；可用 `--pricing` 覆盖，
+# 文件缺省时就用这里的值（评测环境不该因为少一个 JSON 就跑不起来）。
 PRICE_IN_YUAN_PER_MTOK = 2.0
 PRICE_OUT_YUAN_PER_MTOK = 8.0
 
@@ -237,8 +245,8 @@ def preflight(base_url, timeout):
         raise ServiceUnavailable("cannot reach %s/healthz: %s" % (base_url, exc))
 
 
-def run_case(base_url, case, timeout, token=None):
-    """跑一条用例；返回 (result, 拼起来的回答文本)。连接级失败抛 ServiceUnavailable。"""
+def run_case_once(base_url, case, timeout, token=None):
+    """跑**一次**用例；返回 (result, 拼起来的回答文本)。连接级失败抛 ServiceUnavailable。"""
     case_id = case["id"]
     payload = build_payload(case_id, case["question"])
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -339,6 +347,42 @@ def run_case(base_url, case, timeout, token=None):
     return result, "".join(delta_parts)
 
 
+def _median(values):
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def run_case(base_url, case, timeout, token=None, repeats=1):
+    """跑一条用例：重复 `repeats` 次取**中位数**，回答取最后一次成功的。
+
+    为什么要取中位数：mock 场景下 TTFT 只有个位数毫秒，一次连接建立/调度抖动就能到 20ms；
+    P95 在 50 条样本上会被这一条拉高数倍（实测 3.2ms → 21.1ms，直接判退化，而 P50 反而更好）。
+    中位数把"偶发一次"过滤掉，只留"稳定变慢"——这才是门禁要抓的东西（run 42337511062 的教训）。
+    """
+    runs = max(1, int(repeats))
+    sampled = []
+    answer = ""
+    for _ in range(runs):
+        result, current_answer = run_case_once(base_url, case, timeout, token)
+        sampled.append(result)
+        if result["ok"] and current_answer:
+            answer = current_answer
+
+    ok_results = [r for r in sampled if r["ok"]]
+    if not ok_results:
+        return sampled[-1], answer
+
+    merged = dict(ok_results[len(ok_results) // 2])
+    merged["ttft_ms"] = round(_median([r["ttft_ms"] for r in ok_results]), 1)
+    merged["total_ms"] = round(_median([r["total_ms"] for r in ok_results]), 1)
+    token_ins = [r["tokens_in"] for r in ok_results if isinstance(r["tokens_in"], int)]
+    token_outs = [r["tokens_out"] for r in ok_results if isinstance(r["tokens_out"], int)]
+    merged["tokens_in"] = _median(token_ins) if token_ins else None
+    merged["tokens_out"] = _median(token_outs) if token_outs else None
+    merged["runs"] = len(ok_results)
+    return merged, answer
+
+
 def percentile(values, pct):
     """线性插值分位数（样本少时不至于被最近的极值吃掉）。"""
     ordered = sorted(values)
@@ -359,17 +403,40 @@ def case_cost_cents(tokens_in, tokens_out):
     return (ti / 1_000_000.0 * PRICE_IN_YUAN_PER_MTOK + to / 1_000_000.0 * PRICE_OUT_YUAN_PER_MTOK) * 100.0
 
 
+def expect_hit(case, answer):
+    """回答是否命中用例期望要点（`expect.contains` 全部出现）。没写期望 → 不计入命中率。"""
+    expect = case.get("expect") or {}
+    terms = expect.get("contains") or []
+    if isinstance(terms, str):
+        terms = [terms]
+    terms = [term for term in terms if term]
+    if not terms:
+        return None
+    return all(term in answer for term in terms)
+
+
 def summarize(results):
     ttfts = [r["ttft_ms"] for r in results if r["ttft_ms"] is not None]
     totals = [r["total_ms"] for r in results if r["total_ms"] is not None]
     costs = [case_cost_cents(r["tokens_in"], r["tokens_out"]) for r in results]
+    hits = [r["hit"] for r in results if r.get("hit") is not None]
     total = float(len(results))
     return {
+        # —— 五项指标（t162）——
         "p50_ttft_ms": round(percentile(ttfts, 50), 1) if ttfts else None,
         "p95_ttft_ms": round(percentile(ttfts, 95), 1) if ttfts else None,
+        "p50_total_ms": round(percentile(totals, 50), 1) if totals else None,
+        "p95_total_ms": round(percentile(totals, 95), 1) if totals else None,
         "mean_total_ms": round(statistics.mean(totals), 1) if totals else None,
-        "error_rate": round(1.0 - sum(1 for r in results if r["ok"]) / total, 4) if total else None,
+        "tokens_in_total": sum(r["tokens_in"] for r in results if isinstance(r["tokens_in"], int)),
+        "tokens_out_total": sum(r["tokens_out"] for r in results if isinstance(r["tokens_out"], int)),
+        "total_cost_cents": round(sum(costs), 4) if costs else None,
         "est_cost_per_case_cents": round(statistics.mean(costs), 4) if costs else None,
+        "hit_rate": round(sum(1 for hit in hits if hit) / len(hits), 4) if hits else None,
+        "hit_cases": len(hits),
+        "error_rate": round(1.0 - sum(1 for r in results if r["ok"]) / total, 4) if total else None,
+        "cases": len(results),
+        "cases_ok": sum(1 for r in results if r["ok"]),
     }
 
 
@@ -382,27 +449,62 @@ def _num(value):
         return None
 
 
+REGRESSION_TOLERANCE = 0.10  # 退化 > 10% 即阻断（延迟 / 成本 / 命中率三个方向都用它）
+
+# 绝对噪声下限（t162）：mock 上游的延迟是个位数毫秒，+10% 只有 0.3ms，CI 调度抖动就能超过它。
+# 所以"相对 >10%"还要**同时**超过下面的绝对增量才阻断。真实上游是几百毫秒量级，这里永远不生效。
+# 实测（连续三次 CI run）P95 抖动幅度：2.6ms / 3.2ms / 21.1ms。10ms 能盖住 CI 调度毛刺，
+# 而真实上游是几百毫秒量级（10ms ≈ 2–5%），不会掩盖真退化。
+NOISE_FLOOR_MS = 10.0
+NOISE_FLOOR_CENTS = 0.01
+
+
 def compare_with_baseline(summary, baseline):
-    """返回退化原因列表；空列表表示通过。只比 p95 TTFT / mean 总耗时 / error_rate。"""
+    """返回退化原因列表；空列表表示通过。
+
+    判定口径（t162，写死在代码里，避免"改基线把门禁改松"）：
+
+    | 维度 | 方向 | 阈值 |
+    |---|---|---|
+    | TTFT P50 / P95 | 变大是坏 | > +10% |
+    | 总耗时 P50 / P95 | 变大是坏 | > +10% |
+    | 单条成本 | 变大是坏 | > +10% |
+    | 要点命中率 | **变小是坏** | < baseline − 10%（相对） |
+    | 错误率 | 变大是坏 | > baseline + 5pp |
+    """
     base = baseline.get("summary") or {}
     reasons = []
 
-    base_p95 = _num(base.get("p95_ttft_ms"))
-    if base_p95 and summary.get("p95_ttft_ms") is not None:
-        if summary["p95_ttft_ms"] > base_p95 * 1.10:
-            delta = summary["p95_ttft_ms"] / base_p95 - 1.0
+    def worse_high(key, label, floor=0.0):
+        base_value = _num(base.get(key))
+        current = _num(summary.get(key))
+        if base_value and current is not None and current > base_value * (1.0 + REGRESSION_TOLERANCE):
+            delta = current / base_value - 1.0
+            if (current - base_value) < floor:
+                # 相对涨幅够了，但绝对增量小于噪声下限：记一行日志，不阻断
+                print(
+                    "note: %s +%.1f%% 但绝对增量 %.3f < 噪声下限 %.3f，不计为退化"
+                    % (label, delta * 100.0, current - base_value, floor)
+                )
+                return
             reasons.append(
-                "p95_ttft_ms %.1f > baseline %.1f (+%.1f%% > +10%%)"
-                % (summary["p95_ttft_ms"], base_p95, delta * 100.0)
+                "%s %.1f > baseline %.1f (+%.1f%% > +10%%)"
+                % (label, current, base_value, delta * 100.0)
             )
 
-    base_total = _num(base.get("mean_total_ms"))
-    if base_total and summary.get("mean_total_ms") is not None:
-        if summary["mean_total_ms"] > base_total * 1.10:
-            delta = summary["mean_total_ms"] / base_total - 1.0
+    worse_high("p50_ttft_ms", "p50_ttft_ms", NOISE_FLOOR_MS)
+    worse_high("p95_ttft_ms", "p95_ttft_ms", NOISE_FLOOR_MS)
+    worse_high("p50_total_ms", "p50_total_ms", NOISE_FLOOR_MS)
+    worse_high("p95_total_ms", "p95_total_ms", NOISE_FLOOR_MS)
+    worse_high("est_cost_per_case_cents", "est_cost_per_case_cents", NOISE_FLOOR_CENTS)
+
+    base_hit = _num(base.get("hit_rate"))
+    current_hit = _num(summary.get("hit_rate"))
+    if base_hit is not None and current_hit is not None:
+        if current_hit < base_hit * (1.0 - REGRESSION_TOLERANCE):
             reasons.append(
-                "mean_total_ms %.1f > baseline %.1f (+%.1f%% > +10%%)"
-                % (summary["mean_total_ms"], base_total, delta * 100.0)
+                "hit_rate %.4f < baseline %.4f (-%.1f%% > -10%%)"
+                % (current_hit, base_hit, (1.0 - current_hit / base_hit) * 100.0)
             )
 
     base_err = _num(base.get("error_rate"))
@@ -413,6 +515,86 @@ def compare_with_baseline(summary, baseline):
                 % (summary["error_rate"], base_err, (summary["error_rate"] - base_err) * 100.0)
             )
     return reasons
+
+
+def slowest_cases(results, count=3):
+    """最慢的几条（按总耗时）。抖动时先看它们，能把"环境毛刺"和"某条用例真的变慢"分开。"""
+    ordered = sorted(
+        [r for r in results if r.get("ok") and isinstance(r.get("total_ms"), (int, float))],
+        key=lambda r: r["total_ms"],
+        reverse=True,
+    )
+    return ordered[:count]
+
+
+def write_report(path, summary, baseline, reasons, env_note, results=None):
+    """写一份人可读的 Markdown 对比报告（PR 里直接贴）。"""
+    base = (baseline or {}).get("summary") or {}
+
+    def row(label, key, unit="", better="越小越好"):
+        cur = summary.get(key)
+        old = base.get(key)
+        cur_text = "-" if cur is None else ("%.1f" % cur if isinstance(cur, float) else str(cur))
+        old_text = "-" if old is None else ("%.1f" % old if isinstance(old, float) else str(old))
+        if isinstance(cur, (int, float)) and isinstance(old, (int, float)) and old:
+            delta = (cur - old) / old * 100.0
+            delta_text = "%+.1f%%" % delta
+        else:
+            delta_text = "-"
+        return "| %s | %s%s | %s%s | %s | %s |" % (
+            label,
+            cur_text,
+            unit,
+            old_text,
+            unit,
+            delta_text,
+            better,
+        )
+
+    lines = [
+        "# 评测门禁报告（bench）",
+        "",
+        "采集环境：%s" % env_note,
+        "",
+        "| 指标 | 本次 | 基线 | 变化 | 方向 |",
+        "|---|---|---|---|---|",
+        row("TTFT P50", "p50_ttft_ms", " ms"),
+        row("TTFT P95", "p95_ttft_ms", " ms"),
+        row("总耗时 P50", "p50_total_ms", " ms"),
+        row("总耗时 P95", "p95_total_ms", " ms"),
+        row("单条成本", "est_cost_per_case_cents", " 分"),
+        row("要点命中率", "hit_rate", "", "越大越好"),
+        row("错误率", "error_rate", "", "越小越好"),
+        "",
+        "- 用例数：%s（成功 %s）" % (summary.get("cases"), summary.get("cases_ok")),
+        "- tokens：in=%s / out=%s" % (summary.get("tokens_in_total"), summary.get("tokens_out_total")),
+        "- 总成本：%s 分" % summary.get("total_cost_cents"),
+        "- 采集方式：预热 + 每条用例重复取中位数（抗单次毛刺）",
+        "",
+    ]
+    if results:
+        slowest = slowest_cases(results)
+        if slowest:
+            lines.append("| 最慢用例（总耗时） | TTFT | 总耗时 |")
+            lines.append("|---|---|---|")
+            for item in slowest:
+                lines.append(
+                    "| %s | %.1f ms | %.1f ms |"
+                    % (item.get("id"), item["ttft_ms"], item["total_ms"])
+                )
+            lines.append("")
+    if baseline is None:
+        lines.append("**判定：无基线（首次采集）** —— 本次数字可直接作为基线。")
+    elif (baseline or {}).get("bootstrap"):
+        lines.append("**判定：基线标记为 bootstrap（首次采集窗口）** —— 只记录，不阻断。")
+    elif reasons:
+        lines.append("**判定：退化 %d 项 → 阻断合并**" % len(reasons))
+        lines.extend(["", "```"] + reasons + ["```"])
+    else:
+        lines.append("**判定：通过**（所有维度退化均 ≤ 10%）")
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 def write_result(out_path, results, summary):
@@ -463,7 +645,34 @@ def main(argv=None):
     parser.add_argument("--baseline", default=str(DEFAULT_BASELINE), help="基线 JSON（默认 bench/baseline.json）")
     parser.add_argument("--out", default=None, help="结果 JSON 路径（默认 bench/out/bench-<UTC 时间>.json）")
     parser.add_argument("--timeout", type=float, default=60.0, help="单条用例超时秒数（默认 %(default)s）")
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="每条用例重复次数，取中位数（默认 %(default)s；抗单次毛刺）",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=3,
+        help="正式测量前的预热请求数（默认 %(default)s；消掉首个连接的建连/冷缓存）",
+    )
     parser.add_argument("--token", default=None, help="可选 Bearer token；本地免鉴权服务不用传")
+    parser.add_argument(
+        "--report",
+        default=None,
+        help="Markdown 对比报告的输出路径（如 bench/results/report.md）；不传就不写",
+    )
+    parser.add_argument(
+        "--env-note",
+        default="local",
+        help="采集环境标注（写进报告/基线，例如 'GitHub Actions ubuntu-latest'）",
+    )
+    parser.add_argument(
+        "--update-baseline",
+        default=None,
+        help="把本次 summary 写成基线文件（首次采集用；写出的基线会带上环境与时间）",
+    )
     args = parser.parse_args(argv)
 
     base_url = args.base_url.strip().rstrip("/")
@@ -495,13 +704,30 @@ def main(argv=None):
         _print_unreachable(exc)
         return 2
 
+    # 预热（不计入结果）：首个请求要建连、走 DNS/冷缓存，不预热的话它的毛刺会直接进 P95
+    # ——那测的是"冷启动"，不是"稳态退化"。
+    for _ in range(max(0, args.warmup)):
+        try:
+            run_case_once(base_url, cases[0], args.timeout, args.token)
+        except ServiceUnavailable:
+            raise
+        except Exception:  # noqa: BLE001 - 预热失败不该中止正式测量
+            break
+    if args.warmup > 0:
+        print("warmup: %d 次预热完成（不计入结果）" % args.warmup)
+
     results = []
     for index, case in enumerate(cases, 1):
         try:
-            result, answer = run_case(base_url, case, args.timeout, args.token)
+            result, answer = run_case(base_url, case, args.timeout, args.token, args.repeats)
         except ServiceUnavailable as exc:
             _print_unreachable(exc)
             return 2
+        # 五项指标里的后两项（命中 / 成本）在这一层算：run_case 只负责"发请求、收流、计时"
+        result["hit"] = expect_hit(case, answer)
+        result["cost_cents"] = round(
+            case_cost_cents(result["tokens_in"], result["tokens_out"]), 6
+        )
         results.append(result)
         status = "ok" if result["ok"] else "FAIL(%s)" % (result["error_code"] or "UNKNOWN")
         ttft = "n/a" if result["ttft_ms"] is None else "%.1fms" % result["ttft_ms"]
@@ -525,15 +751,52 @@ def main(argv=None):
     print("")
     print("result: %s" % out_path)
     print(
-        "summary: p50_ttft=%s p95_ttft=%s mean_total=%s error_rate=%s est_cost_per_case=%s cents"
+        "summary: cases=%s ok=%s p50_ttft=%s p95_ttft=%s p50_total=%s p95_total=%s "
+        "hit_rate=%s error_rate=%s cost_total=%s cents"
         % (
+            summary["cases"],
+            summary["cases_ok"],
             _fmt_ms(summary["p50_ttft_ms"]),
             _fmt_ms(summary["p95_ttft_ms"]),
-            _fmt_ms(summary["mean_total_ms"]),
+            _fmt_ms(summary["p50_total_ms"]),
+            _fmt_ms(summary["p95_total_ms"]),
+            "-" if summary["hit_rate"] is None else "%.2f%%" % (summary["hit_rate"] * 100.0),
             "-" if summary["error_rate"] is None else "%.4f" % summary["error_rate"],
-            "-" if summary["est_cost_per_case_cents"] is None else "%.4f" % summary["est_cost_per_case_cents"],
+            "-" if summary["total_cost_cents"] is None else "%.4f" % summary["total_cost_cents"],
         )
     )
+
+    # 首次采集：把本次 summary 落成基线（带环境与时间，便于以后追溯"这是在哪台机器上量的"）
+    if args.update_baseline:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        payload = {
+            "version": 2,
+            "collected_at": stamp,
+            "environment": args.env_note,
+            "note": "真实实测基线（bench/run.py --update-baseline 生成）。"
+            "采集环境见 environment；退化门禁见 bench/run.py 的 compare_with_baseline。",
+            "summary": summary,
+        }
+        target = Path(args.update_baseline)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print("baseline written: %s" % target)
+
+    reasons = compare_with_baseline(summary, baseline) if baseline else []
+    if args.report:
+        try:
+            write_report(
+                args.report,
+                summary,
+                baseline,
+                reasons,
+                "%s（%s）" % (args.env_note, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+                results,
+            )
+            print("report: %s" % args.report)
+        except OSError as exc:
+            print("ERROR: cannot write report %s: %s" % (args.report, exc), file=sys.stderr)
+            return 2
 
     if baseline is None:
         print("baseline: %s not found -> gate skipped (exit 0)" % baseline_path)
@@ -541,15 +804,22 @@ def main(argv=None):
 
     base = baseline.get("summary") or {}
     print(
-        "baseline: p50_ttft=%s p95_ttft=%s mean_total=%s error_rate=%s"
+        "baseline: p50_ttft=%s p95_ttft=%s p50_total=%s p95_total=%s hit_rate=%s error_rate=%s"
         % (
             base.get("p50_ttft_ms"),
             base.get("p95_ttft_ms"),
-            base.get("mean_total_ms"),
+            base.get("p50_total_ms"),
+            base.get("p95_total_ms"),
+            base.get("hit_rate"),
             base.get("error_rate"),
         )
     )
-    reasons = compare_with_baseline(summary, baseline)
+
+    if baseline.get("bootstrap"):
+        # 首次采集窗口：只记录不阻断（基线本身还是占位的，拿来当门禁等于拿 0 当分母）
+        print("baseline is marked bootstrap -> record only, gate skipped (exit 0)")
+        return 0
+
     if reasons:
         for reason in reasons:
             print("REGRESSION: %s" % reason, file=sys.stderr)

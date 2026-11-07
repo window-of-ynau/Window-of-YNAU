@@ -1,13 +1,18 @@
-# 评测回归：每天 03:00 UTC + 手动触发
-# 设计文档 §10.3 门禁：TTFT 或成本相对 baseline 退化 > 10% 即失败
+# 评测门禁（issue #56 / W11）
 #
-# 为什么要 BENCH_BASE_URL 这个开关：
-# bench 会真的发 HTTP 请求，而 W1 阶段服务端的 /api/v1/chat/stream 还返回 501。
-# 没有可用服务端时，硬跑只会得到 100% 错误率，把 CI 变红却没有信息量。
-# 所以：**没配置 vars.BENCH_BASE_URL 就跳过**，配了才当作门禁。
+# 设计要点（t162 重写）：
+# 1. **默认执行**：PR、每日定时、手动都能跑。以前靠 `vars.BENCH_BASE_URL` 存在与否决定跑不跑，
+#    实际上等于从没跑过——门禁必须自己把环境拉起来，而不是"假设有个服务在那儿"。
+# 2. 环境自足：PG 服务（pgvector 镜像，跑真迁移）+ mock 上游（bench/mock_upstream.py）
+#    + 现场编译的服务端二进制。**不需要真实厂商 Key**，结果可复现（上游回放固定答案）。
+# 3. 判定在 bench/run.py 里：TTFT P50/P95、总耗时 P50/P95、单条成本（变大 > +10% 阻断）、
+#    要点命中率（相对下跌 > 10% 阻断）、错误率（+5pp 阻断）。基线见 bench/baseline.json。
+# 4. 耗时基线：本 job 约 **2.5–4 分钟**（cargo 编译 1.5–2.5 分钟，有 rust-cache；
+#    评测本身 50 条 ≈ 数秒）。比原来"永远跳过"多了这几分钟，换来的是真门禁。
 name: bench
 
 on:
+  pull_request:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
@@ -16,15 +21,34 @@ concurrency:
   group: bench-${{ github.ref }}
   cancel-in-progress: true
 
-# 只读即可：结果走 artifact，不写回仓库
 permissions:
   contents: read
 
 jobs:
-  regression:
-    name: 评测回归（对比 baseline）
+  gate:
+    name: 评测门禁（50 例 / 五项指标 / 对比基线）
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: yunong_bench
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: yunong_bench
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunong_bench
     steps:
       - uses: actions/checkout@v7
         with:
@@ -35,42 +59,108 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 判断是否具备评测条件
-        id: gate
-        env:
-          BENCH_BASE_URL: ${{ vars.BENCH_BASE_URL }}
+      - name: 安装 stable 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+
+      # 真迁移：与生产同一份文件、同一个 -1 单事务约束
+      - name: 应用迁移
         run: |
-          if [ -z "${BENCH_BASE_URL}" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::未配置仓库变量 BENCH_BASE_URL，本次跳过评测（服务端就绪后在 Settings → Variables 配置）"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "评测目标：${BENCH_BASE_URL}"
+          set -euo pipefail
+          for f in $(printf '%s\n' crates/server/migrations/*.sql | sort); do
+            echo "==> $f"
+            psql -v ON_ERROR_STOP=1 -q -1 -d "$PGDATABASE" -f "$f"
+          done
+
+      - name: 编译服务端
+        run: cargo build -p yunong-server --bin yunong-server
+
+      - name: 起 mock 上游（回放 50 条标准答案）
+        run: |
+          set -euo pipefail
+          nohup python bench/mock_upstream.py \
+            --port 18089 \
+            --cases bench/cases/full.jsonl \
+            > /tmp/mock-upstream.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:18089/ 2>/dev/null || \
+               python -c "import socket,sys; s=socket.socket(); s.settimeout(0.3); sys.exit(0 if s.connect_ex(('127.0.0.1',18089))==0 else 1)"; then
+              echo "mock upstream 就绪"; exit 0
+            fi
+            sleep 0.25
+          done
+          echo "::error::mock 上游没起来"; tail -n 50 /tmp/mock-upstream.log; exit 1
+
+      - name: 起服务端
+        env:
+          # 评测不碰真实厂商：三个协议都指到 mock
+          UPSTREAM_COMPLETIONS_URL: http://127.0.0.1:18089
+          UPSTREAM_RESPONSES_URL: http://127.0.0.1:18089
+          UPSTREAM_MESSAGES_URL: http://127.0.0.1:18089
+          UPSTREAM_API_KEY: sk-bench-mock-not-a-real-key
+          USAGE_SAMPLE_PERCENT: "100"
+          # 评测只要一个可用账号；邀请制本身由 pg_auth / api 用例覆盖
+          AUTH_INVITE_REQUIRED: "false"
+          # 抽样盐必须 >=32 字节且不能是明显序列（否则启动校验会让进程 panic）
+          YUNONG_SAMPLE_SALT: 4f3a9c1e7b2d8065af19c4e3b7d2508f6a1c9e4d3b7f2058c6a92e1d4b7f3085
+          YUNONG_BIND: 127.0.0.1:8080
+          RUST_LOG: warn
+        run: |
+          set -euo pipefail
+          nohup ./target/debug/yunong-server > /tmp/server.log 2>&1 &
+          for _ in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:8080/healthz > /dev/null 2>&1; then
+              echo "服务端就绪"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::服务端没起来"; tail -n 80 /tmp/server.log; exit 1
+
+      - name: 注册评测账号（拿 Bearer）
+        run: |
+          set -euo pipefail
+          response=$(curl -fsS -X POST http://127.0.0.1:8080/api/v1/auth/register \
+            -H 'content-type: application/json' \
+            -d '{"email":"bench@ynau.edu.cn","password":"bench-Passw0rd!"}')
+          token=$(printf '%s' "$response" | python -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])')
+          test -n "$token"
+          echo "::add-mask::$token"
+          echo "BENCH_TOKEN=$token" >> "$GITHUB_ENV"
+
+      # 退出码：0 通过 / 1 退化（阻断合并）/ 2 参数或服务不可达
+      - name: 跑评测并对比基线
+        run: |
+          set -euo pipefail
+          mkdir -p bench/results
+          python bench/run.py \
+            --cases bench/cases/full.jsonl \
+            --base-url http://127.0.0.1:8080 \
+            --token "$BENCH_TOKEN" \
+            --baseline bench/baseline.json \
+            --out bench/results/ci.json \
+            --report bench/results/report.md \
+            --env-note "GitHub Actions ubuntu-latest (issue #56)"
+
+      - name: 把报告贴到 job summary
+        if: always()
+        run: |
+          if [ -f bench/results/report.md ]; then
+            cat bench/results/report.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: 准备输出目录
-        if: steps.gate.outputs.run == 'true'
-        run: mkdir -p bench/results
-
-      # bench/run.py 只用标准库：刻意不装第三方依赖，保证评测可复现
-      # 退出码：0 无退化 / 1 相对 baseline 退化 / 2 参数错误或服务不可达
-      - name: 执行 smoke 评测并与 baseline 对比
-        if: steps.gate.outputs.run == 'true'
-        env:
-          BENCH_BASE_URL: ${{ vars.BENCH_BASE_URL }}
-        run: |
-          python bench/run.py \
-            --cases bench/cases/smoke.jsonl \
-            --baseline bench/baseline.json \
-            --base-url "$BENCH_BASE_URL" \
-            --out bench/results/ci.json
-
-      # 无论通过与否都留档，便于复盘退化曲线
       - name: 上传评测结果
-        if: always() && steps.gate.outputs.run == 'true'
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: bench-results-${{ github.run_id }}
-          path: bench/results/ci.json
+          path: |
+            bench/results/ci.json
+            bench/results/report.md
           if-no-files-found: warn
           retention-days: 30
+
+      - name: 失败时打印服务端日志尾部
+        if: failure()
+        run: tail -n 60 /tmp/server.log || true

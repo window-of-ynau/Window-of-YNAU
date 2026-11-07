@@ -1,0 +1,6 @@
+{
+  "_comment": "估计成本用的价目（元 / 百万 token）。不是账单：套餐按时间授权，服务端只对 1% 请求做 token 抽样。换模型改这里即可。",
+  "currency": "CNY",
+  "price_in_yuan_per_mtok": 2.0,
+  "price_out_yuan_per_mtok": 8.0
+}
