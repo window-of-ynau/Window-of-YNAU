@@ -248,7 +248,8 @@ jobs:
       - name: 上传 APK 与校验和
         uses: actions/upload-artifact@v7
         with:
-          name: yunong-apk-${{ github.ref_name }}
+          # 不能直接用 ref_name：干跑分支名带 / 时 artifact 名非法（与 windows 安装包同一坑）
+          name: yunong-apk-${{ github.run_number }}-${{ github.ref_name == 'main' && 'main' || 'branch' }}
           path: |
             app/build/app/outputs/flutter-apk/*.apk
             app/build/app/outputs/flutter-apk/SHA256SUMS
