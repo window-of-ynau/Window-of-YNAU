@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>布局 v2 视觉稿</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;overflow:hidden;background:#fff;
+    font-family:"Microsoft YaHei UI","Segoe UI","PingFang SC",system-ui,sans-serif}
+  /* ---------- 主题变量 ---------- */
+  body[data-t="a"]{--canvas:#FFFFFF;--surface:#F7F7F7;--alt:#F0F0F0;
+    --ink:#141413;--soft:#6C6A64;--faint:#8E8B82;--line:#E8E8E8;--accent:#0D0D0D;
+    --chip:#FFFFFF;--chipRing:#ECECF1;--field:#F7F7F7;--fieldRing:#ECECF1;--send:#0D0D0D;--sendInk:#fff;
+    --serif:"Microsoft YaHei UI","Segoe UI"}
+  body[data-t="b"]{--canvas:#070D1C;--surface:rgba(255,255,255,.05);--alt:rgba(255,255,255,.09);
+    --ink:#E8EEFC;--soft:#A9BFF0;--faint:#7E92C4;--line:rgba(255,255,255,.10);--accent:#3F68E4;
+    --chip:rgba(255,255,255,.06);--chipRing:rgba(255,255,255,.12);--field:rgba(255,255,255,.05);--fieldRing:rgba(255,255,255,.12);
+    --send:#3F68E4;--sendInk:#fff;--serif:"Microsoft YaHei UI","Segoe UI"}
+  body[data-t="c"]{--canvas:#F5F4ED;--surface:#FAF9F5;--alt:#EFEEE4;
+    --ink:#141413;--soft:#6C6A64;--faint:#8E8B82;--line:#E6DFD8;--accent:#A9583E;
+    --chip:#FAF9F5;--chipRing:#E6DFD8;--field:#FAF9F5;--fieldRing:#E6DFD8;--send:#141413;--sendInk:#FAF9F5;
+    --serif:Georgia,"Songti SC","SimSun",serif}
+  /* ---------- 壳 ---------- */
+  .shell{position:relative;width:100%;height:100%;display:flex;flex-direction:column;background:var(--canvas);color:var(--ink);overflow:hidden}
+  body[data-t="b"] .shell{background:
+     radial-gradient(900px 520px at 12% 8%, rgba(63,104,228,.16), transparent 60%),
+     linear-gradient(135deg,#0E1C3A 0%,#070D1C 55%,#04070F 100%)}
+  .appbar{flex:0 0 auto;display:flex;align-items:center;border-bottom:1px solid var(--line)}
+  .iconcol{width:64px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
+  .icbtn{width:40px;height:40px;display:grid;place-items:center;border-radius:10px;color:var(--ink);font-size:16px}
+  .titleblock{display:flex;flex-direction:column;justify-content:center;gap:1px;padding-left:8px}
+  .ttl{font-size:17px;font-weight:600;line-height:1.25;font-family:var(--serif);letter-spacing:.1px}
+  body[data-t="c"] .ttl{font-weight:500;letter-spacing:0}
+  .sub{font-size:12px;color:var(--soft);line-height:1.3}
+  .grow{flex:1}
+  .body{flex:1;min-height:0;display:flex}
+  /* ---------- 侧栏 ---------- */
+  .side{flex:0 0 auto;background:var(--surface);display:flex;flex-direction:column}
+  .grp{font-size:10px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--soft);
+    padding:12px 0 4px 72px}
+  .navrow{height:36px;display:flex;align-items:center;border-radius:8px;margin:0 8px;color:var(--ink)}
+  .navrow.on{background:var(--alt);font-weight:600}
+  .navrow .ic{width:64px;flex:0 0 auto;display:grid;place-items:center;font-size:15px;color:var(--soft)}
+  .navrow.on .ic{color:var(--ink)}
+  .navrow .lb{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:8px}
+  .sidefoot{margin-top:auto;padding-bottom:12px}
+  .divider-v{width:1px;flex:0 0 auto;background:var(--line)}
+  /* ---------- 内容 ---------- */
+  .main{flex:1;min-width:0;display:flex;flex-direction:column}
+  .empty{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
+  .greet{font-size:30px;font-weight:600;letter-spacing:-.4px;line-height:1.25}
+  body[data-t="c"] .greet{font-size:38px;font-weight:500;letter-spacing:-.5px;font-family:var(--serif)}
+  .tagline{font-size:15px;color:var(--soft);margin-top:10px}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:22px}
+  .chip{font-size:12.5px;padding:7px 13px;border-radius:999px;background:var(--chip);
+    box-shadow:0 0 0 1px var(--chipRing);color:var(--ink)}
+  .composer{display:flex;justify-content:center}
+  .empty .col,.composer .field{max-width:var(--cw);width:100%;margin-left:auto;margin-right:auto}
+  .field{width:100%;height:52px;border-radius:12px;background:var(--field);
+    box-shadow:0 0 0 1px var(--fieldRing);display:flex;align-items:center;padding:0 8px 0 14px;gap:10px}
+  .ph{flex:1;font-size:15px;color:var(--faint)}
+  .send{height:34px;padding:0 14px;border-radius:8px;background:var(--send);color:var(--sendInk);
+    font-size:13px;font-weight:600;display:grid;place-items:center}
+  .bottomnav{flex:0 0 auto;height:64px;display:flex;align-items:center;justify-content:space-around;
+    background:var(--surface);border-top:1px solid var(--line)}
+  .bn{display:flex;flex-direction:column;align-items:center;gap:3px;font-size:10.5px;color:var(--soft)}
+  .bn.on{color:var(--ink);font-weight:600}
+  .bn .bic{font-size:17px}
+  .railfloat{position:absolute;left:0;top:0;bottom:0;width:64px;background:var(--surface);
+    border-radius:0 12px 12px 0;box-shadow:6px 0 18px rgba(0,0,0,.16);display:flex;flex-direction:column;z-index:3}
+  /* ---------- 尺寸标注（画在界面外侧的 28px 边槽里） ---------- */
+  .ann{position:absolute;font-size:10px;line-height:1.5;color:#C2410C;font-family:Consolas,monospace;
+    background:#FFF3E9;border:1px solid #F6C6A8;border-radius:3px;padding:0 4px;white-space:nowrap}
+  .tick{position:absolute;background:#C2410C;opacity:.55}
+  .vrule{position:absolute;width:1px;background:#2563EB;opacity:.55}
+</style>
+</head>
+<body>
+<script>
+  const p = new URLSearchParams(location.search);
+  const q = p.get('q') || 'wide-a';
+  const parts = q.split('-');
+  const size = parts[0], theme = parts[1] || 'a';
+  document.body.dataset.t = theme;
+
+  const CFG = {
+    wide:    { w: 1280, h: 800, side: 224, pad: 24, bar: 60, twoLine: true,  mode: 'side',   cw: 768 },
+    medium:  { w: 760,  h: 800, side: 200, pad: 20, bar: 56, twoLine: true,  mode: 'side',   cw: 720 },
+    narrowA: { w: 480,  h: 800, side: 64,  pad: 16, bar: 52, twoLine: false, mode: 'rail',   cw: 9999 },
+    narrowB: { w: 480,  h: 800, side: 0,   pad: 16, bar: 52, twoLine: false, mode: 'bottom', cw: 9999 },
+  };
+  const c = CFG[size] || CFG.wide;
+
+  const NAV = [['▢','对话'], ['▦','我的课表'], ['▤','成绩查询'], ['▧','门户通知']];
+
+  const navRow = ([ic, lb], i, collapsed) => collapsed
+    ? `<div class="navrow" style="height:40px;margin:2px 0;justify-content:center"><div class="ic">${ic}</div></div>`
+    : `<div class="navrow${i === 0 ? ' on' : ''}"><div class="ic">${ic}</div><div class="lb">${lb}</div></div>`;
+
+  const sideBody = (collapsed) => collapsed
+    ? `<div style="height:8px"></div>${NAV.map((n) => navRow(n, -1, true)).join('')}
+       <div style="margin-top:auto"></div>
+       <div class="navrow" style="height:40px;margin:2px 0;justify-content:center"><div class="ic">⚙</div></div>
+       <div style="height:12px"></div>`
+    : `<div style="height:8px"></div>
+       <div class="grp">功能</div>${navRow(NAV[0], 0, false)}
+       <div class="grp">校园 · 3</div>${NAV.slice(1).map((n, i) => navRow(n, i + 1, false)).join('')}
+       <div class="sidefoot"><div class="navrow"><div class="ic">⚙</div><div class="lb">设置</div></div></div>`;
+
+  const appbar = (hamb, twoLine, h) => `
+    <div class="appbar" style="height:${h}px">
+      ${hamb ? '<div class="iconcol"><div class="icbtn">☰</div></div>' : '<div style="width:16px"></div>'}
+      <div class="titleblock">
+        <div class="ttl">云农之窗</div>${twoLine ? '<div class="sub">对话</div>' : ''}
+      </div>
+      <div class="grow"></div>
+      <div class="iconcol"><div class="icbtn">⚙</div></div>
+    </div>`;
+
+  const pane = (pad, isBottom) => `
+    <div class="main">
+      <div class="empty" style="padding:0 ${pad}px">
+        <div class="col">
+          <div class="greet">今天想从哪儿开始？</div>
+          <div class="tagline">问点什么吧——课表、成绩、校园生活都行。</div>
+          <div class="chips">
+            <div class="chip">第 8 周哪天最累？</div><div class="chip">把课表导出成日历</div>
+            <div class="chip">这门课的考核方式</div><div class="chip">这学期一共几门课？</div>
+          </div>
+        </div>
+      </div>
+      <div class="composer" style="padding:0 ${pad}px ${isBottom ? 12 : 16}px">
+        <div class="field"><div class="ph">输入消息…</div><div class="send">发送</div></div>
+      </div>
+    </div>`;
+
+  const shellStyle = '--cw:' + c.cw + 'px';
+  let inner = '';
+  if (c.mode === 'side') {
+    inner = `<div class="shell" style="${shellStyle}">${appbar(true, c.twoLine, c.bar)}
+      <div class="body">
+        <div class="side" style="width:${c.side}px">${sideBody(false)}</div>
+        <div class="divider-v"></div>
+        ${pane(c.pad, false)}
+      </div></div>`;
+  } else if (c.mode === 'rail') {
+    inner = `<div class="shell" style="${shellStyle}">${appbar(true, false, c.bar)}
+      <div class="body" style="padding-left:64px">${pane(c.pad, false)}</div>
+      <div class="railfloat">${sideBody(true)}</div></div>`;
+  } else {
+    inner = `<div class="shell" style="${shellStyle}">${appbar(false, false, c.bar)}
+      <div class="body">${pane(c.pad, true)}</div>
+      <div class="bottomnav">
+        <div class="bn on"><div class="bic">▢</div>对话</div>
+        <div class="bn"><div class="bic">▦</div>课表</div>
+        <div class="bn"><div class="bic">▤</div>成绩</div>
+        <div class="bn"><div class="bic">⚙</div>设置</div>
+      </div></div>`;
+  }
+
+  // ---- 标注：统一画在界面外侧的边槽 ----
+  const G = 26;          // 左边距/上边距
+  const GR = 148;         // 右边槽（放 AppBar / 图标列标注）
+  const GB = 42;          // 下边槽（放宽度标注）
+  const W = c.w + G + GR, H = c.h + G + GB;
+  const A = [];
+  const ann = (x, y, text) => A.push(`<div class="ann" style="left:${x}px;top:${y}px">${text}</div>`);
+  const tickH = (x1, x2, y) => A.push(`<div class="tick" style="left:${x1}px;top:${y}px;width:${x2 - x1}px;height:1px"></div>`);
+  const tickV = (x, y1, y2) => A.push(`<div class="tick" style="left:${x}px;top:${y1}px;width:1px;height:${y2 - y1}px"></div>`);
+
+  if (c.mode === 'side') {
+    // 左栏宽度（下方标注）
+    tickH(G, G + c.side, G + c.h + 8);
+    ann(G + c.side / 2 - 20, G + c.h + 11, `左栏 ${c.side}dp`);
+    // 分界线
+    ann(G + c.side + 2, G + 76, '1px hairline');
+    // AppBar 高度（右侧标注）
+    tickV(G + c.w + 8, G, G + c.bar);
+    ann(G + c.w + 12, G + c.bar / 2 - 7, `AppBar ${c.bar}`);
+    // 图标列：汉堡 / 设置同一竖线
+    tickV(G + 32, G + 6, G + c.h - 6);
+    ann(G + c.w + 12, G + c.h - 44, '图标列 64 / 中心 x=32');
+    // 内容内边距
+    ann(G + c.side + 6 + c.pad - 22, G + c.h - 22, `padding ${c.pad}`);
+  } else if (c.mode === 'rail') {
+    tickH(G, G + 64, G + c.h + 8);
+    ann(G + 14, G + c.h + 11, 'rail 64（浮层）');
+    tickV(G + c.w + 8, G, G + c.bar);
+    ann(G + c.w + 12, G + c.bar / 2 - 7, `AppBar ${c.bar}`);
+    ann(G + c.w + 12, G + c.h - 40, '无 1px 线，用阴影分层');
+    ann(G + 70 + c.pad, G + c.h - 56, `padding ${c.pad}`);
+  } else {
+    tickH(G, G + c.w, G + c.h + 8);
+    ann(G + 8, G + c.h + 11, '底部导航 64（无左栏）');
+    tickV(G + c.w + 8, G, G + c.bar);
+    ann(G + c.w + 12, G + c.bar / 2 - 7, `AppBar ${c.bar}`);
+    ann(G + c.w + 12, G + c.h - 40, '内容全宽');
+  }
+
+  document.body.innerHTML = `
+    <div style="position:relative;width:${W}px;height:${H}px">
+      <div style="position:absolute;left:${G}px;top:${G}px;width:${c.w}px;height:${c.h}px;
+                  outline:1px solid rgba(0,0,0,.10)">${inner}</div>
+      ${A.join('')}
+    </div>`;
+</script>
+</body>
+</html>

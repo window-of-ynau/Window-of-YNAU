@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>布局 v2 · 总览</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;background:#0f1115;color:#e7ecf3;font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif}
+  .wrap{padding:20px 22px 26px}
+  h1{font-size:16px;margin:0 0 3px}
+  .sub{font-size:12px;opacity:.62;margin:0 0 16px}
+  h2{font-size:13px;margin:14px 0 8px;color:#9fb0c8}
+  .row{display:flex;gap:12px;align-items:flex-start;margin-bottom:6px}
+  .cell{background:#171a20;border-radius:10px;padding:8px}
+  .cell .cap{font-size:11px;opacity:.75;margin:6px 2px 2px;display:flex;justify-content:space-between}
+  .cell .cap b{font-weight:600}
+  .cell .cap span{opacity:.6}
+  img{display:block;border-radius:6px}
+  .w1 img{width:440px}
+  .w2 img{width:600px}
+  .n img{width:300px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>布局 v2 · 总览（按 design/layout-spec-v2.md 渲染）</h1>
+  <p class="sub">左栏 224 / 中 200 / 窄 64；1px hairline + 底色差分界；AppBar 主标题「云农之窗」+ 副标题；汉堡与底部设置同一竖线 x=32。</p>
+
+  <h2>宽屏 ≥840 · 三套主题（1280 × 800）</h2>
+  <div class="row">
+    <div class="cell w1"><img src="wide-theme-a.png"><div class="cap"><b>A 极简黑白</b><span>surface #F7F7F7 / line #E8E8E8</span></div></div>
+    <div class="cell w1"><img src="wide-theme-b.png"><div class="cap"><b>B 深蓝玻璃</b><span>rgba(255,255,255,.05) / line .10</span></div></div>
+    <div class="cell w1"><img src="wide-theme-c.png"><div class="cap"><b>C 书本质感</b><span>surface #FAF9F5 / line #E6DFD8</span></div></div>
+  </div>
+
+  <h2>中屏 600–839（760 × 800）· 窄屏 &lt;600 两变体（480 × 800）</h2>
+  <div class="row">
+    <div class="cell w2"><img src="medium-theme-b.png"><div class="cap"><b>中屏 · 深蓝玻璃</b><span>左栏 200 / padding 20 / 聊天列 720</span></div></div>
+    <div class="cell n"><img src="narrow-variant-a.png"><div class="cap"><b>窄屏 A · 左 rail</b><span>rail 64，内容左让 64</span></div></div>
+    <div class="cell n"><img src="narrow-variant-b.png"><div class="cap"><b>窄屏 B · 底部导航</b><span>无左栏，NavigationBar 64</span></div></div>
+  </div>
+</div>
+</body>
+</html>
