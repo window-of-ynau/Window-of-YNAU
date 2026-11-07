@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 
 import '../chat/chat_settings_section.dart';
 import '../core/build_info.dart';
+import '../core/ffi_bindings.dart';
 import '../core/auth_service.dart';
 import '../core/secret_service.dart';
 import '../core/app_paths.dart';
@@ -199,6 +200,15 @@ class SettingsPage extends StatelessWidget {
               _Group(
                 title: '关于',
                 children: <Widget>[
+                  // t165：端侧核心状态（**始终**显示；失败要写清尝试过的路径与错误）
+                  _Row(
+                    key: const Key('settings-core-status'),
+                    icon: (CoreStatus.latest?.ok ?? false)
+                        ? Icons.memory_outlined
+                        : Icons.report_gmailerrorred_outlined,
+                    title: '端侧核心',
+                    subtitle: (CoreStatus.latest?.label ?? '端侧核心：未探测').replaceFirst('端侧核心：', ''),
+                  ),
                   // t156：当前数据根（覆盖时标注来源）—— 干净环境验证时一眼确认用的是哪份数据。
                   _Row(
                     key: const Key('settings-data-dir'),

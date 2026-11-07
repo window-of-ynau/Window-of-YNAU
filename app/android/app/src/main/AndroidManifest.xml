@@ -1,7 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- t165：端侧核心（libyunong_core.so）用 DynamicLibrary.open 加载，dlopen 只能找到
+         **已解压**到 /data/app/.../lib/<abi>/ 的 .so。AGP 4+ 默认 extractNativeLibs=false
+         （.so 只留在 APK 内，不落盘）→ dlopen 必然失败，表现为「核心不可用，暂时无法读取本地课表」。
+         这里显式要求解压；gradle 侧另有 jniLibs.useLegacyPackaging = true 双保险。 -->
     <application
-        android:label="yunong"
+        android:label="云农之窗"
         android:name="${applicationName}"
+        android:extractNativeLibs="true"
         android:icon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"

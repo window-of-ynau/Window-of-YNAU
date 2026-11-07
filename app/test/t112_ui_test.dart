@@ -9,6 +9,8 @@ import 'package:yunong/main.dart';
 import 'package:yunong/src/theme/theme_controller.dart';
 import 'package:yunong/src/chat/chat_top_bar.dart';
 
+import 'support/test_window.dart';
+
 Widget _host(Widget child) => MaterialApp(home: Scaffold(body: child));
 
 void main() {
@@ -51,6 +53,8 @@ void main() {
     testWidgets('顶栏无齿轮；抽屉底部有整行「设置」', (WidgetTester tester) async {
       // t135：必须注入 MemorySettingsStore —— 默认 FileSettingsStore 会读真实 settings.json，
       // 里面可能残留 `sidebar.collapsed=true`，导致这条测试随本机状态飘。
+    // t165：手机档用底部导航；这条验证的是**宽屏展开侧栏**底部的整行「设置」，所以固定 1280 宽。
+    setTestWindow(tester, 1280, 800);
       await tester.pumpWidget(YunongApp(themeController: ThemeController(store: MemorySettingsStore())));
       await tester.pumpAndSettle();
 
