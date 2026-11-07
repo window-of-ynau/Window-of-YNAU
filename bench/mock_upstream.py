@@ -17,6 +17,7 @@
 
 import argparse
 import json
+import socket
 import sys
 import threading
 import time
@@ -53,6 +54,15 @@ def load_answers(path):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        super().setup()
+        # 关掉 Nagle：SSE 是"小包多"的场景，Nagle 会把它和 Linux 的 delayed-ACK 凑在一起，
+        # 每条请求平白多出 ~40ms（run 42339202049 实测 p50 43ms 就是这么来的）。
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
     def log_message(self, fmt, *args):  # 安静点：CI 日志里只留结论
         return
 
@@ -68,9 +78,8 @@ class Handler(BaseHTTPRequestHandler):
         self._chunked = True
 
     def _write_chunk(self, data):
-        self.wfile.write(b"%x\r\n" % len(data))
-        self.wfile.write(data)
-        self.wfile.write(b"\r\n")
+        # 拼成一次 write：分三次小写会触发 Nagle 等待 ACK（Linux 上 40ms 级停顿）
+        self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
 
     def _chunked_end(self):
         # chunked 的终止块：长度为 0 的 chunk + 空行
