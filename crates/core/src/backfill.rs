@@ -45,6 +45,12 @@ pub const DERIVED_STORES: &[&str] = &["search_docs", "search_postings"];
 /// `every_table_is_classified` 会扫源码里的 `CREATE TABLE` 卡住漏登记。
 pub const PRIMARY_STORES: &[&str] = &["terms", "courses", "memory_items"];
 
+/// 元信息表：既不回填、也不是用户数据（只放版本号这类东西）。
+///
+/// `schema_meta` 属于表结构迁移（`store.rs::SCHEMA_VERSION`），
+/// 与这里管的 `PRAGMA user_version`（派生数据回填进度）**互不相干**。
+pub const META_STORES: &[&str] = &["schema_meta"];
+
 /// 一个回填步骤：`version` 只会往上走。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step {
@@ -344,7 +350,8 @@ mod tests {
         assert!(tables.len() >= 4, "只扫到 {:?}，解析逻辑坏了", tables);
         for table in &tables {
             let classified = PRIMARY_STORES.contains(&table.as_str())
-                || DERIVED_STORES.contains(&table.as_str());
+                || DERIVED_STORES.contains(&table.as_str())
+                || META_STORES.contains(&table.as_str());
             assert!(
                 classified,
                 "表 `{table}` 没有分类：主数据请加进 PRIMARY_STORES，\

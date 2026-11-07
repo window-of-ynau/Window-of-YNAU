@@ -11,6 +11,17 @@
 //! **导入一个空结果 == 删光旧课表**。用户看到"这学期没课"比看到"页面可能改版"危险得多
 //! （v0 的教训），所以 [`CourseStore::import_report`] 对空课程直接报错，不动库。
 //!
+//! # 两套版本号，**互不相干**（别混用！）
+//!
+//! | 机制 | 归谁 | 记什么 |
+//! |---|---|---|
+//! | `PRAGMA user_version` | `backfill.rs` | **派生数据回填**到第几版（索引/摘要等） |
+//! | `schema_meta.schema_version` | 本文件 | **表结构**迁移到第几版（`MIGRATIONS`） |
+//!
+//! 为什么不用同一个：`user_version` 已经被回填占用。如果表结构迁移也拿它当版本号，
+//! 迁移把 `user_version` 抬到 3，回填逻辑就会以为"派生数据已回填到 v3"而**跳过回填**——
+//! 老库升级后索引永远是空的，而且**不报错**。所以表结构版本单独存一张 `schema_meta`。
+//!
 //! # 幂等
 //!
 //! 同一学期重复抓取必须**替换**而不是追加（否则每次抓取课表翻倍）：
@@ -44,6 +55,29 @@ CREATE TABLE IF NOT EXISTS courses (
   teacher TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_courses_term ON courses(term);
+"#;
+
+/// 表结构的目标版本（`schema_meta.schema_version` 最终要等于它）。
+///
+/// **加表/加列时必须 +1**，并在 [`MIGRATIONS`] 追加一项。
+/// 注意：这**不是** `PRAGMA user_version`（那个归 `backfill.rs`，见模块文档）。
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// 逐级迁移：`(目标版本, SQL)`，按版本号升序执行，**每级一个独立事务**。
+///
+/// 新增表/列时：追加 `(SCHEMA_VERSION, "CREATE TABLE …")`，并同步抬 `SCHEMA_VERSION`；
+/// **不要**改历史项（老库已经按老项迁过了）。
+///
+/// v1 是版本机制的**基线**：老库第一次升级到这里时，表已经由上面幂等的 `SCHEMA` 建好，
+/// 这一步只做"打标"，为 v2 起的真实迁移留位置（例如将来 W9 的 `schedule_items` 就从 v2 开始）。
+const MIGRATIONS: &[(i64, &str)] = &[(1, "")];
+
+/// `schema_meta` 表：只放版本号这类元信息，**不放用户数据**。
+const SCHEMA_META_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 "#;
 
 /// 落库后的一门课（带自增 id，便于 UI 定位与删除）。
@@ -80,6 +114,212 @@ pub struct ImportOutcome {
     pub warnings: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// 表结构迁移（`schema_meta.schema_version`）与迁移前备份
+// ---------------------------------------------------------------------------
+//
+// **不要**把这里的版本号写进 `PRAGMA user_version`：那个是 `backfill.rs` 的
+// "派生数据回填进度"，两者混用会让回填被静默跳过（见模块文档）。
+
+/// 读表结构版本；**没有 `schema_meta` 或没有这一行 → 0（全新库/老库）**。
+fn read_schema_version(conn: &Connection) -> CoreResult<i64> {
+    let has_table: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .map_err(|err| CoreError::Storage(format!("读库结构信息失败：{err}")))?;
+    if !has_table {
+        return Ok(0);
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+        .map_err(|err| CoreError::Storage(format!("读 schema_version 失败：{err}")))?;
+    match raw {
+        None => Ok(0),
+        Some(text) => text.trim().parse::<i64>().map_err(|err| {
+            CoreError::Storage(format!("schema_version 不是整数（值={text}）：{err}"))
+        }),
+    }
+}
+
+/// 写表结构版本（与迁移**同一个事务**里调用，见 [`apply_schema_migrations`]）。
+fn write_schema_version(conn: &Connection, version: i64) -> CoreResult<()> {
+    conn.execute(
+        "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![version.to_string()],
+    )
+    .map_err(|err| CoreError::Storage(format!("写 schema_version 失败：{err}")))?;
+    Ok(())
+}
+
+/// 库里是否已经有**用户表**（用来区分"全新库"与"老库"）。
+///
+/// 全新库不需要备份（没数据可丢）；老库必须先备份再迁移。
+fn has_user_tables(conn: &Connection) -> CoreResult<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'table'
+               AND name NOT IN ('schema_meta', 'sqlite_sequence')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| CoreError::Storage(format!("读表清单失败：{err}")))?;
+    Ok(count > 0)
+}
+
+/// 迁移前备份：`<db 父目录>\backups\yunong.db.bak-v{N}-{yyyyMMddHHmmss}`。
+///
+/// **失败必须中止迁移**（返回 `Err`，调用方不会再往下走）——用户的课表/记忆全在这个文件里，
+/// "备份失败但继续迁移"是数据丢失的直通车。
+///
+/// 保留最近 [`BACKUP_KEEP`] 份，更早的按**文件名里的时间戳**清理（不依赖 mtime，
+/// 免得复制/同步工具改 mtime 后清错）。
+fn backup_before_migration(
+    conn: &Connection,
+    db_path: &Path,
+    from_version: i64,
+) -> CoreResult<std::path::PathBuf> {
+    let parent = db_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let dir = parent.join("backups");
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        CoreError::Storage(format!(
+            "创建备份目录失败，已中止迁移（{}）：{err}",
+            dir.display()
+        ))
+    })?;
+
+    // WAL 模式下最近的写入可能还在 `-wal` 文件里：先 checkpoint 再拷主文件，
+    // 否则备份会"少最后几条数据"（正是最需要它的时刻）。失败不致命：退回直接拷主文件。
+    // `PRAGMA wal_checkpoint(TRUNCATE)` 是**带参数括号**的形式，不能用 `pragma_update`
+    // （那会生成 `PRAGMA wal_checkpoint = TRUNCATE`，语法非法）。返回一行三列，结果忽略。
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()));
+
+    // 本地时间戳由 SQLite 生成：不引入额外的日期库，也避免手写时区逻辑
+    let stamp: String = conn
+        .query_row(
+            "SELECT strftime('%Y%m%d%H%M%S', 'now', 'localtime')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| CoreError::Storage(format!("生成备份时间戳失败，已中止迁移：{err}")))?;
+
+    let target = dir.join(format!("yunong.db.bak-v{from_version}-{stamp}"));
+    std::fs::copy(db_path, &target).map_err(|err| {
+        CoreError::Storage(format!(
+            "备份数据库失败，已中止迁移（{}）：{err}",
+            target.display()
+        ))
+    })?;
+    cleanup_old_backups(&dir);
+    Ok(target)
+}
+
+/// 备份保留份数（含本次新建的）。
+const BACKUP_KEEP: usize = 3;
+
+/// 只留最近 `BACKUP_KEEP` 份；清理失败**不影响**迁移（备份已经成功了）。
+fn cleanup_old_backups(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut backups: Vec<(String, std::path::PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stamp = name.rsplit_once('-').map(|(_, stamp)| stamp.to_owned())?;
+            name.starts_with("yunong.db.bak-v")
+                .then(|| (stamp, entry.path()))
+        })
+        .collect();
+    // 时间戳是固定长度的数字串，字典序 == 时间序
+    backups.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, path) in backups.into_iter().skip(BACKUP_KEEP) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// 建表 + 逐级迁移；**成功后才写版本号**。
+///
+/// 顺序（故意如此）：
+/// 1. 读现有版本（0 = 全新库或"没有版本机制的老库"）；
+/// 2. 比程序新 → 直接报错（老程序不能打开新库，否则会写坏数据）；
+/// 3. 需要升级时：老库先备份（失败即中止）；
+/// 4. 跑幂等的 `SCHEMA`（全新库建表；老库是无操作）；
+/// 5. 逐级跑 `MIGRATIONS`（每级一个事务）；
+/// 6. 写 `schema_version`。
+fn apply_schema_migrations(conn: &mut Connection, db_path: Option<&Path>) -> CoreResult<()> {
+    conn.execute_batch(SCHEMA_META_DDL)
+        .map_err(|err| CoreError::Storage(format!("建 schema_meta 失败：{err}")))?;
+    let current = read_schema_version(conn)?;
+    if current > SCHEMA_VERSION {
+        return Err(CoreError::Storage(format!(
+            "库的表结构版本是 {current}，比本程序支持的 {SCHEMA_VERSION} 更新：\
+             请升级云农之窗后再打开（不降级，避免写坏数据）"
+        )));
+    }
+    if current == SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // 老库（已有用户表但没有版本号）才需要备份；全新库没东西可丢
+    if current == 0 && has_user_tables(conn)? {
+        let Some(path) = db_path else {
+            // 内存库：没有文件可备份，也没有"老库升级"的语义
+            return migrate_to_latest(conn, current);
+        };
+        backup_before_migration(conn, path, current)?;
+    }
+    migrate_to_latest(conn, current)
+}
+
+fn migrate_to_latest(conn: &mut Connection, from: i64) -> CoreResult<()> {
+    conn.execute_batch(SCHEMA)
+        .map_err(|err| CoreError::Storage(format!("建表失败：{err}")))?;
+    for (version, sql) in MIGRATIONS {
+        if *version <= from {
+            continue;
+        }
+        let tx = conn
+            .transaction()
+            .map_err(|err| CoreError::Storage(format!("开迁移事务失败：{err}")))?;
+        if !sql.trim().is_empty() {
+            tx.execute_batch(sql)
+                .map_err(|err| CoreError::Storage(format!("迁移到 v{version} 失败：{err}")))?;
+        }
+        write_schema_version(&tx, *version)?;
+        tx.commit()
+            .map_err(|err| CoreError::Storage(format!("提交迁移 v{version} 失败：{err}")))?;
+    }
+    // 迁移列表可能比 SCHEMA_VERSION 短（只抬版本不加 DDL 的情况）
+    let latest = MIGRATIONS.last().map(|(version, _)| *version).unwrap_or(0);
+    if latest < SCHEMA_VERSION {
+        let tx = conn
+            .transaction()
+            .map_err(|err| CoreError::Storage(format!("开迁移事务失败：{err}")))?;
+        write_schema_version(&tx, SCHEMA_VERSION)?;
+        tx.commit()
+            .map_err(|err| CoreError::Storage(format!("提交版本号失败：{err}")))?;
+    }
+    Ok(())
+}
+
 /// 课表库。
 pub struct CourseStore {
     conn: Connection,
@@ -98,6 +338,7 @@ impl CourseStore {
         Self::from_connection(
             Connection::open(path)
                 .map_err(|err| CoreError::Storage(format!("打开 SQLite 失败：{err}")))?,
+            Some(path),
         )
     }
 
@@ -106,16 +347,24 @@ impl CourseStore {
         Self::from_connection(
             Connection::open_in_memory()
                 .map_err(|err| CoreError::Storage(format!("打开内存 SQLite 失败：{err}")))?,
+            // 内存库没有文件可备份，也谈不上"老库升级"
+            None,
         )
     }
 
-    fn from_connection(conn: Connection) -> CoreResult<Self> {
+    fn from_connection(mut conn: Connection, db_path: Option<&Path>) -> CoreResult<Self> {
         // WAL：读写不互相阻塞（会话进行中也要能查课表）。
         // 内存库不支持 WAL，失败就退回默认 journal，不算错。
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        conn.execute_batch(SCHEMA)
-            .map_err(|err| CoreError::Storage(format!("建表失败：{err}")))?;
+        apply_schema_migrations(&mut conn, db_path)?;
         Ok(Self { conn })
+    }
+
+    /// 当前库的**表结构版本**（`schema_meta.schema_version`）。
+    ///
+    /// 诊断/测试用；它与 `PRAGMA user_version`（派生数据回填）是两套东西。
+    pub fn schema_version(&self) -> CoreResult<i64> {
+        read_schema_version(&self.conn)
     }
 
     /// 写入/更新学期元信息。
@@ -264,6 +513,177 @@ impl CourseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // t163 后续：schema_meta 版本机制 + 迁移前备份
+    // -----------------------------------------------------------------------
+
+    /// 每个测试一个独立临时目录（避免并行测试互相覆盖备份目录）。
+    struct TempDb {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempDb {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let dir = std::env::temp_dir()
+                .join(format!("yn-store-{}-{tag}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.dir.join("yunong.db")
+        }
+
+        fn backups(&self) -> std::path::PathBuf {
+            self.dir.join("backups")
+        }
+
+        fn backup_names(&self) -> Vec<String> {
+            let Ok(entries) = std::fs::read_dir(self.backups()) else {
+                return Vec::new();
+            };
+            let mut names: Vec<String> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 把库改成"老库"：已有用户表 + 数据，但**没有** `schema_meta` 版本号
+    /// （模拟引入版本机制之前装过云农之窗的机器）。
+    fn make_legacy_db(path: &std::path::Path) {
+        let store = CourseStore::open(path).unwrap();
+        drop(store);
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO terms (term, starts_on, ends_on) VALUES ('2026 秋', '2026-09-01', NULL);
+             DELETE FROM schema_meta;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fresh_database_is_version_zero_and_migrates_to_latest() {
+        let temp = TempDb::new("fresh");
+        let path = temp.path();
+        // 全新库：还没有 schema_meta → 视为 0
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(read_schema_version(&conn).unwrap(), 0);
+        }
+        let store = CourseStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // 全新库没有旧数据可丢 → 不该产生备份
+        assert!(temp.backup_names().is_empty(), "{:?}", temp.backup_names());
+    }
+
+    /// 迁移只写 `schema_meta`，**绝不**碰 `PRAGMA user_version`（那是回填的进度号）。
+    #[test]
+    fn schema_migration_leaves_user_version_alone() {
+        let temp = TempDb::new("user-version");
+        let path = temp.path();
+        make_legacy_db(&path);
+        // 回填逻辑已经把这个库标成"派生数据回填到 v7"
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 7;").unwrap();
+        }
+        let store = CourseStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let conn = Connection::open(&path).unwrap();
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            user_version, 7,
+            "schema 迁移不许改 user_version（那是 backfill.rs 的回填进度）"
+        );
+    }
+
+    #[test]
+    fn legacy_database_is_backed_up_before_migration() {
+        let temp = TempDb::new("backup");
+        let path = temp.path();
+        make_legacy_db(&path);
+        let store = CourseStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let names = temp.backup_names();
+        println!("[backup] {} / {:?}", temp.backups().display(), names);
+        assert_eq!(names.len(), 1, "老库升级前必须留一份备份：{names:?}");
+        assert!(names[0].starts_with("yunong.db.bak-v0-"), "{names:?}");
+        assert!(temp.backups().join(&names[0]).is_file());
+    }
+
+    /// 备份失败 → **中止迁移**：open 报错，且库的版本号仍然停在 0（迁移没发生）。
+    #[test]
+    fn backup_failure_aborts_migration() {
+        let temp = TempDb::new("backup-fail");
+        let path = temp.path();
+        make_legacy_db(&path);
+        // 把 `backups` 占成一个**文件**：create_dir_all 必然失败
+        std::fs::write(temp.backups(), b"not a directory").unwrap();
+
+        let error = match CourseStore::open(&path) {
+            Ok(_) => panic!("备份失败时必须中止迁移"),
+            Err(error) => error,
+        };
+        let message = format!("{error}");
+        assert!(message.contains("已中止迁移"), "{message}");
+
+        // 迁移确实没发生：版本仍是 0（没有 schema_version 行）
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(read_schema_version(&conn).unwrap(), 0);
+    }
+
+    /// 备份只保留最近 3 份（按文件名里的时间戳），更早的自动清理。
+    #[test]
+    fn backups_are_pruned_to_the_latest_three() {
+        let temp = TempDb::new("prune");
+        std::fs::create_dir_all(temp.backups()).unwrap();
+        // 预先放 5 份"旧备份"，时间戳递增
+        for stamp in [
+            "20260101000000",
+            "20260102000000",
+            "20260103000000",
+            "20260104000000",
+            "20260105000000",
+        ] {
+            std::fs::write(
+                temp.backups().join(format!("yunong.db.bak-v0-{stamp}")),
+                b"old",
+            )
+            .unwrap();
+        }
+        let path = temp.path();
+        make_legacy_db(&path);
+        let store = CourseStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+
+        let names = temp.backup_names();
+        assert_eq!(names.len(), BACKUP_KEEP, "只该留 3 份：{names:?}");
+        // 最新的三份保留（新建的那份时间戳最大，一定在里面）
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("yunong.db.bak-v0-2")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.ends_with("20260101000000")),
+            "最旧的应被清掉：{names:?}"
+        );
+    }
 
     fn course(name: &str, weekday: u8, start: u8, end: u8) -> Course {
         Course {
