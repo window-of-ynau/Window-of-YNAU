@@ -14,6 +14,7 @@
 // - 网络/证书 → `NETWORK` / `CERT`，只给可读提示，不弹异常栈。
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:collection';
 
 import 'package:flutter/material.dart';
@@ -34,6 +35,21 @@ enum CampusFetchMode {
 }
 
 /// WebView 版取数实现（真实登录 + 会话复用）。
+/// 学期格式：`YYYY-YYYY-N`（1 或 2 学期）。
+///
+/// 学期是**我们自己的固定格式**，不接受自由文本：这个值会被拼进校务 origin 上的
+/// 注入脚本（CAS 会话所在域），任何"字符串拼接"都可能变成代码执行（R4-F1）。
+bool isValidTermFormat(String term) => _termPattern.hasMatch(term);
+
+final RegExp _termPattern = RegExp(r'^20\d\d-20\d\d-[12]$');
+
+/// 生成设置学期变量的注入脚本。
+///
+/// **必须用 `jsonEncode`**：产出的双引号字符串字面量会转义内部引号/反斜杠/换行，
+/// 用户输入无法跳出字符串；历史上用单引号直接拼 `'$term'`，可被
+/// `x';globalThis.PWNED=1;//` 这类输入执行任意 JS（R4-F1）。
+String termAssignmentJs(String term) => 'window.__yunongTerm = ${jsonEncode(term)};';
+
 class WebViewSchoolFetcher implements SchoolFetcher {
   WebViewSchoolFetcher({this.timeout = const Duration(minutes: 5)});
 
@@ -54,12 +70,26 @@ class WebViewSchoolFetcher implements SchoolFetcher {
   ///
   /// 与 HTML 路径共用同一个 WebView 页面（`CampusWebViewPage` 的 `mode` 区分）。
   @override
-  Future<ScheduleApiResult> fetchSchedule({required String entryUrl, String? term}) =>
-      _open<ScheduleApiResult>(
-        entryUrl: entryUrl,
-        mode: CampusFetchMode.portalApi,
-        term: term,
-      );
+  Future<ScheduleApiResult> fetchSchedule({required String entryUrl, String? term}) async {
+    _requireValidTerm(term);
+    return _open<ScheduleApiResult>(
+      entryUrl: entryUrl,
+      mode: CampusFetchMode.portalApi,
+      term: term,
+    );
+  }
+
+  /// 学期格式不合法 → 直接报错（不把自由文本带进校务页面）。
+  void _requireValidTerm(String? term) {
+    if (term == null || term.isEmpty || isValidTermFormat(term)) {
+      return;
+    }
+    throw const FetchException(
+      code: 'BAD_INPUT',
+      userHint: '学期格式应形如 2026-2027-1',
+      message: '学期格式非法（只接受 YYYY-YYYY-1/2）',
+    );
+  }
 
   Future<FetchedPage> fetchTimetablePage({required String entryUrl}) =>
       _open<FetchedPage>(
@@ -154,6 +184,13 @@ class CampusWebViewPage extends StatefulWidget {
 
 class _CampusWebViewPageState extends State<CampusWebViewPage> {
   InAppWebViewController? _controller;
+
+  /// t98：Dart 主动拉取 `window.__yunongState` 的轮询（不依赖 JS→Dart 桥）。
+  Timer? _statePull;
+  int _consumedStateEvents = 0;
+
+  /// t100：JS 侧文档会话 id；变化说明发生了导航/文档重建，必须重置消费游标。
+  String? _lastSessionId;
   WebViewEnvironment? _environment;
 
   /// 门户接口模式下：20s 内没捕获到课表请求就明确报错（绝不静默挂起）。
@@ -181,6 +218,58 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     onScheduleTemplate: _onScheduleTemplate,
     onScheduleApi: widget.onFetchedSchedule,
     onStageChange: _onStageChange,
+    // t151：课程行数（就绪判定要求 > 0，避免"框架在、行还没渲染"→ PARSE_EMPTY）
+    rowProbe: () async {
+      final InAppWebViewController? controller = _controller;
+      if (controller == null) {
+        return -1;
+      }
+      try {
+        final Object? raw = await controller.evaluateJavascript(source: kCourseRowCountScript);
+        final int? count = int.tryParse('${raw ?? ''}'.replaceAll('"', '').trim());
+        return count ?? -1;
+      } on Object catch (failure) {
+        // 【t161】可以吞：行数探测只是**就绪判定的加分项**，拿不到按"未知"处理，
+        // 由 waitForTimetableReady 的其它条件（长度/关键字/URL）兜底；但要留痕便于排障。
+        debugPrint('[capture] courseRowCount 探测失败：${failure.runtimeType} $failure');
+        return -1;
+      }
+    },
+    // t150：页面元信息（URL/标题）—— 抓取失败时用来判断"是不是还停在登录页"
+    metaProbe: () async {
+      final InAppWebViewController? controller = _controller;
+      if (controller == null) {
+        return null;
+      }
+      String url = '';
+      String title = '';
+      try {
+        url = (await controller.getUrl())?.toString() ?? '';
+      } on Object catch (failure) {
+        // 【t161】可以吞：URL 只用于诊断与"是否停在登录页"的辅助判断，
+        // 拿不到时诊断显示"（空）"，不影响抓取主流程。
+        debugPrint('[capture] getUrl 失败：${failure.runtimeType} $failure');
+        url = '';
+      }
+      try {
+        final Object? raw = await controller.evaluateJavascript(source: 'document.title');
+        title = raw is String ? raw : '';
+      } on Object catch (failure) {
+        // 【t161】可以吞：标题同上，仅诊断用；失败时显示"（空）"。
+        debugPrint('[capture] document.title 失败：${failure.runtimeType} $failure');
+        title = '';
+      }
+      return (url: url, title: title);
+    },
+    // t148：空壳 html 时用页面侧可重复入口重取一次（不重新导航、不发请求）
+    grabHtml: () async {
+      final InAppWebViewController? controller = _controller;
+      if (controller == null) {
+        return null;
+      }
+      final Object? raw = await controller.evaluateJavascript(source: kGrabHtmlScript);
+      return raw is String ? raw : null;
+    },
     onStage: (FetchStage stage) {
       widget.onStage?.call(stage);
       if (stage == FetchStage.grabbed) {
@@ -200,10 +289,73 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
     });
   }
 
+  /// t98：主路径——Dart 每 400ms 拉一次 `window.__yunongState`，把新事件喂给同一个 bridge。
+  ///
+  /// 为什么换架构：诊断显示 Dart→JS 完全可用（候选/hook/XHR 都能拿到），
+  /// 但 JS→Dart 的 `flutter_inappwebview` 桥在该环境里始终不注入；与其继续修桥，不如反向拉取。
+  void _startStatePull() {
+    _statePull?.cancel();
+    _statePull = Timer.periodic(const Duration(milliseconds: 400), (_) async {
+      final Object? raw = await _controller?.evaluateJavascript(
+        source: 'JSON.stringify(window.__yunongState || null)',
+      );
+      if (raw is! String || raw.isEmpty || raw == 'null') {
+        return;
+      }
+      Object? decoded;
+      try {
+        decoded = jsonDecode(raw);
+      } on FormatException {
+        return;
+      }
+      if (decoded is! Map<String, dynamic>) {
+        return;
+      }
+      _bridge.pullCount += 1;
+      final Object? updatedAt = decoded['updatedAt'];
+      if (updatedAt is num) {
+        _bridge.lastStateAgeSeconds =
+            ((DateTime.now().millisecondsSinceEpoch - updatedAt.toInt()) / 1000).round();
+      }
+      // t100：导航到新文档后 `window.__yunongState` 从 0 开始，而 Dart 游标仍停在旧值 →
+      // 新事件全被当作"已消费"跳过。表现正是 owner 报的"首次登录必失败、重试才好"。
+      // 判据：JS 侧 sessionId 变化（新文档）**或** events 变短（被重置）→ 游标归零。
+      final Object? sessionId = decoded['sessionId'];
+      final Object? events = decoded['events'];
+      if (events is List) {
+        _consumedStateEvents = nextConsumedCursor(
+          consumed: _consumedStateEvents,
+          eventCount: events.length,
+          sessionId: sessionId is String ? sessionId : null,
+          lastSessionId: _lastSessionId,
+        );
+      }
+      if (sessionId is String) {
+        _lastSessionId = sessionId;
+      }
+      if (events is List) {
+        for (var i = _consumedStateEvents; i < events.length; i++) {
+          final Object? event = events[i];
+          if (event is Map<String, dynamic>) {
+            _bridge.handle(event);
+            _bridge.stateEventsConsumed += 1;
+          }
+        }
+        _consumedStateEvents = events.length;
+      }
+    });
+  }
+
+  void _stopStatePull() {
+    _statePull?.cancel();
+    _statePull = null;
+  }
+
   @override
   void dispose() {
     _stopProgressWatchdog();
     _stopGrabLoop();
+    _stopStatePull();
     super.dispose();
   }
 
@@ -386,13 +538,16 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-          _stage == 'login'
-              ? '请先在页面里完成登录（登录成功后会自动抓取，不需要再点按钮）'
-              : _probe.hint,
-          style: theme.textTheme.bodySmall,
-        ),
+                          _stage == 'login'
+                              ? '请先在页面里完成登录（登录成功后会自动抓取，不需要再点按钮）'
+                              : _probe.hint,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: theme.colorScheme.onSurface,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
                       ),
-                      OutlinedButton(
+                      FilledButton(
                         onPressed: () async {
                           // 门户模式先走接口（__yunongGrab）；旧正方页面才走 DOM（__yunongGrabDom）
                           await _controller?.evaluateJavascript(
@@ -423,6 +578,18 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                     initialUserScripts: UnmodifiableListView<UserScript>(<UserScript>[
                       UserScript(
                         source: kCampusProbeScript,
+                        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+                        forMainFrameOnly: false,
+                      ),
+                      // 【t151】课程行计数（就绪判定用；只回数字，不回 DOM）
+                      UserScript(
+                        source: kCourseRowCountInstallScript,
+                        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+                        forMainFrameOnly: false,
+                      ),
+                      // 【t148】可重复调用的抓取入口：`window.__yunongGrabHtml()`
+                      UserScript(
+                        source: kGrabHtmlInstallScript,
                         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
                         forMainFrameOnly: false,
                       ),
@@ -459,11 +626,21 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
                         _progress.enterStage('waiting_card', DateTime.now());
                         _markProgress();
                         _startProgressWatchdog();
+                        // t98：主路径——Dart 主动拉取状态（不依赖 JS→Dart 桥）
+                        _startStatePull();
                       }
                       final term = widget.term;
                       if (term != null && term.isNotEmpty) {
+                        // 纵深防御：入口已校验，这里再挡一次；注入语句用 jsonEncode 生成
+                        if (!isValidTermFormat(term)) {
+                          throw const FetchException(
+                            code: 'BAD_INPUT',
+                            userHint: '学期格式应形如 2026-2027-1',
+                            message: '学期格式非法（只接受 YYYY-YYYY-1/2）',
+                          );
+                        }
                         await _controller?.evaluateJavascript(
-                          source: "window.__yunongTerm = '$term';",
+                          source: termAssignmentJs(term),
                         );
                       }
                       // 门户模式 + 已离开登录页：立刻跑一次"自动优先"发现流程
@@ -502,4 +679,27 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
       ),
     );
   }
+}
+
+/// t100：导航/文档重建后消费游标必须归零。
+///
+/// 触发条件（任一）：
+/// - `sessionId` 变化：JS 侧新文档会生成新 id；
+/// - `eventCount < consumed`：JS 侧 events 变短，说明被重置。
+///
+/// 为什么需要它：SSO 登录页 → 服务门户是**换文档**，`window.__yunongState` 从 0 开始，
+/// 而 Dart 游标停在旧值 → 新事件全被跳过 → 首次登录必失败、重试（不再导航）才好。
+int nextConsumedCursor({
+  required int consumed,
+  required int eventCount,
+  String? sessionId,
+  String? lastSessionId,
+}) {
+  if (sessionId != null && sessionId != lastSessionId) {
+    return 0;
+  }
+  if (eventCount < consumed) {
+    return 0;
+  }
+  return consumed;
 }

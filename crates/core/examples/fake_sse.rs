@@ -10,11 +10,25 @@
 //! cargo run -p yunong-core --example fake_sse -- --port 8765 --mode error
 //! # 非 SSE（200 text/html，模拟被代理/登录页劫持）
 //! cargo run -p yunong-core --example fake_sse -- --port 8765 --mode html
+//! # 工具事件端到端（第 1 次请求回 tool_calls，第 2 次回文本 + done）
+//! cargo run -p yunong-core --example fake_sse -- --port 8765 --mode tool
+//! # 工具失败（memory_search 缺 query → tool_result(ok:false, code="BAD_ARGS")）
+//! cargo run -p yunong-core --example fake_sse -- --port 8765 --mode tool-fail
 //! ```
+//!
+//! `--mode tool` 是**工具事件的长期护栏**：客户端（真 DLL）或 Rust 探针把它当上游，
+//! 就能看到一条真实的 `tool_call` → `tool_result` → `delta` → `done` 流。
+//!
+//! **轮次按请求体判定，不用计数器**：body 里出现 `"role":"tool"`（工具结果回填）
+//! 就回"第二轮文本"，否则回"第一轮 tool_calls"。
+//!
+//! 这条规则是 t109 换来的教训：早先用进程级 `AtomicUsize` 数请求次数，
+//! 同一个 mock 进程被两个测试连续使用时计数会漂移，第二个测试直接拿到"文本"响应
+//! （实测 12 帧、`tool_call=0`）。无状态判定对重试、并发、连续测试都稳。
 //!
 //! 参数：
 //! - `--port <u16>`：监听端口（默认 8765，只绑 127.0.0.1）
-//! - `--mode ok|error|html`：响应形态（默认 ok）
+//! - `--mode ok|error|html|tool|tool-fail`：响应形态（默认 ok）
 //! - `--delay-ms <u64>`：每个 chunk 之间的间隔（默认 120ms，模拟逐字）
 //! - `--text <str>`：流式输出的文本（默认"你好，我是云农之窗"）
 //!
@@ -34,6 +48,10 @@ enum Mode {
     Error,
     /// 200 但返回 HTML（模拟被登录页/代理劫持）
     Html,
+    /// 第一轮回 `tool_calls`（memory_search），第二轮回文本 + done
+    Tool,
+    /// 同 [`Mode::Tool`]，但工具调用**必定失败**（缺 query → BAD_ARGS）
+    ToolFail,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +103,8 @@ fn parse_args() -> Config {
                 config.mode = match args.next().as_deref() {
                     Some("error") => Mode::Error,
                     Some("html") => Mode::Html,
+                    Some("tool") => Mode::Tool,
+                    Some("tool-fail") | Some("tool_fail") => Mode::ToolFail,
                     _ => Mode::Ok,
                 }
             }
@@ -100,7 +120,10 @@ fn parse_args() -> Config {
             }
             "--help" | "-h" => {
                 println!(
-                    "用法：fake_sse [--port 8765] [--mode ok|error|html] [--delay-ms 120] [--text ...]"
+                    "用法：fake_sse [--port 8765] [--mode ok|error|html|tool|tool-fail] [--delay-ms 120] [--text ...]\n\n\
+                     --mode tool       第 1 次请求回 tool_calls(memory_search)，第 2 次回文本+done\n\
+                     --mode tool-fail  同上，但工具调用缺 query（端侧会回 ok:false / BAD_ARGS）\n\
+                     工具事件契约见 crates/core/src/tool_events.rs"
                 );
                 std::process::exit(0);
             }
@@ -138,7 +161,7 @@ async fn handle(mut stream: TcpStream, config: Config) -> std::io::Result<()> {
                 body.len(),
                 String::from_utf8_lossy(&body)
             );
-            return respond(stream, config).await;
+            return respond(stream, config, &body).await;
         }
         if read >= buffer.len() {
             return Ok(());
@@ -167,7 +190,11 @@ fn parse_content_length(head: &str) -> usize {
     0
 }
 
-async fn respond(mut stream: TcpStream, config: Config) -> std::io::Result<()> {
+async fn respond(
+    mut stream: TcpStream,
+    config: Config,
+    request_body: &[u8],
+) -> std::io::Result<()> {
     match config.mode {
         Mode::Error => {
             let body = r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"fake_sse: 限流（模拟）","retry_after":2}}"#;
@@ -189,43 +216,106 @@ async fn respond(mut stream: TcpStream, config: Config) -> std::io::Result<()> {
             stream.write_all(response.as_bytes()).await?;
             stream.flush().await
         }
-        Mode::Ok => {
-            stream
+        Mode::Tool | Mode::ToolFail => {
+            // **按请求体判定轮次，不用全局计数器**：
+            // 客户端把工具结果回填时，body 里一定有 `"role":"tool"`；没有就是"第一轮"。
+            //
+            // 早先用 `AtomicUsize` 数请求次数，结果同一个 fake_sse 进程被两个测试连续使用时
+            // 计数会漂移：第 2 个测试的"第一轮"拿到的是"第二轮文本"，整条工具路径直接测不到
+            //（实测：第 2 次运行 12 帧、tool_call=0）。按 body 判定是**无状态**的，重试/并发都稳。
+            let body_text = String::from_utf8_lossy(request_body);
+            let has_tool_result =
+                body_text.contains("\"role\":\"tool\"") || body_text.contains("\"role\": \"tool\"");
+            if !has_tool_result {
+                // 第一轮：让模型"要求调用工具"（OpenAI Completions 的流式 tool_calls 形状）
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                    )
+                    .await?;
+                stream.flush().await?;
+                // `tool-fail`：故意不给 query → 端侧 memory_search 返回 Invalid → BAD_ARGS
+                let arguments = match config.mode {
+                    Mode::ToolFail => "{}".to_owned(),
+                    _ => "{\"query\":\"雨伞\"}".to_owned(),
+                };
+                let call = serde_json::json!({
+                    "id": "fake-tool-1",
+                    "object": "chat.completion.chunk",
+                    "model": "fake-model",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "memory_search", "arguments": arguments }
+                        }]},
+                        "finish_reason": serde_json::Value::Null
+                    }]
+                });
+                write_sse(&mut stream, &format!("data: {call}\n\n")).await?;
+                let finish = serde_json::json!({
+                    "id": "fake-tool-1",
+                    "object": "chat.completion.chunk",
+                    "model": "fake-model",
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+                });
+                write_sse(&mut stream, &format!("data: {finish}\n\n")).await?;
+                write_sse(&mut stream, "data: [DONE]\n\n").await?;
+                stream.flush().await?;
+                let _ = stream.shutdown().await;
+                println!(
+                    "[fake_sse] 第 1 轮：已发出 tool_calls（call_1 / memory_search / {:?}）",
+                    config.mode
+                );
+                Ok(())
+            } else {
+                // 第二轮（工具结果已回传）：正常说人话
+                println!("[fake_sse] 第 2 轮（body 里有 tool 结果）：返回文本");
+                stream_text(stream, &config, &config.text).await
+            }
+        }
+        Mode::Ok => stream_text(stream, &config, &config.text).await,
+    }
+}
+
+/// 正常 SSE：逐字 delta + 结束帧（带 usage）+ `[DONE]`。
+async fn stream_text(mut stream: TcpStream, config: &Config, text: &str) -> std::io::Result<()> {
+    stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
                 )
                 .await?;
-            stream.flush().await?;
+    stream.flush().await?;
 
-            // 逐字输出（OpenAI Completions 的 delta 形状）
-            for (index, ch) in config.text.chars().enumerate() {
-                let payload = serde_json::json!({
-                    "id": "fake-1",
-                    "object": "chat.completion.chunk",
-                    "model": "fake-model",
-                    "choices": [{ "index": 0, "delta": { "content": ch.to_string() }, "finish_reason": serde_json::Value::Null }]
-                });
-                write_sse(&mut stream, &format!("data: {payload}\n\n")).await?;
-                if index == 0 {
-                    println!("[fake_sse] 已发出第一个 delta（逐字流开始）");
-                }
-                tokio::time::sleep(config.delay).await;
-            }
-            // 结束帧 + usage（模拟 stream_options.include_usage）
-            let finish = serde_json::json!({
-                "id": "fake-1",
-                "object": "chat.completion.chunk",
-                "model": "fake-model",
-                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33 }
-            });
-            write_sse(&mut stream, &format!("data: {finish}\n\n")).await?;
-            write_sse(&mut stream, "data: [DONE]\n\n").await?;
-            stream.flush().await?;
-            println!("[fake_sse] 流结束（usage 已发）");
-            Ok(())
+    // 逐字输出（OpenAI Completions 的 delta 形状）
+    for (index, ch) in text.chars().enumerate() {
+        let payload = serde_json::json!({
+            "id": "fake-1",
+            "object": "chat.completion.chunk",
+            "model": "fake-model",
+            "choices": [{ "index": 0, "delta": { "content": ch.to_string() }, "finish_reason": serde_json::Value::Null }]
+        });
+        write_sse(&mut stream, &format!("data: {payload}\n\n")).await?;
+        if index == 0 {
+            println!("[fake_sse] 已发出第一个 delta（逐字流开始）");
         }
+        tokio::time::sleep(config.delay).await;
     }
+    // 结束帧 + usage（模拟 stream_options.include_usage）
+    let finish = serde_json::json!({
+        "id": "fake-1",
+        "object": "chat.completion.chunk",
+        "model": "fake-model",
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33 }
+    });
+    write_sse(&mut stream, &format!("data: {finish}\n\n")).await?;
+    write_sse(&mut stream, "data: [DONE]\n\n").await?;
+    stream.flush().await?;
+    println!("[fake_sse] 流结束（usage 已发）");
+    Ok(())
 }
 
 async fn write_sse(stream: &mut TcpStream, text: &str) -> std::io::Result<()> {

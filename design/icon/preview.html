@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>云农之窗 · 图标预览</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;background:#0f1115;color:#e7ecf3;font-family:"Segoe UI","Microsoft YaHei UI",system-ui,sans-serif}
+  .wrap{padding:20px 22px 28px}
+  h1{font-size:16px;margin:0 0 3px}
+  .sub{font-size:12px;opacity:.6;margin:0 0 18px}
+  h2{font-size:13px;margin:0 0 9px;color:#9fb0c8}
+  .row{display:flex;gap:14px;margin-bottom:18px;align-items:flex-end}
+  .cell{text-align:center}
+  .cell .cap{font-size:10.5px;opacity:.55;margin-top:6px}
+  .tile-dark{background:#202020;border-radius:10px;padding:12px;display:grid;place-items:center}
+  .tile-light{background:#F3F3F3;border-radius:10px;padding:12px;display:grid;place-items:center}
+  .ladder{display:flex;align-items:flex-end;gap:16px;background:#F3F3F3;border-radius:10px;padding:16px 18px}
+  .ladder.dark{background:#202020}
+  .ladder img{display:block;image-rendering:pixelated}
+  .zooms{display:flex;gap:16px}
+  .zooms .z{background:#F3F3F3;border-radius:10px;padding:10px;text-align:center}
+  .zooms .z .cap{font-size:10.5px;opacity:.6;color:#333;margin-top:6px}
+  .zooms .z.dark{background:#202020}
+  .zooms img{width:132px;height:132px;display:block;image-rendering:pixelated}
+  .bar{display:flex;align-items:center;gap:10px;border-radius:10px;padding:8px 14px;width:520px}
+  .bar.dark{background:#202020}
+  .bar.light{background:#F3F3F3;border:1px solid #E5E5E5}
+  .bar .sep{width:1px;height:22px;background:rgba(128,128,128,.35);margin:0 4px}
+  .bar img.c24{width:24px;height:24px}
+  .bar img.c16{width:16px;height:16px}
+  .legend{font-size:11.5px;opacity:.7;line-height:1.8;margin:0 0 16px}
+  code{font-family:Consolas,monospace;font-size:11px;color:#c9d6ea}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>云农之窗 · 应用图标（三稿）</h1>
+  <p class="sub">真 PNG 渲染（非矢量预览）。深/浅任务栏背景、1:1 尺寸阶梯、16/24/32 最近邻放大都在这一张里。</p>
+
+  <h2>一、三稿 · 深色任务栏 / 浅色任务栏（128px 显示）</h2>
+  <div class="row">
+    <div class="cell"><div class="tile-dark"><img src="v1/icon-128.png" width="128" height="128"></div><div class="cap">V1 窗格 · 深</div></div>
+    <div class="cell"><div class="tile-light"><img src="v1/icon-128.png" width="128" height="128"></div><div class="cap">V1 窗格 · 浅</div></div>
+    <div class="cell"><div class="tile-dark"><img src="v2/icon-128.png" width="128" height="128"></div><div class="cap">V2 田垄 · 深</div></div>
+    <div class="cell"><div class="tile-light"><img src="v2/icon-128.png" width="128" height="128"></div><div class="cap">V2 田垄 · 浅</div></div>
+    <div class="cell"><div class="tile-dark"><img src="v3/icon-128.png" width="128" height="128"></div><div class="cap">V3 墨瓦 · 深</div></div>
+    <div class="cell"><div class="tile-light"><img src="v3/icon-128.png" width="128" height="128"></div><div class="cap">V3 墨瓦 · 浅</div></div>
+  </div>
+
+  <h2>二、尺寸阶梯（1:1 实际像素，上：浅底；下：深底）</h2>
+  <div class="ladder" style="margin-bottom:10px">
+    <img src="v1/icon-16.png" width="16" height="16"><img src="v1/icon-24.png" width="24" height="24">
+    <img src="v1/icon-32.png" width="32" height="32"><img src="v1/icon-48.png" width="48" height="48">
+    <img src="v1/icon-64.png" width="64" height="64"><img src="v1/icon-128.png" width="128" height="128">
+    <img src="v1/icon-256.png" width="256" height="256">
+  </div>
+  <div class="ladder dark">
+    <img src="v1/icon-16.png" width="16" height="16"><img src="v1/icon-24.png" width="24" height="24">
+    <img src="v1/icon-32.png" width="32" height="32"><img src="v1/icon-48.png" width="48" height="48">
+    <img src="v1/icon-64.png" width="64" height="64"><img src="v1/icon-128.png" width="128" height="128">
+    <img src="v1/icon-256.png" width="256" height="256">
+  </div>
+
+  <h2>三、小尺寸放大（16 / 24 / 32，最近邻 ×12 —— 看能不能认出"窗格"）</h2>
+  <div class="zooms">
+    <div class="z"><img src="v1/zoom-16.png"><div class="cap">V1 · 16</div></div>
+    <div class="z"><img src="v1/zoom-24.png"><div class="cap">V1 · 24</div></div>
+    <div class="z"><img src="v1/zoom-32.png"><div class="cap">V1 · 32</div></div>
+    <div class="z dark"><img src="v1/zoom-16.png"></div>
+    <div class="z dark"><img src="v1/zoom-24.png"></div>
+    <div class="z dark"><img src="v1/zoom-32.png"></div>
+  </div>
+  <p class="legend">V1 在 16px 下仍能看出：外框 + 十字窗棂 + 一格填色。V2 在 16px 下退化为"三条横带"，辨识度低于 V1；V3 是负形（墨底亮窗），深色任务栏上更稳，但浅色任务栏上会成一块重色方块。</p>
+
+  <h2>四、任务栏模拟（24px 与 16px 实际大小）</h2>
+  <div class="row">
+    <div class="bar dark">
+      <span style="color:#eee;font:12px/1 'Segoe UI'">⊞</span>
+      <img class="c24" src="v1/icon-24.png"><img class="c16" src="v1/icon-16.png">
+      <div class="sep"></div>
+      <img class="c24" src="v1/icon-24.png"><span style="color:#bbb;font:12px/1 'Segoe UI'">云农之窗</span>
+    </div>
+    <div class="bar light">
+      <span style="color:#222;font:12px/1 'Segoe UI'">⊞</span>
+      <img class="c24" src="v1/icon-24.png"><img class="c16" src="v1/icon-16.png">
+      <div class="sep"></div>
+      <img class="c24" src="v1/icon-24.png"><span style="color:#333;font:12px/1 'Segoe UI'">云农之窗</span>
+    </div>
+  </div>
+
+  <h2>五、Android 自适应图标（432 前景 + 背景）</h2>
+  <div class="row">
+    <div class="cell"><div class="tile-light" style="padding:0"><img src="android-background-432.png" width="144" height="144"></div><div class="cap">背景层 #FAF9F5</div></div>
+    <div class="cell"><div class="tile-dark" style="padding:0;background:repeating-conic-gradient(#2a2a2a 0% 25%, #333 0% 50%) 0 0/16px 16px">
+      <img src="android-foreground-432.png" width="144" height="144"></div><div class="cap">前景层（透明，安全区内）</div></div>
+    <div class="cell"><div class="tile-light" style="padding:0;background:#FAF9F5;position:relative">
+      <img src="android-background-432.png" width="144" height="144">
+      <img src="android-foreground-432.png" width="144" height="144" style="position:absolute;left:0;top:0"></div>
+      <div class="cap">合成效果（圆形遮罩内可见）</div></div>
+  </div>
+</div>
+</body>
+</html>

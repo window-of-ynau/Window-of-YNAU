@@ -93,6 +93,43 @@ curl http://127.0.0.1:8080/healthz
 - 容器内监听地址由 compose 固定为 `YUNONG_BIND=0.0.0.0:8080`（默认 `127.0.0.1` 会让端口映射进来的流量失效）；
 - **升级必须先跑迁移再起新二进制**：启动时会校验 `usage_samples` 是否具备 `turn_id`/`estimated`，缺失直接拒绝启动并提示执行 `migrations/0003_usage_turn_estimated.sql`；
 - 数据库不映射端口，只在 compose 内网可达。
+## 3.2 密钥扫描：禁止写真实密钥
+
+**铁律：代码、测试、文档、示例、提交信息里都不许出现真实密钥/令牌/带密码的 DSN。**
+示例一律用 `sk-test-` 开头（扫描器对这个前缀放行），例如
+`sk-test-0123456789abcdef0123456789abcdef`。
+
+这条不是建议：owner 的真实 API Key 曾被写进测试代码并推到 GitHub（已吊销 + 脱敏，留档在
+`deploy/README.md` 的"密钥泄露防护"一节）。现在有双保险：
+
+| 时机 | 工具 | 行为 |
+|---|---|---|
+| 提交前 | `.git/hooks/pre-commit` → `scripts/secret-scan.py --staged` | 命中即**拒绝提交** |
+| PR / push main | CI `密钥扫描（secret scanning）` job → `scripts/secret-scan.py --all` | 命中即红 |
+
+**一次性安装钩子**（每台开发机装一次，规则跟着仓库走，别手抄第二份）：
+
+```bash
+bash scripts/install-hooks.sh                 # Linux / macOS / Git Bash
+powershell -File scripts/install-hooks.ps1    # Windows PowerShell
+```
+
+规则（与 `scripts/secret-scan.py` 头部注释同一份）：
+
+| 规则 | 匹配 | 说明 |
+|---|---|---|
+| `sk-api-key` | `sk-` + ≥20 位字母数字 | **`sk-test-` 前缀放行**（示例值必须用它） |
+| `aws-access-key` | `AKIA` + 16 位 | AWS Access Key ID |
+| `github-token` | `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` + ≥20 位 | GitHub token |
+| `private-key` | `-----BEGIN … PRIVATE KEY-----` | 私钥块 |
+| `dsn-with-password` | `postgres://user:<≥16 位密码>@` 等 | 短口令（本地/CI 示例）不拦 |
+
+**误报**：`ALLOW_SECRET=1 git commit -m "..."`（会打 `::warning::`，别当习惯）。
+长期误报请改写示例，而不是常开这个开关。
+
+**真泄露了**：① 立刻去厂商控制台吊销/轮换；② 脱敏并清理历史；③ 在
+`deploy/README.md` 的"密钥泄露防护"一节留档（时间 / 影响 / 处置）。
+
 ## 4. PR 要求
 
 - PR 描述请用仓库模板：变更说明 / 关联 ADR 或 issue / 验证方式 / 是否影响 `shared` / 自检清单。

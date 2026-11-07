@@ -51,6 +51,11 @@ done
 注意：
 
 - 顺序执行，别打乱；`CREATE EXTENSION vector` 需要超级用户，compose 里的 `POSTGRES_USER`（yunong）是超级用户，够用。
+- **`-1`（单事务）不能去掉**：迁移里有 `DROP CONSTRAINT → ADD CONSTRAINT` 这类顺序敏感的 DDL。
+- **`-1` 只能加在 `-f`（整份迁移文件）上**：`psql -1 -c "CREATE DATABASE ..."` 会报 `cannot run inside a transaction block`——`CREATE DATABASE` 不能在事务块里跑。CI 的迁移 job 里，前缀只带 `-v ON_ERROR_STOP=1`，`-1` 只加在文件级 `psql -f`（t81/M2 的真实教训，别统一加）。
+  非单事务时，ADD 失败而 DROP 已提交，等于**把约束永久删掉**（RAG 的 `rag_candidates_status_check`
+  就踩过这个坑：库里存在 `status='fetching'` 的行时重跑会让约束丢失）。
+  加 `-1` 后每份迁移要么全生效、要么全回滚。
 - 重跑前确认 SQL 幂等（`IF NOT EXISTS` / 迁移记录表）；非幂等的迁移重复执行会报错，别用 `ON_ERROR_STOP=0` 硬吞。
 - 如果宿主机已经装了 `psql`，也可以直接连——但默认没发布 5432，需要临时在 compose 里映射或用 `docker compose exec`。映射之后就是常规写法：
 
@@ -62,6 +67,35 @@ done
 
 - 服务端若自带启动迁移，以它为准；当前按设计由部署方执行（服务端只管运行期查询）。
 
+## RAG 抓取 worker 的运维开关
+
+抓取默认**关闭**（`RAG_FETCH_ENABLED=false`）：CI 与离线环境都不允许联网抓取。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `RAG_FETCH_ENABLED` | `false` | 打开后每 6 小时跑一轮（只处理 `pending`） |
+| `RAG_FETCH_TOP_N` | `100` | 每轮按 `count` 取前 N 条 |
+| `RAG_FETCH_RETRIES` | `3` | 单条重试次数（总计 `retries+1` 次） |
+| `RAG_FETCH_MIN_INTERVAL_MS` | `1000` | 两次抓取之间的最小间隔（对 arXiv 礼貌访问） |
+| `RAG_FETCH_TIMEOUT_SECS` | `10` | 单次 HTTP 超时 |
+| `RAG_FETCH_STALE_AFTER_SECS` | `1800` | `fetching` 占位多久算"上个 worker 崩了"，可被下一轮回收 |
+| `RAG_FETCH_MAX_BODY_BYTES` | `2097152` | 正文字节上限；超过判失败（不落库） |
+| `RAG_FETCH_DOI_ALLOWED_HOSTS` | 见 `crates/server/src/config.rs` 的 `DEFAULT_DOI_HOSTS` | DOI 抓取允许跟随的重定向域名白名单 |
+| `RAG_FETCH_RETRY_FAILED` | `false` | **重试失败项**：设为 `true` 后本轮把 `status='failed'` 的候选也纳入 |
+| `RAG_REPORT_PER_MIN` | `30` | `/api/v1/rag/referrals` 每账号每分钟上限（0 = 关闭） |
+
+**怎么重试失败项**：把 `RAG_FETCH_RETRY_FAILED=true` 写进 `deploy/.env` 并重启 `server`，
+下一轮（或手动触发一轮）会把本月 `failed` 的候选重新抓一遍；**确认恢复后记得改回 `false`**，
+否则失败项会被无限重试（每 6 小时一轮）。
+
+**怎么看待 DOI 重定向**：`doi.org` 是 302 跳到出版商，不跟随则 DOI 源完全不可用。
+抓取器只在 `RAG_FETCH_DOI_ALLOWED_HOSTS` 白名单内跟随（最多 5 跳、只允许 https、拒绝私网地址）。
+这与上游模型 API 的"完全不跟随重定向"不冲突——那是我们自己配置的地址，这是抓外网公开资源，风险模型不同。
+
+**不上白名单的源**：`application/pdf` 等二进制内容直接判失败不落库（我们不解析 PDF）。
+正文按"去标签 + 解实体 + 折叠空白"粗清洗后写入 `rag_known_docs.doc_text`（上限 20 万字符），
+正式清洗管线（去导航/分节/引用解析）另排期。
+
 ## 冒烟验证
 
 ```bash
@@ -71,7 +105,7 @@ curl -sS http://127.0.0.1:8080/readyz        # DB 可用 + 上游配置存在才
 # SSE 流式接口（-N 关掉 curl 自己的缓冲；带鉴权的环境补 -H 'Authorization: Bearer ...'）
 curl -N -X POST http://127.0.0.1:8080/api/v1/chat/stream \
   -H 'Content-Type: application/json' \
-  -d '{"session_id":"s_demo","turn_id":"t_demo","round":1,"model":"deepseek-chat","protocol":"openai_completions","messages":[{"role":"user","content":"下周三下午有课吗"}],"tools":[],"max_output_tokens":512,"stream":true,"estimated_input_tokens":16}'
+  -d '{"session_id":"s_demo","turn_id":"t_demo","round":1,"model":"deepseek-flash","protocol":"openai_completions","messages":[{"role":"user","content":"下周三下午有课吗"}],"tools":[],"max_output_tokens":512,"stream":true,"estimated_input_tokens":16}'
 ```
 
 期望看到 `event: meta` → `delta` → `usage` → `done`；异常是 `event: error` 且带 `code`。想看量化指标直接跑 `python bench/run.py`。
@@ -140,6 +174,8 @@ server {
 
 ```bash
 bash scripts/docker-smoke.sh yunong-server:ci   # 或任意本地镜像 tag
+# 注意：冒烟会断言 org.opencontainers.image.revision 是 40 位 commit，
+# 本地构建镜像时要传 --build-arg GIT_SHA=$(git rev-parse HEAD)
 ```
 
 ## 发布流程（版本标签与产物）
@@ -150,8 +186,9 @@ bash scripts/docker-smoke.sh yunong-server:ci   # 或任意本地镜像 tag
 # 1. 确认 main 上 CI 全绿（rust / flutter / docs / migrations / pg / docker 六个 job）
 gh run list --branch main --limit 3
 
-# 2. 版本号对齐：tag vX.Y.Z 必须等于 Cargo.toml 的 [workspace.package].version
-#    （workflow 会校验，不一致直接红）app/pubspec.yaml 的版本前缀建议同步，不一致只 warning
+# 2. 版本号三处对齐：git tag vX.Y.Z == Cargo.toml 的 [workspace.package].version
+#    == app/pubspec.yaml 的 version 前缀。release workflow 的 version-check job 会硬校验，
+#    不一致直接红（安装包版本由 Cargo.toml 推导、APK 由 pubspec 推导，所以卡这里等于卡住四个产物）
 grep -A2 '\[workspace.package\]' Cargo.toml
 grep '^version:' app/pubspec.yaml
 
@@ -166,8 +203,109 @@ git push origin v0.1.0
 | 服务端镜像 | `ghcr.io/<owner>/yunong-server:vX.Y.Z` 与 `:latest` | 多阶段构建、非 root、只含二进制 + CA 证书；**冒烟通过后才推送** |
 | Android APK | Actions artifact `yunong-apk-vX.Y.Z` | 4 个签名 secret 齐备才出 release 包，否则降级 debug 并在日志里 `::warning::` |
 | APK 校验和 | 同一 artifact 里的 `SHA256SUMS` | 下载后 `sha256sum -c SHA256SUMS` 验证 |
+| **Windows 安装包** | `WindowOfYNAU-vX.Y.Z-setup.exe`（Actions artifact + Release asset） | Inno Setup 6 构建；安装 `yunong.exe` + `yunong_core.dll` + `flutter_windows.dll` + `data\`（DLL 必须与 exe 同目录） |
+
+### Windows 安装包（Inno Setup）
+
+选 **Inno Setup 6** 而不是 WiX：单文件 `.iss` + 一条 `ISCC` 命令就能进 CI（`choco install innosetup -y`），
+中文界面、开始菜单/可选桌面快捷方式、卸载程序都是声明式配置；而"卸载时保留用户数据并提示位置"
+需要写一小段 Pascal 回调，Inno 的 `CurUninstallStepChanged` 三行就够了，WiX 那边要额外自定义 Action。
+对本项目的桌面端规模，WiX 的 `.wxs/.wixproj` + Toolset 版本矩阵不划算。
+
+```bash
+# 本机打安装包（先构建 exe + DLL，再过护栏 → 白名单暂存 → ISCC）
+pwsh scripts/build-windows-installer.ps1 -Version 0.9.0
+# 产物：dist/WindowOfYNAU-0.9.0-setup.exe + dist/SHA256SUMS
+```
+
+**⚠️ 不要直接对 `app/build/windows/x64/runner/Release/` 打整包**——这是 2026-11 真实发生过的事故：
+在 Release 目录里跑过一次 App 之后，WebView2 会在 exe 同级生成 `yunong.exe.WebView2/EBWebView/`，
+里面有**本机保存的 Cookie 与 Login Data**（校方会话、登录凭据）。t154 之前的 `.iss` 用
+`{SourceDir}\*` 通配打包，把这些用户数据一起打进了发布安装包。
+
+现在打包脚本是**白名单模式**，顺序是：
+
+1. `scripts/build-windows-app.ps1` 构建 `yunong.exe` + `yunong_core.dll` + Flutter 产物；
+2. **护栏 A**：扫 Release 目录，出现 `*.WebView2` / `EBWebView` / `*.db` / `secrets` / `*.pdb` / `.env` / `*.jks` 直接失败并列出路径；
+3. **白名单暂存** `build/installer-staging/`：只复制 `yunong.exe`、`yunong_core.dll`、`flutter_windows.dll`、`flutter_inappwebview_windows_plugin.dll`、`WebView2Loader.dll`、`native_assets.json`（可选）与 `data\`（排除 db/secrets/.env/pdb）；
+4. ISCC 只对暂存目录编译（`.iss` 里另带 `Excludes` 作第二道保险）；
+5. **护栏 C**：安装包 ≥ 40 MB 直接失败（异常增大通常意味着混进了用户数据/调试符号）；
+6. **护栏 D**：比对 `setup.exe` 与 `yunong.exe` 的图标 SHA256，确认安装向导用的是应用图标而不是 Inno 默认图标。
+
+发布流水线里还有 **护栏 B**：静默安装到临时目录后复查安装目录里没有 `.WebView2` / `*.db` / `secrets`，
+再断言卸载后 `%LOCALAPPDATA%\yunong` 仍保留。
+
+**前置**：本机需要 **Inno Setup 6**（`winget install JRSoftware.InnoSetup`）。脚本会先查注册表里的
+`InstallLocation` 定位 `ISCC.exe`，再回退到常见安装路径——不再依赖硬编码目录（本机它就装在
+`D:\Program Files\Inno Setup 6`）。找不到时脚本会给出安装提示。
+
+- **未签名**：暂无代码签名证书。用户首次运行会看到 SmartScreen"Windows 已保护你的电脑"，
+  处理方式：点 **更多信息 → 仍要运行**（发布说明里也要写这句）。拿到证书后把 `signtool` 加进
+  `scripts/build-windows-installer.ps1` 的步骤 5 之前即可，`.iss` 不用改。
+- **用户数据不随卸载删除**：安装目录删干净，但 `%LOCALAPPDATA%\yunong`（SQLite 课表库、记忆/凭据的
+  DPAPI 密文、设置）保留；卸载完成页会弹出该路径。要彻底清除只能手动删目录——这是有意的，
+  卸载不该毁掉用户数据。
+- CI 里除了构建，还会做一次**从零安装验证**：静默装到临时目录 → 断言 `yunong.exe`、`yunong_core.dll`、
+  `flutter_windows.dll`、`data\` 都在 → 静默卸载 → 断言 `%LOCALAPPDATA%\yunong` 未被删。
+
+### Android 签名 APK（配好 4 个 Secrets 即可用）
+
+CI 的 `android` job 有两种模式，日志里会明确打印走了哪条：
+
+- 有 `KEYSTORE_BASE64` → `using release keystore (KEYSTORE_BASE64 已配置, alias=…)`，产出正式签名 APK；
+- 没有 → `fallback to debug signing (secrets missing)` + `::warning::`，只产出 debug APK（可在测试机侧载，**不可发布**）。
+
+护栏：如果配了 Secrets 但 APK 仍由 debug keystore 签名（`apksigner --print-certs` 里出现 `CN=Android Debug`），
+job **直接失败**——防止"以为签了其实没签"。想不打包 tag 也验证这条链路：
+
+```bash
+gh workflow run release --ref main -f dry_run=true -f build_android=true
+```
+
+**owner 要做四步**（一次性）：
+
+```bash
+# 1. 生成 upload keystore（口令自己定；有效期 10000 天 ≈ 27 年）
+keytool -genkeypair -v -keystore upload-keystore.jks -keyalg RSA -keysize 2048 \
+  -validity 10000 -alias upload -storetype JKS
+
+# 2. base64 编码（Linux/macOS；Windows 用 pwsh 的 [Convert]::ToBase64String 或 certutil -encode）
+base64 -w0 upload-keystore.jks > keystore.b64
+
+# 3. 写入 4 个 GitHub Secrets
+gh secret set KEYSTORE_BASE64   --body "$(cat keystore.b64)"
+gh secret set KEYSTORE_PASSWORD --body '<store password>'
+gh secret set KEY_ALIAS         --body 'upload'
+gh secret set KEY_PASSWORD      --body '<key password>'
+
+# 4. 立刻删掉本地副本
+rm -f keystore.b64 upload-keystore.jks
+```
+
+**验证方式**：跑 `gh workflow run release --ref main -f dry_run=true -f build_android=true`，
+日志里应看到 `using release keystore` 与 `OK：APK 由 release keystore 签名（非 Android Debug）`；
+本地可用 `apksigner verify --print-certs app-release.apk` 看证书 DN。
+
+**keystore 绝不能提交进仓库**（`.gitignore` 已覆盖 `*.jks` / `*.keystore` / `app/android/key.properties`）。
+**丢失 keystore 的后果**：已发布到应用商店/分发的 APK 无法再更新——包名不变时 Android 要求新包用**同一签名**
+（否则用户必须先卸载、数据全丢）。所以 keystore 与两个口令要离线备份（密码管理器 + 加密备份各一份）。
+
+### 干跑发布流水线
+
+```bash
+# 不推 GHCR、不打 Release，只验证四个 job 能跑通（含 Windows 安装包的装/卸闭环）
+gh workflow run release --ref main -f dry_run=true
+gh run watch <run-id>
+```
 
 **镜像先冒烟后推送**：构建只 load 到 runner 本地 → `scripts/docker-smoke.sh` 起容器探 `/healthz`、`/readyz`、检查二进制 ≥2MB 与 uid=10001 → 全过才 `docker push`。坏镜像不会进 GHCR，也不会顶掉 `:latest`。
+
+**镜像自带你需要的元数据（OCI labels）**：`org.opencontainers.image.revision` = 构建时的 commit（CI / release 传 `--build-arg GIT_SHA=${{ github.sha }}`），另有 `created` / `version` / `source` / `title` / `licenses`。排查线上"这容器跑的是哪个提交"时：
+
+```bash
+docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/<owner>/yunong-server:vX.Y.Z
+# 输出 40 位 commit sha；scripts/docker-smoke.sh 也会断言它非空且长度 40
+```
 
 **干跑**（验证发布流水线本身，不推送 GHCR）：
 
@@ -182,13 +320,85 @@ gh run watch
 
 | 约束 | 为什么 |
 |---|---|
-| `ci.yml` 各 job 的 `name:` = 分支保护的必需检查名 | 改名等于静默取消保护。当前必需：`Rust（fmt / clippy / test）`、`Flutter（analyze / test）`、`文档（表格 / 相对链接）`、`迁移脚本（PG16 + pgvector）`、`PostgreSQL（auth 真实 SQL 集成测试）`。改名前先 `gh api repos/<owner>/<repo>/branches/main/protection` 看现状，改完同步更新 required checks |
+| `ci.yml` 各 job 的 `name:` = 分支保护的必需检查名 | 改名等于静默取消保护。当前必需（9 个）：`Rust（fmt / clippy / test）`、`Flutter（analyze / test）`、`文档（表格 / 相对链接）`、`迁移脚本（PG16 + pgvector）`、`PostgreSQL（auth 真实 SQL 集成测试）`、`服务端镜像（build + /healthz 冒烟）`、`端到端对话闭环（mock 上游）`、`密钥扫描（secret scanning）`、`依赖安全与许可证（cargo-deny）`。改名前先 `gh api repos/<owner>/<repo>/branches/main/protection` 看现状，改完同步更新 required checks |
 | 迁移按文件名 glob **全量**跑（0001 → 最后一个） | 只跑部分文件会漏后加的表/索引；`migrations` 与 `pg` 两个 job 都必须全量 |
 | `persist-credentials: false` 保持 | 不把 token 写进 `.git/config`；需要凭据的步骤（GHCR 登录）单独用 `GITHUB_TOKEN` |
 | `release.yml` 是唯一提权 workflow（`packages: write`） | 不要在 `ci.yml` 里加 `packages: write` / `contents: write` |
 | 镜像冒烟只有一份实现：`scripts/docker-smoke.sh` | CI 的 docker job 与 release 的发布前检查共用，改断言只改一处 |
-| `docker` / `security` job 暂不在必需检查里 | 先观察耗时与稳定性；稳定后再用 `gh api` 一次性加入 required checks（加之前它们只报警、不阻塞合入） |
+| `security`（cargo-deny）job 已是必需检查 | 连续多次绿后（t69）加入；依赖升级 / 新增依赖后若红，先看 `deny.toml` 白名单与 `cargo deny check advisories` 输出 |
 | PG 用例不并行加锁（不要 `--test-threads=1`） | 每条用例用独立 schema（`yunong_pg_<uuid>`）隔离，并行是安全的；单线程只会白白变慢 |
+
+## 端到端闭环（无凭据）
+
+CI 的 `e2e` job（`端到端对话闭环（mock 上游）`）验证的是"**用户能完成一次对话**"，而不是"各组件单测过了"：
+
+```
+mock 上游(假 SSE) ← 服务端容器 ← 脚本客户端（注册 → 登录 → /api/v1/chat/stream）
+```
+
+**不需要任何真实账号或 Key**：mock 上游不校验 Key；用户在测试里现注册现登录。
+
+- 编排脚本：`scripts/e2e-chat.py`（docker + python3 stdlib，无需 psql——迁移和断言都走 pgvector 镜像里的 psql）；
+- mock 上游：`scripts/mock-upstream/mock_upstream.py`，按请求体里的 `model` 选形态：
+  `mock-ok`（正常流）、`mock-500`、`mock-html`（非 SSE）、`mock-hang`（挂起）、`mock-stream-error`（流内错误帧）；
+- 覆盖的断言：正常流契约（`meta` 首 / `usage` / `done` 末且唯一）、上游 500 → 502 **不泄露原文**、
+  非 SSE → 502、流内错误帧 → `event: error`（终止事件）且洗掉厂商原文、首事件超时 → 504、
+  100% 抽样时 `usage_samples` 落 1 行且 token 数与 mock 一致、上游失败写 `audit_logs(decision='error')`。
+
+本地复现（需要 Docker，Windows/macOS/Linux 都行；容器通过 `host.docker.internal` 访问本机 mock）：
+
+> mock 必须监听 `0.0.0.0`：Linux runner 上容器里的 `host.docker.internal` 是 docker 网关 IP，
+> 只绑 `127.0.0.1` 时 CI 连不上（本机 Docker Desktop 会做转发，所以只在 CI 暴露过）。脚本已经这么传参。
+
+```bash
+docker build -f deploy/Dockerfile.server \
+  --build-arg GIT_SHA=$(git rev-parse HEAD) \
+  -t yunong-server:ci .
+python3 scripts/e2e-chat.py --image yunong-server:ci
+# 失败时保留容器排查：python3 scripts/e2e-chat.py --image yunong-server:ci --keep
+```
+
+**当前节奏**：该 job 带 `continue-on-error: true`，先观察 3~5 个 PR，稳定后删掉这行转阻断，
+最后再与其他非必需 job 一起用 `gh api` 加进分支保护。
+
+### 两个"假上游"的分工（别合并，也别互相替代）
+
+| 工具 | 用途 | 谁用 |
+|---|---|---|
+| `crates/core/examples/fake_sse.rs` | **端侧 BYOK 手动联调**（Dart/Flutter 发真实请求，看逐字输出） | 开发者本机 |
+| `scripts/mock-upstream/mock_upstream.py` | **CI 服务端 E2E**（6 种场景、容器网络、psql 断言） | CI |
+
+`fake_sse` 只有 ok/429/html 三种形态、没有"流内错误帧"和"挂起"，覆盖不了 `event: error`
+与超时路径；CI 闭环用 `scripts/mock-upstream/` 这份。两者是**不同层面的测试替身**，
+不是重复实现——断言逻辑只写在 `scripts/e2e-chat.py` 一处。
+
+## 密钥泄露防护（secret scanning）
+
+**事故留档（2026-11）**：owner 的真实 API Key 曾被写进测试代码并推到 GitHub。处置：立即吊销并换新 Key → 脱敏（示例值统一改成 `sk-test-…`）→ 加下面这道闸。影响面：该 Key 在泄露窗口内可被任意人使用，需按"已泄露"看待（吊销是唯一正确的收尾），不是改代码就能当没发生。
+
+**现在的双保险**（规则只有一份：`scripts/secret-scan.py`）：
+
+| 时机 | 触发 | 行为 |
+|---|---|---|
+| 提交前 | `.git/hooks/pre-commit` → `scripts/secret-scan.py --staged` | 命中即**拒绝提交** |
+| PR / push main | CI `密钥扫描（secret scanning）` job → `scripts/secret-scan.py --all` | 命中即红（当前阶段 1 `continue-on-error`，观察 3~5 个 PR 后转阻断） |
+
+**每台开发机装一次钩子**：
+
+```bash
+bash scripts/install-hooks.sh                 # Linux / macOS / Git Bash
+powershell -File scripts/install-hooks.ps1    # Windows PowerShell
+```
+
+规则：`sk-` + ≥20 位（**`sk-test-` 前缀放行**）、`AKIA`+16 位、`gh[pousr]_`+≥20 位、
+`-----BEGIN … PRIVATE KEY-----`、带 ≥16 位密码的 DSN。误报用 `ALLOW_SECRET=1 git commit …`
+放行一次（会打 `::warning::`），长期误报请改写示例而不是常开这个开关。
+
+**fail-open**：钩子发现 `scripts/secret-scan.py` 不存在（切到旧分支、脚本还没合入）时只警告并放行，不会把提交卡死——这条是踩过的坑，别改成硬失败。
+
+**为什么不用 gitleaks**：gitleaks 规则更全，但要额外引一个 action / 二进制；本项目当前
+只需要"拦住我们实际踩过的那几类"（尤其 `sk-` 前缀），轻量正则 + 一份脚本就能同时服务
+CI 与 pre-commit，且**离线可跑、规则可读**。等规则明显不够用时再换。
 
 ## 依赖安全与许可证（cargo-deny）
 

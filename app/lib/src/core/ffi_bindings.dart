@@ -248,6 +248,105 @@ class CoreLibrary implements CoreApi {
 }
 
 /// 核心 DLL 加载失败（打包缺文件 / 架构不匹配）。
+/// 【t165】端侧核心的**可显示状态**（设置页「关于」常驻一行）。
+///
+/// owner 反馈"v0.9 没有『端侧核心已就绪』"：加载失败时只有一条黄色横幅，
+/// 看不到失败原因（哪个路径、什么错误）。这里把 dlopen 的真实过程记下来。
+class CoreStatus {
+  const CoreStatus._({required this.ok, required this.detail, this.sizeBytes, this.version});
+
+  /// 测试用构造（不触发真实 dlopen）。
+  const CoreStatus.testOnly({
+    required this.ok,
+    required this.detail,
+    this.sizeBytes,
+    this.version,
+  });
+
+  /// 是否加载成功。
+  final bool ok;
+
+  /// 失败原因（含每个尝试过的路径与 `dlerror` 文本）；成功时是简短说明。
+  final String detail;
+
+  /// 库文件大小（能 stat 到时才有；Android 上可能取不到）。
+  final int? sizeBytes;
+
+  /// 核心导出的版本字符串（成功时才有）。
+  final String? version;
+
+  static CoreStatus? _latest;
+
+  /// 最近一次探测结果（未探测过返回 null）。
+  static CoreStatus? get latest => _latest;
+
+  /// 测试/启动时注入。
+  static set debugLatest(CoreStatus? value) => _latest = value;
+
+  /// 探测一次（只做 dlopen + 版本，不建表、不读业务数据）。
+  static CoreStatus probe() {
+    final List<String> candidates = CoreLibrary._candidates();
+    try {
+      final CoreLibrary library = CoreLibrary.instance();
+      String? version;
+      try {
+        version = library.version;
+      } on Object {
+        version = null;
+      }
+      int? size;
+      for (final String path in candidates) {
+        try {
+          final File file = File(path);
+          if (file.existsSync()) {
+            size = file.lengthSync();
+            break;
+          }
+        } on Object {
+          // 路径不是文件（如纯文件名交给系统搜索）→ 跳过大小探测
+        }
+      }
+      final CoreStatus status = CoreStatus._(
+        ok: true,
+        detail: version == null ? '已就绪' : '已就绪（yunong_core $version）',
+        sizeBytes: size,
+        version: version,
+      );
+      _latest = status;
+      return status;
+    } on CoreUnavailable catch (failure) {
+      final CoreStatus status = CoreStatus._(
+        ok: false,
+        detail: '未加载（尝试过：${candidates.join(' / ')}；错误：${failure.detail}）',
+      );
+      _latest = status;
+      return status;
+    } on Object catch (failure) {
+      final CoreStatus status = CoreStatus._(
+        ok: false,
+        detail: '未加载（尝试过：${candidates.join(' / ')}；错误：${failure.runtimeType}: $failure）',
+      );
+      _latest = status;
+      return status;
+    }
+  }
+
+  /// 设置页/关于页显示的一行文案。
+  String get label {
+    if (!ok) {
+      return '端侧核心：$detail';
+    }
+    final int? bytes = sizeBytes;
+    if (bytes == null) {
+      return '端侧核心：$detail';
+    }
+    final String size = bytes >= 1024 * 1024
+        ? '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB'
+        : '${(bytes / 1024).toStringAsFixed(0)} KB';
+    return '端侧核心：已就绪（yunong_core $size）';
+  }
+}
+
 class CoreUnavailable implements Exception {
   const CoreUnavailable(this.detail);
 

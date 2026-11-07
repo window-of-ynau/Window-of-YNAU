@@ -65,6 +65,15 @@ if [ "$size" -lt 2000000 ]; then
   exit 1
 fi
 
+echo "== 1.5) 镜像自带 revision 标签（能回答"容器跑的是哪个提交"）"
+revision=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image" 2>/dev/null || true)
+echo "image_revision=${revision:-<empty>}"
+if [ "${#revision}" -ne 40 ]; then
+  echo "::error::镜像缺 org.opencontainers.image.revision（当前 '${revision:-<empty>}'，应 40 位 commit）"
+  echo "         构建时请传：--build-arg GIT_SHA=\$(git rev-parse HEAD)"
+  exit 1
+fi
+
 echo "== 2) 非 root 运行（Dockerfile 约定 uid/gid=10001）"
 uid=$(docker run --rm --entrypoint /bin/sh "$image" -c 'id -u') || uid=""
 echo "uid=$uid"

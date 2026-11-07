@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- t159：Android 8.0+ 自适应图标。
+     前景 = design/icon/android-foreground-432.png（透明，标记落在中心安全区）
+     背景 = design/icon/android-background-432.png（纸色 #FAF9F5）
+     两层都用 drawable-nodpi（432 画布不随密度缩放），由系统按 safe zone 裁切。 -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

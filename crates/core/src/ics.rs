@@ -260,7 +260,12 @@ mod tests {
         assert_eq!(report.events, 15);
         let text = read(&out);
         // 第 9 周周三 = 2026-11-04 必须缺席；第 10 周周三 = 2026-11-11 在场
-        assert!(!text.contains("20261104"), "第 9 周不该有事件：{text}");
+        // 只断言"事件起始日期"——直接 `contains("20261104")` 会被 `DTSTAMP`（导出当天）
+        // 误伤：2026-11-04 这天跑测试就会红（真实踩过）
+        assert!(
+            !text.contains("DTSTART;VALUE=DATE:20261104"),
+            "第 9 周不该有事件：{text}"
+        );
         assert!(text.contains("DTSTART;VALUE=DATE:20261111"), "{text}");
         assert_ics_shape(&text);
     }

@@ -9,21 +9,33 @@
 
 #![deny(unsafe_code)]
 
+pub mod auth;
+pub mod backfill;
 pub mod calendar;
 pub mod chat_ffi;
+pub mod compact;
 pub mod context;
 pub mod error;
 pub mod gateway;
 pub mod ics;
 pub mod index;
 pub mod keystore;
+pub mod local_search;
 pub mod memory;
 pub mod memory_items;
+pub mod memory_ref;
 pub mod parse;
+pub mod protocol_pick;
 pub mod protocols;
+pub mod providers;
 pub mod schedule;
+pub mod search;
 pub mod secret;
 pub mod store;
+pub mod titlebar;
+pub mod tool_choice;
+pub mod tool_events;
+pub mod tool_loop;
 pub mod tools;
 
 pub use error::{CoreError, CoreResult};
@@ -41,7 +53,15 @@ pub fn version() -> &'static str {
 
 /// 常用导入。
 pub mod prelude {
+    pub use crate::auth::{
+        refresh_blocking, refresh_with, AuthRefreshError, RefreshTimeouts, Refreshed, ACCESS_KEY,
+        REFRESH_KEY,
+    };
     pub use crate::calendar::{parse_term_start, parse_weeks, Course, IcsEvent};
+    pub use crate::compact::{
+        compact, pressure_tokens, retain_tokens, should_compact, should_compact_on_model_switch,
+        summarize, CompactConfig, Outcome, Plan as CompactPlan, Summary, Trigger,
+    };
     pub use crate::context::{estimate_tokens, plan_compaction, should_compress, CompactionPlan};
     pub use crate::error::{CoreError, CoreResult};
     pub use crate::gateway::{
@@ -51,6 +71,10 @@ pub mod prelude {
     pub use crate::ics::{build_events, export_term_ics, IcsExport};
     pub use crate::index::{Bm25Index, LocalIndex, SearchHit};
     pub use crate::keystore::{SecretKind, SecretStore};
+    pub use crate::local_search::{
+        SearchDoc, SearchResult, SearchStats, SearchStore, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT,
+        SNIPPET_RADIUS,
+    };
     pub use crate::memory::{Blob, BlobKind, MemoryStore, Message};
     pub use crate::memory_items::{
         MemoryDraft, MemoryItem, MemoryItemStore, MemoryKind, MemoryWrite,
@@ -61,5 +85,7 @@ pub mod prelude {
         compress_weeks, merge, MergedSchedule, SchedulePayload, WeekPayload,
     };
     pub use crate::store::{CourseStore, ImportOutcome, StoredCourse, TermRecord};
+    pub use crate::titlebar::{set_dark as set_titlebar_dark, TitlebarError, TitlebarReport};
+    pub use crate::tool_loop::{run as run_tool_loop, LoopConfig, LoopEvent, LoopOutcome};
     pub use crate::tools::{ToolCall, ToolOutcome, ToolRegistry};
 }

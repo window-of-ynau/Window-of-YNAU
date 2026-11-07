@@ -282,6 +282,19 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
         .unwrap_or(false)
 }
 
+/// 拼上游完整 URL：`base_url` 与端点路径。
+///
+/// **规范化只有一份实现**：`yunong_shared::normalize_base_url`（修 issue #51）。
+/// 之前这里只 `trim_end_matches('/')`，用户把 `…/v1` 粘进 `base_url` 时会拼成
+/// `/v1/v1/chat/completions` → 上游 404；BYOK 直连那边会剥掉，于是"同一配置、
+/// 一条通道能用、另一条 404"。
+pub fn upstream_url(base_url: &str, protocol: Protocol) -> String {
+    // **唯一实现**：`yunong_shared::provider_url`（base 规范化 + 厂商相关路径）。
+    // BYOK 直连（`yunong_core::gateway::wire::endpoint`）调的是同一个函数——
+    // 同一个配置，两条通道必然给出同一个 URL（issue #51）。
+    yunong_shared::provider_url(base_url, protocol)
+}
+
 /// 协议对应的上游端点（`docs/02` §7.1）。
 pub fn endpoint(protocol: Protocol) -> &'static str {
     match protocol {
@@ -326,6 +339,10 @@ impl UpstreamClient {
     }
 
     /// 发请求并等到响应头。之后用 [`UpstreamStream::next_chunks`] 逐条取事件。
+    ///
+    /// `tool_choice` 是**本次请求**的工具选择策略（t129）：服务端只把它按协议映射后
+    /// 塞进上游请求体（映射只有一份，在 `yunong_core::tool_choice`），
+    /// 不做工具白名单、不改写参数、也不在这里跑工具循环——工具的定义与执行都在端侧。
     pub async fn open(
         &self,
         protocol: Protocol,
@@ -338,17 +355,26 @@ impl UpstreamClient {
             )));
         };
 
-        let url = format!(
-            "{}{}",
-            provider.base_url().trim_end_matches('/'),
-            endpoint(protocol)
-        );
+        let url = upstream_url(provider.base_url(), protocol);
         // 强制 `stream=true`（评审 F4）：这个端点是纯流式代理，端侧若声明 stream=false
         // 上游会回一整个 JSON，我们收不到 SSE 事件，只会变成"空回答"。
         // `build_body` 以入参为准，所以这里传一份改过的副本，而不是依赖端侧声明。
         let mut streaming = request.clone();
         streaming.stream = true;
-        let body = yunong_core::protocols::build_body(protocol, &streaming);
+        // `build_body_with` 而不是 `build_body`：后者用默认 `BuildOptions`（`tool_choice: None`），
+        // 客户端的「强制/禁止调用工具」会在这一层被静默丢掉。
+        //
+        // `tools` 不需要单独处理：`ChatRequest.tools` 已经由 core 的三个 builder 按协议编码进
+        // `tools` 字段（`encode_tools`），服务端保持**原样转发**、不做任何增删。
+        // 客户端给的值在这里归一（认不出的 → auto，与端侧同一套规则；warn 在 api 层打过）
+        let (tool_choice, _) =
+            yunong_core::tool_choice::ToolChoice::parse(request.tool_choice.as_deref());
+        let options = yunong_core::protocols::BuildOptions {
+            // 与 `build_body` 的默认一致：让上游在流里回报 usage（记账口径要用真实值）
+            report_usage: true,
+            tool_choice: Some(tool_choice),
+        };
+        let body = yunong_core::protocols::build_body_with(protocol, &streaming, &options);
         // 自己序列化而不是 reqwest 的 `.json()`：那条路径要开 `json` feature，
         // 这里只需要把 `serde_json::Value` 写进 body，没必要多开一个 feature。
         let body = serde_json::to_vec(&body)
@@ -522,6 +548,31 @@ impl UpstreamStream {
 
 #[cfg(test)]
 mod tests {
+    /// issue #51（服务端一侧）：`base_url` 带 `/v1` 时，最终 URL 必须与
+    /// `yunong_shared::endpoint_url` 完全一致——BYOK 直连调的也是它，
+    /// 所以两条通道不会再次分叉。
+    #[test]
+    fn upstream_url_matches_the_shared_cases() {
+        // 与 BYOK 直连（`yunong_core::gateway::wire::endpoint`）**断言同一张表**：
+        // 两侧调的都是 `yunong_shared::provider_url`，所以同一个配置必然同一个 URL。
+        for (base, protocol, expected) in yunong_shared::url::ENDPOINT_CASES {
+            assert_eq!(
+                upstream_url(base, *protocol),
+                *expected,
+                "base={base} protocol={protocol:?}"
+            );
+            assert!(
+                !upstream_url(base, *protocol).contains("/v1/v1"),
+                "出现了重复 /v1：{base} / {protocol:?}"
+            );
+        }
+        // #51 的现场：用户把文档里的 /v1 粘进 base_url（规范化后不该出现 /v1/v1）
+        assert_eq!(
+            upstream_url("https://api.deepseek.com/v1", Protocol::OpenaiCompletions),
+            "https://api.deepseek.com/chat/completions"
+        );
+    }
+
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -562,6 +613,7 @@ mod tests {
             max_output_tokens: 128,
             stream: true,
             estimated_input_tokens: 12,
+            tool_choice: None,
         }
     }
 

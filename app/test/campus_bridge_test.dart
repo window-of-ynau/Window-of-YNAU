@@ -12,11 +12,14 @@ class _Recorder {
   final List<LoginProbe> probes = <LoginProbe>[];
   final List<FetchStage> stages = <FetchStage>[];
 
+  // t148：这些老用例关心的是"消息协议"，不是 HTML 长度 —— 关掉空壳判定，保持原行为。
   late final CampusBridge bridge = CampusBridge(
     onFetched: fetched.add,
     onError: errors.add,
     onLoginState: probes.add,
     onStage: stages.add,
+    minHtmlLength: 0,
+    requireTimetableKeyword: false,
   );
 }
 

@@ -12,6 +12,9 @@ import 'dart:async';
 
 import 'campus_entries.dart';
 import '../core/timetable_service.dart';
+import 'capture_cache.dart';
+import 'capture_readiness.dart';
+import '../theme/context_menu.dart';
 import 'timetable/course_palette.dart';
 import 'timetable/timetable_grid.dart';
 import 'timetable/timetable_notices.dart';
@@ -51,6 +54,7 @@ class _TimetablePageState extends State<TimetablePage> {
   List<String> _warnings = const <String>[];
   TimetableException? _failure;
 
+
   /// 最近一次 ICS 导出结果（成功时显示路径与事件数）。
   IcsExportResult? _exportResult;
 
@@ -78,10 +82,70 @@ class _TimetablePageState extends State<TimetablePage> {
     // 只对"人工验证过的学期"给建议值；其它学期留空，等用户确认。
     _termStartDraft = suggestedTermStart(_currentTerm);
     unawaited(_loadTermStart());
+    // t111：页面被重建（切栏目再切回）时必须从 SQLite 回填已有课表，
+    // 否则用户会以为“抓到的课表丢了”，被迫重抓一次。
+    unawaited(_loadCoursesFromDb());
+    // t112：手改学期要立即按新学期重载（旧学期的课必须清掉，否则误导）。
+    _term.addListener(_onTermChanged);
+  }
+
+  /// 学期切换代次：慢请求回来时若学期已变，丢弃结果，避免覆盖新学期。
+  int _termGeneration = 0;
+
+  void _onTermChanged() {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _courses = const <StoredCourse>[];
+      _warnings = const <String>[];
+      _failure = null;
+      _termStartDraft = suggestedTermStart(_currentTerm);
+    });
+    unawaited(_loadCoursesFromDb());
+    unawaited(_loadTermStart());
+  }
+
+  /// 从本地 SQLite 读取当前学期的课表（t111）。
+  ///
+  /// 读库失败时**不把失败伪装成“没课”**：保留已有内存数据，并给出可读提示。
+  Future<void> _loadCoursesFromDb() async {
+    final String term = _currentTerm;
+    if (term.isEmpty) {
+      return;
+    }
+    final int generation = ++_termGeneration;
+    try {
+      final List<StoredCourse> courses = await widget.service.listCourses(term: term);
+      if (!mounted || generation != _termGeneration) {
+        return;
+      }
+      setState(() {
+        _courses = courses;
+        _failure = null;
+      });
+    } on TimetableException catch (failure) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _warnings = <String>[..._warnings, '读取本地课表失败：${failure.userHint}'];
+      });
+    } on Object catch (failure) {
+      // 端侧核心不可用（无 DLL / 平台不支持）时页面必须仍可用：只记提示，不崩。
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _warnings = <String>[..._warnings, '端侧核心不可用，暂时无法读取本地课表'];
+      });
+      debugPrint('[timetable] 读取本地课表失败：$failure');
+    }
   }
 
   @override
   void dispose() {
+    _term.removeListener(_onTermChanged);
     _term.dispose();
     super.dispose();
   }
@@ -100,7 +164,10 @@ class _TimetablePageState extends State<TimetablePage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Column(
+    // t149：课表页的「学期」输入框会弹文本选择菜单，它读的是**本页 context 的主题**。
+    // 用 OpaqueMenuScope 兜一层，保证菜单表面一定不透明（透底会让菜单文字与课程块混色）。
+    return OpaqueMenuScope(
+      child: Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
         Padding(
@@ -233,6 +300,7 @@ class _TimetablePageState extends State<TimetablePage> {
           ),
         Expanded(child: _buildBody(theme)),
       ],
+      ),
     );
   }
 
@@ -418,7 +486,7 @@ class _TimetablePageState extends State<TimetablePage> {
               color: theme.colorScheme.onSurfaceVariant,
             ),
             const SizedBox(height: 12),
-            Text('还没有导入课表', style: theme.textTheme.titleMedium),
+            Text('还没有课表', style: theme.textTheme.titleMedium),
             const SizedBox(height: 8),
             Text(
               '在校务系统登录一次，或在调试环境导入一份课表 HTML。\n'
@@ -426,6 +494,13 @@ class _TimetablePageState extends State<TimetablePage> {
               textAlign: TextAlign.center,
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 16),
+            // t111：明确空态——“没数据”而不是“数据丢了”，并给出下一步操作
+            FilledButton.icon(
+              onPressed: _busy ? null : () => unawaited(_fetchFromCampus()),
+              icon: const Icon(Icons.login, size: 18),
+              label: const Text('登录抓取'),
             ),
           ],
         ),
@@ -594,10 +669,26 @@ class _TimetablePageState extends State<TimetablePage> {
   /// 兜底路径：抓 `table#timetable` 的 HTML（接口改版/抓不到模板时用）。
   Future<void> _fetchFromCampusHtml(SchoolFetcher fetcher, {String? hint}) async {
     await _run(() async {
-      final page = await fetcher.fetchTimetablePage(
-        entryUrl: CampusEntry.timetable.url,
+      // t151：PARSE_EMPTY 也要可重试（最多 3 次、间隔 800ms）。
+      // 页面常见"框架在、课程行还没渲染"的中间态：HTML 够长但解析 0 门课，重试即好。
+      final ParseRetryResult result = await importHtmlWithParseRetry(
+        fetchHtml: () async {
+          final page = await fetcher.fetchTimetablePage(
+            entryUrl: CampusEntry.timetable.url,
+          );
+          return page.html;
+        },
+        importHtml: (String html) => widget.service.importHtml(html: html, term: _currentTerm),
+        rowCountOf: countTableRowsInHtml,
       );
-      return widget.service.importHtml(html: page.html, term: _currentTerm);
+      if (!result.ok) {
+        throw TimetableException(
+          code: 'PARSE_EMPTY',
+          userHint: '课表解析出 0 门课，已自动重试 ${result.attempts.length} 次仍失败',
+          message: result.diagnostics,
+        );
+      }
+      return result.outcome;
     }, notice: hint ?? '已从校务系统页面抓取');
   }
   Future<void> _importFixture({required bool revamped}) async {
@@ -873,7 +964,9 @@ class _TimetablePageState extends State<TimetablePage> {
       setState(() {
         _courses = courses;
         _warnings = outcome.warnings;
-        _notice = '$notice，本学期 ${outcome.imported} 门课';
+        // t151：抓取成功的诊断行里也带上 cardId（缓存）——
+        // "抓不到 cardId"到底指抓取诊断里没有，还是探针里看不见，一眼能分清。
+        _notice = '$notice，本学期 ${outcome.imported} 门课 · ${describeCachedCardId()}';
       });
     } on TimetableException catch (failure) {
       if (!mounted) {

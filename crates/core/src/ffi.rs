@@ -29,8 +29,11 @@ use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
+use crate::backfill;
 use crate::error::CoreError;
+use crate::local_search::{SearchDoc, SearchStore};
 use crate::memory_items::{MemoryDraft, MemoryItemStore, MemoryKind};
+use crate::memory_ref;
 use crate::parse::{ParseError, ParseReport};
 use crate::schedule::{merge, SchedulePayload};
 use crate::store::CourseStore;
@@ -439,16 +442,16 @@ pub unsafe extern "C" fn yunong_export_ics(
 }
 
 // -------------------------------------------------------------------------
-// 本地记忆（W7-3）：`memory_items` 的增删查。正文只在本机，不上云（ADR-02）。
+// 本地记忆（W7-3）与本地检索（W9）：`memory_items` / `search_*` 的增删查。
+// 正文只在本机，不上云（ADR-02 / ADR-19）。
 // -------------------------------------------------------------------------
 
-/// 记忆相关的错误映射：**校验类**问题统一 `BAD_INPUT`。
+/// 校验类错误统一 `BAD_INPUT` 的映射（记忆与检索共用）。
 ///
 /// 共享的 [`map_core_error`] 把 `Invalid` 归到 `STORAGE`（课表那几个函数的历史行为，
-/// 改动它等于改既有契约）。但"记忆类型写错"不是存储故障：界面若显示
-/// "本地记忆保存失败"，用户会去查磁盘而不是改输入。所以这里只给记忆这三个函数
-/// 单独把 `Invalid` 映射成 `BAD_INPUT`。
-fn memory_error(err: CoreError) -> Value {
+/// 改动它等于改既有契约）。但"记忆类型写错""limit 越界"不是存储故障：界面若显示
+/// "本地数据保存失败"，用户会去查磁盘而不是改输入。所以这两个模块单独映射。
+fn input_error(err: CoreError) -> Value {
     match err {
         CoreError::Invalid(message) => err_json("BAD_INPUT", message),
         other => {
@@ -526,7 +529,7 @@ pub unsafe extern "C" fn yunong_memory_upsert(
         };
         let kind = match MemoryKind::parse(kind) {
             Ok(kind) => kind,
-            Err(err) => return memory_error(err),
+            Err(err) => return input_error(err),
         };
         let id = match parse_optional_id(id_or_empty) {
             Ok(id) => id,
@@ -534,7 +537,7 @@ pub unsafe extern "C" fn yunong_memory_upsert(
         };
         let mut store = match MemoryItemStore::open(db_path) {
             Ok(store) => store,
-            Err(err) => return memory_error(err),
+            Err(err) => return input_error(err),
         };
         let draft = MemoryDraft {
             kind,
@@ -544,8 +547,24 @@ pub unsafe extern "C" fn yunong_memory_upsert(
             expires_at: None,
         };
         match store.upsert(&draft, id) {
-            Ok(write) => ok_json(json!({ "id": write.id, "evicted": write.evicted })),
-            Err(err) => memory_error(err),
+            Ok(write) => {
+                // P0-2：记忆写完**必须**同步进本地检索索引，否则"存了却搜不到"。
+                // 索引失败不回滚记忆（内容已经安全落库），但要如实告诉调用方。
+                let title = if title.trim().is_empty() {
+                    None
+                } else {
+                    Some(title)
+                };
+                let (indexed, index_error) =
+                    index_memory_for_search(db_path, write.id, kind.as_str(), title, content);
+                ok_json(json!({
+                    "id": write.id,
+                    "evicted": write.evicted,
+                    "indexed": indexed,
+                    "index_error": index_error,
+                }))
+            }
+            Err(err) => input_error(err),
         }
     })
 }
@@ -580,8 +599,139 @@ pub unsafe extern "C" fn yunong_memory_list(
             "" => None,
             text => match MemoryKind::parse(text) {
                 Ok(kind) => Some(kind),
-                Err(err) => return memory_error(err),
+                Err(err) => return input_error(err),
             },
+        };
+        let limit = match parse_list_limit(limit) {
+            Ok(limit) => limit,
+            Err(err) => return err_json("BAD_INPUT", err),
+        };
+        // 列表里看得到的记忆，索引里也该有（老库补齐；幂等，补齐后几乎零成本）
+        let _ = backfill::run(db_path, backfill::DEFAULT_BATCH);
+        let store = match MemoryItemStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return input_error(err),
+        };
+        match store.list(kind, limit) {
+            Ok(items) => ok_json(json!(items)),
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 回填派生数据（升级路径，W2b/t95）。
+///
+/// 老版本的行缺少派生数据（最典型的是 `memory_items` 没有 `search_docs` 索引条目），
+/// 这个接口按 `PRAGMA user_version` 记录的版本号**一次性**补齐：幂等、可中断、有单次上限。
+///
+/// 返回 `{"ok":true,"data":{"from_version":0,"to_version":1,"latest_version":1,"processed":5,"remaining":0,"steps_run":[1],"done":true}}`
+///
+/// - `limit` 是单次最多处理条数（十进制字符串；空 = 默认 200）；`remaining > 0` 就下次接着调；
+/// - **建议 App 启动时调一次**（不阻塞：上限内处理完就返回）；即使不调，`yunong_search_local`
+///   与 `yunong_memory_list` 也会懒回填一批，保证"老记忆搜得到"；
+/// - `limit = "0"` 只报进度不干活（用来判断"还欠多少"）。
+///
+/// # Safety
+///
+/// 两个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_maintenance_backfill(
+    limit: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (limit, db_path) = match (read_arg(limit, "limit"), read_arg(db_path, "db_path")) {
+            (Ok(limit), Ok(db_path)) => (limit, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        // 空 = 默认批量；"0" = 只报进度不干活（判断"还欠多少"用）
+        let batch = match limit.trim() {
+            "" => backfill::DEFAULT_BATCH,
+            "0" => 0,
+            other => match parse_list_limit(other) {
+                Ok(batch) => batch,
+                Err(err) => return err_json("BAD_INPUT", err),
+            },
+        };
+        match backfill::run(db_path, batch) {
+            Ok(report) => {
+                // `done` 是派生值（不是字段），显式塞进 JSON，客户端不用自己算
+                let done = report.done();
+                let mut value = json!(report);
+                value["done"] = json!(done);
+                ok_json(value)
+            }
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 按 `memory://<id>` 引用取回被压缩的原文（W8 阶段 2）。
+///
+/// 成功：`{"ok":true,"data":{"ref_id":12,"kind":"summary","title":"…","content":"原文","source":"compact"}}`
+/// 引用失效（被容量淘汰/手动删除）：`{"ok":true,"data":null}`
+///
+/// 引用失效**不算错误**：压缩摘要可能比记忆活得久，界面显示"原文已被清理"即可。
+///
+/// # Safety
+///
+/// `ref_id` 必须是有效的 NUL 结尾十进制字符串；`db_path` 同其它记忆接口。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_memory_expand(
+    ref_id: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (ref_id, db_path) = match (read_arg(ref_id, "ref_id"), read_arg(db_path, "db_path")) {
+            (Ok(ref_id), Ok(db_path)) => (ref_id, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        let id = match parse_optional_id(ref_id) {
+            Ok(Some(id)) => id,
+            Ok(None) => return err_json("BAD_INPUT", "ref_id 不能为空"),
+            Err(err) => return err_json("BAD_INPUT", err),
+        };
+        let store = match MemoryItemStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return input_error(err),
+        };
+        match memory_ref::expand(&store, id) {
+            Ok(Some(item)) => ok_json(json!(item)),
+            Ok(None) => ok_json(Value::Null),
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 在压缩摘要/已落库的原文里按关键词检索（W8 阶段 2）。
+///
+/// 返回：
+/// ```json
+/// {"ok":true,"data":{"hits":[{"ref_id":12,"title":"课表","snippet":"…带雨具和雨伞…","original":"周三记得带雨具和雨伞","truncated":false}]}}
+/// ```
+/// - 匹配规则：大小写不敏感的子串；`title` 命中也算；
+/// - 原文超过 2000 字时不内联（`truncated:true`、没有 `original`），用 `yunong_memory_expand` 再取；
+/// - `limit` 是十进制字符串，0 或空返回空列表。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_memory_search_refs(
+    query: *const c_char,
+    limit: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (query, limit, db_path) = match (
+            read_arg(query, "query"),
+            read_arg(limit, "limit"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(query), Ok(limit), Ok(db_path)) => (query, limit, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
         };
         let limit = match parse_list_limit(limit) {
             Ok(limit) => limit,
@@ -589,11 +739,11 @@ pub unsafe extern "C" fn yunong_memory_list(
         };
         let store = match MemoryItemStore::open(db_path) {
             Ok(store) => store,
-            Err(err) => return memory_error(err),
+            Err(err) => return input_error(err),
         };
-        match store.list(kind, limit) {
-            Ok(items) => ok_json(json!(items)),
-            Err(err) => memory_error(err),
+        match memory_ref::search_refs(&store, query, limit) {
+            Ok(hits) => ok_json(json!({ "hits": hits })),
+            Err(err) => input_error(err),
         }
     })
 }
@@ -624,11 +774,234 @@ pub unsafe extern "C" fn yunong_memory_delete(
         };
         let mut store = match MemoryItemStore::open(db_path) {
             Ok(store) => store,
-            Err(err) => return memory_error(err),
+            Err(err) => return input_error(err),
+        };
+        match store.delete(id) {
+            Ok(deleted) => {
+                // P0-2：删记忆必须同步删索引，否则"删了还能搜到"（孤儿倒排）
+                let unindexed = unindex_memory_for_search(db_path, id);
+                ok_json(json!({ "deleted": deleted, "unindexed": unindexed }))
+            }
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 把一条记忆写进本地检索索引；返回 `(是否成功, 失败原因)`。
+///
+/// 失败**不阻断**记忆写入：正文已经安全落库，索引可以重建（`yunong_search_upsert` 也能补）。
+/// 但要如实回给调用方，否则又会变成"存了搜不到"且无人知情。
+fn index_memory_for_search(
+    db_path: &str,
+    id: i64,
+    kind: &str,
+    title: Option<&str>,
+    content: &str,
+) -> (bool, Option<String>) {
+    match SearchStore::open(db_path) {
+        Ok(mut search) => {
+            let doc = SearchDoc {
+                id,
+                kind,
+                title,
+                content,
+            };
+            match search.upsert(&doc) {
+                Ok(_) => (true, None),
+                Err(err) => (false, Some(err.to_string())),
+            }
+        }
+        Err(err) => (false, Some(err.to_string())),
+    }
+}
+
+/// 从本地检索索引里删掉一条记忆；返回是否删成功（失败只影响搜索，不影响记忆本身）。
+fn unindex_memory_for_search(db_path: &str, id: i64) -> bool {
+    match SearchStore::open(db_path) {
+        Ok(mut search) => search.delete(id).is_ok(),
+        Err(_) => false,
+    }
+}
+
+// -------------------------------------------------------------------------
+// 本地检索（ADR-19 决策 1）：SQLite 上的 BM25，中文 bigram，不做 embedding。
+// -------------------------------------------------------------------------
+
+/// 解析检索的 `limit`：空串 = 默认 10；**超过 100 按 100 处理（不报错）**；
+/// 0 / 非数字才报 `BAD_INPUT`（"要 0 条"是调用方的 bug，静默返回空数组会掩盖它）。
+fn parse_search_limit(text: &str) -> Result<usize, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(crate::local_search::DEFAULT_SEARCH_LIMIT);
+    }
+    match text.parse::<usize>() {
+        Ok(0) => Err("limit 必须是正整数".to_owned()),
+        Ok(limit) => Ok(limit.min(crate::local_search::MAX_SEARCH_LIMIT)),
+        Err(_) => Err(format!("limit 必须是整数：{text}")),
+    }
+}
+
+/// 请求 id（响应里带一个，便于 Dart 侧把"哪次点搜索"与日志对上）。
+fn new_request_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// 本地 BM25 检索（**契约已锁**，不要再改形状）。
+///
+/// ```json
+/// {"ok":true,"data":{"hits":[{"id":12,"kind":"note","title":"…","snippet":"…","score":3.2741}]},"request_id":"…"}
+/// ```
+///
+/// - 空查询 / 只含标点 / 无命中 → `{"ok":true,"data":{"hits":[]}}`（"没搜到"不是错误）；
+/// - `limit` 缺省 10，上限 100（超出按 100 处理，不报错）；
+/// - `id` 是数字（记忆页 = `memory_items.id`），`kind` 与记忆一致（note/summary/fact），
+///   `score` 保留 4 位小数。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_search_local(
+    query: *const c_char,
+    limit: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (query, limit, db_path) = match (
+            read_arg(query, "query"),
+            read_arg(limit, "limit"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(query), Ok(limit), Ok(db_path)) => (query, limit, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
+        };
+        let limit = match parse_search_limit(limit) {
+            Ok(limit) => limit,
+            Err(err) => return err_json("BAD_INPUT", err),
+        };
+        // 升级路径：老版本存下的记忆没有索引条目，搜之前先补一批（有上限，幂等）。
+        // 失败不回滚搜索：本版本先按现有索引搜，下次再补。
+        let _ = backfill::run(db_path, backfill::DEFAULT_BATCH);
+        let store = match SearchStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return input_error(err),
+        };
+        match store.search(query, limit) {
+            // 契约：**必须**包 `data.hits`（不是 data 直接是数组）
+            Ok(results) => json!({
+                "ok": true,
+                "data": { "hits": results },
+                "request_id": new_request_id(),
+            }),
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 写入/更新一篇可检索文档（索引**增量**更新，不重建）。
+///
+/// 返回 `{"ok":true,"data":{"id":12,"terms":37}}`，`terms` = 该文档的倒排行数。
+/// 同一数字 `doc_id` 反复调用 = 覆盖（旧倒排会被清掉）。
+/// `kind` 与 `memory_items` 一致：`note` / `summary` / `fact`。
+///
+/// # Safety
+///
+/// 五个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_search_upsert(
+    doc_id: *const c_char,
+    kind: *const c_char,
+    title: *const c_char,
+    content: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (doc_id, kind, title, content, db_path) = match (
+            read_arg(doc_id, "doc_id"),
+            read_arg(kind, "kind"),
+            read_arg(title, "title"),
+            read_arg(content, "content"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(id), Ok(kind), Ok(title), Ok(content), Ok(db_path)) => {
+                (id, kind, title, content, db_path)
+            }
+            _ => return err_json("BAD_INPUT", "参数不完整或不是 UTF-8"),
+        };
+        // id 是数字：契约（`data.hits[].id`）是 number，不是 "memory:12" 这种字符串
+        let id = match doc_id.trim().parse::<i64>() {
+            Ok(id) if id > 0 => id,
+            _ => {
+                return err_json(
+                    "BAD_INPUT",
+                    format!("doc_id 必须是正整数：{}", doc_id.trim()),
+                )
+            }
+        };
+        let kind = match MemoryKind::parse(kind) {
+            Ok(kind) => kind,
+            Err(err) => return input_error(err),
+        };
+        let mut store = match SearchStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return input_error(err),
+        };
+        let title = if title.trim().is_empty() {
+            None
+        } else {
+            Some(title)
+        };
+        let doc = SearchDoc {
+            id,
+            kind: kind.as_str(),
+            title,
+            content,
+        };
+        match store.upsert(&doc) {
+            // `evicted` 只在索引到容量上限、按 updated_at 淘汰了最旧文档时才非 0（R5-F3）
+            Ok(outcome) => ok_json(json!({
+                "id": id,
+                "terms": outcome.terms,
+                "evicted": outcome.evicted,
+            })),
+            Err(err) => input_error(err),
+        }
+    })
+}
+
+/// 从索引里删除一篇文档（倒排 + 文档行），返回 `{"ok":true,"data":{"deleted":0|1}}`。
+///
+/// # Safety
+///
+/// 两个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_search_delete(
+    doc_id: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (doc_id, db_path) = match (read_arg(doc_id, "doc_id"), read_arg(db_path, "db_path")) {
+            (Ok(doc_id), Ok(db_path)) => (doc_id, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        let id = match doc_id.trim().parse::<i64>() {
+            Ok(id) if id > 0 => id,
+            _ => {
+                return err_json(
+                    "BAD_INPUT",
+                    format!("doc_id 必须是正整数：{}", doc_id.trim()),
+                )
+            }
+        };
+        let mut store = match SearchStore::open(db_path) {
+            Ok(store) => store,
+            Err(err) => return input_error(err),
         };
         match store.delete(id) {
             Ok(deleted) => ok_json(json!({ "deleted": deleted })),
-            Err(err) => memory_error(err),
+            Err(err) => input_error(err),
         }
     })
 }
@@ -637,10 +1010,29 @@ pub unsafe extern "C" fn yunong_memory_delete(
 // 流式对话（W7 P0）：回调式 FFI
 // ---------------------------------------------------------------------------
 
-/// 流式回调：`chunk_json` **只在本次回调期间有效**（Rust 分配、Rust 释放，Dart 侧绝不能 free）；
-/// 返回 `1` = 调用方要求取消（停止读取上游），`0` = 继续。
-pub type ChatChunkCallback =
-    unsafe extern "C" fn(chunk_json: *const c_char, user: *mut c_void) -> i32;
+/// 流式回调。
+///
+/// # ⚠️ `chunk_json` 的所有权**转移给调用方**（T82 契约）
+///
+/// 这块内存由 Rust `CString::into_raw` 分配，**调用方读完必须调 [`yunong_free_string`] 释放**：
+/// ```c
+/// void on_chunk(const char* json, void* user) {
+///     /* 1. 拷出内容（UTF-8 → 你的字符串类型） */
+///     /* 2. 立刻：yunong_free_string((char*)json);  <-- 不调就是内存泄漏 */
+/// }
+/// ```
+/// **不释放 = 泄漏；释放后再读 = UB。**
+///
+/// 为什么必须这样：`NativeCallable.listener` 是**异步投递**（经 Dart 端口），
+/// 回调函数返回时数据还没被读；Rust 若在返回时 drop，Dart 读到的就是已释放内存
+/// （现象：`FormatException: Missing extension byte` 或内容乱掉）。
+///
+/// # 返回类型是 `void`
+///
+/// 回调里**不能**通过返回值取消流（`listener` 只能返回 void，寄存器内容未定义）。
+/// 要取消请拿 [`yunong_chat_stream`] 返回的 handle 调 [`yunong_chat_cancel`]。
+/// 取消之后仍会再收到**一帧终态** `{"type":"done","finish":"stop"}`。
+pub type ChatChunkCallback = unsafe extern "C" fn(chunk_json: *const c_char, user: *mut c_void);
 
 static CHAT_CANCEL: OnceLock<crate::chat_ffi::CancelRegistry> = OnceLock::new();
 
@@ -661,18 +1053,33 @@ struct ChatCallback {
 unsafe impl Send for ChatCallback {}
 
 impl ChatCallback {
+    /// 投递一条 chunk。返回 `false` 表示**无法投递**（含 NUL 的非法 JSON），调用方应停止。
+    ///
+    /// # 所有权：**必须 `into_raw` 移交给调用方**
+    ///
+    /// `NativeCallable.listener` 是**异步投递**：它只是把指针塞进 Dart 端口就返回，
+    /// Dart 那边稍后才真正读取。所以**绝不能用 `c.as_ptr()`** —— 函数一返回 `c` 就被 drop，
+    /// Dart 读到的是已释放内存（表现为 `FormatException: Missing extension byte`，
+    /// 或者更糟：读到别人刚写进去的数据）。
+    ///
+    /// 契约：
+    /// - 所有权随回调**转移给调用方**；
+    /// - 调用方拷出内容（UTF-8 → Dart String）后**必须**调 [`yunong_free_string`] 释放；
+    /// - 不释放 = 内存泄漏；释放后再读 = UB。
+    ///
+    /// # 取消
+    ///
+    /// 回调是 `void`（`NativeCallable.listener` 只能返回 void，返回值寄存器内容未定义），
+    /// 所以这里恒返回 `true`。要取消请用 [`yunong_chat_cancel`]，由 registry 判定。
     fn emit(&self, json: &str) -> bool {
-        let Ok(text) = CString::new(json.replace('\0', "")) else {
-            return true;
-        };
-        // catch_unwind：Dart 侧回调抛异常不能把 Rust 进程带崩
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            (self.on_chunk)(text.as_ptr(), self.user)
-        }));
-        // 字符串 `text` 在本次调用期间有效，返回后即释放（Dart 侧不得保存指针）
-        drop(text);
-        match result {
-            Ok(value) => value == 0,
+        match CString::new(json) {
+            Ok(c) => {
+                // 所有权移交：这块内存活到调用方调 `yunong_free_string`
+                let ptr = c.into_raw();
+                unsafe { (self.on_chunk)(ptr, self.user) };
+                true
+            }
+            // 含 NUL 的非法 JSON：无法安全投递，按终止处理（不分配、不泄漏）
             Err(_) => false,
         }
     }
@@ -682,6 +1089,12 @@ impl ChatCallback {
 /// 流内的错误也以 `Chunk::Error` 回调，**不会**用返回值/异常表达。
 ///
 /// 返回 `0` 表示入参无效（空指针 / 空 JSON）；此时不会启动线程。
+///
+/// # 首帧与所有权（T80 / T82）
+///
+/// - 流启动后**立刻**发一条 `{"type":"meta",…}`（不等上游）：收到它就证明回调通了；
+/// - 回调收到的 `chunk_json` **所有权归调用方**，读完必须 `yunong_free_string`（见 [`ChatChunkCallback`]）；
+/// - `user` 原样回传（Dart 用它当 sink 的键，不要指望 handle 的时序）。
 ///
 /// # Safety
 ///
@@ -782,6 +1195,8 @@ fn secret_status_json(status: crate::secret::SecretStatus) -> Value {
         "set": status.set,
         "masked": status.masked,
         "degraded": status.degraded,
+        // R4-F3：`set:true, broken:true` = 本地有密文但解不开，UI 该提示"请重新填写"
+        "broken": status.broken,
         "reason": status.reason,
     }))
 }
@@ -864,6 +1279,103 @@ pub unsafe extern "C" fn yunong_delete_secret(
         }
     })
 }
+
+/// 用**存储里的 refresh** 换一个新的 access（"重启免登录"的最后一环）。
+///
+/// refresh 明文**永不跨过这道边界**：Rust 自己从平台安全存储读出来发请求，
+/// 只把新的 access 交给 Dart；服务端若轮换了 refresh，也由 Rust 直接写回存储。
+///
+/// ```json
+/// {"ok":true,"data":{"access_token":"…","expires_in":3600}}
+/// {"ok":false,"code":"UNAUTHORIZED","message":"登录已失效，请重新登录"}
+/// {"ok":false,"code":"NETWORK","message":"网络不可用：…"}
+/// ```
+///
+/// **失败分级**（这是本函数最要紧的语义）：
+/// - 401 / 403 → 删掉本地 access + refresh，返回 `UNAUTHORIZED`（UI 回未登录态）；
+/// - 网络不可达 / 超时 / 5xx / 429 → **保留令牌**，返回 `NETWORK`（让用户重试，而不是重新登录）。
+///
+/// # 阻塞说明
+///
+/// 这是一次同步 HTTP 调用（最长 `connect 5s + total 10s`）。**Dart 侧应放在后台 isolate 里调**，
+/// 别在 UI isolate 上直接调用。
+///
+/// # Safety
+///
+/// 两个参数都必须是有效的 NUL 结尾 UTF-8 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_auth_refresh_from_store(
+    cloud_base_url: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (base_url, db_path) = match (
+            read_arg(cloud_base_url, "cloud_base_url"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(base_url), Ok(db_path)) => (base_url, db_path),
+            (Err(err), _) | (_, Err(err)) => return err_json("BAD_INPUT", err),
+        };
+        let store = secret_store_for(db_path);
+        auth_refresh_json(store.as_ref(), base_url)
+    })
+}
+
+/// `yunong_auth_refresh_from_store` 的本体（把 store 作为参数，方便测试注入内存实现）。
+fn auth_refresh_json(store: &dyn crate::secret::KeyStore, base_url: &str) -> Value {
+    match crate::auth::refresh_blocking(store, base_url, Default::default()) {
+        Ok(refreshed) => ok_json(json!({
+            "access_token": refreshed.access_token,
+            "expires_in": refreshed.expires_in,
+            "rotated": refreshed.rotated,
+        })),
+        Err(err) => err_json(err.code(), err.message()),
+    }
+}
+// ---------------------------------------------------------------------------
+// 联网搜索状态（ADR-19 决策 5）：UI 必须诚实
+// ---------------------------------------------------------------------------
+
+/// 查询当前通道/协议下可用的搜索来源。
+///
+/// 返回 `{source, label, available, hint}`：`available:false` 时 UI **必须**常驻提示
+/// “未配置联网搜索”，不允许静默降级。
+///
+/// # Safety
+///
+/// 三个参数都必须是有效的 NUL 结尾 UTF-8 字符串（db_path 用于判断 BYOK Key 是否已保存）。
+#[no_mangle]
+pub unsafe extern "C" fn yunong_search_status(
+    channel: *const c_char,
+    protocol: *const c_char,
+    db_path: *const c_char,
+) -> *mut c_char {
+    respond(|| {
+        let (channel, protocol, db_path) = match (
+            read_arg(channel, "channel"),
+            read_arg(protocol, "protocol"),
+            read_arg(db_path, "db_path"),
+        ) {
+            (Ok(channel), Ok(protocol), Ok(db_path)) => (channel, protocol, db_path),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                return err_json("BAD_INPUT", err)
+            }
+        };
+        // BYOK 是否已保存"自带搜索 Key"（复用同一套 secret store，明文不出 Rust）
+        let has_byok_key = {
+            let store = secret_store_for(db_path);
+            matches!(store.load_raw(crate::secret::BYOK_SEARCH_KEY), Ok(Some(_)))
+        };
+        let source = crate::search::resolve_source(channel, protocol, has_byok_key);
+        let status = crate::search::SearchStatus::for_source(source);
+        ok_json(json!({
+            "source": status.source,
+            "label": status.label,
+            "available": status.available,
+            "hint": status.hint,
+        }))
+    })
+}
 /// 释放本模块返回的字符串。传 null 是安全的空操作。
 ///
 /// # Safety
@@ -875,6 +1387,35 @@ pub unsafe extern "C" fn yunong_free_string(ptr: *mut c_char) {
         return;
     }
     drop(CString::from_raw(ptr));
+}
+
+/// 让 Windows 原生标题栏跟随 App 主题（深色/浅色）。
+///
+/// ```json
+/// {"ok":true,"data":{"dark":true,"attribute":20,"hwnd":1234567}}
+/// {"ok":false,"code":"UNSUPPORTED","message":"当前平台不支持设置标题栏颜色（仅 Windows）"}
+/// {"ok":false,"code":"NOT_FOUND","message":"没找到云农之窗的窗口（标题栏设置需在窗口创建之后调用）"}
+/// {"ok":false,"code":"DWM_FAILED","message":"设置标题栏颜色失败：…"}
+/// ```
+///
+/// - 属性号先试 **20**（Win10 20H1+ / Win11）再试 **19**（1809~2004），两个都失败才报错；
+/// - **必须在窗口创建之后调用**：启动时调一次 + 用户切主题时再调；
+/// - 非 Windows 返回 `UNSUPPORTED`（不 panic）；找不到窗口返回 `NOT_FOUND`（可重试）。
+///
+/// # Safety
+///
+/// 无指针参数，任何线程调用都安全（内部只做 Win32 调用）。
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn yunong_set_titlebar_dark(dark: i32) -> *mut c_char {
+    respond(|| match crate::titlebar::set_dark(dark != 0) {
+        Ok(report) => ok_json(json!({
+            "dark": report.dark,
+            "attribute": report.attribute,
+            "hwnd": report.hwnd,
+        })),
+        Err(err) => err_json(err.code(), err.message()),
+    })
 }
 
 /// 版本号（用于 Dart 侧确认 DLL 与 app 匹配）。返回静态字符串，**不要** free。
@@ -1593,6 +2134,720 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
     }
+
+    // ---------------------------------------------------------------------
+    // P0-2：记忆写入/更新/删除必须同步本地检索索引
+    // ---------------------------------------------------------------------
+
+    fn search_hits(query: &str, db: &str) -> Vec<serde_json::Value> {
+        let value = call_search_local(query, "", db);
+        assert_eq!(value["ok"], true, "{value}");
+        value["data"]["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    // ---------------------------------------------------------------------
+    // W8 阶段 2：memory:// 找回（expand / search_refs）
+    // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // W2b/t95：升级路径回填（老记忆没有索引条目）
+    // ---------------------------------------------------------------------
+
+    fn call_backfill(limit: &str, db: &str) -> Value {
+        let limit = CString::new(limit).unwrap();
+        let db = CString::new(db).unwrap();
+        let raw = unsafe { yunong_maintenance_backfill(limit.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null());
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn search_hits_of(query: &str, db: &str) -> Vec<Value> {
+        let query = CString::new(query).unwrap();
+        let limit = CString::new("10").unwrap();
+        let db_c = CString::new(db).unwrap();
+        let raw = unsafe { yunong_search_local(query.as_ptr(), limit.as_ptr(), db_c.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        value["data"]["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 造"上个版本的库"：记忆在，索引条目被拿掉（模拟升级前写入的数据）。
+    fn legacy_memory(db: &str, content: &str) -> i64 {
+        let created = call_memory_upsert("note", "", content, "user", "", db);
+        assert_eq!(created["ok"], true, "{created}");
+        let id = created["data"]["id"].as_i64().unwrap();
+        let id_text = CString::new(id.to_string()).unwrap();
+        let db_c = CString::new(db).unwrap();
+        let raw = unsafe { yunong_search_delete(id_text.as_ptr(), db_c.as_ptr()) };
+        assert!(!raw.is_null());
+        unsafe { yunong_free_string(raw) };
+        id
+    }
+
+    /// 首次搜索就自动回填：老记忆**不用删掉重加**也能搜到。
+    #[test]
+    fn legacy_memory_is_found_by_the_first_search() {
+        let db = temp_db();
+        let id = legacy_memory(&db, "雨伞是黑色的，放在宿舍楼 3 栋 502");
+        // 反证：直接查索引是空的
+        let store = SearchStore::open(&db).unwrap();
+        assert_eq!(store.len().unwrap(), 0, "构造失败：索引里不该有条目");
+        drop(store);
+
+        // 第一次搜索：懒回填 → 命中
+        let hits = search_hits_of("雨伞", &db);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0]["id"].as_i64(), Some(id));
+        // 第二次搜索（已补齐，幂等）
+        assert_eq!(search_hits_of("雨伞", &db).len(), 1);
+        // 回填只做一次：版本号已抬到 1，再调 maintenance 不干活
+        let again = call_backfill("200", &db);
+        assert_eq!(again["data"]["processed"], 0, "{again}");
+        assert_eq!(again["data"]["to_version"], 1, "{again}");
+    }
+
+    /// 维护接口：有上限、可中断、幂等。
+    #[test]
+    fn maintenance_backfill_is_bounded_and_resumable() {
+        let db = temp_db();
+        for index in 0..3 {
+            legacy_memory(&db, &format!("老记忆 {index}：周三带雨具"));
+        }
+        // limit=0：只报进度
+        let progress = call_backfill("0", &db);
+        assert_eq!(progress["ok"], true, "{progress}");
+        assert_eq!(progress["data"]["processed"], 0, "{progress}");
+        assert_eq!(progress["data"]["remaining"], 3, "{progress}");
+        assert_eq!(progress["data"]["done"], false, "{progress}");
+
+        // limit=2：补 2 条，剩下 1 条，版本号不动
+        let partial = call_backfill("2", &db);
+        assert_eq!(partial["data"]["processed"], 2, "{partial}");
+        assert_eq!(partial["data"]["remaining"], 1, "{partial}");
+        assert_eq!(partial["data"]["to_version"], 0, "{partial}");
+        assert_eq!(partial["data"]["done"], false, "{partial}");
+
+        // 补齐：版本号抬到 1
+        let done = call_backfill("200", &db);
+        assert_eq!(done["data"]["processed"], 1, "{done}");
+        assert_eq!(done["data"]["remaining"], 0, "{done}");
+        assert_eq!(done["data"]["to_version"], 1, "{done}");
+        assert_eq!(done["data"]["done"], true, "{done}");
+        assert_eq!(done["data"]["steps_run"], serde_json::json!([1]));
+
+        // 三条都能搜到
+        assert_eq!(search_hits_of("雨具", &db).len(), 3);
+        // 空 limit：用默认批量；库已补齐 → 什么都不做
+        assert_eq!(call_backfill("", &db)["data"]["processed"], 0);
+    }
+
+    fn call_memory_expand(ref_id: &str, db: &str) -> Value {
+        let ref_id = CString::new(ref_id).unwrap();
+        let db = CString::new(db).unwrap();
+        let raw = unsafe { yunong_memory_expand(ref_id.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null());
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn call_search_refs(query: &str, limit: &str, db: &str) -> Value {
+        let query = CString::new(query).unwrap();
+        let limit = CString::new(limit).unwrap();
+        let db = CString::new(db).unwrap();
+        let raw = unsafe { yunong_memory_search_refs(query.as_ptr(), limit.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null());
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// `memory://` 往返：落库后用 id 取回**逐字节一致**的原文。
+    #[test]
+    fn memory_expand_returns_the_exact_original() {
+        let db = temp_db();
+        let content = "周三带雨具；宿舍楼 3 栋 502；课表第 3-4 节《数据库原理》";
+        let created = call_memory_upsert("summary", "会话存档", content, "compact", "", &db);
+        assert_eq!(created["ok"], true, "{created}");
+        let id = created["data"]["id"].as_i64().unwrap();
+
+        let expanded = call_memory_expand(&id.to_string(), &db);
+        assert_eq!(expanded["ok"], true, "{expanded}");
+        assert_eq!(expanded["data"]["ref_id"], id, "{expanded}");
+        assert_eq!(expanded["data"]["content"], content, "{expanded}");
+        assert_eq!(expanded["data"]["title"], "会话存档");
+        assert_eq!(expanded["data"]["source"], "compact");
+
+        // 引用失效：ok:true + data:null（不是错误，界面显示"原文已被清理"即可）
+        let gone = call_memory_expand("999999", &db);
+        assert_eq!(gone["ok"], true, "{gone}");
+        assert!(gone["data"].is_null(), "{gone}");
+        // 非法入参：明确报错，不崩
+        let bad = call_memory_expand("", &db);
+        assert_eq!(bad["ok"], false, "{bad}");
+        assert_eq!(bad["code"], "BAD_INPUT", "{bad}");
+    }
+
+    /// 在压缩摘要里按关键词检索，拿到 `{ref_id, snippet, original}`。
+    #[test]
+    fn memory_search_refs_finds_archived_summaries() {
+        let db = temp_db();
+        let created = call_memory_upsert(
+            "summary",
+            "会话存档",
+            "第 0 轮：帮我看下课表里周三有没有课，记得带雨具",
+            "compact",
+            "",
+            &db,
+        );
+        let id = created["data"]["id"].as_i64().unwrap();
+        call_memory_upsert("note", "", "买牛奶", "user", "", &db);
+
+        let hits = call_search_refs("雨具", "5", &db);
+        assert_eq!(hits["ok"], true, "{hits}");
+        let list = hits["data"]["hits"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "{hits}");
+        assert_eq!(list[0]["ref_id"], id);
+        assert!(list[0]["snippet"].as_str().unwrap().contains("雨具"));
+        assert!(list[0]["original"].as_str().unwrap().contains("课表"));
+        assert_eq!(list[0]["truncated"], false);
+
+        // 检索不到 / 空查询：空列表，不报错
+        assert_eq!(
+            call_search_refs("不存在", "5", &db)["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            call_search_refs("  ", "5", &db)["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        // limit 是十进制字符串：给 1 就最多 1 条
+        assert!(
+            call_search_refs("雨具", "1", &db)["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .len()
+                <= 1
+        );
+    }
+
+    #[test]
+    /// owner 实测场景：**不填标题**、正文「雨伞是黑色的」，搜「雨伞」「黑色」都要能命中。
+    fn memory_upsert_is_searchable_even_without_title() {
+        let db = temp_db();
+        let created = call_memory_upsert("note", "", "雨伞是黑色的", "user", "", &db);
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(created["data"]["indexed"], true, "{created}");
+        let id = created["data"]["id"].as_i64().unwrap();
+
+        for query in ["雨伞", "黑色", "雨伞是黑色的"] {
+            let hits = search_hits(query, &db);
+            assert!(
+                hits.iter().any(|hit| hit["id"].as_i64() == Some(id)),
+                "搜 {query:?} 应当命中记忆 {id}，实际：{hits:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    /// 带标题的记忆：标题与正文都能搜到，kind 跟着记忆走。
+    #[test]
+    fn memory_upsert_indexes_title_and_kind() {
+        let db = temp_db();
+        let created = call_memory_upsert("fact", "宿舍", "水壶在柜子里", "user", "", &db);
+        assert_eq!(created["data"]["indexed"], true, "{created}");
+        let id = created["data"]["id"].as_i64().unwrap();
+        let hits = search_hits("水壶", &db);
+        let hit = hits
+            .iter()
+            .find(|hit| hit["id"].as_i64() == Some(id))
+            .unwrap_or_else(|| panic!("没命中：{hits:?}"));
+        assert_eq!(hit["kind"], "fact");
+        assert_eq!(hit["title"], "宿舍");
+        assert!(search_hits("宿舍", &db)
+            .iter()
+            .any(|h| h["id"].as_i64() == Some(id)));
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    /// 更新记忆：索引换成新内容，**不是**多出一条。
+    #[test]
+    fn memory_update_replaces_index_entry() {
+        let db = temp_db();
+        let created = call_memory_upsert("note", "", "雨伞是黑色的", "user", "", &db);
+        let id = created["data"]["id"].as_i64().unwrap().to_string();
+
+        let updated = call_memory_upsert("note", "", "雨伞是蓝色的", "user", &id, &db);
+        assert_eq!(updated["ok"], true, "{updated}");
+        assert_eq!(updated["data"]["id"].as_i64(), id.parse::<i64>().ok());
+
+        assert!(
+            search_hits("黑色", &db).is_empty(),
+            "旧内容不该还能搜到（否则是没更新索引）"
+        );
+        let hits = search_hits("蓝色", &db);
+        assert_eq!(hits.len(), 1, "更新后只该有一条：{hits:?}");
+        assert_eq!(hits[0]["id"].as_i64(), id.parse::<i64>().ok());
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    /// 删除记忆：索引里也要消失。
+    #[test]
+    fn memory_delete_removes_index_entry() {
+        let db = temp_db();
+        let created = call_memory_upsert("note", "", "雨伞是黑色的", "user", "", &db);
+        let id = created["data"]["id"].as_i64().unwrap();
+        assert!(!search_hits("雨伞", &db).is_empty());
+
+        let deleted = call_memory_delete(&id.to_string(), &db);
+        assert_eq!(deleted["data"]["deleted"], 1, "{deleted}");
+        assert_eq!(deleted["data"]["unindexed"], true, "{deleted}");
+        assert!(
+            search_hits("雨伞", &db).is_empty(),
+            "删了记忆还搜得到 = 索引没清"
+        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    // ---------------------------------------------------------------------
+    // 本地检索 FFI（ADR-19 决策 1）
+    // ---------------------------------------------------------------------
+
+    fn call_search_upsert(doc_id: &str, kind: &str, title: &str, content: &str, db: &str) -> Value {
+        let (doc_id, kind, title, content, db) = (
+            CString::new(doc_id).unwrap(),
+            CString::new(kind).unwrap(),
+            CString::new(title).unwrap(),
+            CString::new(content).unwrap(),
+            CString::new(db).unwrap(),
+        );
+        let raw = unsafe {
+            yunong_search_upsert(
+                doc_id.as_ptr(),
+                kind.as_ptr(),
+                title.as_ptr(),
+                content.as_ptr(),
+                db.as_ptr(),
+            )
+        };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn call_search_local(query: &str, limit: &str, db: &str) -> Value {
+        let (query, limit, db) = (
+            CString::new(query).unwrap(),
+            CString::new(limit).unwrap(),
+            CString::new(db).unwrap(),
+        );
+        let raw = unsafe { yunong_search_local(query.as_ptr(), limit.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn call_search_delete(doc_id: &str, db: &str) -> Value {
+        let (doc_id, db) = (CString::new(doc_id).unwrap(), CString::new(db).unwrap());
+        let raw = unsafe { yunong_search_delete(doc_id.as_ptr(), db.as_ptr()) };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn search_roundtrip_via_ffi_matches_the_locked_contract() {
+        let db = temp_db();
+        let written = call_search_upsert(
+            "1",
+            "note",
+            "课表提醒",
+            "周三下午三门课，最后一门在尚农楼1-18",
+            &db,
+        );
+        assert_eq!(written["ok"], true, "{written}");
+        // 契约：data.id 是**数字**
+        assert_eq!(written["data"]["id"], 1, "{written}");
+        assert!(written["data"]["terms"].as_u64().unwrap() > 0, "{written}");
+        call_search_upsert("2", "fact", "图书馆", "图书馆开放到晚十点", &db);
+
+        let found = call_search_local("尚农楼", "", &db);
+        assert_eq!(found["ok"], true, "{found}");
+        // 契约：必须包 `data.hits`，且带 request_id
+        assert!(found["data"].is_object(), "{found}");
+        let hits = found["data"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{found}");
+        assert_eq!(hits[0]["id"], 1, "id 必须是数字");
+        assert_eq!(hits[0]["kind"], "note");
+        assert_eq!(hits[0]["title"], "课表提醒");
+        assert!(hits[0]["snippet"].as_str().unwrap().contains("尚农楼"));
+        assert!(hits[0]["score"].as_f64().unwrap() > 0.0);
+        assert!(
+            found["request_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "响应必须带 request_id：{found}"
+        );
+
+        // limit 生效
+        let one = call_search_local("三门", "1", &db);
+        assert_eq!(one["data"]["hits"].as_array().unwrap().len(), 1, "{one}");
+
+        // 删除后不再命中
+        assert_eq!(call_search_delete("1", &db)["data"]["deleted"], 1);
+        assert!(call_search_local("尚农楼", "", &db)["data"]["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(call_search_delete("1", &db)["data"]["deleted"], 0);
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn search_empty_query_bad_limits_and_kind_via_ffi() {
+        let db = temp_db();
+        call_search_upsert("1", "note", "笔记", "高等数学笔记", &db);
+        // 空查询 = 空数组，不是错误
+        let empty = call_search_local("   ", "", &db);
+        assert_eq!(empty["ok"], true, "{empty}");
+        assert!(
+            empty["data"]["hits"].as_array().unwrap().is_empty(),
+            "{empty}"
+        );
+        // 无命中也不是错误
+        let miss = call_search_local("量子力学", "", &db);
+        assert_eq!(miss["ok"], true, "{miss}");
+        assert!(
+            miss["data"]["hits"].as_array().unwrap().is_empty(),
+            "{miss}"
+        );
+        // limit：0 / 非数字是 BAD_INPUT；超过 100 **夹到 100 不报错**
+        for bad in ["0", "abc", "-1"] {
+            let result = call_search_local("数学", bad, &db);
+            assert_eq!(result["code"], "BAD_INPUT", "limit={bad} => {result}");
+        }
+        let clamped = call_search_local("数学", "999", &db);
+        assert_eq!(clamped["ok"], true, "{clamped}");
+        assert_eq!(
+            clamped["data"]["hits"].as_array().unwrap().len(),
+            1,
+            "{clamped}"
+        );
+
+        // R5-F2：超长 query 走 BAD_INPUT（上限 512 字符）
+        let too_long = "数".repeat(crate::local_search::MAX_QUERY_CHARS + 1);
+        let over = call_search_local(&too_long, "", &db);
+        assert_eq!(over["code"], "BAD_INPUT", "{over}");
+
+        // doc_id 必须是正整数；kind 只接受 note/summary/fact
+        assert_eq!(
+            call_search_upsert("memory:1", "note", "标题", "正文", &db)["code"],
+            "BAD_INPUT"
+        );
+        assert_eq!(
+            call_search_upsert("0", "note", "标题", "正文", &db)["code"],
+            "BAD_INPUT"
+        );
+        assert_eq!(
+            call_search_upsert("2", "doc", "标题", "正文", &db)["code"],
+            "BAD_INPUT"
+        );
+        assert_eq!(
+            call_search_upsert("2", "", "标题", "正文", &db)["code"],
+            "BAD_INPUT"
+        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&db).parent().unwrap());
+    }
+
+    #[test]
+    fn search_null_arguments_do_not_crash() {
+        let raw =
+            unsafe { yunong_search_local(std::ptr::null(), std::ptr::null(), std::ptr::null()) };
+        assert!(!raw.is_null(), "绝不返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+
+        let raw = unsafe {
+            yunong_search_upsert(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+
+        let raw = unsafe { yunong_search_delete(std::ptr::null(), std::ptr::null()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+    }
+
+    // ---------------------------------------------------------------------
+    // 套餐令牌刷新 FFI（T61）：refresh 明文不出 Rust，失败分级清/不清存储
+    // ---------------------------------------------------------------------
+
+    const AUTH_OK_BODY: &str = r#"{"ok":true,"data":{"user_id":"u1","access_token":"new-access-9","expires_in":3600,"refresh_token":"rotated-9"}}"#;
+
+    fn memory_store_with(
+        refresh: Option<&str>,
+        access: Option<&str>,
+    ) -> crate::secret::MemoryKeyStore {
+        use crate::secret::KeyStore;
+        let store = crate::secret::MemoryKeyStore::new("测试内存存储");
+        if let Some(value) = refresh {
+            store.set(crate::auth::REFRESH_KEY, value).unwrap();
+        }
+        if let Some(value) = access {
+            store.set(crate::auth::ACCESS_KEY, value).unwrap();
+        }
+        store
+    }
+
+    fn raw_of(store: &crate::secret::MemoryKeyStore, key: &str) -> Option<String> {
+        use crate::secret::KeyStore;
+        store.load_raw(key).unwrap()
+    }
+
+    /// 成功：返回新 access、把轮换后的 refresh 写回存储。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_refresh_success_returns_access_and_rotates_refresh() {
+        let server =
+            crate::gateway::fake_server::FakeServer::reply(200, "application/json", AUTH_OK_BODY)
+                .await;
+        let store = std::sync::Arc::new(memory_store_with(Some("old-refresh"), Some("old-access")));
+        let base = server.base_url();
+        let store_for_call = std::sync::Arc::clone(&store);
+        // `auth_refresh_json` 内部会自己 block_on 一个 runtime，所以放到阻塞线程里跑，
+        // 否则会把测试自己的多线程运行时堵住（假上游也就没线程驱动了）。
+        let result =
+            tokio::task::spawn_blocking(move || auth_refresh_json(store_for_call.as_ref(), &base))
+                .await
+                .unwrap();
+
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["access_token"], "new-access-9");
+        assert_eq!(result["data"]["expires_in"], 3600);
+        assert_eq!(result["data"]["rotated"], true);
+        assert_eq!(server.captured().path(), crate::auth::REFRESH_PATH);
+        assert_eq!(server.captured().json()["refresh_token"], "old-refresh");
+        assert_eq!(
+            raw_of(&store, crate::auth::REFRESH_KEY).as_deref(),
+            Some("rotated-9"),
+            "轮换后的 refresh 必须写回，否则下次刷新就 401"
+        );
+        assert_eq!(
+            raw_of(&store, crate::auth::ACCESS_KEY).as_deref(),
+            Some("new-access-9")
+        );
+    }
+
+    /// 401：返回 UNAUTHORIZED，且本地 access + refresh 都被清掉。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_refresh_unauthorized_clears_store() {
+        let server = crate::gateway::fake_server::FakeServer::reply(
+            401,
+            "application/json",
+            r#"{"ok":false,"code":"UNAUTHORIZED","message":"刷新令牌无效"}"#,
+        )
+        .await;
+        let store =
+            std::sync::Arc::new(memory_store_with(Some("dead-refresh"), Some("dead-access")));
+        let base = server.base_url();
+        let store_for_call = std::sync::Arc::clone(&store);
+        let result =
+            tokio::task::spawn_blocking(move || auth_refresh_json(store_for_call.as_ref(), &base))
+                .await
+                .unwrap();
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "UNAUTHORIZED");
+        assert_eq!(result["message"], "登录已失效，请重新登录");
+        assert_eq!(raw_of(&store, crate::auth::REFRESH_KEY), None);
+        assert_eq!(raw_of(&store, crate::auth::ACCESS_KEY), None);
+    }
+
+    /// 网络不可达：返回 NETWORK，且**存储内容一个字节都不动**。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_refresh_network_failure_keeps_store() {
+        let store =
+            std::sync::Arc::new(memory_store_with(Some("good-refresh"), Some("good-access")));
+        let store_for_call = std::sync::Arc::clone(&store);
+        let result = tokio::task::spawn_blocking(move || {
+            auth_refresh_json(store_for_call.as_ref(), "http://127.0.0.1:1")
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "NETWORK", "{result}");
+        assert_eq!(
+            raw_of(&store, crate::auth::REFRESH_KEY).as_deref(),
+            Some("good-refresh"),
+            "断网不能把用户登出"
+        );
+        assert_eq!(
+            raw_of(&store, crate::auth::ACCESS_KEY).as_deref(),
+            Some("good-access")
+        );
+    }
+
+    #[test]
+    fn auth_refresh_ffi_rejects_null_and_bad_base_url() {
+        let raw = unsafe { yunong_auth_refresh_from_store(std::ptr::null(), std::ptr::null()) };
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+
+        let base = CString::new("").unwrap();
+        let db = CString::new(temp_db()).unwrap();
+        let raw = unsafe { yunong_auth_refresh_from_store(base.as_ptr(), db.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "BAD_INPUT", "{value}");
+        assert!(value["message"]
+            .as_str()
+            .unwrap()
+            .contains("cloud_base_url"));
+    }
+
+    /// R4-F3：密文损坏时 `get_secret` 的 JSON 必须带 `broken:true`（与 `set:true` 并存），
+    /// 这样 UI 能提示"本地凭据已损坏，请重新填写"，而不是显示矛盾的"未设置"。
+    #[cfg(windows)]
+    #[test]
+    fn get_secret_reports_broken_ciphertext_via_ffi() {
+        let dir = std::env::temp_dir().join(format!("yunong-ffi-broken-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("timetable.db").to_string_lossy().into_owned();
+        // 先正常存一条
+        let store = secret_store_for(&db_path);
+        store
+            .set("byok_api_key", "sk-test-0123456789abcdef")
+            .unwrap();
+        // 再把它写坏
+        let bin = dir.join("secrets").join("byok_api_key.bin");
+        std::fs::write(&bin, b"not-a-dpapi-blob").unwrap();
+
+        let key = CString::new("byok_api_key").unwrap();
+        let db = CString::new(db_path.clone()).unwrap();
+        let raw = unsafe { yunong_get_secret(key.as_ptr(), db.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["ok"], true, "{value}");
+        assert_eq!(value["data"]["set"], true, "{value}");
+        assert_eq!(value["data"]["broken"], true, "{value}");
+        assert!(!value["data"]["masked"].as_str().unwrap().is_empty());
+        // 明文绝不出现在返回里
+        assert!(
+            !text.contains("sk-test-0123456789abcdef"),
+            "泄漏明文：{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 平台差异（与 secret 用例同一条规则）：非 Windows 没有系统安全存储，
+    /// `default_store` 每次调用都是**新的内存实例**，所以 FFI 这条路上读不到 refresh →
+    /// 如实返回 UNAUTHORIZED。Windows 上则真的能读出来并刷新（下一个用例）。
+    #[cfg(not(windows))]
+    #[test]
+    fn auth_refresh_ffi_reports_unauthorized_on_degraded_storage() {
+        let base = CString::new("http://127.0.0.1:1").unwrap();
+        let db = CString::new(temp_db()).unwrap();
+        let raw = unsafe { yunong_auth_refresh_from_store(base.as_ptr(), db.as_ptr()) };
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["code"], "UNAUTHORIZED", "{value}");
+    }
+
+    /// Windows 端到端：走真实 FFI + DPAPI 文件存储，验证"存进去 → 刷新 → 轮换写回"。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_refresh_ffi_end_to_end_on_windows() {
+        let server =
+            crate::gateway::fake_server::FakeServer::reply(200, "application/json", AUTH_OK_BODY)
+                .await;
+        let dir = std::env::temp_dir().join(format!("yunong-ffi-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("timetable.db").to_string_lossy().into_owned();
+
+        // 先用 FFI 把一对令牌存进平台安全存储（模拟登录那次）
+        let db = CString::new(db_path.clone()).unwrap();
+        let refresh_key = CString::new(crate::auth::REFRESH_KEY).unwrap();
+        let refresh_value = CString::new("old-refresh").unwrap();
+        unsafe {
+            let response = call_secret(yunong_set_secret(
+                refresh_key.as_ptr(),
+                refresh_value.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(response["ok"], true, "{response}");
+            let access_key = CString::new(crate::auth::ACCESS_KEY).unwrap();
+            let access_value = CString::new("old-access").unwrap();
+            let response = call_secret(yunong_set_secret(
+                access_key.as_ptr(),
+                access_value.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(response["ok"], true, "{response}");
+        }
+
+        // 再走刷新 FFI。注意：`refresh_blocking` 会自建 runtime，
+        // 所以必须在**阻塞线程**上调用（tokio 不允许在 runtime 里再 block_on 一个 runtime）。
+        let base = CString::new(server.base_url()).unwrap();
+        let db_for_call = db.clone();
+        let text = tokio::task::spawn_blocking(move || unsafe {
+            let raw = yunong_auth_refresh_from_store(base.as_ptr(), db_for_call.as_ptr());
+            assert!(!raw.is_null(), "绝不能返回 NULL");
+            let text = CStr::from_ptr(raw).to_str().unwrap().to_owned();
+            yunong_free_string(raw);
+            text
+        })
+        .await
+        .unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["ok"], true, "{value}");
+        assert_eq!(value["data"]["access_token"], "new-access-9");
+        assert_eq!(value["data"]["rotated"], true);
+
+        // 轮换后的 refresh 真的写回了存储
+        let store = secret_store_for(&db_path);
+        assert_eq!(
+            store.load_raw(crate::auth::REFRESH_KEY).unwrap().as_deref(),
+            Some("rotated-9")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---------------------------------------------------------------------
     // 凭据 FFI（W7 P0）：明文永不出 Rust
     // ---------------------------------------------------------------------
@@ -1603,6 +2858,73 @@ mod tests {
         serde_json::from_str(&text).unwrap()
     }
 
+    #[test]
+    fn search_status_covers_four_channels_honestly() {
+        let base = std::env::temp_dir().join(format!("yunong-search-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let db = CString::new(base.join("t.db").to_string_lossy().to_string()).unwrap();
+        let cloud = CString::new("cloud").unwrap();
+        let byok = CString::new("byok").unwrap();
+        let responses = CString::new("openai_responses").unwrap();
+        let completions = CString::new("openai_completions").unwrap();
+
+        unsafe {
+            // ① 套餐 + Responses → 内置
+            let r = call_secret(yunong_search_status(
+                cloud.as_ptr(),
+                responses.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(r["data"]["source"], "built_in");
+            assert_eq!(r["data"]["label"], "内置");
+            assert_eq!(r["data"]["available"], true);
+
+            // ② 套餐 + Completions → 我方代理
+            let r = call_secret(yunong_search_status(
+                cloud.as_ptr(),
+                completions.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(r["data"]["source"], "proxy");
+            assert_eq!(r["data"]["label"], "我方代理");
+
+            // ③ BYOK 未填 Key → 未配置 + 诚实提示
+            let r = call_secret(yunong_search_status(
+                byok.as_ptr(),
+                completions.as_ptr(),
+                db.as_ptr(),
+            ));
+            assert_eq!(r["data"]["source"], "none");
+            assert_eq!(r["data"]["available"], false);
+            assert!(r["data"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("未配置联网搜索"));
+
+            // ④ BYOK 已填自带 Key → 自带 Key
+            // 平台差异（与下面的 secret 用例同一条规则）：非 Windows 没有系统安全存储，
+            // set 走降级不落盘，因此读回来仍是「未配置」。断言必须按平台分支，
+            // 否则 Linux CI 上会红（此前就是这样挂的）。
+            let store = secret_store_for(&base.join("t.db").to_string_lossy());
+            let _ = store.set(crate::secret::BYOK_SEARCH_KEY, "sk-test-0123456789abcdef");
+            let r = call_secret(yunong_search_status(
+                byok.as_ptr(),
+                completions.as_ptr(),
+                db.as_ptr(),
+            ));
+            if cfg!(windows) {
+                assert_eq!(r["data"]["source"], "byok");
+                assert_eq!(r["data"]["label"], "自带 Key");
+                assert_eq!(r["data"]["available"], true);
+                assert_eq!(r["data"]["hint"], "");
+            } else {
+                // 降级：Key 未能持久化，必须诚实报「未配置」，不得假装可用
+                assert_eq!(r["data"]["source"], "none");
+                assert_eq!(r["data"]["available"], false);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
     #[test]
     fn secret_set_get_delete_never_leaks_plaintext() {
         let base = std::env::temp_dir().join(format!("yunong-ffi-secret-{}", uuid::Uuid::new_v4()));
@@ -1637,7 +2959,10 @@ mod tests {
             }
             let raw = response.to_string();
             assert!(!raw.contains(plain), "get 返回里出现明文：{raw}");
-            assert!(!raw.contains("0123456789abcdef"), "get 返回里出现明文片段：{raw}");
+            assert!(
+                !raw.contains("0123456789abcdef"),
+                "get 返回里出现明文片段：{raw}"
+            );
 
             // delete → get(set:false)；非 Windows 本来就没存，deleted 为 false
             let response = call_secret(yunong_delete_secret(key.as_ptr(), db.as_ptr()));
@@ -1710,14 +3035,46 @@ mod tests {
     // 流式对话 FFI（W7 P0）
     // ---------------------------------------------------------------------
 
-    extern "C" fn collect_chunk(chunk_json: *const c_char, user: *mut c_void) -> i32 {
+    /// 测试用回调：立刻拷出内容，然后**按契约释放**（T82：所有权在回调方）。
+    extern "C" fn collect_chunk(chunk_json: *const c_char, user: *mut c_void) {
         let sink = unsafe { &mut *(user as *mut Vec<String>) };
         let text = unsafe { CStr::from_ptr(chunk_json) }
             .to_str()
             .unwrap()
             .to_owned();
+        // 所有权已转移给我们：拷完就还回去（等价于 Dart 侧调 yunong_free_string）
+        drop(unsafe { CString::from_raw(chunk_json as *mut c_char) });
         sink.push(text);
-        0
+    }
+
+    /// T75：标题栏深色开关——信封形态正确、任何平台都不 panic。
+    #[test]
+    fn set_titlebar_dark_returns_envelope_without_panicking() {
+        let raw = yunong_set_titlebar_dark(1);
+        assert!(!raw.is_null(), "绝不能返回 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+        unsafe { yunong_free_string(raw) };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        if cfg!(windows) {
+            if value["ok"] == true {
+                let attribute = value["data"]["attribute"].as_u64().unwrap();
+                assert!(attribute == 20 || attribute == 19, "{value}");
+                assert!(value["data"]["hwnd"].as_u64().unwrap_or(0) > 0, "{value}");
+            } else {
+                let code = value["code"].as_str().unwrap_or_default();
+                assert!(
+                    code == "NOT_FOUND" || code == "DWM_FAILED",
+                    "Windows 上只该是 NOT_FOUND/DWM_FAILED：{value}"
+                );
+            }
+        } else {
+            assert_eq!(value["ok"], false, "{value}");
+            assert_eq!(value["code"], "UNSUPPORTED", "{value}");
+        }
+        // 浅色也调一次（同样不许 panic）
+        let raw = yunong_set_titlebar_dark(0);
+        assert!(!raw.is_null());
+        unsafe { yunong_free_string(raw) };
     }
 
     #[test]
@@ -1748,6 +3105,205 @@ mod tests {
         // 收尾：取消（幂等）+ 句柄最终会被回收
         assert_eq!(yunong_chat_cancel(handle), 1);
         assert_eq!(yunong_chat_cancel(handle), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // T80：user 指针透传 + 首帧即 meta
+    // ---------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    static USER_CB_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static USER_CB_LAST_USER: AtomicUsize = AtomicUsize::new(0);
+    static USER_CB_FIRST_TYPE: Mutex<Option<String>> = Mutex::new(None);
+    static USER_CB_SECOND_TYPE: Mutex<Option<String>> = Mutex::new(None);
+    static CALLBACK_RETURNED: AtomicBool = AtomicBool::new(false);
+    static FIRST_CB_BEFORE_RETURN: AtomicBool = AtomicBool::new(false);
+
+    fn reset_user_probe() {
+        USER_CB_COUNT.store(0, Ordering::SeqCst);
+        USER_CB_LAST_USER.store(0, Ordering::SeqCst);
+        *USER_CB_FIRST_TYPE.lock().unwrap() = None;
+        *USER_CB_SECOND_TYPE.lock().unwrap() = None;
+        CALLBACK_RETURNED.store(false, Ordering::SeqCst);
+        FIRST_CB_BEFORE_RETURN.store(false, Ordering::SeqCst);
+    }
+
+    /// 记录每次回调收到的 `user`（**只比较，不解引用**），顺带记下前两帧的类型。
+    unsafe extern "C" fn record_user_cb(json: *const c_char, user: *mut std::os::raw::c_void) {
+        let count = USER_CB_COUNT.fetch_add(1, Ordering::SeqCst);
+        USER_CB_LAST_USER.store(user as usize, Ordering::SeqCst);
+        if count == 0 && !CALLBACK_RETURNED.load(Ordering::SeqCst) {
+            FIRST_CB_BEFORE_RETURN.store(true, Ordering::SeqCst);
+        }
+        let text = unsafe { CStr::from_ptr(json) }
+            .to_string_lossy()
+            .into_owned();
+        // T82 契约：回调方拥有所有权，拷完必须释放
+        drop(unsafe { CString::from_raw(json as *mut c_char) });
+        let kind = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+            value
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
+        match count {
+            0 => *USER_CB_FIRST_TYPE.lock().unwrap() = kind,
+            1 => *USER_CB_SECOND_TYPE.lock().unwrap() = kind,
+            _ => {}
+        }
+    }
+
+    fn byok_request_with_dead_upstream() -> CString {
+        // 上游不可达：正好验证"meta 不等上游就会到"，随后收到 error 帧
+        let request = serde_json::json!({
+            "channel": "byok",
+            "protocol": "openai_completions",
+            "model": "deepseek-flash",
+            "base_url": "http://127.0.0.1:1",
+            "api_key": "sk-test",
+            "messages": [{ "role": "user", "content": "你好" }]
+        });
+        CString::new(request.to_string()).unwrap()
+    }
+
+    fn wait_for_user_callbacks(target: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while USER_CB_COUNT.load(Ordering::SeqCst) < target {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "等回调超时：只收到 {} 次（期望 ≥{target}）",
+                    USER_CB_COUNT.load(Ordering::SeqCst)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // T82：回调指针的所有权转移（模拟 Dart 异步投递的"延迟读取"）
+    // ---------------------------------------------------------------------
+
+    /// 只把指针**存起来**，不读、不释放——模拟 `NativeCallable.listener` 的异步投递。
+    static DELAYED_PTRS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn delay_cb(json: *const c_char, _user: *mut std::os::raw::c_void) {
+        DELAYED_PTRS.lock().unwrap().push(json as usize);
+    }
+
+    /// 回调返回之后，指针指向的内容**必须仍然有效**。
+    ///
+    /// 这正是 T82 的回归测试：修复前 `emit` 用 `c.as_ptr()`，回调一返回 `CString` 就被 drop，
+    /// 这里延迟读取要么读到乱码、要么直接崩溃/`FormatException`（Dart 侧的
+    /// `Missing extension byte` 就是这么来的）。
+    #[test]
+    fn chunk_pointer_stays_valid_after_callback_returns() {
+        DELAYED_PTRS.lock().unwrap().clear();
+        let request = byok_request_with_dead_upstream();
+        let db = CString::new("").unwrap();
+        let handle = unsafe {
+            yunong_chat_stream(
+                request.as_ptr(),
+                db.as_ptr(),
+                Some(delay_cb),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(handle > 0);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while DELAYED_PTRS.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "等回调超时（只存了 {} 个指针）",
+                DELAYED_PTRS.lock().unwrap().len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // 给"流已经收尾"留点时间，确保不是刚写就被读到
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let pointers = DELAYED_PTRS.lock().unwrap().clone();
+        let mut kinds = Vec::new();
+        for ptr in pointers {
+            let text = unsafe { CStr::from_ptr(ptr as *const c_char) }
+                .to_str()
+                .unwrap_or_else(|err| panic!("延迟读到的不是合法 UTF-8：{err}"))
+                .to_owned();
+            let value: Value = serde_json::from_str(&text)
+                .unwrap_or_else(|err| panic!("延迟读到的不是 JSON（{err}）：{text:?}"));
+            kinds.push(value["type"].as_str().unwrap_or_default().to_owned());
+            // 读完按契约释放（否则就是泄漏）
+            drop(unsafe { CString::from_raw(ptr as *mut c_char) });
+        }
+        assert_eq!(kinds, vec!["meta", "error"], "延迟读到的帧序列：{kinds:?}");
+    }
+
+    /// `user` 原样透传 + 首帧即 meta + 竞态测量（一个测试里顺序做，避免并行测试互相踩静态量）。
+    #[test]
+    fn chat_stream_user_pointer_and_early_meta() {
+        // 1) user 必须原样传回每一次回调（Dart 侧拿它当 sink 的键）
+        reset_user_probe();
+        // 一个绝不可能被解引用的哨兵值：回调里只比较，不 deref
+        let sentinel = 0xDEAD_BEEF_usize as *mut std::os::raw::c_void;
+        let request = byok_request_with_dead_upstream();
+        let db = CString::new("").unwrap();
+        let handle = unsafe {
+            yunong_chat_stream(
+                request.as_ptr(),
+                db.as_ptr(),
+                Some(record_user_cb),
+                sentinel,
+            )
+        };
+        assert!(handle > 0, "handle 应该是正整数");
+        CALLBACK_RETURNED.store(true, Ordering::SeqCst);
+        wait_for_user_callbacks(2);
+        assert_eq!(
+            USER_CB_LAST_USER.load(Ordering::SeqCst),
+            sentinel as usize,
+            "回调收到的 user 被改写了（Dart 会因此找不到 sink）"
+        );
+        // 2) 首帧必须是 meta（不等上游），第二帧是 error（不是重复 meta）
+        assert_eq!(
+            USER_CB_FIRST_TYPE.lock().unwrap().as_deref(),
+            Some("meta"),
+            "首帧必须是 meta（Dart 靠它区分'没投递'与'上游慢'）"
+        );
+        assert_eq!(
+            USER_CB_SECOND_TYPE.lock().unwrap().as_deref(),
+            Some("error"),
+            "上游不可达时第二帧应当是 error"
+        );
+        assert_eq!(
+            USER_CB_COUNT.load(Ordering::SeqCst),
+            2,
+            "meta + error，各一条"
+        );
+
+        // 3) 量一下"首帧早于 handle 返回"的竞态幅度（Dart 不能用 handle 做键的直接理由）
+        const ROUNDS: usize = 20;
+        let mut early = 0;
+        for _ in 0..ROUNDS {
+            reset_user_probe();
+            let request = byok_request_with_dead_upstream();
+            let handle = unsafe {
+                yunong_chat_stream(
+                    request.as_ptr(),
+                    db.as_ptr(),
+                    Some(record_user_cb),
+                    sentinel,
+                )
+            };
+            assert!(handle > 0);
+            CALLBACK_RETURNED.store(true, Ordering::SeqCst);
+            if FIRST_CB_BEFORE_RETURN.load(Ordering::SeqCst) {
+                early += 1;
+            }
+            wait_for_user_callbacks(2);
+        }
+        println!("{ROUNDS} 轮里，首帧早于 handle 返回的有 {early} 轮");
     }
 
     #[test]

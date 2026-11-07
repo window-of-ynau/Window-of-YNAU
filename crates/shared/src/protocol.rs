@@ -177,6 +177,17 @@ pub struct ChatRequest {
     /// 端侧估算，用于"先拒后转"
     #[serde(default)]
     pub estimated_input_tokens: u32,
+    /// 工具选择策略：`auto`（默认）/ `none` / `required`（t128）。
+    ///
+    /// 可选：**`None` 时不序列化**（`skip_serializing_if`），保证老服务端收到
+    /// 不带该键的请求不会报错（向后兼容）；反序列化侧 `#[serde(default)]` 同样兜底。
+    ///
+    /// 语义差异：**套餐通道只透传，不解释**——真正的协议映射由端侧
+    /// （`yunong_core::tool_choice`）与上游服务端各自负责；Anthropic 兼容层下
+    /// `required` 只能发 `{"type":"any"}`（DeepSeek 文档：any 按 auto 处理），
+    /// 端侧会在 meta 里如实回报 `tool_choice_effective`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<String>,
 }
 
 const fn default_max_output() -> u32 {
@@ -370,18 +381,40 @@ impl Chunk {
 mod tests {
     use super::*;
 
+    /// t128：`tool_choice` 必须**可选**——设了才序列化，没设就完全不出现在 JSON 里
+    /// （向后兼容：老服务端收到不带该键的请求不能报错）。
+    #[test]
+    fn tool_choice_is_skipped_when_none() {
+        let mut request = req();
+        request.tool_choice = Some("required".into());
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""tool_choice":"required""#), "{json}");
+
+        request.tool_choice = None;
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("tool_choice"), "None 时不该出现该键：{json}");
+
+        // 反序列化侧：老请求（没有这个键）也必须能读
+        let old = r#"{"session_id":"s_1","turn_id":"t_1","round":1,"model":"deepseek-flash",
+            "protocol":"openai_completions","messages":[],"tools":[],"max_output_tokens":1024,
+            "stream":true,"estimated_input_tokens":0}"#;
+        let parsed: ChatRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.tool_choice, None);
+    }
+
     fn req() -> ChatRequest {
         ChatRequest {
             session_id: "s_1".into(),
             turn_id: "t_1".into(),
             round: 1,
-            model: "deepseek-chat".into(),
+            model: "deepseek-flash".into(),
             protocol: Protocol::OpenaiCompletions,
             messages: vec![ChatMessage::user("下周三下午有课吗")],
             tools: vec![],
             max_output_tokens: 512,
             stream: true,
             estimated_input_tokens: 3120,
+            tool_choice: None,
         }
     }
 

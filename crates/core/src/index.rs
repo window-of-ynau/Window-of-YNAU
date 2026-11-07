@@ -7,6 +7,35 @@
 
 use std::collections::HashMap;
 
+/// BM25 的 `k1`（词频饱和点）：标准值 1.2，写死不做可调（ADR-19 决策 1）。
+pub const BM25_K1: f32 = 1.2;
+
+/// BM25 的 `b`（文档长度归一化强度）：标准值 0.75。
+pub const BM25_B: f32 = 0.75;
+
+/// BM25 的 IDF（`ln(1 + (N - df + 0.5)/(df + 0.5))`，恒为正，不会因高频词变负）。
+///
+/// `doc_count` = 文档总数，`doc_freq` = 含该词的文档数（0 也安全）。
+pub fn bm25_idf(doc_count: u32, doc_freq: u32) -> f32 {
+    let n = doc_count as f32;
+    let df = doc_freq as f32;
+    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+}
+
+/// 单个查询词对一篇文档的得分贡献。
+///
+/// `term_freq` = 该词在文档里的出现次数，`doc_len`/`avg_len` = 文档长度与平均长度（token 数）。
+/// `avg_len` 会被夹到 ≥1，空文档/空库不会除零。
+pub fn bm25_term_score(term_freq: u32, doc_len: u32, avg_len: f32, idf: f32) -> f32 {
+    let tf = term_freq as f32;
+    if tf <= 0.0 {
+        return 0.0;
+    }
+    let avg = avg_len.max(1.0);
+    let denom = tf + BM25_K1 * (1.0 - BM25_B + BM25_B * doc_len as f32 / avg);
+    idf * (tf * (BM25_K1 + 1.0)) / denom
+}
+
 /// 一条检索结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
@@ -76,14 +105,15 @@ struct Doc {
     len: u32,
 }
 
-/// BM25-lite 实现。
+/// BM25-lite 实现（**内存版**）。
+///
+/// 落 SQLite 的持久化版本见 [`crate::local_search::SearchStore`]：两者共用
+/// [`tokenize`] 与 [`bm25_idf`] / [`bm25_term_score`]，所以打分口径不会分叉。
 #[derive(Debug, Clone)]
 pub struct Bm25Index {
     docs: Vec<Doc>,
     df: HashMap<String, u32>,
     avg_len: f32,
-    k1: f32,
-    b: f32,
 }
 
 impl Default for Bm25Index {
@@ -98,8 +128,6 @@ impl Bm25Index {
             docs: Vec::new(),
             df: HashMap::new(),
             avg_len: 0.0,
-            k1: 1.2,
-            b: 0.75,
         }
     }
 
@@ -110,12 +138,6 @@ impl Bm25Index {
             let total: u32 = self.docs.iter().map(|d| d.len).sum();
             self.avg_len = total as f32 / self.docs.len() as f32;
         }
-    }
-
-    fn idf(&self, term: &str, n: u32) -> f32 {
-        let df = *self.df.get(term).unwrap_or(&0) as f32;
-        let n = n as f32;
-        (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
     }
 }
 
@@ -166,14 +188,12 @@ impl LocalIndex for Bm25Index {
             .filter_map(|doc| {
                 let mut score = 0.0_f32;
                 for term in &terms {
-                    let tf = *doc.tf.get(term).unwrap_or(&0) as f32;
-                    if tf == 0.0 {
+                    let tf = *doc.tf.get(term).unwrap_or(&0);
+                    if tf == 0 {
                         continue;
                     }
-                    let denom = tf
-                        + self.k1
-                            * (1.0 - self.b + self.b * doc.len as f32 / self.avg_len.max(1.0));
-                    score += self.idf(term, n) * (tf * (self.k1 + 1.0)) / denom;
+                    let df = *self.df.get(term).unwrap_or(&0);
+                    score += bm25_term_score(tf, doc.len, self.avg_len, bm25_idf(n, df));
                 }
                 (score > 0.0).then(|| SearchHit {
                     id: doc.id.clone(),

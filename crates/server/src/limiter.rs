@@ -22,7 +22,10 @@ use yunong_shared::ErrorCode;
 
 use crate::api::error::AppError;
 
-/// 三条未鉴权路由的分类（限流键与阈值都按它取）。
+/// 限流路由的分类（限流键与阈值都按它取）。
+///
+/// 前三条是**未鉴权**端点（security 的 H1/R2 系列）；`RagReport` 是**已鉴权**的
+/// RAG 上报端点（t81 / M6：它之前**完全无限流**，一个账号可以无限刷 count 总和）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthRoute {
     /// 注册：建账号 + 一次哈希
@@ -31,6 +34,8 @@ pub enum AuthRoute {
     Login,
     /// 刷新：只有数据库读写，不哈希
     Refresh,
+    /// RAG 上报（已鉴权；键是用户 ID，不是 IP——IP 可被 XFF 伪造）
+    RagReport,
 }
 
 impl AuthRoute {
@@ -39,6 +44,7 @@ impl AuthRoute {
             Self::Register => "register",
             Self::Login => "login",
             Self::Refresh => "refresh",
+            Self::RagReport => "rag_referrals",
         }
     }
 
@@ -48,6 +54,7 @@ impl AuthRoute {
             Self::Register => "注册",
             Self::Login => "登录",
             Self::Refresh => "刷新",
+            Self::RagReport => "RAG 上报",
         }
     }
 }
@@ -73,6 +80,34 @@ fn bounded_key(key: &str) -> String {
     format!("sha256:{digest:x}")
 }
 
+/// 淘汰策略（R2-F4 的限流桶与 R5-F4 的 RAG 配额共用，**只有这一份实现**）。
+///
+/// 优先淘汰"未回满/未用满"的条目；全都是惩罚/用满状态时，才退化为淘汰最旧的一条。
+/// 为什么不能按最旧直接淘汰：攻击者只要灌新键，就能把受害者正在冷却的桶挤掉、
+/// 使其额度立刻重置（R2-F4 与 R5-F4 是同一个洞）。
+pub fn evict_oldest_unexhausted<K, V>(
+    map: &mut std::collections::HashMap<K, V>,
+    is_exhausted: impl Fn(&V) -> bool,
+    updated_at: impl Fn(&V) -> std::time::Instant,
+) -> bool
+where
+    K: Clone + std::cmp::Eq + std::hash::Hash,
+{
+    let victim = map
+        .iter()
+        .filter(|(_, value)| !is_exhausted(value))
+        .min_by_key(|(_, value)| updated_at(value))
+        .or_else(|| map.iter().min_by_key(|(_, value)| updated_at(value)))
+        .map(|(key, _)| key.clone());
+    match victim {
+        Some(victim) => {
+            map.remove(&victim);
+            true
+        }
+        None => false,
+    }
+}
+
 /// 一个令牌桶。
 #[derive(Debug)]
 struct Bucket {
@@ -94,6 +129,8 @@ pub struct AuthLimiter {
     login_per_min: u32,
     register_per_min: u32,
     refresh_per_min: u32,
+    /// RAG 上报的每分钟上限；0 = 关闭（t81 / M6）
+    rag_report_per_min: u32,
 }
 
 impl AuthLimiter {
@@ -110,7 +147,18 @@ impl AuthLimiter {
             login_per_min,
             register_per_min,
             refresh_per_min,
+            // 默认关闭：由 `with_rag_report_limit` 按配置打开（保持既有构造点不变）
+            rag_report_per_min: 0,
         }
+    }
+
+    /// 打开 RAG 上报端点的速率限制（t81 / M6）。
+    ///
+    /// 用独立入口而不是改 `new()` 的签名：`AuthLimiter::new` 有若干既有调用点
+    /// （含测试），加参数会让"少传一个就默认关闭"变成静默缺口。
+    pub fn with_rag_report_limit(mut self, per_min: u32) -> Self {
+        self.rag_report_per_min = per_min;
+        self
     }
 
     /// 该路由每分钟允许的次数；0 表示"不限次数"（并发闸仍然生效）。
@@ -119,6 +167,7 @@ impl AuthLimiter {
             AuthRoute::Register => self.register_per_min,
             AuthRoute::Login => self.login_per_min,
             AuthRoute::Refresh => self.refresh_per_min,
+            AuthRoute::RagReport => self.rag_report_per_min,
         }
     }
 
@@ -143,15 +192,13 @@ impl AuthLimiter {
         // 打到 429 之后灌 1024 个新键，就能把这个账号的惩罚桶挤掉、额度立刻重置
         // （2000 个新邮箱 ≈ 1.5s 一次，成本极低）。只有整张表都是惩罚桶时才动它们。
         if buckets.len() >= MAX_BUCKETS && !buckets.contains_key(&(route, key.clone())) {
-            let victim = buckets
-                .iter()
-                .filter(|(_, bucket)| bucket.tokens >= 1.0)
-                .min_by_key(|(_, bucket)| bucket.updated)
-                .or_else(|| buckets.iter().min_by_key(|(_, bucket)| bucket.updated))
-                .map(|(k, _)| k.clone());
-            if let Some(victim) = victim {
-                buckets.remove(&victim);
-            }
+            // 跳过"还没回满"的惩罚桶（R2-F4）——共用实现见 `evict_oldest_unexhausted`。
+            // 注意谓词是 `is_exhausted`：**tokens < 1.0 才算惩罚桶**（极性别反）。
+            evict_oldest_unexhausted(
+                &mut buckets,
+                |bucket| bucket.tokens < 1.0,
+                |bucket| bucket.updated,
+            );
         }
 
         let burst = f64::from(limit.max(1));

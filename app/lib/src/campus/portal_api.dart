@@ -14,8 +14,99 @@
 
 import 'dart:convert';
 
+/// 【t148】页面侧**可重复调用**的抓取入口：`window.__yunongGrabHtml()`。
+///
+/// - 幂等：任意时刻可调，重复调用不产生副作用（只读 DOM）；
+/// - 返回：合格 HTML 字符串；页面还没渲染出课表容器时返回 `null`；
+/// - 供 bridge 在收到"空壳 html"时**重取一次**（不重新导航、不发网络请求）。
+const String kGrabHtmlInstallScript = r'''
+(function () {
+  if (window.__yunongGrabHtml) { return; }
+  window.__yunongGrabHtml = function () {
+    try {
+      var table = document.querySelector('table#timetable')
+        || document.querySelector('#timetable')
+        || document.querySelector('table.timetable');
+      var html = table ? table.outerHTML
+        : (document.documentElement ? document.documentElement.outerHTML : '');
+      if (!html || typeof html !== 'string' || html.length < 200) { return null; }
+      return html;
+    } catch (e) {
+      return null;
+    }
+  };
+})();
+''';
+
+/// 调用上面的入口（供 `evaluateJavascript` 直接使用）。
+const String kGrabHtmlScript = '(window.__yunongGrabHtml ? window.__yunongGrabHtml() : null)';
+/// 【t151】课程行计数选择器 —— **必须与抓取/解析用的表一致**（`table#timetable`）。
+///
+/// 解析侧（Rust）读的是这张表的行，所以"就绪"必须要求表里**有课程行**：
+/// 否则会出现"框架在、行还没渲染"的中间态 —— HTML 够长、含课表字样，但解析出 0 门课（PARSE_EMPTY）。
+const String kCourseRowSelector = 'table#timetable tr';
+
+/// 安装轻量计数入口（只回数字、不回 DOM）：`window.__yunongCourseRowCount()`。
+const String kCourseRowCountInstallScript = r'''
+(function () {
+  if (window.__yunongCourseRowCount) { return; }
+  window.__yunongCourseRowCount = function () {
+    try {
+      var rows = document.querySelectorAll('table#timetable tr');
+      if (!rows || rows.length === 0) {
+        rows = document.querySelectorAll('#timetable tr, table.timetable tr');
+      }
+      return rows ? rows.length : 0;
+    } catch (e) {
+      return 0;
+    }
+  };
+})();
+''';
+
+/// 调用计数入口（拿不到返回 -1）。
+const String kCourseRowCountScript =
+    '(window.__yunongCourseRowCount ? window.__yunongCourseRowCount() : -1)';
+
 /// 接口路径（用于脚本匹配；改版时只改这里）。
 const String kScheduleApiPath = '/api/uppcard/kbsz/queryAWeekSchedule';
+
+/// 【t139】页内抓取用的**同款请求形状**：URL 构造 + 关键请求头。
+///
+/// 页内脚本（`kPortalScheduleScript`，见本文件末尾的 `API + '?years=' + ...` 段）用的是：
+/// ```
+/// GET {origin}/api/uppcard/kbsz/queryAWeekSchedule
+///     ?years=<encodeURIComponent(学期)>&results=<周>&cardId=<32hex>&_t=<Date.now()>
+/// credentials: 'include'
+/// Accept: application/json, text/plain, */*
+/// ```
+/// 探针必须**照抄这份**，否则服务端会返回 500（参数不全/形状不对）。
+const String kScheduleAcceptHeader = 'application/json, text/plain, */*';
+
+/// 拼课表接口 URL（与页内脚本一致的参数顺序与编码）。
+///
+/// - `years` 形如 `2026-2027-1`（学年-学期）；
+/// - `week` 从 1 开始；
+/// - `cardId` 是每人不同的 32 位 hex（页内从 DOM/网络里抓到，探针里由用户填）；
+/// - `timestampMs` 对应页内的 `Date.now()`（默认当前时间）。
+Uri buildScheduleApiUrl({
+  required String origin,
+  required String years,
+  required int week,
+  required String cardId,
+  int? timestampMs,
+}) {
+  final String base = origin.replaceAll(RegExp(r'/+$'), '');
+  final int ts = timestampMs ?? DateTime.now().millisecondsSinceEpoch;
+  return Uri.parse('$base$kScheduleApiPath').replace(
+    queryParameters: <String, String>{
+      'years': years,
+      'results': '$week',
+      'cardId': cardId,
+      '_t': '$ts',
+    },
+  );
+}
 
 /// 人工验证过的学期锚点（**仅作建议值，不是真值**），来源：云南农业大学
 /// 2026—2027 学年校历。
@@ -451,7 +542,10 @@ class ScheduleTemplate {
         cardIdSource: message['card_id_source'] as String?,
       );
 
-  bool get isValid => cardId.isNotEmpty && years.isNotEmpty;
+  // t142：只要拿到 cardId 就算有效 —— 学期可由 Dart 侧（用户所选学期/校历）补上。
+  // 旧实现要求"cardId 与 years 同时有"，SPA 还没渲染学期下拉时整条模板会被丢弃，
+  // 诊断因此一直显示「cardId 无」。
+  bool get isValid => cardId.isNotEmpty;
 }
 
 /// 批量取数的结果（原样交给 Rust 合并）。
@@ -557,7 +651,7 @@ const String kPortalScheduleScript = r'''
   // 诊断用：owner/我们据此判断卡在哪一步（不含任何凭据）
   var DIAG = {
     xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0,
-    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: [], probeParams: null, steps: []
+    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: [], probeParams: null, steps: [], probeAttempts: 0
   };
   // **没有任何"从页面打开算起"的绝对超时**：只有"无进展兜底"（见 watchdog）
   var LAST_PROGRESS = { at: Date.now(), what: 'start' };
@@ -569,13 +663,63 @@ const String kPortalScheduleScript = r'''
     timeoutPosted = false;
   }
 
+  // t94：注入脚本可能早于 flutter_inappwebview 的 polyfill（AT_DOCUMENT_START），
+  // 此时 `window.flutter_inappwebview` 还不存在——**旧实现在这里静默 return false，消息直接丢了**，
+  // 于是诊断出现“脚本探测 1 次 / Dart 收到 0 条”。现在改为排队 + 定时/加载后补发。
+  // t98：**主路径改为 Dart 主动拉取**。本脚本只把要上报的东西挂到
+  // `window.__yunongState.events`，由 Dart 用 `evaluateJavascript('JSON.stringify(window.__yunongState)')`
+  // 轮询取走（Dart→JS 已被证明可用；JS→Dart 的 bridge 在某些环境里始终不注入）。
+  window.__yunongState = window.__yunongState || {
+    events: [], updatedAt: 0, diag: DIAG,
+    // t100：文档级会话 id —— 导航后新文档会生成新 id，Dart 据此重置消费游标
+    sessionId: Math.random().toString(36).slice(2) + '-' + Date.now().toString(36)
+  };
+  var PENDING = [];
+  var BRIDGE = { queued: 0, flushed: 0, dropped: 0 };
+  DIAG.bridgeQueued = 0;
   function post(payload) {
+    // 主路径：写进可被 Dart 拉取的状态（不依赖桥）
     try {
-      if (!window.flutter_inappwebview) { return false; }
+      var st = window.__yunongState;
+      if (st) {
+        st.events.push(payload);
+        if (st.events.length > 60) { st.events.shift(); }
+        st.updatedAt = Date.now();
+        st.diag = DIAG;
+      }
+    } catch (e) {}
+    // 兜底：桥可用时仍照旧推送（失败入队，不再静默丢弃）
+    try {
+      if (!window.flutter_inappwebview) {
+        PENDING.push(payload); DIAG.bridgeQueued += 1; BRIDGE.queued += 1;
+        return false;
+      }
       window.flutter_inappwebview.callHandler('yunongBridge', JSON.stringify(payload));
       return true;
-    } catch (e) { return false; }
+    } catch (e) {
+      PENDING.push(payload); DIAG.bridgeQueued += 1; BRIDGE.queued += 1;
+      return false;
+    }
   }
+
+  function flushPending() {
+    if (!PENDING.length) { return; }
+    if (!window.flutter_inappwebview) { return; }
+    var items = PENDING; PENDING = [];
+    for (var i = 0; i < items.length; i++) {
+      try {
+        window.flutter_inappwebview.callHandler('yunongBridge', JSON.stringify(items[i]));
+        BRIDGE.flushed += 1;
+      } catch (e) {
+        PENDING.push(items[i]); BRIDGE.dropped += 1;
+      }
+    }
+  }
+  try {
+    setInterval(flushPending, 200);
+    window.addEventListener('load', flushPending);
+    document.addEventListener('DOMContentLoaded', flushPending);
+  } catch (e) {}
 
   function parseUrl(raw) {
     try { return new URL(raw, location.href); } catch (e) { return null; }
@@ -583,6 +727,13 @@ const String kPortalScheduleScript = r'''
 
   function capture(rawUrl) {
     DIAG.xhrSeen += 1;
+    // t142：把见过的请求 URL 记到有限长度的环形日志里，
+    // 供「自动探测 cardId」在**不发新请求**的前提下从历史请求里找 32 位 hex。
+    try {
+      window.__yunongXhrLog = window.__yunongXhrLog || [];
+      window.__yunongXhrLog.push({ url: String(rawUrl || ''), body: '' });
+      if (window.__yunongXhrLog.length > 20) { window.__yunongXhrLog.shift(); }
+    } catch (e0) {}
     var url = parseUrl(rawUrl);
     if (!url || url.pathname.indexOf(API) < 0) { return; }
     var cardId = url.searchParams.get('cardId') || '';
@@ -673,7 +824,8 @@ const String kPortalScheduleScript = r'''
       probeFailed: DIAG.probeFailed,
       probeResults: DIAG.probeResults,
       probeParams: DIAG.probeParams,
-      steps: DIAG.steps
+      steps: DIAG.steps,
+      probeAttempts: DIAG.probeAttempts
     });
   };
 
@@ -731,6 +883,18 @@ const String kPortalScheduleScript = r'''
   }
 
   function cardIdFromPage() {
+    // t142：先用**通用扫描**（window 自有属性 / XHR 历史 / HTML / storage），
+    // 这一步覆盖了"React SPA 把 cardId 放在闭包或 storage 里"的情况 —— 旧实现只看
+    // `[data-cardid]` 和 `__INITIAL_STATE__`，所以 owner 那边一直显示「cardId 无」。
+    var hints = [];
+    try { hints = JSON.parse(window.__yunongProbeCardIdsRaw ? window.__yunongProbeCardIdsRaw() : '[]'); } catch (e0) {}
+    if (hints && hints.length) {
+      for (var h = 0; h < hints.length; h++) {
+        if (hints[h] && hints[h].v) {
+          return { cardId: hints[h].v, source: String(hints[h].s || 'scan') };
+        }
+      }
+    }
     try {
       var el = document.querySelector('[data-cardid]');
       if (el) {
@@ -776,19 +940,22 @@ const String kPortalScheduleScript = r'''
     if (TEMPLATE) { return true; }
     var found = cardIdFromPage();
     if (!found) { return false; }
+    // t142：学期可能还没渲染出来（SPA 先出卡片再出学期下拉）。
+    // 不再因为 years 为空就放弃整条模板 —— 先把 cardId 交给 Dart，学期由用户所选学期补。
     var years = termFromDom();
-    if (!years) { return false; }
-    TEMPLATE = { cardId: found.cardId, years: years, weekcount: 20, weekcountFromApi: false };
+    TEMPLATE = { cardId: found.cardId, years: years || '', weekcount: 20, weekcountFromApi: false };
     DIAG.cardIdPrefix = found.cardId.slice(0, 8);
     DIAG.cardIdSource = found.source;
     post({
       type: 'schedule_template',
       card_id: found.cardId,
-      years: years,
+      years: years || '',
       weekcount: 20,
       card_id_source: found.source
     });
-    setTimeout(function () { window.__yunongFetchSchedule(); }, 300);
+    if (years) {
+      setTimeout(function () { window.__yunongFetchSchedule(); }, 300);
+    }
     return true;
   }
 
@@ -1047,6 +1214,7 @@ const String kPortalScheduleScript = r'''
     (function next(index) {
       if (TEMPLATE || index >= queue.length) { return; }
       var cand = queue[index];
+      DIAG.probeAttempts = (DIAG.probeAttempts || 0) + 1;
       DIAG.steps.push('→ ' + cand.value.slice(0, 8));
       var pending;
       try {

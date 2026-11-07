@@ -34,6 +34,7 @@ use axum::{
 use futures_core::Stream;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+use yunong_core::tool_choice::ToolChoice;
 use yunong_shared::{ApiError, Channel, ChatRequest, Chunk, ChunkAssembler, ErrorCode, Usage};
 
 use crate::accounting::{AuditEntry, UsageSample};
@@ -68,6 +69,17 @@ fn encode_event(chunk: &Chunk) -> Bytes {
     Bytes::from(format!("event: {}\ndata: {data}\n\n", event_name(chunk)))
 }
 
+/// 审计里的工具摘要（t129）：**只记数量与策略**。
+///
+/// `tools` 的内容可能很长（端侧 JSON Schema），而且属于端侧数据；审计只保留可聚合的短码。
+/// 没有任何工具也没给策略时返回 `None`（保持既有审计行不变）。
+fn tool_audit_reason(tool_count: usize, choice: ToolChoice) -> Option<String> {
+    if tool_count == 0 && choice == ToolChoice::Auto {
+        return None;
+    }
+    Some(format!("tools={tool_count},choice={}", choice.as_str()))
+}
+
 /// `POST /api/v1/chat/stream`（需 Bearer）：套餐通道的流式代理。
 pub async fn chat_stream(
     State(state): State<AppState>,
@@ -86,6 +98,18 @@ pub async fn chat_stream(
     request
         .validate()
         .map_err(|(code, message)| AppError::new(code, message, &req_id.0))?;
+
+    // t129/t131：`tools` 与 `tool_choice` 都已是 `ChatRequest` 的正式字段（原样转发）。
+    // 语义归一仍交给 `yunong_core::tool_choice`：认不出的值 → auto + warn，**不 422**
+    // （端侧升级比服务端快是常态，一个未知取值不该让整次提问失败）。
+    let (tool_choice, tool_choice_warn) = ToolChoice::parse(request.tool_choice.as_deref());
+    if let Some(warn) = &tool_choice_warn {
+        tracing::warn!(
+            request_id = %req_id.0,
+            raw = ?request.tool_choice,
+            "{warn}"
+        );
+    }
 
     // 红队 M4：标识字段的长度上限。**超限 422、不做截断**——静默截断会让审计/抽样里
     // 的 turn_id 与客户端后续轮次对不上（同一次提问被拆成两个 turn），排查时是灾难。
@@ -130,6 +154,24 @@ pub async fn chat_stream(
             &req_id.0,
         ));
     }
+
+    // ── 配额 / 记账口径（t129 明确）──────────────────────────────────────────
+    //
+    // **按 HTTP 请求计，不按"用户提问轮次"计。** 一次提问若触发工具循环，端侧会为每一跳
+    // 各发一次 `/chat/stream`（每跳都有各自的 `turn_id` 相同、`round` 递增），
+    // 服务端因此对每一跳分别做：准入估算、并发闸门、上游计费、抽样记账。
+    //
+    // 理由（与 captain 的倾向一致）：
+    // 1. **防放大**：按"提问轮次"计的话，一次提问内的工具循环次数只受端侧控制——
+    //    端侧（或篡改过的端侧）可以发 1000 跳，而服务端只记 1 次配额/成本；
+    // 2. **与真实成本对齐**：每一跳都是一次真实的上游请求（真实 token、真实账单），
+    //    记账必须逐跳，否则成本监控会系统性低估工具场景；
+    // 3. **可解释**：`(turn_id, round)` 已经是抽样的幂等键，逐跳计数天然可对账；
+    // 4. **不变式更少**：不需要服务端理解"一次提问"的边界（那需要信任端侧的循环控制）。
+    //
+    // 代价：一次提问在被工具循环放大时会更快撞到配额上限。这是**有意的**——
+    // 工具循环的上限由端侧的 `MAX_ROUNDS` 兜住，配额只需保证"总上游请求数有上限"。
+    // 说明写在这里而不是 docs/：docs 是单写者，口径在 PR 描述里同步给 captain。
 
     // 1) 并发闸门：按 turn 计（不是按 HTTP 请求计）
     let permit = match state
@@ -184,11 +226,13 @@ pub async fn chat_stream(
     };
 
     // 3) 审计放行 + 起流
-    state.accounting.record_audit_detached(AuditEntry::allow(
-        principal.user_id,
-        req_id.0.clone(),
-        request.turn_id.clone(),
-    ));
+    // t129：工具摘要只记数量与策略（`tools` 内容可能很长，且属于端侧数据，不进审计）。
+    let mut allow_entry =
+        AuditEntry::allow(principal.user_id, req_id.0.clone(), request.turn_id.clone());
+    // t129：审计只记 `tools=N,choice=…`（可聚合的短码），**绝不落工具内容**。
+    allow_entry.reason = tool_audit_reason(request.tools.len(), tool_choice);
+    let tool_count = request.tools.len();
+    state.accounting.record_audit_detached(allow_entry);
     tracing::info!(
         request_id = %req_id.0,
         session_id = %request.session_id,
@@ -196,6 +240,8 @@ pub async fn chat_stream(
         round = request.round,
         model = %request.model,
         protocol = ?request.protocol,
+        tool_count,
+        tool_choice = tool_choice.as_str(),
         "开始转发"
     );
 
@@ -580,6 +626,100 @@ impl Stream for SseBody {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_recv(cx)
+    }
+}
+
+#[cfg(test)]
+mod tool_choice_tests {
+    use super::*;
+
+    /// 老客户端（不带 `tool_choice`）必须能正常反序列化 → `None`，**不报错**。
+    ///
+    /// 这是向后兼容的硬要求：端侧发版比服务端慢是常态，多一个必填字段就等于让旧版本全挂。
+    #[test]
+    fn old_client_without_tool_choice_deserializes_to_none() {
+        let old = r#"{
+            "session_id":"s","turn_id":"t","round":1,"model":"m",
+            "protocol":"openai_completions","messages":[],
+            "tools":[],"max_output_tokens":1024,"stream":true,"estimated_input_tokens":0
+        }"#;
+        let parsed: ChatRequest = serde_json::from_str(old).expect("老客户端请求不能报错");
+        assert_eq!(parsed.tool_choice, None);
+        // 归一结果与"没给"一致（auto，不发字段）
+        assert_eq!(
+            ToolChoice::parse(parsed.tool_choice.as_deref()).0,
+            ToolChoice::Auto
+        );
+    }
+
+    /// `skip_serializing_if` 生效：`None` 时序列化出来的 JSON 里**完全没有**该键
+    /// （服务端若回显/转发 ChatRequest，老上游不该看到一个陌生字段）。
+    #[test]
+    fn none_tool_choice_is_not_serialized() {
+        let mut request: ChatRequest = serde_json::from_str(
+            r#"{
+                "session_id":"s","turn_id":"t","round":1,"model":"m",
+                "protocol":"openai_completions","messages":[],
+                "tools":[],"max_output_tokens":1024,"stream":true,"estimated_input_tokens":0
+            }"#,
+        )
+        .expect("最小请求");
+
+        let json = serde_json::to_string(&request).expect("序列化");
+        assert!(!json.contains("tool_choice"), "None 时不该出现该键：{json}");
+
+        request.tool_choice = Some("required".to_owned());
+        let json = serde_json::to_string(&request).expect("序列化");
+        assert!(json.contains(r#""tool_choice":"required""#), "{json}");
+    }
+
+    /// 取值的归一规则（与端侧同一套）：大小写/别名都认，未知值 → auto + warn，**不 422**。
+    #[test]
+    fn values_normalize_like_the_client() {
+        assert_eq!(ToolChoice::parse(Some("auto")).0, ToolChoice::Auto);
+        assert_eq!(ToolChoice::parse(Some("none")).0, ToolChoice::None);
+        assert_eq!(ToolChoice::parse(Some("required")).0, ToolChoice::Required);
+        assert_eq!(
+            ToolChoice::parse(Some(" REQUIRED ")).0,
+            ToolChoice::Required
+        );
+        // Anthropic 形状的别名也算 required
+        assert_eq!(ToolChoice::parse(Some("any")).0, ToolChoice::Required);
+        // 未知值：不报错，按 auto 处理并给出 warn（服务端选择继续放行）
+        let (choice, warn) = ToolChoice::parse(Some("tool_use_required_v2"));
+        assert_eq!(choice, ToolChoice::Auto);
+        assert!(warn.is_some(), "未知取值必须留 warn，不能静默改语义");
+    }
+
+    #[test]
+    fn audit_reason_only_carries_counts_and_policy() {
+        // 没有工具、也没要求策略 → 不改动既有审计行
+        assert_eq!(tool_audit_reason(0, ToolChoice::Auto), None);
+        // 有工具就要留痕，但只有数量
+        assert_eq!(
+            tool_audit_reason(2, ToolChoice::Auto).as_deref(),
+            Some("tools=2,choice=auto")
+        );
+        // 要求策略时记下它（这是"本次放行了强制工具调用"的唯一线索）
+        assert_eq!(
+            tool_audit_reason(1, ToolChoice::Required).as_deref(),
+            Some("tools=1,choice=required")
+        );
+        // 没有任何工具却要求 required：也要记（这是可疑输入，支持排查）
+        assert_eq!(
+            tool_audit_reason(0, ToolChoice::Required).as_deref(),
+            Some("tools=0,choice=required")
+        );
+    }
+
+    /// 端侧可能发大写/别名（`any` 等价于 `required`），解析规则与端侧同一套（core 里只有一份）。
+    #[test]
+    fn unknown_values_fall_back_to_auto_with_warning() {
+        assert_eq!(ToolChoice::parse(Some("REQUIRED")).0, ToolChoice::Required);
+        assert_eq!(ToolChoice::parse(Some("any")).0, ToolChoice::Required);
+        let (choice, warn) = ToolChoice::parse(Some("whatever"));
+        assert_eq!(choice, ToolChoice::Auto);
+        assert!(warn.is_some(), "认不出的值必须打 warn，不能静默改语义");
     }
 }
 

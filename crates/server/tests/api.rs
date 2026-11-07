@@ -131,7 +131,7 @@ fn chat_body(round: u8, estimated_input_tokens: u32) -> Value {
         "session_id": "s_1",
         "turn_id": "t_1",
         "round": round,
-        "model": "deepseek-chat",
+        "model": "deepseek-flash",
         "protocol": "openai_completions",
         "messages": [{ "role": "user", "content": "下周三下午有课吗" }],
         "tools": [],
@@ -600,4 +600,113 @@ async fn chat_oversized_input_maps_to_413() {
 async fn unknown_route_is_404_not_401() {
     let res = TestApp::new().call(get("/api/v1/nope")).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+// ============ t141：邀请制注册（对外行为） ============
+
+/// 打开"必须邀请码"的 AppState（内存鉴权后端，无需数据库）。
+fn invite_only_app() -> AppState {
+    let mut config = yunong_server::config::Config::for_tests();
+    config.auth_invite_required = true;
+    AppState::new(config, None)
+}
+
+fn register_request(email: &str, invite_code: Option<&str>) -> Request<Body> {
+    let mut payload = json!({ "email": email, "password": PASSWORD });
+    if let Some(code) = invite_code {
+        payload["invite_code"] = json!(code);
+    }
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/register")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::USER_AGENT, "ynau-api-test/1.0")
+        .body(Body::from(payload.to_string()))
+        .expect("构造请求")
+}
+
+async fn call(state: &AppState, request: Request<Body>) -> Res {
+    let res = app(state.clone())
+        .oneshot(request)
+        .await
+        .expect("服务应能处理请求");
+    let status = res.status();
+    let bytes = res
+        .into_body()
+        .collect()
+        .await
+        .expect("读取响应体")
+        .to_bytes();
+    Res {
+        status,
+        body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        request_id: None,
+    }
+}
+
+/// 不带邀请码 → 403；带一个乱码也是同一个 403（不泄露"码存不存在"）。
+#[tokio::test]
+async fn register_without_invite_is_invite_invalid_and_indistinguishable() {
+    let state = invite_only_app();
+
+    let missing = call(&state, register_request(EMAIL, None)).await;
+    let bogus = call(
+        &state,
+        register_request(EMAIL, Some("ynau-not-a-real-code")),
+    )
+    .await;
+    let expired = call(&state, register_request(EMAIL, Some("ynau-expired"))).await;
+
+    for res in [&missing, &bogus] {
+        // t147：专用错误码（403 + INVITE_INVALID），客户端可据此给针对性提示
+        assert_eq!(res.status, StatusCode::FORBIDDEN);
+        assert_eq!(res.body["error"]["code"], "INVITE_INVALID");
+        assert_eq!(res.body["error"]["message"], "邀请码无效或已不可用");
+    }
+    // 信封里的 `request_id` 每次都不同，所以比"错误码 + 文案"这两项对外可见的判据
+    assert_eq!(
+        missing.body["error"]["code"], bogus.body["error"]["code"],
+        "失败码必须一致"
+    );
+    assert_eq!(
+        missing.body["error"]["message"], bogus.body["error"]["message"],
+        "失败文案必须一致"
+    );
+    assert_eq!(expired.status, StatusCode::FORBIDDEN);
+    assert_eq!(expired.body["error"]["code"], "INVITE_INVALID");
+}
+
+/// 有可用邀请码 → 201；同一个一次性码第二次用 → 403。
+#[tokio::test]
+async fn valid_invite_registers_once() {
+    let state = invite_only_app();
+    state
+        .auth
+        .add_memory_invite_for_tests("ynau-one-shot", "b1", 1, None);
+
+    let ok = call(&state, register_request(EMAIL, Some("ynau-one-shot"))).await;
+    assert_eq!(ok.status, StatusCode::CREATED, "{:?}", ok.body);
+    assert!(
+        ok.body["data"]["access_token"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "应返回令牌对：{:?}",
+        ok.body
+    );
+
+    let again = call(
+        &state,
+        register_request("another@ynau.edu.cn", Some("ynau-one-shot")),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::FORBIDDEN, "一次性码不能复用");
+    assert_eq!(again.body["error"]["code"], "INVITE_INVALID");
+}
+
+/// 关掉开关（本地开发/测试）时仍然可以不带走码注册——行为与旧版一致。
+#[tokio::test]
+async fn invite_can_be_switched_off_for_local_dev() {
+    let state = AppState::for_tests(); // for_tests 默认关闭邀请制
+    let res = call(&state, register_request(EMAIL, None)).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{:?}", res.body);
 }

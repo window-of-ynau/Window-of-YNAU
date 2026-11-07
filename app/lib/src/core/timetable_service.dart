@@ -13,6 +13,7 @@ import 'dart:io';
 
 import 'package:flutter/services.dart' show rootBundle;
 
+import '../campus/capture_cache.dart';
 import '../campus/portal_api.dart';
 import 'ffi_bindings.dart';
 
@@ -258,6 +259,130 @@ class FetchException implements Exception {
 
   @override
   String toString() => 'FetchException($code): ${message ?? userHint}';
+}
+
+/// 【t146】抓取重试：HTML 太短 / 不含课表关键字时，**间隔 [delay] 自动重试一次**。
+///
+/// 背景：每次构建后第一次抓取必报 `PARSE_EMPTY`，重试就正常 —— 首次构建后 WebView 缓存为空、
+/// 页面渲染更慢，抓取窗口里拿到的是空壳 HTML。按内容判断 + 重试一次，比固定延时靠谱。
+///
+/// - [minLength]：低于它视为"空壳"（默认 2000 字符；真实课表页远大于此）；
+/// - 第二次仍不合格就**返回最后一次结果**，由上游照常报错（不掩盖问题）。
+Future<HtmlFetchAttempt> fetchHtmlWithRetry({
+  required Future<String> Function() fetch,
+  Duration delay = const Duration(milliseconds: 800),
+  int minLength = 2000,
+  int maxAttempts = 2,
+}) async {
+  HtmlFetchAttempt attempt = const HtmlFetchAttempt(html: '', tries: 0);
+  for (int i = 0; i < maxAttempts; i++) {
+    final String html = await fetch();
+    attempt = HtmlFetchAttempt(html: html, tries: i + 1);
+    if (!attempt.looksEmpty(minLength: minLength)) {
+      return attempt;
+    }
+    if (i + 1 < maxAttempts) {
+      await Future<void>.delayed(delay);
+    }
+  }
+  return attempt;
+}
+
+/// 一次 HTML 抓取的结果（含诊断信息，**不记录原始 HTML**）。
+class HtmlFetchAttempt {
+  const HtmlFetchAttempt({required this.html, required this.tries});
+
+  final String html;
+
+  /// 第几次尝试（1 = 首次）。
+  final int tries;
+
+  int get length => html.length;
+
+  /// 是否含课表关键字（既用于诊断，也用于判断是否需要重试）。
+  bool get hasTimetableMark =>
+      RegExp(r'timetable|课程|节次|课表|周次', caseSensitive: false).hasMatch(html);
+
+  /// "空壳"：太短或不含课表关键字。
+  bool looksEmpty({int minLength = 2000}) => length < minLength || !hasTimetableMark;
+
+  /// 诊断行：`html 长度=N / 是否含课表关键字=true|false（第 N 次）`
+  String get diagnostics =>
+      'html 长度=$length / 是否含课表关键字=$hasTimetableMark（第 $tries 次）';
+}
+
+/// 【t151】`PARSE_EMPTY`（解析出 0 门课）也要可重试：最多 3 次（首发 + 2 次重试），间隔 800ms。
+///
+/// 背景：页面可能处于"课表框架已渲染、课程行还没填"的中间态 —— HTML 够长、含课表字样，
+/// 但 Rust 解析出 0 门课。用户手动重试就好，说明只是**时机**问题。
+///
+/// 每次尝试都记录：`html 长度 / 课程行数 / 是否 PARSE_EMPTY`，失败消息一并带给用户。
+Future<ParseRetryResult> importHtmlWithParseRetry({
+  required Future<String> Function() fetchHtml,
+  required Future<ImportOutcome> Function(String html) importHtml,
+  int maxAttempts = 3,
+  Duration delay = const Duration(milliseconds: 800),
+  int Function(String html)? rowCountOf,
+}) async {
+  final List<ParseAttempt> attempts = <ParseAttempt>[];
+  String html = '';
+  ImportOutcome? lastOutcome;
+  for (int i = 1; i <= maxAttempts; i++) {
+    try {
+      html = await fetchHtml();
+    } on Object {
+      // 取不到就用上一次的 html 再解析一次（比直接失败更有用）
+    }
+    lastOutcome = await importHtml(html);
+    attempts.add(ParseAttempt(
+      index: i,
+      htmlLength: html.length,
+      rowCount: rowCountOf?.call(html) ?? -1,
+      parseEmpty: lastOutcome.imported == 0,
+    ));
+    if (lastOutcome.imported > 0) {
+      return ParseRetryResult(outcome: lastOutcome, attempts: attempts);
+    }
+    if (i < maxAttempts) {
+      await Future<void>.delayed(delay);
+    }
+  }
+  return ParseRetryResult(outcome: lastOutcome!, attempts: attempts);
+}
+
+/// 一次解析尝试的记录（诊断用，不含 HTML 原文）。
+class ParseAttempt {
+  const ParseAttempt({
+    required this.index,
+    required this.htmlLength,
+    required this.rowCount,
+    required this.parseEmpty,
+  });
+
+  final int index;
+  final int htmlLength;
+  final int rowCount;
+  final bool parseEmpty;
+
+  String get diagnostics =>
+      '第 $index 次：html 长度=$htmlLength / 课程行数=${rowCount < 0 ? '未知' : rowCount} / '
+      'PARSE_EMPTY=${parseEmpty ? '是' : '否'}';
+}
+
+/// 带重试的导入结果。
+class ParseRetryResult {
+  const ParseRetryResult({required this.outcome, required this.attempts});
+
+  final ImportOutcome outcome;
+  final List<ParseAttempt> attempts;
+
+  bool get ok => outcome.imported > 0;
+
+  String get diagnostics {
+    final String detail = attempts.map((ParseAttempt a) => a.diagnostics).join('；');
+    final String cardId = describeCachedCardId();
+    return '$detail；$cardId';
+  }
 }
 
 /// 课表服务：HTML → Rust 核心（解析 + SQLite）→ 列表。

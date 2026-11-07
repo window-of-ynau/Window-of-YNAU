@@ -9,7 +9,7 @@
 //! ```
 //!
 //! 可选覆盖：`YUNONG_REAL_BASE_URL`（默认 `https://api.deepseek.com`）、
-//! `YUNONG_REAL_MODEL`（默认 `deepseek-chat`）。
+//! `YUNONG_REAL_MODEL`（默认 `deepseek-flash`）。
 
 use std::time::{Duration, Instant};
 
@@ -33,13 +33,14 @@ fn request(protocol: Protocol, prompt: &str) -> ChatRequest {
         session_id: "s_real".into(),
         turn_id: "t_real".into(),
         round: 1,
-        model: env_or("YUNONG_REAL_MODEL", "deepseek-chat"),
+        model: env_or("YUNONG_REAL_MODEL", "deepseek-flash"),
         protocol,
         messages: vec![ChatMessage::user(prompt)],
         tools: vec![],
         max_output_tokens: 64,
         stream: true,
         estimated_input_tokens: 0,
+        tool_choice: None,
     }
 }
 
@@ -50,7 +51,7 @@ async fn real_upstream_streams_end_to_end() {
     let provider = DirectProvider::new(
         Protocol::OpenaiCompletions,
         env_or("YUNONG_REAL_BASE_URL", "https://api.deepseek.com"),
-        env_or("YUNONG_REAL_MODEL", "deepseek-chat"),
+        env_or("YUNONG_REAL_MODEL", "deepseek-flash"),
     )
     .with_api_key(api_key());
 
@@ -107,7 +108,7 @@ async fn real_upstream_handles_concurrent_streams() {
     let concurrency: usize = env_or("YUNONG_REAL_CONCURRENCY", "8").parse().unwrap_or(8);
     let key = api_key();
     let base = env_or("YUNONG_REAL_BASE_URL", "https://api.deepseek.com");
-    let model = env_or("YUNONG_REAL_MODEL", "deepseek-chat");
+    let model = env_or("YUNONG_REAL_MODEL", "deepseek-flash");
 
     let mut handles = Vec::new();
     for i in 0..concurrency {
@@ -199,7 +200,7 @@ async fn real_upstream_all_three_protocols() {
         let provider = DirectProvider::new(
             protocol,
             base.clone(),
-            env_or("YUNONG_REAL_MODEL", "deepseek-chat"),
+            env_or("YUNONG_REAL_MODEL", "deepseek-flash"),
         )
         .with_api_key(key.clone());
         let req = request(protocol, "只回复两个字：成功");

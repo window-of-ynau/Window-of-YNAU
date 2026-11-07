@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 // WebView JS bridge 的**纯 Dart** 部分：解析消息 → 驱动取数状态机。
 //
 // 抽出来的原因：WebView 本身在测试里起不来（平台通道），但"消息怎么解释"是逻辑，
@@ -6,9 +7,12 @@
 // 白名单（隐私）：只接受 `type` / `state` / `reason` / `path` / `html` / `code` / `message`，
 // **不接受也不解析任何 Cookie、表单值、完整 URL**。
 
+import 'dart:async';
 import 'dart:convert';
 
 import '../core/timetable_service.dart';
+import 'capture_cache.dart';
+import 'capture_readiness.dart';
 import 'portal_api.dart';
 import 'webview_session.dart';
 
@@ -25,9 +29,59 @@ class CampusBridge {
     this.onScheduleTemplate,
     this.onScheduleApi,
     this.onStageChange,
+    this.grabHtml,
+    this.retryDelay = const Duration(milliseconds: 800),
+    this.pollInterval = const Duration(milliseconds: 500),
+    this.pollTimeout = const Duration(seconds: 6),
+    this.metaProbe,
+    this.rowProbe,
+    this.minHtmlLength = 2000,
+    this.requireTimetableKeyword = true,
   });
 
   final void Function(FetchedPage page) onFetched;
+
+  /// 【t148】页面侧可重复调用的抓取入口（`window.__yunongGrabHtml()`）。
+  ///
+  /// 首次收到的 html 若是"空壳"，用它**重取一次**（不重新导航），再判失败。
+  final Future<String?> Function()? grabHtml;
+
+  /// 重取前的等待（默认 800ms；t150 起仅用于兼容旧调用）。
+  final Duration retryDelay;
+
+  /// t150：等待页面就绪的轮询间隔与总超时。
+  final Duration pollInterval;
+  final Duration pollTimeout;
+
+  /// t150：页面元信息（URL/标题）探测；为空时诊断里对应字段显示"（空）"。
+  final PageMetaProbe? metaProbe;
+
+  /// t151：课程行数探测（就绪判定必须要求行数 > 0，否则会出现"框架在、行还没渲染"）。
+  final CourseRowProbe? rowProbe;
+
+  /// "空壳"判定阈值（默认 2000 字符；测试可调小）。
+  final int minHtmlLength;
+
+  /// 是否要求 HTML 含课表关键字（测试可关掉）。
+  final bool requireTimetableKeyword;
+
+  /// 按当前配置判断一条 html 是否算"空壳"。
+  bool _isHollow(String html) {
+    final HtmlFetchAttempt attempt = HtmlFetchAttempt(html: html, tries: 1);
+    if (html.trim().isEmpty) {
+      return true;
+    }
+    if (html.length < minHtmlLength) {
+      return true;
+    }
+    return requireTimetableKeyword && !attempt.hasTimetableMark;
+  }
+
+  /// 是否已经用过那一次重取机会（每次抓取只重试一次）。
+  bool _htmlRetryUsed = false;
+
+  /// 最近一次交付/失败的 html 诊断行（`html 长度=N / 是否含课表关键字=…（第 N 次）`）。
+  String? lastHtmlDiagnostics;
   final void Function(FetchException error) onError;
   final void Function(LoginProbe probe)? onLoginState;
   final void Function(FetchStage stage)? onStage;
@@ -37,6 +91,14 @@ class CampusBridge {
 
   /// 批量拉周完成（原样交给 Rust 合并）
   final void Function(ScheduleApiResult result)? onScheduleApi;
+
+  /// Dart 侧收到的 schedule_api 消息数（用于和脚本侧探测计数对照）。
+  int scheduleApiCount = 0;  /// t98：Dart 主动拉取 `window.__yunongState` 的统计（诊断用）。  int pullCount = 0;  int lastStateAgeSeconds = -1;  int stateEventsConsumed = 0;
+
+  /// t98：Dart 主动拉取 `window.__yunongState` 的统计（诊断用）。
+  int pullCount = 0;
+  int lastStateAgeSeconds = -1;
+  int stateEventsConsumed = 0;
 
   /// 阶段变化：`login`（等用户登录，**不抓取**）/ `capture`（登录完成，开始抓）
   final void Function(String stage, Map<String, dynamic>? diagnostics)? onStageChange;
@@ -80,7 +142,7 @@ class CampusBridge {
         _fail(FetchException(
           code: 'CAPTURE_TIMEOUT',
           userHint: '请在页面里打开「课表」卡片，或切换一次周次后重试',
-          message: _formatDiagnostics(message['diagnostics']),
+          message: _formatDiagnostics(          message['diagnostics'],          dartScheduleApiCount: scheduleApiCount,          pullCount: pullCount,          stateAgeSeconds: lastStateAgeSeconds,          stateEventsConsumed: stateEventsConsumed,        ),
         ));
         return true;
 
@@ -88,7 +150,7 @@ class CampusBridge {
         _fail(FetchException(
           code: 'PORTAL_PAGE',
           userHint: '当前是门户页，需要先打开「课表」卡片',
-          message: _formatDiagnostics(message['diagnostics']),
+          message: _formatDiagnostics(          message['diagnostics'],          dartScheduleApiCount: scheduleApiCount,          pullCount: pullCount,          stateAgeSeconds: lastStateAgeSeconds,          stateEventsConsumed: stateEventsConsumed,        ),
         ));
         return true;
       case 'stage':
@@ -106,12 +168,18 @@ class CampusBridge {
       case 'schedule_template':
         final template = ScheduleTemplate.fromMessage(message);
         if (template.isValid) {
+          // t150：抓取成功即缓存 cardId/学期 —— 抓完 WebView 会关闭，探针只能靠这份缓存。
+          CampusCaptureCache.instance.rememberTemplate(
+            cardId: template.cardId,
+            years: template.years,
+          );
           onScheduleTemplate?.call(template);
         }
         return true;
 
       case 'schedule_api':
-        final result = ScheduleApiResult.fromMessage(message);
+        scheduleApiCount += 1;
+      final result = ScheduleApiResult.fromMessage(message);
         if (_delivered) {
           return true;
         }
@@ -129,22 +197,24 @@ class CampusBridge {
         return true;
       case 'timetable':
         final html = message['html'];
-        if (html is! String || html.trim().isEmpty) {
-          _fail(const FetchException(
-            code: 'HTML_CHANGED',
-            userHint: '学校页面可能已更新，请反馈',
-            message: '抓到空表格',
-          ));
+        final String path = (message['path'] as String?) ?? '';
+        final String htmlText = html is String ? html : '';
+        final HtmlFetchAttempt attempt = HtmlFetchAttempt(html: htmlText, tries: 1);
+        if (!_isHollow(htmlText)) {
+          _deliver(attempt, path);
           return true;
         }
-        if (_delivered) {
+        // t148：空壳不再立刻失败 —— 先用页面侧的可重复入口**重取一次**（800ms 后），
+        // 仍不合格才报 HTML_CHANGED（诊断里带上次数与长度，便于定位）。
+        if (!_htmlRetryUsed && grabHtml != null) {
+          _htmlRetryUsed = true;
+          unawaited(_retryHtml(path, first: attempt));
           return true;
         }
-        _delivered = true;
-        onStage?.call(FetchStage.grabbed);
-        onFetched(FetchedPage(
-          html: html,
-          url: (message['path'] as String?) ?? '',
+        _fail(FetchException(
+          code: 'HTML_CHANGED',
+          userHint: '学校页面可能已更新，请反馈',
+          message: '抓到空表格（${attempt.diagnostics}）',
         ));
         return true;
 
@@ -163,6 +233,46 @@ class CampusBridge {
     }
   }
 
+  /// 交付一次合格的 HTML（只交付一次）。
+  void _deliver(HtmlFetchAttempt attempt, String path) {
+    if (_delivered) {
+      return;
+    }
+    _delivered = true;
+    lastHtmlDiagnostics = attempt.diagnostics;
+    onStage?.call(FetchStage.grabbed);
+    onFetched(FetchedPage(html: attempt.html, url: path));
+  }
+
+  /// t150：空壳 → **轮询等待页面就绪**（每 500ms 一次，最多 6s），而不是固定等 800ms 再取一次。
+  ///
+  /// 失败时把每次探测的诊断（html 长度 / 标题 / URL / 是否登录页 / 是否含课表关键字）全带进消息，
+  /// 这样下次真机失败能直接看出是"还停在登录页"还是"页面里没有课表"。
+  Future<void> _retryHtml(String path, {required HtmlFetchAttempt first}) async {
+    final CaptureWaitResult result = await waitForTimetableReady(
+      html: () async => (await grabHtml?.call()) ?? '',
+      meta: metaProbe,
+      rows: rowProbe,
+      interval: pollInterval,
+      timeout: pollTimeout,
+      minLength: 0, // 阈值统一交给 _isHollow（含关键字判断）
+    );
+    final String html = result.last.html;
+    if (!_isHollow(html)) {
+      _deliver(HtmlFetchAttempt(html: html, tries: result.last.tries + 1), path);
+      return;
+    }
+    final bool loginPage = result.last.looksLikeLoginPage;
+    _fail(FetchException(
+      // 登录页 → 明确说明"没登录"，不要用 PARSE_EMPTY/HTML_CHANGED 混淆
+      code: loginPage ? 'NOT_LOGGED_IN' : 'HTML_CHANGED',
+      userHint: loginPage
+          ? '登录未完成：请在弹出的校务页面里完成登录后再试'
+          : '学校页面可能已更新，请反馈',
+      message: '${result.failureMessage}；首次：${first.diagnostics}',
+    ));
+  }
+
   void _fail(FetchException error) {
     if (_delivered) {
       return;
@@ -177,6 +287,25 @@ class CampusBridge {
     }
     onError(error);
   }
+
+  /// 【t161 / issue #54】桥接安装失败要**立刻可见**，而不是让页面一直转圈。
+  ///
+  /// 场景：`addJavaScriptHandler('yunongBridge')` 或 UserScript 注入抛异常
+  /// （控制器已销毁 / 平台通道异常 / WebView2 未就绪）。这时页面永远收不到消息，
+  /// 用户只看到「抓取中…」，无法判断是不是自己操作错了。
+  ///
+  /// 处理：写一条诊断 + 通过 `onError` 抛 [FetchException]，
+  /// 页面用**同一套失败卡片**展示原因（不是静默等待）。
+  void reportBridgeFailure(Object failure, {String? where}) {
+    final String detail = '${failure.runtimeType}: $failure';
+    lastHtmlDiagnostics = '桥接安装失败${where == null ? '' : '（$where）'}：$detail';
+    debugPrint('[capture] $lastHtmlDiagnostics');
+    _fail(FetchException(
+      code: 'BRIDGE_UNAVAILABLE',
+      userHint: '内嵌页面通道没建立起来：请重试一次；仍失败就重启应用',
+      message: lastHtmlDiagnostics,
+    ));
+  }
 }
 
 /// 抓取失败码 → 用户看得懂的一句话（不要弹异常栈）。
@@ -185,6 +314,7 @@ String describeFetchFailure(String code) => switch (code) {
       'CARD_NOT_FOUND' => '没抓到课表接口：请先在门户里打开一次课表卡片',
       'CAPTURE_TIMEOUT' => '请在页面里打开「课表」卡片，或切换一次周次后重试',
       'PORTAL_PAGE' => '当前是门户页，需要先打开「课表」卡片',
+      'BRIDGE_UNAVAILABLE' => '内嵌页面通道没建立起来：请重试一次；仍失败就重启应用',
       'AUTH_REQUIRED' => '登录态已失效，请重新登录',
       'LOGIN_TIMEOUT' => '登录超时，请重试',
       'NO_WEBVIEW' => '当前平台不支持内置浏览器',
@@ -215,7 +345,7 @@ String classifyWebViewError(String? description, {String? type}) {
 }
 
 /// 把脚本带回的诊断信息压成一行（给人看，**不含任何凭据**）。
-String _formatDiagnostics(Object? raw) {
+String _formatDiagnostics(  Object? raw, {  int dartScheduleApiCount = 0,  int pullCount = 0,  int stateAgeSeconds = -1,  int stateEventsConsumed = 0,}) {
   if (raw is! Map) {
     return '';
   }
@@ -257,6 +387,14 @@ String _formatDiagnostics(Object? raw) {
   if (probeParams is Map) {
     parts.add('参数 years=${probeParams['years']} results=${probeParams['results']}');
   }
+  // 两侧计数对照：脚本侧"探测了几次" vs Dart 侧"收到几条 schedule_api"。
+  // 两者都 0 → 真的没发；脚本 >0 而 Dart=0 → 发了没上报（桥接问题）。
+  final scriptProbes = raw['probeAttempts'];
+  final scriptProbeCount = scriptProbes is num
+      ? scriptProbes.toInt()
+      : (raw['probeResults'] is List ? (raw['probeResults'] as List).length : 0);
+  parts.add('桥接 脚本探测$scriptProbeCount 次 / Dart收到 $dartScheduleApiCount 条');
+    parts.add('拉取 $pullCount 次 / 最后状态 age=${stateAgeSeconds}s / 已消费 $stateEventsConsumed 条');
   final probeResults = raw['probeResults'];
   if (probeResults is List && probeResults.isNotEmpty) {
     final tried = probeResults.take(12).map((dynamic item) => '[$item]').join(' ');

@@ -18,6 +18,8 @@
 
 import 'package:flutter/material.dart';
 
+import '../../theme/yunong_tokens.dart';
+
 /// 一套课程配色：`container` 是块底，`ink` 是课名，`inkSoft` 是教室/节次，
 /// `border` 只用来把块从白底上勾出来。
 ///
@@ -249,13 +251,17 @@ Map<String, int> assignCourseTints(Iterable<String> names) {
   return result;
 }
 
-/// 取某门课在当前亮度下的一套颜色（自动处理"第二轮加深"）。
+/// 取某门课在当前主题下的一套颜色（自动处理"第二轮加深"）。
+///
+/// **色相不随主题变**：槽位只由课程名决定（`assignCourseTints`），
+/// 主题只能决定取"浅档"还是"深档"（`tokens.useDarkCoursePalette`）——
+/// B 的深色画布用深档，A/C 用浅档，课程与色相的对应关系始终不变。
 CourseTint courseTintOf(
   BuildContext context,
   Map<String, int> assignment,
   String courseName,
 ) {
-  final List<CourseTint> palette = Theme.of(context).brightness == Brightness.dark
+  final List<CourseTint> palette = context.tokens.useDarkCoursePalette
       ? kCourseTintsDark
       : kCourseTintsLight;
   final int slot = assignment[courseName] ?? 0;

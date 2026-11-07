@@ -45,3 +45,16 @@ Thumbs.db
 
 # 内部工程规范（不公开）
 .internal/
+
+# Windows 快捷方式（本地创建，不入库）
+*.lnk
+
+# Rust 交叉编译产物（scripts/build-android-core.ps1 生成，不入库）
+app/android/app/src/main/jniLibs/
+app/android/build/
+
+# 安装包白名单暂存目录（scripts/build-windows-installer.ps1 生成，不入库）
+build/installer-staging/
+
+# 安装包产物（scripts/build-windows-installer.ps1 生成，不入库）
+dist/

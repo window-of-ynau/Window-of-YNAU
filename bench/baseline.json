@@ -1,11 +1,18 @@
 {
-  "version": 1,
-  "_comment": "占位基线：这些数字不是实测结果，只用来把 bench/run.py 的对比流程跑通。首次真实跑通（服务可访问、上游有 Key）后必须整体替换：用 bench/out 里那次的 summary 覆盖下面的 summary，并把 version 加 1。替换前确认那次全部用例 ok、error_rate 为 0。",
+  "version": 2,
+  "collected_at": "2026-11-07T03:58:09Z",
+  "environment": "GitHub Actions ubuntu-latest（run 42336225236 的 bench job）",
+  "source": "bench/cases/full.jsonl + bench/mock_upstream.py（回放固定答案，chunk=64 chars, tokens_in=400）",
+  "note": "实测基线。换机器 / 换上游 / 换价目都要重新采并在 PR 里说明原因。退化判定见 bench/run.py 的 compare_with_baseline()（相对 >10% 且超过绝对噪声下限）。",
   "summary": {
-    "p50_ttft_ms": 900,
-    "p95_ttft_ms": 1800,
-    "mean_total_ms": 6000,
+    "p50_ttft_ms": 2.6,
+    "p95_ttft_ms": 3.2,
+    "p50_total_ms": 2.7,
+    "p95_total_ms": 3.3,
+    "est_cost_per_case_cents": 0.1029,
+    "hit_rate": 1.0,
     "error_rate": 0.0,
-    "est_cost_per_case_cents": 2
+    "cases": 50,
+    "cases_ok": 50
   }
 }

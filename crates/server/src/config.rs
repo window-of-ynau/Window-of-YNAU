@@ -64,6 +64,52 @@ pub struct Config {
     /// 是否信任 `X-Forwarded-For`（R2-F6）。默认 **false**：没有反向代理时，
     /// XFF 是攻击者随便填的，按它分桶等于没有限流。部署在 Caddy/Nginx 后面再打开。
     pub trust_proxy: bool,
+    /// RAG 月度盐的进程内缓存 TTL（秒，ADR-19 决策 2）。0 = 每次都查库。
+    pub rag_salt_ttl_secs: u64,
+    /// 单次上报条数上限（ADR-19 决策 3）
+    pub rag_max_items_per_request: usize,
+    /// 单月单客户端累计上报条数上限（防放大）
+    pub rag_max_items_per_month: usize,
+    /// 是否启用抓取 worker（默认 **false**：CI 与离线环境都不允许联网抓取）
+    pub rag_fetch_enabled: bool,
+    /// 每轮抓取最多处理多少个候选（按 count 排序）
+    pub rag_fetch_top_n: usize,
+    /// 抓取失败的重试次数（总计 retries+1 次尝试）
+    pub rag_fetch_retries: u32,
+    /// 重试退避基数（毫秒）：第 n 次等 backoff * 2^(n-1)
+    pub rag_fetch_backoff_ms: u64,
+    /// 抓取 HTTP 超时（秒）
+    pub rag_fetch_timeout_secs: u64,
+    /// 同一轮内两次抓取之间的最小间隔（毫秒）——限速，对 arXiv 这类要求礼貌访问的源必要
+    pub rag_fetch_min_interval_ms: u64,
+    /// 是否把上次 `failed` 的候选也纳入本轮（t81 / M8）。
+    ///
+    /// 默认 **false**：默认只跑 pending，保证"失败不会被无限重试"；
+    /// 但运维必须**有手段**重试（旧实现只有代码里一个 `retry_failed: false` 字面量）。
+    pub rag_fetch_retry_failed: bool,
+    /// `fetching` 占位的过期阈值（秒，t81 / M1）。
+    ///
+    /// 只有 `claimed_at` 早于这个阈值的行才会被下一轮回收；正在跑的 worker 的占位不会被抢。
+    pub rag_fetch_stale_after_secs: u64,
+    /// 抓取正文的字节上限（t81 / M4）。超过直接判永久失败，不落库。
+    pub rag_fetch_max_body_bytes: usize,
+    /// DOI 抓取允许跟随的重定向目标域名白名单（t81 / M3）。
+    ///
+    /// doi.org 是 302 跳到出版商；不跟重定向 ⇒ DOI 源 100% 失败。
+    /// 但也不能无条件跟（会被带去任意地址），所以只在白名单域名内跟。
+    pub rag_fetch_doi_allowed_hosts: Vec<String>,
+    /// `/api/v1/rag/referrals` 的每分钟上报次数上限（t81 / M6）。0 = 关闭。
+    pub rag_report_per_min: u32,
+    /// 注册是否必须带邀请码（t141 / ADR-11 1.0 方案）。**默认开**。
+    ///
+    /// 关掉只用于"本地开发/自动化测试"：线上关掉等于回到开放注册，
+    /// 而校方身份又无法在云端校验，等于任何人都能拿学号占坑。
+    pub auth_invite_required: bool,
+    /// `rag_known_docs` 保留月数（0 = 不清理）。与盐的保留期**分开配置**：
+    /// "语料保留多久"和"盐保留多久"是两类不同决策。
+    pub rag_known_docs_retention_months: u32,
+    /// `rag_salts` 保留月数（0 = 不清理）。删掉旧盐后，跨月"同标识"就不可证明了。
+    pub rag_salts_retention_months: u32,
     /// 套餐通道的上游供应商（三家协议可各配一套；Key 只存在服务端）
     pub upstream: UpstreamConfig,
 }
@@ -104,6 +150,24 @@ impl Config {
             auth_refresh_per_min: env_parse("AUTH_REFRESH_PER_MIN", 60),
             body_limit_bytes: env_parse("YUNONG_BODY_LIMIT_BYTES", 1024 * 1024),
             auth_body_limit_bytes: env_parse("AUTH_BODY_LIMIT_BYTES", 8 * 1024),
+            rag_salt_ttl_secs: env_parse("RAG_SALT_TTL_SECS", 600),
+            rag_max_items_per_request: env_parse("RAG_MAX_ITEMS_PER_REQUEST", 200),
+            rag_max_items_per_month: env_parse("RAG_MAX_ITEMS_PER_MONTH", 2_000),
+            rag_fetch_enabled: env_flag("RAG_FETCH_ENABLED"),
+            rag_fetch_top_n: env_parse("RAG_FETCH_TOP_N", 100),
+            rag_fetch_retries: env_parse("RAG_FETCH_RETRIES", 3),
+            rag_fetch_backoff_ms: env_parse("RAG_FETCH_BACKOFF_MS", 200),
+            rag_fetch_timeout_secs: env_parse("RAG_FETCH_TIMEOUT_SECS", 10),
+            rag_fetch_min_interval_ms: env_parse("RAG_FETCH_MIN_INTERVAL_MS", 1_000),
+            rag_fetch_retry_failed: env_flag("RAG_FETCH_RETRY_FAILED"),
+            rag_fetch_stale_after_secs: env_parse("RAG_FETCH_STALE_AFTER_SECS", 1_800),
+            rag_fetch_max_body_bytes: env_parse("RAG_FETCH_MAX_BODY_BYTES", 2 * 1024 * 1024),
+            rag_fetch_doi_allowed_hosts: env_list("RAG_FETCH_DOI_ALLOWED_HOSTS", DEFAULT_DOI_HOSTS),
+            rag_report_per_min: env_parse("RAG_REPORT_PER_MIN", 30),
+            // 缺省为真：不写这个变量时就是邀请制（安全默认）
+            auth_invite_required: env_flag_default_true("AUTH_INVITE_REQUIRED"),
+            rag_known_docs_retention_months: env_parse("RAG_KNOWN_DOCS_RETENTION_MONTHS", 3),
+            rag_salts_retention_months: env_parse("RAG_SALTS_RETENTION_MONTHS", 3),
             trust_proxy: env::var("YUNONG_TRUST_PROXY")
                 .ok()
                 .map(|value| {
@@ -113,17 +177,7 @@ impl Config {
                     )
                 })
                 .unwrap_or(false),
-            sample_salt: env::var("YUNONG_SAMPLE_SALT")
-                .ok()
-                .filter(|value| value.len() >= 16)
-                .unwrap_or_else(|| {
-                    let generated = uuid::Uuid::new_v4().simple().to_string();
-                    tracing::warn!(
-                        "YUNONG_SAMPLE_SALT 未设置（或短于 16 字符）：本次启动用随机盐；\
-                         重启后抽样判定会变（历史行不受影响，也不回填）。生产请固定一个随机串。"
-                    );
-                    generated
-                }),
+            sample_salt: sample_salt_from_env(),
             stream_total_timeout_secs: env_parse("STREAM_TOTAL_TIMEOUT_SECS", 600),
             max_output_tokens_cap: env_parse("MAX_OUTPUT_TOKENS_CAP", 8_192),
             upstream: UpstreamConfig::from_env(),
@@ -154,8 +208,33 @@ impl Config {
             body_limit_bytes: 1024 * 1024,
             auth_body_limit_bytes: 8 * 1024,
             trust_proxy: false,
-            // 测试用固定盐：抽样判定在用例之间必须可复现
-            sample_salt: "test-sample-salt-0123456789".into(),
+            rag_salt_ttl_secs: 600,
+            rag_max_items_per_request: 200,
+            rag_max_items_per_month: 2_000,
+            // 测试默认不联网；需要抓取的用例自己注入 mock Fetcher
+            rag_fetch_enabled: false,
+            rag_fetch_top_n: 100,
+            rag_fetch_retries: 3,
+            rag_fetch_backoff_ms: 0,
+            rag_fetch_timeout_secs: 10,
+            rag_fetch_min_interval_ms: 0, // 测试里不限速（否则用例会变慢）
+            rag_fetch_retry_failed: false,
+            rag_fetch_stale_after_secs: 1_800,
+            rag_fetch_max_body_bytes: 2 * 1024 * 1024,
+            rag_fetch_doi_allowed_hosts: DEFAULT_DOI_HOSTS
+                .iter()
+                .map(|host| (*host).to_owned())
+                .collect(),
+            rag_report_per_min: 1_000, // 测试默认不挡路；需要断言限流的用例自己调小
+            // 既有测试大量直接注册；需要验证邀请制的用例自己打开
+            auth_invite_required: false,
+
+            rag_known_docs_retention_months: 3,
+            rag_salts_retention_months: 3,
+            // 测试用固定盐：抽样判定在用例之间必须可复现。
+            // 这里刻意用"64 字符小写十六进制"——它必须能通过 `validate_sample_salt`，
+            // 否则将来有人把校验接到 for_tests 上会整片测试挂掉。
+            sample_salt: "9f2c7b1e4d6a8035c1e9f7b2d4a6c8e05b3d1f7a9c2e4b6d8f0a1c3e5b7d9f2c".into(),
             // 测试默认不限总时长（长流用例要稳定）；M5 的用例会显式设小
             stream_total_timeout_secs: 0,
             max_output_tokens_cap: 8_192,
@@ -173,11 +252,161 @@ impl Config {
     }
 }
 
+/// 抽样盐的最小长度（R3-F2：16 太松，提到 32 字节）。
+pub const MIN_SAMPLE_SALT_BYTES: usize = 32;
+
+/// `.env.example` 里出现过的示例值前缀：一旦被原样使用，等于**没加盐**（R3-F1）。
+const SAMPLE_SALT_PLACEHOLDER: &str = "CHANGE_ME";
+
+/// 读抽样盐（R3-F1 / R3-F2）。
+///
+/// - **留空**：启动时随机生成并 `warn`（重启后抽样判定会变；历史行不受影响、不回填）；
+/// - **配置了但不合规**（示例值 / 太短 / 低熵）：**启动失败**。
+///   理由：盐是成本监控的信任根，配错是**静默**失效——`warn` 会被忽略，
+///   security 已实测用它可以把"不被抽中"做成 100% 规避。宁可起不来。
+fn sample_salt_from_env() -> String {
+    let raw = env::var("YUNONG_SAMPLE_SALT").unwrap_or_default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        let generated = uuid::Uuid::new_v4().simple().to_string();
+        tracing::warn!(
+            "YUNONG_SAMPLE_SALT 未设置：本次启动用随机盐；重启后抽样判定会变\
+             （历史行不受影响，也不回填）。生产请固定 ≥{MIN_SAMPLE_SALT_BYTES} 字节的随机值\
+             （例如 `openssl rand -hex 32`）。"
+        );
+        return generated;
+    }
+    match validate_sample_salt(trimmed) {
+        Ok(()) => trimmed.to_owned(),
+        Err(reason) => panic!(
+            "YUNONG_SAMPLE_SALT 不合规（{reason}）：抽样判定必须不可预测，否则成本监控可被规避。\
+             请填 ≥{MIN_SAMPLE_SALT_BYTES} 字节的随机值（`openssl rand -hex 32`），或留空使用随机盐。"
+        ),
+    }
+}
+
+/// 盐的强度校验（R3-F2）。`Ok(())` 表示可用，`Err(原因)` 用于启动失败与测试。
+///
+/// 只做"明显低熵"的启发式，不过度设计：
+/// 示例值 / 太短 / 纯数字 / 字符种类过少 / 明显的递增序列 / 短的小写十六进制串。
+pub fn validate_sample_salt(salt: &str) -> Result<(), String> {
+    if salt.trim().is_empty() {
+        return Err("盐是全空白".to_owned());
+    }
+    if salt.contains(SAMPLE_SALT_PLACEHOLDER) {
+        return Err("这是 .env.example 里的示例值，等于没加盐".to_owned());
+    }
+    if salt.len() < MIN_SAMPLE_SALT_BYTES {
+        return Err(format!(
+            "长度 {} 字节，少于 {MIN_SAMPLE_SALT_BYTES}",
+            salt.len()
+        ));
+    }
+    if salt.chars().all(|c| c.is_ascii_digit()) {
+        return Err("纯数字（可预测）".to_owned());
+    }
+    let mut distinct: Vec<char> = salt.chars().collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() <= 4 {
+        return Err(format!("字符种类只有 {} 种（可预测）", distinct.len()));
+    }
+    // 明显的递增序列：0123456789 / abcdefghijklmnopqrstuvwxyz 之类出现在盐里
+    const OBVIOUS_RUNS: [&str; 4] = ["0123456789", "abcdefghij", "ABCDEFGHIJ", "qwertyuiop"];
+    if OBVIOUS_RUNS.iter().any(|run| salt.contains(run)) {
+        return Err("包含明显的递增/键盘序列".to_owned());
+    }
+    // 短的小写十六进制串（例如 32 位的 0123456789abcdef...）：熵不够。
+    // 注意 `openssl rand -hex 32` 是 **64** 字符，能通过。
+    let is_lower_hex = salt
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+    if is_lower_hex && salt.len() < 64 {
+        return Err("小写十六进制串不足 64 字符（建议 `openssl rand -hex 32`）".to_owned());
+    }
+    Ok(())
+}
+
+/// DOI 抓取允许跟随的重定向目标（t81 / M3 的默认白名单）。
+///
+/// 为什么不无条件跟随：重定向目标由上游响应决定，等于把"我们去访问哪个地址"交给对方；
+/// 不跟随则 doi.org（302 跳到出版商）**整源不可用**。折中是：只在已知出版商域名内跟，
+/// 且永远拒绝私网/回环/链路本地地址。
+pub const DEFAULT_DOI_HOSTS: &[&str] = &[
+    "doi.org",
+    "www.doi.org",
+    "dx.doi.org",
+    "link.springer.com",
+    "www.sciencedirect.com",
+    "ieeexplore.ieee.org",
+    "dl.acm.org",
+    "onlinelibrary.wiley.com",
+    "www.nature.com",
+    "www.tandfonline.com",
+    "www.mdpi.com",
+    "pubs.acs.org",
+    "academic.oup.com",
+    "journals.plos.org",
+    "www.pnas.org",
+    "www.frontiersin.org",
+    "www.biorxiv.org",
+    "www.cambridge.org",
+];
+
+/// 布尔开关，**缺省为真**（安全默认）。
+///
+/// 与 [`env_flag`] 的区别：那里缺省是假（可选功能），这里缺省是真（安全前提）。
+/// 显式 `0/false/no/off` 才关闭。
+fn env_flag_default_true(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
+
+/// 从环境读一个逗号分隔的列表（空值/缺失 → 默认值）。
+fn env_list(key: &str, default: &[&str]) -> Vec<String> {
+    match env::var(key) {
+        Ok(raw) => {
+            let parsed: Vec<String> = raw
+                .split(',')
+                .map(|item| item.trim().to_ascii_lowercase())
+                .filter(|item| !item.is_empty())
+                .collect();
+            if parsed.is_empty() {
+                tracing::warn!(key, "列表配置为空，回退到默认值");
+                default.iter().map(|item| (*item).to_owned()).collect()
+            } else {
+                parsed
+            }
+        }
+        Err(_) => default.iter().map(|item| (*item).to_owned()).collect(),
+    }
+}
+
 /// 把 `AUTH_HASH_CONCURRENCY` 夹到允许区间（security 报告加固建议 1）。
 ///
 /// 单独抽出来是为了可测：配置错误必须能被回归抓住，而不是等上线后被放大。
 pub fn clamp_auth_hash_concurrency(configured: usize) -> usize {
     configured.clamp(1, MAX_AUTH_HASH_CONCURRENCY)
+}
+
+/// 布尔开关：`1/true/yes/on` 为真（大小写不敏感），其余为假。
+fn env_flag(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -222,6 +451,82 @@ mod tests {
             timeouts.first_event > timeouts.idle,
             "首事件预算必须比空闲预算宽"
         );
+    }
+
+    /// R3-F1：`.env.example` 里的示例值一旦被原样使用，等于**没加盐**
+    /// （security 实测：可 100% 规避抽样）。这种配置错误必须**启动失败**，不能只 warn。
+    #[test]
+    fn sample_salt_rejects_example_placeholder() {
+        assert!(validate_sample_salt("CHANGE_ME_random_hex_32").is_err());
+        assert!(validate_sample_salt("CHANGE_ME").is_err());
+        assert!(
+            validate_sample_salt("prefix-CHANGE_ME-suffix-0123456789abcdef").is_err(),
+            "嵌在中间的示例值也要挡住"
+        );
+    }
+
+    /// R3-F2：强度校验——太短、全空白、纯数字、字符种类太少、明显序列都要拒。
+    #[test]
+    fn sample_salt_rejects_weak_values() {
+        for weak in [
+            "",
+            "    ",
+            "short",
+            "0123456789abcdef",
+            "0123456789abcdef0123456789abcdef",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1234567890123456789012345678901234567890",
+            "qwertyuiopasdfghjklzxcvbnm123456",
+        ] {
+            assert!(
+                validate_sample_salt(weak).is_err(),
+                "弱盐应被拒绝：{weak:?}"
+            );
+        }
+    }
+
+    /// 合法的随机盐必须能通过（含 `openssl rand -hex 32` 的形态）。
+    #[test]
+    fn sample_salt_accepts_strong_values() {
+        for strong in [
+            "9f2c7b1e4d6a8035c1e9f7b2d4a6c8e05b3d1f7a9c2e4b6d8f0a1c3e5b7d9f2c",
+            "kR7#pQ2$vN9@wT4&zX6!bM1^cL8*hJ3%fD5(sG0)aE2-uY4+tI6=oP8]rW1[",
+        ] {
+            assert!(
+                validate_sample_salt(strong).is_ok(),
+                "强盐应通过：{strong:?}"
+            );
+        }
+    }
+
+    /// 测试默认配置里的盐必须能过校验（否则将来把校验接到 `for_tests` 会整片挂）。
+    #[test]
+    fn test_config_salt_is_valid() {
+        let config = Config::for_tests();
+        assert!(validate_sample_salt(&config.sample_salt).is_ok());
+        assert!(config.sample_salt.len() >= MIN_SAMPLE_SALT_BYTES);
+    }
+
+    /// 加固建议 1（t28）：并发闸配成 64 等于重开内存放大（64×19MiB ≈ 1.2 GiB）。
+    #[test]
+    fn auth_hash_concurrency_is_clamped() {
+        assert_eq!(clamp_auth_hash_concurrency(8), 8);
+        assert_eq!(clamp_auth_hash_concurrency(0), 1, "0 会让登录永久不可用");
+        assert_eq!(
+            clamp_auth_hash_concurrency(64),
+            MAX_AUTH_HASH_CONCURRENCY,
+            "超上限必须夹紧，否则一个配置错误就重开 H1"
+        );
+        assert_eq!(MAX_AUTH_HASH_CONCURRENCY, 32);
+    }
+
+    /// R2-F5：鉴权端点的 body 上限必须**远小于**业务接口（8 KiB vs 1 MiB）。
+    #[test]
+    fn auth_body_limit_is_smaller_than_api_limit() {
+        let config = Config::for_tests();
+        assert!(config.auth_body_limit_bytes < config.body_limit_bytes);
+        assert_eq!(config.auth_body_limit_bytes, 8 * 1024);
+        assert!(!config.trust_proxy, "默认不信任 XFF");
     }
 
     #[test]

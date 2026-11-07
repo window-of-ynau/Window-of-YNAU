@@ -85,7 +85,9 @@ void main() {
     test('落在应用数据目录，不是临时目录', () {
       final dir = WebViewSession.userDataDir();
       expect(dir, contains('yunong'));
-      expect(dir, endsWith('webview'));
+      // t155：WebView2 用户数据从 exe 同级挪到 `<数据根>/webview2`
+      expect(dir, endsWith('webview2'));
+      expect(dir.contains('.WebView2'), isFalse, reason: '不能落回 WebView2 的 exe 同级默认目录');
       expect(Directory(dir).existsSync(), isTrue);
       final temp = Directory.systemTemp.path;
       if (!temp.startsWith(Platform.environment['LOCALAPPDATA'] ?? '\u0000')) {

@@ -42,11 +42,43 @@ pub struct BuildOptions {
     /// 上游是**第三方兼容网关**、因为未知字段返回 400 时，由调用方关掉
     /// （`DirectProvider::with_usage_reporting(false)`）。
     pub report_usage: bool,
+    /// 本次请求的「工具选择」策略（`auto` / `none` / `required`）。
+    ///
+    /// **只对本次请求的首轮生效**：上层只在 `request.round <= 1` 时把它设进来，
+    /// 工具循环的后续轮次保持 `None`（否则会逼模型一轮接一轮地调工具）。
+    /// 三协议的写法不同（`"required"` vs `{"type":"any"}`），映射见 [`crate::tool_choice`]。
+    pub tool_choice: Option<crate::tool_choice::ToolChoice>,
 }
 
 impl Default for BuildOptions {
     fn default() -> Self {
-        Self { report_usage: true }
+        Self {
+            report_usage: true,
+            tool_choice: None,
+        }
+    }
+}
+
+/// 把 `tool_choice` 写进请求体（三协议形状不同；`auto` 不写字段）。
+///
+/// 只在**有工具**时才写：没有 `tools` 却给 `required`，多数上游会直接 400。
+pub(super) fn apply_tool_choice(
+    body: &mut Map<String, Value>,
+    protocol: Protocol,
+    options: &BuildOptions,
+) {
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    let Some(choice) = options.tool_choice else {
+        return;
+    };
+    if !has_tools {
+        return;
+    }
+    if let Some(value) = crate::tool_choice::wire_value(protocol, choice) {
+        body.insert("tool_choice".into(), value);
     }
 }
 
@@ -67,12 +99,12 @@ pub fn build_body(protocol: Protocol, request: &ChatRequest) -> Value {
     }
 }
 
-/// [`build_body`] 的可配置版本（目前只有 Completions 的 usage 回报开关）。
+/// [`build_body`] 的可配置版本（usage 回报开关 + 本次请求的 `tool_choice`）。
 pub fn build_body_with(protocol: Protocol, request: &ChatRequest, options: &BuildOptions) -> Value {
     match protocol {
         Protocol::OpenaiCompletions => completions::build_with(request, options),
-        Protocol::OpenaiResponses => responses::build(request),
-        Protocol::AnthropicMessages => messages::build(request),
+        Protocol::OpenaiResponses => responses::build_with(request, options),
+        Protocol::AnthropicMessages => messages::build_with(request, options),
     }
 }
 
@@ -287,7 +319,7 @@ fn fixture_request(protocol: Protocol) -> ChatRequest {
         session_id: "s_1".into(),
         turn_id: "t_1".into(),
         round: 1,
-        model: "deepseek-chat".into(),
+        model: "deepseek-flash".into(),
         protocol,
         messages: vec![
             ChatMessage::system(FIXTURE_SYSTEM),
@@ -305,6 +337,7 @@ fn fixture_request(protocol: Protocol) -> ChatRequest {
         max_output_tokens: 512,
         stream: true,
         estimated_input_tokens: 100,
+        tool_choice: None,
     }
 }
 
@@ -349,7 +382,35 @@ fn fixture_text_and_tool_round(protocol: Protocol) -> ChatRequest {
 const FIXTURE_SYSTEM: &str = "你是云农之窗助手";
 
 #[cfg(test)]
-const FIXTURE_MODEL: &str = "deepseek-chat";
+const FIXTURE_MODEL: &str = "deepseek-flash";
+
+/// t126：**不要**给上游发 `thinking` / `reasoning` 之类的开关。
+///
+/// DeepSeek 文档说明思考模式**默认开启**；我们一个字段都不发，等于"跟随默认"。
+/// 一旦有人在协议构造里写死 `thinking: disabled` 或 `reasoning.effort`，
+/// 这条测试会红（防止无意中关掉思考）。
+#[test]
+fn request_bodies_never_disable_thinking() {
+    for protocol in [
+        Protocol::OpenaiCompletions,
+        Protocol::OpenaiResponses,
+        Protocol::AnthropicMessages,
+    ] {
+        let body = build_body(protocol, &fixture_request(protocol));
+        println!(
+            "[body:{}] {}",
+            crate::protocol_pick::protocol_name(protocol),
+            body
+        );
+        for key in ["thinking", "reasoning", "reasoning_effort"] {
+            assert!(
+                body.get(key).is_none(),
+                "{} 不该发 {key} 字段：{body}",
+                crate::protocol_pick::protocol_name(protocol)
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

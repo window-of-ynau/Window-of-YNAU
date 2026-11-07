@@ -6,7 +6,7 @@
 // final chat = ChatService();          // 内部复用端侧核心 DLL
 // final stream = chat.send(ChatRequestDto(
 //   channel: ChatChannel.byok,          // ★ 通道可选
-//   model: 'deepseek-chat',
+//   model: 'deepseek-flash',
 //   apiKey: key,                        // ★ 只进 DLL，不进日志
 //   messages: <ChatTurn>[ChatTurn.user('你好')],
 // ));
@@ -20,6 +20,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
+
 
 import 'package:ffi/ffi.dart';
 
@@ -73,6 +74,8 @@ class ChatRequestDto {
     this.apiKey,
     this.secretKey,
     this.dataDir,
+    this.dbPath,
+    this.toolChoice,
     this.cloudToken,
     this.baseUrl,
     this.cloudBaseUrl,
@@ -95,6 +98,15 @@ class ChatRequestDto {
   /// 应用数据目录（Rust 用它定位 secret store）
   final String? dataDir;
 
+  /// 内置工具开关：给了它 Rust 才启用 `memory_search` / `timetable_query`；不给则行为与旧版一致。
+  ///
+  /// **实测（t106）：这是数据库文件路径，不是目录。**传目录会得到
+  /// `SQLITE_CANTOPEN: unable to open database file`（曾按“目录”理解踩过一次）。
+  final String? dbPath;
+
+  /// t122：调试开关 —— `required` 时模型被迫调用至少一个工具（DeepSeek 支持）。
+  final String? toolChoice;
+
   /// 套餐通道的访问令牌
   final String? cloudToken;
   final String? baseUrl;
@@ -110,6 +122,9 @@ class ChatRequestDto {
         'messages': messages.map((ChatTurn turn) => turn.toJson()).toList(),
         if (secretKey != null && secretKey!.isNotEmpty) 'secret_key': secretKey,
         if (dataDir != null && dataDir!.isNotEmpty) 'data_dir': dataDir,
+    // 注意：必须是目录（传 .db 文件路径会让 Rust 把它当目录用）
+    if (dbPath != null && dbPath!.isNotEmpty) 'db_path': dbPath,
+    if (toolChoice != null && toolChoice!.isNotEmpty) 'tool_choice': toolChoice,
         // 仅测试/命令行用；App 正常路径不会带明文
         if (apiKey != null && apiKey!.isNotEmpty) 'api_key': apiKey,
         if (cloudToken != null && cloudToken!.isNotEmpty) 'cloud_token': cloudToken,
@@ -137,6 +152,13 @@ class ChatEvent {
     this.promptTokens,
     this.completionTokens,
     this.finishReason,
+    this.toolCallId,
+    this.toolName,
+    this.toolArgs,
+    this.toolOk,
+    this.toolSummary,
+    this.toolsEnabled,
+    this.tools,
   });
 
   final ChatEventKind kind;
@@ -149,6 +171,22 @@ class ChatEvent {
   final int? promptTokens;
   final int? completionTokens;
   final String? finishReason;
+
+  // ---- 工具调用（t102）----
+  /// 同一次调用的 started/completed 用同一个 id 配对。
+  final String? toolCallId;
+  /// 工具名（如 `timetable_query`）。
+  final String? toolName;
+  /// 参数 JSON 原文（UI 折叠展示，不做结构假设）。
+  final String? toolArgs;
+  /// 结果是否成功；失败时 [errorCode]/[errorMessage] 会带上原因。
+  final bool? toolOk;
+  /// 结果的一句话摘要（如「5 条结果」），不含大段 JSON。
+  final String? toolSummary;
+
+  /// meta 帧里的工具状态（t122：判断“没挂工具”还是“模型不调用”）。
+  final bool? toolsEnabled;
+  final List<String>? tools;
 
   bool get isTerminal => kind == ChatEventKind.done || kind == ChatEventKind.error;
 
@@ -178,6 +216,19 @@ class ChatEvent {
       completionTokens:
           _intOf(decoded['completion_tokens'] ?? (usage is Map ? usage['completion_tokens'] : null)),
       finishReason: decoded['finish'] as String? ?? decoded['reason'] as String?,
+      toolCallId: (decoded['call_id'] as String?) ?? (decoded['id'] as String?),
+      toolName: decoded['name'] as String?,
+      toolArgs: _toolArgsText(decoded['args'] ?? decoded['arguments']),
+      toolOk: decoded['ok'] is bool ? decoded['ok'] as bool : null,
+      toolSummary: decoded['summary'] as String?,
+      toolsEnabled: decoded['tools_enabled'] is bool ? decoded['tools_enabled'] as bool : null,
+      // 元素可能是字符串，也可能是 {"name": "..."} 对象 —— 两种都归一成工具名。
+      tools: decoded['tools'] is List
+          ? (decoded['tools'] as List<dynamic>)
+              .map((dynamic item) => item is Map ? '${item['name'] ?? ''}' : '$item')
+              .where((String name) => name.isNotEmpty)
+              .toList(growable: false)
+          : null,
     );
   }
 
@@ -228,9 +279,58 @@ String describeChatError(String? code) => switch (code) {
       _ => '出错了，请稍后重试',
     };
 
+/// 一次对话的运行时诊断（**内存对象**，供界面读取；不打印日志）。
+///
+/// 记录六个关键节点：send 调用 / handle 返回值 / 回调注册 / 回调触发 / 事件累计 / 流结束。
+/// 任何异常都写进 [lastError]，**不静默吞掉**。**绝不包含 Key 明文**。
+class ChatDiagnostics {
+  bool sendCalled = false;
+  String channel = '';
+  String model = '';
+  String baseUrl = '';
+  String protocol = '';
+  int? handle;
+  bool callbackRegistered = false;
+  String? callbackError;
+  int eventsReceived = 0;
+  String? lastEventKind;
+  /// P0-1 观测：收到多少条 delta、最后一条 delta 的文本长度（判断"只出几个字就停"）
+  int deltaCount = 0;
+  int lastDeltaLength = 0;
+  String mergedText = '';
+  String? lastError;
+  /// 终态时间（done/error/cancel）；为空说明流从未进入终态
+  DateTime? finishedAt;
+  DateTime? startedAt;
+  /// 界面横幅（3 秒无事件时显示）。
+  String get banner =>
+      '对话没有启动 · 通道=$channel · handle=${handle ?? "-"} · '
+      '回调注册=${callbackRegistered ? "成功" : "失败${callbackError == null ? "" : "($callbackError)"}"} · '
+      '已收到事件=$eventsReceived · 最后错误=${lastError ?? "无"}';
+
+  /// 复制给开发者的完整诊断（不含任何凭据）。
+  String toClipboardText() => <String>[
+        'send_called=$sendCalled',
+        'channel=$channel',
+        'model=$model',
+        'base_url=$baseUrl',
+        'protocol=$protocol',
+        'handle=${handle ?? "-"}',
+        'callback_registered=$callbackRegistered',
+        'callback_error=${callbackError ?? "-"}',
+        'events_received=$eventsReceived',
+        'last_event=${lastEventKind ?? "-"}',
+        'last_error=${lastError ?? "-"}',
+        'started_at=${startedAt?.toIso8601String() ?? "-"}',
+        'finished_at=${finishedAt?.toIso8601String() ?? "-"}',
+      ].join(' | ');
+}
 /// 一次对话的句柄（事件流 + 取消）。
 class ChatStream {
-  ChatStream._(this._events, this._handle, this._backend, this._onClose);
+  ChatStream._(this._events, this._handle, this._backend, this._onClose, this.diagnostics);
+
+  /// 本轮对话的诊断（界面失败横幅/复制按钮用）。
+  final ChatDiagnostics diagnostics;
 
   final Stream<ChatEvent> _events;
   final int _handle;
@@ -257,38 +357,63 @@ abstract class ChatBackend {
 }
 
 /// 真 FFI 后端：`NativeCallable.listener` + `yunong_chat_stream/cancel`。
+///
+/// **投递顺序（t79 根因）**：Rust 在 `yunong_chat_stream` 里 spawn 线程后可能**立刻** emit，
+/// 若等函数返回后再登记 sink，首批帧会找不到接收者而丢失（表现为 events=0、无错误）。
+/// 因此这里改成：先自己分配 `streamId` → **先登记** sink → 把 `streamId` 当 `user` 指针传给 Rust
+/// → Rust 原样回传（`ffi.rs` 的 `ChatCallback::emit`）→ 回调按 `user` 找 sink。
 class FfiChatBackend implements ChatBackend {
   FfiChatBackend() : _lib = CoreLibrary.openCoreLibrary() {
     _stream = _lib.lookupFunction<_StreamNative, _StreamDart>('yunong_chat_stream');
     _cancelFn = _lib.lookupFunction<_CancelNative, _CancelDart>('yunong_chat_cancel');
+    // 回调字符串由 Rust CString::into_raw 移交所有权，必须由 Dart 释放
+    try {
+      _freeString = _lib.lookupFunction<Void Function(Pointer<Utf8>), void Function(Pointer<Utf8>)>('yunong_free_string');
+    } on ArgumentError {
+      // 旧包没有该符号：退化为不释放（宁可泄漏也不 double free）
+      _freeString = (Pointer<Utf8> _) {};
+    }
   }
 
   final DynamicLibrary _lib;
   late final _StreamDart _stream;
   late final _CancelDart _cancelFn;
+  late final void Function(Pointer<Utf8>) _freeString;
 
-  /// 每个流一个 listener（端口 id 通过 `user` 传给 Rust）。
-  final Map<int, ({NativeCallable<_ChunkCbNative> callable, void Function(String) onChunk})>
-      _sinks = <int, ({NativeCallable<_ChunkCbNative> callable, void Function(String) onChunk})>{};
+  int _nextStreamId = 1;
+  final Map<int, _ChatSink> _sinks = <int, _ChatSink>{};
+  final Map<int, int> _handleToStreamId = <int, int>{};
+
+  /// 回调**实际触发**次数（诊断用：区分“回调没来”与“回调来了但被丢”）。
+  int framesFired = 0;
 
   @override
   int start(String requestJson, bool Function(String chunkJson) onChunk) {
-    // Rust 侧从任意线程回调 → 必须用 listener（端口投递）而不是 isLeaf/sync
+    final streamId = _nextStreamId++;
     final callable = NativeCallable<_ChunkCbNative>.listener(
       (Pointer<Utf8> chunkJson, Pointer<Void> user) {
-        // 字符串只在回调期间有效：立刻拷成 Dart String
-        onChunk(chunkJson.toDartString());
+        framesFired += 1;
+        // 回调返回的指针由 Rust `CString::into_raw` 移交所有权：
+        // **必须先拷出内容，再 `yunong_free_string`**——直接把指针当字符串用就是
+        // 悬垂读（t79 的 `Missing extension byte` 就是这么来的）；
+        // 不释放会泄漏，**重复释放是 UB**。
+        final String json = chunkJson.toDartString();
+        _freeString(chunkJson);
+        final sink = _sinks[user.address];
+        (sink?.onChunk ?? onChunk)(json);
       },
     );
+    // **先登记再调用**（见类文档）
+    _sinks[streamId] = _ChatSink(callable: callable, onChunk: onChunk);
+
     final request = requestJson.toNativeUtf8();
     final dbPath = ''.toNativeUtf8();
     try {
-      // 用自己的指针当 user：只做标识，不跨 isolate 解引用
-      final handle = _stream(request, dbPath, callable.nativeFunction, Pointer.fromAddress(0));
+      final handle = _stream(request, dbPath, callable.nativeFunction, Pointer<Void>.fromAddress(streamId));
       if (handle > 0) {
-        _sinks[handle] = (callable: callable, onChunk: onChunk);
+        _handleToStreamId[handle] = streamId;
       } else {
-        callable.close();
+        _sinks.remove(streamId)?.callable.close();
       }
       return handle;
     } finally {
@@ -300,8 +425,18 @@ class FfiChatBackend implements ChatBackend {
   @override
   void cancel(int handle) {
     _cancelFn(handle);
-    _sinks.remove(handle)?.callable.close();
+    final streamId = _handleToStreamId.remove(handle);
+    if (streamId != null) {
+      _sinks.remove(streamId)?.callable.close();
+    }
   }
+}
+
+class _ChatSink {
+  _ChatSink({required this.callable, required this.onChunk});
+
+  final NativeCallable<_ChunkCbNative> callable;
+  final void Function(String) onChunk;
 }
 
 // listener 只能返回 void（取消走 yunong_chat_cancel，而不是回调返回值）
@@ -321,6 +456,13 @@ class ChatService {
 
   /// 发起一次流式对话。
   ChatStream send(ChatRequestDto request) {
+    final diag = ChatDiagnostics()
+      ..sendCalled = true
+      ..channel = request.channel.wire
+      ..model = request.model
+      ..baseUrl = request.baseUrl ?? '(空)'
+      ..protocol = request.protocol.wire
+      ..startedAt = DateTime.now();
     final controller = StreamController<ChatEvent>();
     void close() {
       if (!controller.isClosed) {
@@ -329,29 +471,88 @@ class ChatService {
     }
 
     var handle = 0;
-    handle = _backend.start(request.toJson(), (String chunkJson) {
-      final event = ChatEvent.fromJsonString(chunkJson);
-      if (!controller.isClosed) {
-        controller.add(event);
-      }
-      if (event.isTerminal) {
-        if (handle > 0) {
-          _backend.cancel(handle); // 不再消费上游
+    try {
+      handle = _backend.start(request.toJson(), (String chunkJson) {
+        final event = ChatEvent.fromJsonString(chunkJson);
+        diag.eventsReceived += 1;
+        diag.lastEventKind = event.kind.name;
+        if (event.kind == ChatEventKind.delta) {
+          diag.deltaCount += 1;
+          diag.lastDeltaLength = (event.text ?? '').length;
+          diag.mergedText += event.text ?? '';
         }
-        close();
-        return false;
+        if (event.kind == ChatEventKind.error) {
+          diag.lastError = event.errorCode ?? event.errorMessage ?? 'error';
+        }
+        if (!controller.isClosed) {
+          controller.add(event);
+        }
+        if (event.isTerminal) {
+          diag.finishedAt = DateTime.now();
+          if (handle > 0) {
+            _backend.cancel(handle);
+          }
+          close();
+          return false;
+        }
+        return true;
+      });
+      diag.callbackRegistered = handle > 0;
+    } on Object catch (err) {
+      diag.callbackRegistered = false;
+      diag.callbackError = err.runtimeType.toString();
+      // 不静默：任何异常都进诊断与 UI
+      diag.lastError = '${err.runtimeType}: $err';
+      diag.finishedAt = DateTime.now();
+      if (!controller.isClosed) {
+        controller.add(ChatEvent(
+          kind: ChatEventKind.error,
+          errorCode: 'INTERNAL',
+          errorMessage: diag.lastError,
+        ));
       }
-      return true;
-    });
+      close();
+      return ChatStream._(controller.stream, 0, _backend, close, diag);
+    } finally {
+      diag.handle = handle;
+    }
 
     if (handle <= 0) {
-      controller.add(const ChatEvent(
-        kind: ChatEventKind.error,
-        errorCode: 'INTERNAL',
-        errorMessage: '端侧核心未就绪',
-      ));
+      diag.lastError ??= 'yunong_chat_stream 返回 $handle（入口被拒）';
+      diag.finishedAt = DateTime.now();
+      if (!controller.isClosed) {
+        controller.add(const ChatEvent(
+          kind: ChatEventKind.error,
+          errorCode: 'INTERNAL',
+          errorMessage: '端侧核心未就绪',
+        ));
+      }
       close();
     }
-    return ChatStream._(controller.stream, handle, _backend, close);
+    return ChatStream._(controller.stream, handle, _backend, close, diag);
   }
+}
+
+/// 把工具参数转成可折叠展示的文本：字符串原样，其它用紧凑 JSON。
+String? _toolArgsText(Object? raw) {
+  if (raw == null) {
+    return null;
+  }
+  if (raw is String) {
+    return raw;
+  }
+  try {
+    return jsonEncode(raw);
+  } on Object {
+    return raw.toString();
+  }
+}
+
+/// 工具状态的诊断文案（t122）：一眼判断“没挂工具”还是“模型不调用”。
+String toolDiagnosticsText({bool? toolsEnabled, List<String>? tools}) {
+  if (toolsEnabled == null && tools == null) {
+    return 'tools_enabled=未知';
+  }
+  final String names = (tools == null || tools.isEmpty) ? '[]' : '[${tools.join(', ')}]';
+  return 'tools_enabled=${toolsEnabled ?? '未知'} | tools=$names';
 }

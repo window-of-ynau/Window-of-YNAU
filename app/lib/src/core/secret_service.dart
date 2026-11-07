@@ -18,6 +18,7 @@ class SecretStatus {
     required this.set,
     required this.masked,
     this.degraded = false,
+    this.broken = false,
     this.reason,
   });
 
@@ -25,6 +26,7 @@ class SecretStatus {
         set: json['set'] == true,
         masked: (json['masked'] as String?) ?? '',
         degraded: json['degraded'] == true,
+        broken: json['broken'] == true,
         reason: json['reason'] as String?,
       );
 
@@ -35,12 +37,18 @@ class SecretStatus {
 
   /// true = 只存在内存里（重启失效）
   final bool degraded;
+
+  /// 密文存在但解不开（DPAPI 失败/文件损坏）：必须提示重新填写，不能当“已配置”。
+  final bool broken;
   final String? reason;
 
   String get display => set ? masked : '未设置';
 
   /// 降级时的提示文案（Rust 给 reason 就用它，否则用通用文案）
   String get degradedHint => reason ?? '本次仅内存生效，重启需重新填写';
+
+  /// 是否可用于发请求：已设置且密文可解。
+  bool get usable => set && !broken;
 }
 
 /// 凭据后端接口（测试用 fake，不需要真 DLL）。

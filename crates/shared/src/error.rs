@@ -14,6 +14,11 @@ pub enum ErrorCode {
     TokenExpired,
     /// 越权
     Forbidden,
+    /// 邀请码无效或已不可用（不存在 / 过期 / 撤销 / 用完）
+    ///
+    /// 与 [`Self::Forbidden`] **同为 403**，但 code 不同：客户端据此给出
+    /// "邀请码错误"的针对性提示，而不是笼统的"没权限"（t147）。
+    InviteInvalid,
     /// 资源不存在
     NotFound,
     /// 参数非法（含超长 message）
@@ -45,6 +50,7 @@ impl ErrorCode {
             Self::Unauthorized => "UNAUTHORIZED",
             Self::TokenExpired => "TOKEN_EXPIRED",
             Self::Forbidden => "FORBIDDEN",
+            Self::InviteInvalid => "INVITE_INVALID",
             Self::NotFound => "NOT_FOUND",
             Self::ValidationError => "VALIDATION_ERROR",
             Self::MessageTooLarge => "MESSAGE_TOO_LARGE",
@@ -63,7 +69,7 @@ impl ErrorCode {
     pub const fn http_status(self) -> u16 {
         match self {
             Self::Unauthorized | Self::TokenExpired => 401,
-            Self::Forbidden | Self::ReviewRejected => 403,
+            Self::Forbidden | Self::ReviewRejected | Self::InviteInvalid => 403,
             Self::NotFound => 404,
             Self::ValidationError => 422,
             Self::MessageTooLarge => 413,
@@ -163,6 +169,23 @@ mod tests {
     fn codes_serialize_upper_snake() {
         let s = serde_json::to_string(&ErrorCode::QuotaExceeded).unwrap();
         assert_eq!(s, "\"QUOTA_EXCEEDED\"");
+    }
+
+    /// t147：邀请码错误有**自己的**代码，但仍是 403（与 Forbidden 同状态不同 code）。
+    #[test]
+    fn invite_invalid_is_its_own_code_with_403() {
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::InviteInvalid).unwrap(),
+            "\"INVITE_INVALID\""
+        );
+        assert_eq!(ErrorCode::InviteInvalid.http_status(), 403);
+        assert_eq!(ErrorCode::InviteInvalid.as_str(), "INVITE_INVALID");
+        // 反序列化也要认
+        let parsed: ErrorCode = serde_json::from_str("\"INVITE_INVALID\"").unwrap();
+        assert_eq!(parsed, ErrorCode::InviteInvalid);
+        // 与 Forbidden 区分开（这正是加它的理由）
+        assert_ne!(ErrorCode::InviteInvalid, ErrorCode::Forbidden);
+        assert_eq!(ErrorCode::Forbidden.http_status(), 403);
     }
 
     #[test]

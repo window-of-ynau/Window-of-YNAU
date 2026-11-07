@@ -94,7 +94,7 @@ void main() {
         'warnings': <dynamic>[],
       }),
     ])..courses = const <StoredCourse>[
-        StoredCourse(
+        const StoredCourse(
           id: 1,
           term: '2026-2027-1',
           name: '高等数学A',
@@ -109,7 +109,7 @@ void main() {
     final service = TimetableService(core: core, dbPath: '/tmp/t.db');
 
     await tester.pumpWidget(_wrap(TimetablePage(service: service)));
-    expect(find.text('还没有导入课表'), findsOneWidget);
+    expect(find.text('还没有课表'), findsOneWidget);
 
     await tester.tap(find.text('导入内置样本'));
     await tester.pumpAndSettle();
@@ -164,7 +164,7 @@ void main() {
       }),
       const CoreEnvelope(ok: false, code: 'PARSE_EMPTY', message: '未解析到课程'),
     ])..courses = const <StoredCourse>[
-        StoredCourse(
+        const StoredCourse(
           id: 1,
           term: '2026-2027-1',
           name: '高等数学A',
@@ -210,4 +210,82 @@ void main() {
     // 取数说明是给人看的，不能是空 JSON 之类的占位
     expect(jsonDecode(DebugFixtures.extractionScriptDescription), isA<Map<String, dynamic>>());
   });
-}
+
+  testWidgets('t111：新建 TimetablePage 时从 SQLite 回填课表（无需再抓）', (WidgetTester tester) async {
+    final core = ScriptedCore(<CoreEnvelope>[])
+      ..courses = <StoredCourse>[
+        const StoredCourse(
+          id: 1,
+          term: '2026-2027-1',
+          name: '高等数学A',
+          weekday: 1,
+          startPeriod: 1,
+          endPeriod: 2,
+          weeks: '1-16',
+          room: '东305',
+        ),
+      ];
+    final service = TimetableService(core: core, dbPath: '/tmp/t111.db');
+
+    await tester.pumpWidget(_wrap(TimetablePage(service: service, initialTerm: '2026-2027-1')));
+    await tester.pumpAndSettle();
+
+    // 没有任何抓取动作，仅靠 DB 回填
+    expect(find.textContaining('高等数学A'), findsWidgets);
+    expect(find.text('还没有课表'), findsNothing);
+  });
+
+  testWidgets('t111：切走再切回（重建 widget）后课表仍在', (WidgetTester tester) async {
+    final core = ScriptedCore(<CoreEnvelope>[])
+      ..courses = <StoredCourse>[
+        const StoredCourse(
+          id: 2,
+          term: '2026-2027-1',
+          name: '大学英语',
+          weekday: 2,
+          startPeriod: 3,
+          endPeriod: 4,
+          weeks: '1-16',
+        ),
+      ];
+    final service = TimetableService(core: core, dbPath: '/tmp/t111b.db');
+
+    await tester.pumpWidget(_wrap(TimetablePage(service: service, initialTerm: '2026-2027-1')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('大学英语'), findsWidgets);
+
+    // 模拟切换栏目：整棵页面被销毁重建（新的 TimetablePage 实例）
+    await tester.pumpWidget(_wrap(const SizedBox.shrink()));
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(_wrap(TimetablePage(service: service, initialTerm: '2026-2027-1')));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('大学英语'), findsWidgets, reason: '重建后必须从 SQLite 回填，不能要求学生重抓');
+  });
+  testWidgets('t112：手改学期后按新学期重载（旧学期课程不保留）', (WidgetTester tester) async {
+    final core = ScriptedCore(<CoreEnvelope>[])
+      ..courses = <StoredCourse>[
+        const StoredCourse(
+          id: 3,
+          term: '2026-2027-1',
+          name: '高等数学A',
+          weekday: 1,
+          startPeriod: 1,
+          endPeriod: 2,
+          weeks: '1-16',
+        ),
+      ];
+    final service = TimetableService(core: core, dbPath: '/tmp/t112.db');
+
+    await tester.pumpWidget(_wrap(TimetablePage(service: service, initialTerm: '2026-2027-1')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('高等数学A'), findsWidgets);
+
+    // 手改学期：库对新学期返回空 → 旧学期课程必须清掉、显示空态
+    core.courses = const <StoredCourse>[];
+    await tester.enterText(find.byType(TextField).first, '2026-2027-2');
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('高等数学A'), findsNothing, reason: '旧学期的课不能留在新学期');
+    expect(find.text('还没有课表'), findsOneWidget);
+  });}
