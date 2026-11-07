@@ -26,6 +26,7 @@ class ModelSelector extends StatelessWidget {
     this.onModelChanged,
     this.onEffortChanged,
     this.onUseCloud,
+    this.onPresetSelected,
   });
 
   final List<ProviderConfig> providers;
@@ -41,6 +42,9 @@ class ModelSelector extends StatelessWidget {
 
   /// 「套餐通道」：未登录时由 ChatPage 弹登录框。
   final VoidCallback? onUseCloud;
+
+  /// 【t168】选中一个内置预设（= 登记成 Provider 配置并设为当前）。
+  final ValueChanged<ProviderPreset>? onPresetSelected;
 
   static const List<String> effortLabels = <String>['auto', 'low', 'medium', 'high'];
 
@@ -63,7 +67,15 @@ class ModelSelector extends StatelessWidget {
         return provider.name;
       }
     }
-    return providers.isEmpty ? '未配置供应商' : providers.first.name;
+    return providers.isEmpty ? ProviderStore.placeholderLabel : providers.first.name;
+  }
+
+  /// 摘要行：未配置时只显示占位符（灰色），不显示 `DeepSeek · deepseek-flash`。
+  String get _summary {
+    if (providers.isEmpty) {
+      return ProviderStore.placeholderLabel;
+    }
+    return '$_providerName · $model · ${effortText(effort)}';
   }
 
   @override
@@ -79,10 +91,14 @@ class ModelSelector extends StatelessWidget {
         icon: const Icon(Icons.tune, size: 16),
         // 一行摘要：provider · 模型 · effort（窄窗靠 ellipsis，不溢出）
         label: Text(
-          '$_providerName · $model · ${effortText(effort)}',
+          _summary,
+          key: const Key('model-selector-summary'),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: theme.textTheme.bodySmall,
+          style: theme.textTheme.bodySmall?.copyWith(
+            // 未配置时用灰色占位，避免看起来"已经可用"
+            color: providers.isEmpty ? theme.hintColor : null,
+          ),
         ),
         style: TextButton.styleFrom(
           padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -104,19 +120,35 @@ class ModelSelector extends StatelessWidget {
             _Row(
               title: '供应商',
               value: _providerName,
-              onTap: providers.isEmpty
-                  ? null
-                  : () async {
-                      final String? picked = await _pick(
-                        sheetContext,
-                        '供应商',
-                        <_Option>[for (final ProviderConfig p in providers) _Option(p.id, p.name)],
-                        activeProviderId ?? providers.first.id,
-                      );
-                      if (picked != null) {
-                        onProviderChanged?.call(picked);
-                      }
-                    },
+              // t168：即使一个都没配置，也允许打开（里面是"预设模板"）
+              onTap: () async {
+                final String? picked = await _pick(
+                  sheetContext,
+                  '供应商',
+                  <_Option>[
+                    for (final ProviderConfig p in providers)
+                      _Option('provider:${p.id}', p.name),
+                    for (final ProviderPreset preset in ProviderPreset.all)
+                      if (!providers.any((ProviderConfig p) => p.id == 'preset-${preset.id}'))
+                        _Option('preset:${preset.id}', '${preset.displayName}（预设）'),
+                  ],
+                  activeProviderId == null ? '' : 'provider:$activeProviderId',
+                );
+                if (picked == null) {
+                  return;
+                }
+                if (picked.startsWith('preset:')) {
+                  final String id = picked.substring('preset:'.length);
+                  for (final ProviderPreset preset in ProviderPreset.all) {
+                    if (preset.id == id) {
+                      onPresetSelected?.call(preset);
+                      return;
+                    }
+                  }
+                  return;
+                }
+                onProviderChanged?.call(picked.substring('provider:'.length));
+              },
             ),
             _Row(
               title: '模型',

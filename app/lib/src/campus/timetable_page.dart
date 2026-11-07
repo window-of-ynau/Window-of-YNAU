@@ -699,12 +699,15 @@ class _TimetablePageState extends State<TimetablePage> {
       final String lastHtml = htmlSeq.isEmpty ? '' : htmlSeq.last;
       final String lastUrl = urlSeq.isEmpty ? '' : urlSeq.last;
       if (!result.ok) {
+        final ({int dataRows, int headerRows, int totalRows}) rowCounts =
+            tableRowCounts(lastHtml);
         final List<CaptureAttemptRecord> records = <CaptureAttemptRecord>[
           for (final ParseAttempt attempt in result.attempts)
             CaptureAttemptRecord(
               index: attempt.index,
               htmlLength: attempt.htmlLength,
               rowCount: attempt.rowCount,
+              headerRowCount: rowCounts.headerRows,
               parsedCourses: attempt.parseEmpty ? 0 : null,
               url: lastUrl,
               hasTimetableMark: lastHtml.contains('timetable'),

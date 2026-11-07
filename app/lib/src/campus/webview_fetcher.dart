@@ -225,9 +225,16 @@ class _CampusWebViewPageState extends State<CampusWebViewPage> {
         return -1;
       }
       try {
+        // 脚本返回 "数据行:总行数"（例如 "0:1" = 只有表头；"7:8" = 7 行课程）
         final Object? raw = await controller.evaluateJavascript(source: kCourseRowCountScript);
-        final int? count = int.tryParse('${raw ?? ''}'.replaceAll('"', '').trim());
-        return count ?? -1;
+        final String text = '${raw ?? ''}'.replaceAll('"', '').trim();
+        final int colon = text.indexOf(':');
+        if (colon <= 0) {
+          final int? single = int.tryParse(text);
+          return single ?? -1;
+        }
+        final int? data = int.tryParse(text.substring(0, colon));
+        return data ?? -1;
       } on Object catch (failure) {
         // 【t161】可以吞：行数探测只是**就绪判定的加分项**，拿不到按"未知"处理，
         // 由 waitForTimetableReady 的其它条件（长度/关键字/URL）兜底；但要留痕便于排障。

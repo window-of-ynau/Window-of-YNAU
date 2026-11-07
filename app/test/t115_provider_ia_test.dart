@@ -66,6 +66,8 @@ void main() {
     test('provider 列表可增删并持久化到设置', () async {
       final SettingsStore settings = MemorySettingsStore();
       final store = ProviderStore(store: settings, secrets: SecretService(backend: _SeededSecrets(), dbPath: '/tmp/t115'));
+      // t168：默认不再预置 Provider，所以先加"默认"这条，再加 p2
+      await store.add(const ProviderConfig(id: 'p1', name: '默认', baseUrl: 'https://api.deepseek.com'));
       await store.add(const ProviderConfig(id: 'p2', name: '自建', baseUrl: 'https://self.example'));
       expect(store.providers.length, 2);
       expect(store.activeId, 'p2');
@@ -104,7 +106,8 @@ void main() {
 
       expect(find.byKey(const Key('model-selector-button')), findsOneWidget);
       // t132：摘要改为 provider · 模型 · 推理等级（不再带 "effort" 英文前缀）
-      expect(find.textContaining('deepseek-flash'), findsWidgets);
+      // t168：未配置时摘要显示占位符，不再默认深色 DeepSeek
+      expect(find.text('请选择或添加你的 Provider'), findsWidgets);
 
       await tester.tap(find.byKey(const Key('model-selector-button')));
       await tester.pumpAndSettle();

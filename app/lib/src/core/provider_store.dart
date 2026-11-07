@@ -100,6 +100,64 @@ class DeepSeekPreset {
   return (model: next, migratedFrom: trimmed);
 }
 
+/// 【t168】内置 **Provider 预设**（模板，不是"已配置"）。
+///
+/// owner 的口径（2026-11 明确纠正）：
+/// - 列表显示**显示名**（`displayName`），实际请求体里用 `modelId`；
+/// - 两者独立，厂商改名不影响请求；
+/// - 显示名**原样保留**（`GPT6.1Sol` / `Claude Sonnet 5.5` / `deepseek-flash`），
+///   不做"规范化"（不要变成 gpt-6.1-sol 之类）；
+/// - Base URL 走 `shared/url.rs` 的统一规范化（带不带 `/v1` 都能工作，#63）。
+class ProviderPreset {
+  const ProviderPreset({
+    required this.id,
+    required this.displayName,
+    required this.modelId,
+    required this.baseUrl,
+  });
+
+  final String id;
+
+  /// 列表里显示的名字（原样保留）。
+  final String displayName;
+
+  /// 实际发给 API 的 `model` 字段。
+  final String modelId;
+
+  final String baseUrl;
+
+  static const ProviderPreset openai = ProviderPreset(
+    id: 'openai',
+    displayName: 'GPT6.1Sol',
+    modelId: 'GPT6.1Sol',
+    baseUrl: 'https://api.openai.com',
+  );
+
+  static const ProviderPreset anthropic = ProviderPreset(
+    id: 'anthropic',
+    displayName: 'Claude Sonnet 5.5',
+    modelId: 'Claude Sonnet 5.5',
+    baseUrl: 'https://api.anthropic.com',
+  );
+
+  static const ProviderPreset deepseek = ProviderPreset(
+    id: 'deepseek',
+    displayName: 'deepseek-flash',
+    modelId: 'deepseek-flash',
+    baseUrl: 'https://api.deepseek.com',
+  );
+
+  static const List<ProviderPreset> all = <ProviderPreset>[openai, anthropic, deepseek];
+
+  /// 预设转成一条真正的 Provider 配置（选中才算"已配置"）。
+  ProviderConfig toConfig() => ProviderConfig(
+        id: 'preset-$id',
+        name: displayName,
+        baseUrl: baseUrl,
+        models: <String>[modelId],
+      );
+}
+
 /// 一个供应商。
 class ProviderConfig {
   const ProviderConfig({
@@ -161,15 +219,46 @@ class ProviderStore extends ChangeNotifier {
   final SecretService? _secrets;
 
   /// 内置预设（值见 [DeepSeekPreset] 的文档注释）。
-  List<ProviderConfig> _providers = const <ProviderConfig>[
-    ProviderConfig(
-      id: defaultProviderId,
-      name: DeepSeekPreset.name,
-      baseUrl: DeepSeekPreset.baseUrl,
-      models: DeepSeekPreset.models,
-    ),
-  ];
-  String _activeId = defaultProviderId;
+  /// 【t168】默认**没有任何已配置供应商**（不再默认 DeepSeek）。
+  ///
+  /// 理由：以前默认塞一个 DeepSeek 配置，用户从没配过也看到 `DeepSeek · deepseek-flash`，
+  /// 会误以为"已经能用了"。现在默认空列表 → UI 显示占位符，选中预设才算配置。
+  List<ProviderConfig> _providers = const <ProviderConfig>[];
+  String _activeId = '';
+
+  /// 未配置时选择器里的占位文案。
+  static const String placeholderLabel = '请选择或添加你的 Provider';
+
+  /// 是否已有可用配置（有 Key 的供应商由 SecretService 另行判断）。
+  bool get hasConfigured => _providers.isNotEmpty;
+
+  /// 当前生效的供应商；未配置时为 null。
+  ProviderConfig? get activeOrNull {
+    if (_providers.isEmpty) {
+      return null;
+    }
+    for (final ProviderConfig provider in _providers) {
+      if (provider.id == _activeId) {
+        return provider;
+      }
+    }
+    return _providers.first;
+  }
+
+  /// 选中一个预设（= 把它登记成一条 Provider 配置并设为当前）。
+  Future<void> selectPreset(ProviderPreset preset) async {
+    final ProviderConfig config = preset.toConfig();
+    final bool exists = _providers.any((ProviderConfig p) => p.id == config.id);
+    if (!exists) {
+      _providers = <ProviderConfig>[..._providers, config];
+    }
+    _activeId = config.id;
+    await _persist();
+    notifyListeners();
+  }
+
+  /// 已配置的供应商 id 集合（用于把预设标成"已添加"）。
+  bool hasProvider(String id) => _providers.any((ProviderConfig p) => p.id == id);
 
   /// 旧模型名迁移记录（诊断用；为空 = 没迁过）。
   String? modelMigrationNote;
@@ -177,14 +266,17 @@ class ProviderStore extends ChangeNotifier {
 
   List<ProviderConfig> get providers => List<ProviderConfig>.unmodifiable(_providers);
   String get activeId => _activeId;
-  ProviderConfig get active => _providers.firstWhere(
-        (ProviderConfig provider) => provider.id == _activeId,
-        orElse: () => _providers.first,
-      );
+  ProviderConfig get active => activeOrNull!;
 
   /// 当前 provider 的模型列表（空则用内置预设的模型表）。
-  List<String> get activeModels =>
-      active.models.isEmpty ? DeepSeekPreset.models : active.models;
+  /// 当前 provider 的模型列表；未配置时为空（不再回落到 DeepSeek 预设）。
+  List<String> get activeModels {
+    final ProviderConfig? provider = activeOrNull;
+    if (provider == null) {
+      return const <String>[];
+    }
+    return provider.models.isEmpty ? const <String>[] : provider.models;
+  }
 
   /// 从设置里读回列表；没有则保持「DeepSeek 预设」。
   Future<void> load() async {

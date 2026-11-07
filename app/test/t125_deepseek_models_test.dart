@@ -19,11 +19,14 @@ void main() {
       expect(DeepSeekPreset.isAnthropicEndpoint('https://api.deepseek.com'), isFalse);
     });
 
-    test('ProviderStore 默认 provider 用的就是这套预设', () {
+    test('ProviderStore 默认**不预置** Provider；选中预设后才生效（t168）', () async {
       final ProviderStore store = ProviderStore(store: MemorySettingsStore());
-      expect(store.active.name, DeepSeekPreset.name);
-      expect(store.active.baseUrl, DeepSeekPreset.baseUrl);
-      expect(store.activeModels, DeepSeekPreset.models);
+      expect(store.hasConfigured, isFalse);
+      expect(store.activeModels, isEmpty);
+      await store.selectPreset(ProviderPreset.deepseek);
+      expect(store.active.name, ProviderPreset.deepseek.displayName);
+      expect(store.active.baseUrl, ProviderPreset.deepseek.baseUrl);
+      expect(store.activeModels, <String>[ProviderPreset.deepseek.modelId]);
     });
 
     test('模型列表只有文档里的两个（不臆造）', () {
