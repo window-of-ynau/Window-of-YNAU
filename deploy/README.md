@@ -213,10 +213,31 @@ git push origin v0.1.0
 对本项目的桌面端规模，WiX 的 `.wxs/.wixproj` + Toolset 版本矩阵不划算。
 
 ```bash
-# 本机打安装包（会先跑 scripts/build-windows-app.ps1 构建 exe + DLL）
-pwsh scripts/build-windows-installer.ps1 -Version 0.1.0
-# 产物：dist/WindowOfYNAU-0.1.0-setup.exe + dist/SHA256SUMS
+# 本机打安装包（先构建 exe + DLL，再过护栏 → 白名单暂存 → ISCC）
+pwsh scripts/build-windows-installer.ps1 -Version 0.9.0
+# 产物：dist/WindowOfYNAU-0.9.0-setup.exe + dist/SHA256SUMS
 ```
+
+**⚠️ 不要直接对 `app/build/windows/x64/runner/Release/` 打整包**——这是 2026-11 真实发生过的事故：
+在 Release 目录里跑过一次 App 之后，WebView2 会在 exe 同级生成 `yunong.exe.WebView2/EBWebView/`，
+里面有**本机保存的 Cookie 与 Login Data**（校方会话、登录凭据）。t154 之前的 `.iss` 用
+`{SourceDir}\*` 通配打包，把这些用户数据一起打进了发布安装包。
+
+现在打包脚本是**白名单模式**，顺序是：
+
+1. `scripts/build-windows-app.ps1` 构建 `yunong.exe` + `yunong_core.dll` + Flutter 产物；
+2. **护栏 A**：扫 Release 目录，出现 `*.WebView2` / `EBWebView` / `*.db` / `secrets` / `*.pdb` / `.env` / `*.jks` 直接失败并列出路径；
+3. **白名单暂存** `build/installer-staging/`：只复制 `yunong.exe`、`yunong_core.dll`、`flutter_windows.dll`、`flutter_inappwebview_windows_plugin.dll`、`WebView2Loader.dll`、`native_assets.json`（可选）与 `data\`（排除 db/secrets/.env/pdb）；
+4. ISCC 只对暂存目录编译（`.iss` 里另带 `Excludes` 作第二道保险）；
+5. **护栏 C**：安装包 ≥ 40 MB 直接失败（异常增大通常意味着混进了用户数据/调试符号）；
+6. **护栏 D**：比对 `setup.exe` 与 `yunong.exe` 的图标 SHA256，确认安装向导用的是应用图标而不是 Inno 默认图标。
+
+发布流水线里还有 **护栏 B**：静默安装到临时目录后复查安装目录里没有 `.WebView2` / `*.db` / `secrets`，
+再断言卸载后 `%LOCALAPPDATA%\yunong` 仍保留。
+
+**前置**：本机需要 **Inno Setup 6**（`winget install JRSoftware.InnoSetup`）。脚本会先查注册表里的
+`InstallLocation` 定位 `ISCC.exe`，再回退到常见安装路径——不再依赖硬编码目录（本机它就装在
+`D:\Program Files\Inno Setup 6`）。找不到时脚本会给出安装提示。
 
 - **未签名**：暂无代码签名证书。用户首次运行会看到 SmartScreen"Windows 已保护你的电脑"，
   处理方式：点 **更多信息 → 仍要运行**（发布说明里也要写这句）。拿到证书后把 `signtool` 加进
@@ -227,61 +248,47 @@ pwsh scripts/build-windows-installer.ps1 -Version 0.1.0
 - CI 里除了构建，还会做一次**从零安装验证**：静默装到临时目录 → 断言 `yunong.exe`、`yunong_core.dll`、
   `flutter_windows.dll`、`data\` 都在 → 静默卸载 → 断言 `%LOCALAPPDATA%\yunong` 未被删。
 
-### Android 签名 APK
+### Android 签名 APK（配好 4 个 Secrets 即可用）
 
-签名材料**不进仓库**，走 GitHub Secrets（四个）：
+CI 的 `android` job 有两种模式，日志里会明确打印走了哪条：
+
+- 有 `KEYSTORE_BASE64` → `using release keystore (KEYSTORE_BASE64 已配置, alias=…)`，产出正式签名 APK；
+- 没有 → `fallback to debug signing (secrets missing)` + `::warning::`，只产出 debug APK（可在测试机侧载，**不可发布**）。
+
+护栏：如果配了 Secrets 但 APK 仍由 debug keystore 签名（`apksigner --print-certs` 里出现 `CN=Android Debug`），
+job **直接失败**——防止"以为签了其实没签"。想不打包 tag 也验证这条链路：
 
 ```bash
-# 一次性生成 upload keystore（口令自己定，别用示例值）
+gh workflow run release --ref main -f dry_run=true -f build_android=true
+```
+
+**owner 要做四步**（一次性）：
+
+```bash
+# 1. 生成 upload keystore（口令自己定；有效期 10000 天 ≈ 27 年）
 keytool -genkeypair -v -keystore upload-keystore.jks -keyalg RSA -keysize 2048 \
   -validity 10000 -alias upload -storetype JKS
 
-base64 -w0 upload-keystore.jks > keystore.b64   # Windows: certutil -encode 或 pwsh [Convert]::ToBase64String
+# 2. base64 编码（Linux/macOS；Windows 用 pwsh 的 [Convert]::ToBase64String 或 certutil -encode）
+base64 -w0 upload-keystore.jks > keystore.b64
 
+# 3. 写入 4 个 GitHub Secrets
 gh secret set KEYSTORE_BASE64   --body "$(cat keystore.b64)"
 gh secret set KEYSTORE_PASSWORD --body '<store password>'
 gh secret set KEY_ALIAS         --body 'upload'
 gh secret set KEY_PASSWORD      --body '<key password>'
-rm -f keystore.b64 upload-keystore.jks   # 本地别留副本
+
+# 4. 立刻删掉本地副本
+rm -f keystore.b64 upload-keystore.jks
 ```
 
-CI 在 `app/android/key.properties` 里还原（该文件已 gitignore）：有 `key.properties` → 真签名；
-没有 → 退回 debug 签名并打 `::warning::`（本地 `flutter run --release` 仍可用，但产物不可发布）。
+**验证方式**：跑 `gh workflow run release --ref main -f dry_run=true -f build_android=true`，
+日志里应看到 `using release keystore` 与 `OK：APK 由 release keystore 签名（非 Android Debug）`；
+本地可用 `apksigner verify --print-certs app-release.apk` 看证书 DN。
 
-`targetSdk` 跟随 `flutter.targetSdkVersion`（当前 Flutter stable 版本对应值）；权限只看
-`app/android/app/src/main/AndroidManifest.xml`，本项目**不需要**存储写入权限（课表走 WebView 抓取 + 本地 SQLite），
-只需 `INTERNET`——Android 13+ 的分区存储/通知权限变化对我们无影响。
-
-### 干净环境验证（安装包真装真跑，不污染真身）
-
-在没有 Windows Sandbox / Hyper-V 的机器上（**Windows 11 家庭版不提供**：`Containers-DisposableClientVM`
-与 Hyper-V 都要专业版/企业版），用**改写环境变量**的方式做安装验证：
-
-```powershell
-# 先打一个安装包（或直接拿 CI 的 artifact：yunong-windows-setup-<run>）
-pwsh scripts/build-windows-installer.ps1 -Version 0.9.0
-pwsh scripts/verify-install-clean.ps1 -Root D:\verify -KeepArtifacts
-```
-
-脚本做的事（13 条断言，全自动、不需要点界面）：
-
-1. 建空目录 `D:\verify\profile-<时间戳>` 当"假用户配置"、`D:\verify\app-<时间戳>` 当安装目录；
-2. `setup.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=<安装目录>` 静默安装，断言 exe / 三个 DLL / `data\` / 卸载程序都在，且**不含** `.WebView2`、`*.db`、`secrets`；
-3. `$env:LOCALAPPDATA = "<假用户配置>"` 后启动已安装的 `yunong.exe`，断言进程没崩、假配置下创建了 `yunong\`；
-4. 断言**真实** `%LOCALAPPDATA%\yunong` 的文件数/字节数/修改时间**完全没变**（证明没污染真身），且运行后安装目录里**没有**冒出 `.WebView2`；
-5. 静默卸载：断言 `yunong.exe` 已删除、**用户数据仍保留**、真实目录依旧没被碰过。
-
-**原理**：应用的数据根来自 `LOCALAPPDATA ?? APPDATA ?? USERPROFILE`（`app/lib/src/core/app_paths.dart`），
-所以给进程换一个 `LOCALAPPDATA`，它就看到一个"空的可写根"。不需要改应用代码，也不引入 Profile 概念。
-
-**局限（必须说清，别把它当安全边界）**：
-- 这不是沙盒：**注册表**（HKCU）、开始菜单/桌面快捷方式、Program Files 写入仍然是真实系统的；
-- 只覆盖"应用把数据放在环境变量指向的目录"这一件事；
-- 验证的是本机环境下的行为，不代表另一台 Windows 的差异（缺 WebView2 Runtime、无权限等）。
-
-**要"系统级干净"的验证，两个选项**：
-- **新建一个本地 Windows 用户**（`设置 → 账户 → 其他用户`，标准用户即可），切过去装一遍——隔离注册表与用户目录，成本最低；
-- **虚拟机**（VirtualBox/VMware 装干净 Win11），能顺带验证"没装 WebView2 Runtime 会不会挂"这类全新系统问题。
+**keystore 绝不能提交进仓库**（`.gitignore` 已覆盖 `*.jks` / `*.keystore` / `app/android/key.properties`）。
+**丢失 keystore 的后果**：已发布到应用商店/分发的 APK 无法再更新——包名不变时 Android 要求新包用**同一签名**
+（否则用户必须先卸载、数据全丢）。所以 keystore 与两个口令要离线备份（密码管理器 + 加密备份各一份）。
 
 ### 干跑发布流水线
 
