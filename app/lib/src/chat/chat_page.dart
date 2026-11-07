@@ -151,10 +151,17 @@ class ChatPageState extends State<ChatPage> {
   late final ProviderStore _providers = ProviderStore();
   /// t146：预设 + 自定义**按名字去重、预设优先**。
   /// 旧实现是直接拼接 → 同名模型出现两次、两处都打勾（`option.value == current` 命中两条）。
-  List<String> get _models => DeepSeekPreset.mergeModelNames(
-        presets: DeepSeekPreset.models,
-        custom: _providers.active.models,
-      );
+  /// 【t168】模型候选 = 当前 provider 自己的模型（预设已各自带 modelId）。
+  ///
+  /// 以前是「DeepSeek 预设 + 当前 provider 的模型」拼一起，于是同一个模型出现两次；
+  /// 现在只取当前 provider 的列表，并且 `mergeModelNames` 仍然按名字去重兜底。
+  List<String> get _models {
+    final List<String> own = _providers.activeModels;
+    if (own.isEmpty) {
+      return const <String>[];
+    }
+    return DeepSeekPreset.mergeModelNames(presets: own, custom: const <String>[]);
+  }
 
   /// t122：强制工具调用（诊断弹窗可切）。开启后请求带 `tool_choice=required`。
   bool _toolChoiceRequired = false;
@@ -532,7 +539,7 @@ class ChatPageState extends State<ChatPage> {
           children: <Widget>[
             Text('通道：${_channel == 'cloud' ? '套餐' : '直连（BYOK）'}'),
             Text('模型：$_model · 推理等级：${ModelSelector.effortText(_effort)}'),
-            Text('服务商：${_providers.active.name}'),
+            Text('服务商：${_providers.activeOrNull?.name ?? ProviderStore.placeholderLabel}'),
             Text(searchLine),
             Text('Key：${_keyStatus.display}'),
           ],
@@ -949,6 +956,13 @@ class ChatPageState extends State<ChatPage> {
             onModelChanged: (String value) => setState(() => _model = value),
             onEffortChanged: (String value) => setState(() => _effort = value),
             onUseCloud: () => unawaited(_signInCloud()),
+            onPresetSelected: (ProviderPreset preset) async {
+              await _providers.selectPreset(preset);
+              final List<String> models = _providers.activeModels;
+              if (mounted && models.isNotEmpty) {
+                setState(() => _model = models.first);
+              }
+            },
           ),
         ),
         const SizedBox(width: 4),

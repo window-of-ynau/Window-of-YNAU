@@ -46,19 +46,33 @@ const String kGrabHtmlScript = '(window.__yunongGrabHtml ? window.__yunongGrabHt
 /// 否则会出现"框架在、行还没渲染"的中间态 —— HTML 够长、含课表字样，但解析出 0 门课（PARSE_EMPTY）。
 const String kCourseRowSelector = 'table#timetable tr';
 
+/// 【t168 修复】**数据行**选择器：表头行（`<th>`）也是 `<tr>`，不能算成绩效行。
+///
+/// 证据：`assets/fixtures/timetable_sample.html` 里 `table#timetable` 的第一个 `<tr>`
+/// 是 10 个 `<th>`（节次/星期一…），接着才是含 `<td>` 的课程行 ——
+/// 所以旧的 `tr` 计数在"只有表头"时会得到 1，让就绪判定误判为"已经有课程行"。
+/// 现在统计口径 = 含 `<td>` 的行（=Rust 解析器实际会去看的行）。
+const String kCourseDataRowSelector = 'table#timetable tr:has(td)';
+
 /// 安装轻量计数入口（只回数字、不回 DOM）：`window.__yunongCourseRowCount()`。
 const String kCourseRowCountInstallScript = r'''
 (function () {
   if (window.__yunongCourseRowCount) { return; }
+  // 返回 "数据行:总行数"（数据行 = 含 <td> 的行；表头行只含 <th>）。
   window.__yunongCourseRowCount = function () {
     try {
-      var rows = document.querySelectorAll('table#timetable tr');
-      if (!rows || rows.length === 0) {
-        rows = document.querySelectorAll('#timetable tr, table.timetable tr');
+      var table = document.querySelector('table#timetable') ||
+                  document.querySelector('#timetable') ||
+                  document.querySelector('table.timetable');
+      if (!table) { return '0:0'; }
+      var rows = table.querySelectorAll('tr');
+      var data = 0;
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].querySelector('td')) { data += 1; }
       }
-      return rows ? rows.length : 0;
+      return data + ':' + rows.length;
     } catch (e) {
-      return 0;
+      return '0:0';
     }
   };
 })();

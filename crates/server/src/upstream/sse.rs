@@ -1,70 +1,43 @@
-//! SSE 事件解码：从上游字节流里切出**完整事件**的 `data:` 负载。
+//! SSE 事件解码：从上游字节流里切出**完整事件**的 `data:` 负载
+//! —— 切分逻辑已收敛到 `yunong_shared::sse`（issue #18）。
 //!
-//! 只做 wire 层的事（行切分、多行 `data` 合并、注释行忽略），不理解 JSON——
-//! 语义交给 `yunong_core::protocols::parse_events`。
+//! 这里只剩一层薄适配：把共享帧切分器产出的事件映射成"纯 `data:` 负载"。
+//! 服务端**不需要**事件名（三家上游的 `event:` 叫法都不一样，Completions 干脆没有），
+//! 也不理解 JSON——语义交给 `yunong_core::protocols::parse_events`。
 //!
-//! 为什么还需要它：HTTP 传输交给 `reqwest`（TLS / 分块解码 / 重定向都是它的事），
-//! 但它只给"没凑齐一行的字节块"。归一化只要 `data:` 负载——上游的 `event:` 名字
-//! 三家都不一样，Completions 干脆不带 `event:`，所以帧切分这一层留着更省事。
+//! 与端侧唯一的有意差异：这里用 [`SseFramer::new_strict_utf8`]（非 UTF-8 行丢弃整个事件），
+//! 保留服务端原有语义；端侧用的是 lossy。
+
+use yunong_shared::SseFramer;
 
 /// 增量解码器：可以喂任意切分的字节片段（网络读到的边界不可控）。
 #[derive(Debug, Default)]
 pub struct SseDecoder {
-    /// 还没凑成完整一行的字节
-    line: Vec<u8>,
-    /// 当前事件已收集的 data（多行按规范用 `\n` 连接）
-    data: Option<String>,
+    framer: SseFramer,
 }
 
 impl SseDecoder {
+    /// 严格 UTF-8 版（服务端语义：乱码行不往下传）。
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            framer: SseFramer::new_strict_utf8(),
+        }
     }
 
     /// 喂一段字节，把**完整事件**的 data 负载追加到 `out`。
+    ///
+    /// 只有真的出现过 `data:` 的帧才输出（`event: x` 单独出现时不上报，与旧行为一致）。
     pub fn feed(&mut self, input: &[u8], out: &mut Vec<String>) {
-        for &byte in input {
-            if byte == b'\n' {
-                let mut line = std::mem::take(&mut self.line);
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                self.handle_line(&line, out);
-            } else {
-                self.line.push(byte);
-            }
-        }
-    }
-
-    fn handle_line(&mut self, line: &[u8], out: &mut Vec<String>) {
-        // 空行 = 事件结束
-        if line.is_empty() {
-            if let Some(data) = self.data.take() {
-                out.push(data);
-            }
-            return;
-        }
-        // 注释（`: keep-alive`）与 `event:` / `id:` / `retry:` 都不进 data
-        let Ok(text) = std::str::from_utf8(line) else {
-            // 非 UTF-8 行：丢掉当前事件，别把乱码当 JSON 往下传
-            self.data = None;
-            return;
-        };
-        let Some(rest) = text.strip_prefix("data:") else {
-            return;
-        };
-        // 规范允许 `data:x` 与 `data: x` 两种写法
-        let value = rest.strip_prefix(' ').unwrap_or(rest);
-        match &mut self.data {
-            Some(data) => {
-                data.push('\n');
-                data.push_str(value);
-            }
-            None => self.data = Some(value.to_owned()),
-        }
+        let mut events = Vec::new();
+        self.framer.push(input, &mut events);
+        out.extend(
+            events
+                .into_iter()
+                .filter(|event| event.had_data)
+                .map(|event| event.data),
+        );
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +88,28 @@ mod tests {
     fn unfinished_event_is_not_emitted() {
         let out = decode(b"data: {\"a\":1}");
         assert!(out.is_empty(), "没有空行收尾，事件还不完整");
+    }
+
+    /// 与端侧**共用**的用例表：服务端只关心 `data`，但切分结果必须与表一致。
+    #[test]
+    fn shared_case_table_holds_here() {
+        for case in yunong_shared::sse::SSE_CASES {
+            let mut decoder = SseDecoder::new();
+            let mut out = Vec::new();
+            decoder.feed(case.wire.as_bytes(), &mut out);
+            if case.needs_finish {
+                // **有意的语义差异**：服务端历史上没有"收尾吐最后一帧"（流被截断就丢掉），
+                // 这里保持原样，不去顺手改上游代理解析行为。
+                assert!(out.is_empty(), "服务端不 flush 未收尾帧：{case:?}");
+                continue;
+            }
+            let expected: Vec<String> = case
+                .frames
+                .iter()
+                .map(|(_, data)| (*data).to_owned())
+                .collect();
+            assert_eq!(out, expected, "case={case:?}");
+        }
     }
 
     #[test]
