@@ -1,20 +1,11 @@
-//! SSE 帧解码（`text/event-stream`）。
+//! SSE 帧解码（`text/event-stream`）——**切分逻辑已收敛到 `yunong_shared::sse`**（issue #18）。
 //!
-//! 只做**字节 → 帧**的切分，不掺业务：三家厂商的 BYOK 直连与我们自己的套餐通道
-//! 都走这一套解码器，事件怎么解释由各自的解析层负责（`protocols::parse_events` /
-//! [`super::cloud_sse::parse_cloud_event`]）。
-//!
-//! 依据 WHATWG 的 SSE 规则实现子集：
-//! - 行尾 `CRLF` / `LF` / 单独的 `CR` 都认；
-//! - `:` 开头的注释行（心跳/保活）直接丢弃；
-//! - `field: value`，冒号后的**一个**空格可有可无；
-//! - 多行 `data:` 用 `\n` 连接（一帧一个 payload）；
-//! - 空行 = 派发一帧；
-//! - 未识别的字段（`id:` / `retry:`）忽略；
-//! - 跨 `push` 的半行、半帧留在内部缓冲里，`push` 只吐出**完整**的帧。
-//!
-//! 不在这里做 UTF-8 校验：按行（以字节找换行）切出来之后才解码，
-//! 所以一个多字节字符即使被切在两个 TCP 包里也不会损坏。
+//! 这个文件现在只剩一层薄适配：把共享帧切分器产出的 [`SseEvent`] 转成端侧一直用的
+//! [`SseFrame`]（`event` 从 `Option` 变成缺省 `"message"` 的字符串）。
+//! 边界规则（`\r\n` / 跨 chunk 半帧 / 注释行 / 多行 data / 收尾帧）全部写在
+//! `crates/shared/src/sse.rs`，三处调用点共用同一份用例表。
+
+use yunong_shared::{SseEvent, SseFramer};
 
 /// 一帧 SSE。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,17 +23,19 @@ impl SseFrame {
     }
 }
 
-/// 增量式 SSE 解码器。
+impl From<SseEvent> for SseFrame {
+    fn from(event: SseEvent) -> Self {
+        Self {
+            event: event.event.unwrap_or_else(|| "message".to_owned()),
+            data: event.data,
+        }
+    }
+}
+
+/// 增量式 SSE 解码器（薄封装：真正的切分在 [`SseFramer`]）。
 #[derive(Debug, Default)]
 pub struct SseDecoder {
-    /// 还没见到行尾的半行（按字节缓冲，避免切断 UTF-8）
-    buf: Vec<u8>,
-    /// 当前帧还没派发的事件名
-    event: Option<String>,
-    /// 当前帧累计的 data
-    data: String,
-    /// 是否已经收到过 `data:`（用来区分"空 data"与"根本没有 data"）
-    has_data: bool,
+    framer: SseFramer,
 }
 
 impl SseDecoder {
@@ -52,96 +45,20 @@ impl SseDecoder {
 
     /// 喂入一段字节，返回其中已经完整到达的帧。
     pub fn push(&mut self, bytes: &[u8]) -> Vec<SseFrame> {
-        self.buf.extend_from_slice(bytes);
-        let mut frames = Vec::new();
-        while let Some((end, sep)) = line_end(&self.buf) {
-            let line: Vec<u8> = self.buf.drain(..end + sep).take(end).collect();
-            let line = String::from_utf8_lossy(&line).into_owned();
-            if let Some(frame) = self.handle_line(&line) {
-                frames.push(frame);
-            }
-        }
-        frames
+        let mut events = Vec::new();
+        self.framer.push(bytes, &mut events);
+        events.into_iter().map(SseFrame::from).collect()
     }
 
     /// 流结束：把"没有以空行收尾"的最后一帧也吐出来。
     ///
     /// 宽松处理：上游偶尔会在 `data:` 之后直接断 TCP（不发空行）。
     pub fn finish(&mut self) -> Vec<SseFrame> {
-        let mut frames = Vec::new();
-        if !self.buf.is_empty() {
-            let rest: Vec<u8> = std::mem::take(&mut self.buf);
-            let line = String::from_utf8_lossy(&rest).into_owned();
-            if let Some(frame) = self.handle_line(&line) {
-                frames.push(frame);
-            }
-        }
-        if let Some(frame) = self.dispatch() {
-            frames.push(frame);
-        }
-        frames
-    }
-
-    fn handle_line(&mut self, line: &str) -> Option<SseFrame> {
-        if line.is_empty() {
-            return self.dispatch();
-        }
-        if line.starts_with(':') {
-            // 注释行 / 心跳：不产生帧
-            return None;
-        }
-        let (field, value) = match line.split_once(':') {
-            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
-            // 没有冒号的行按"空值字段"处理（SSE 规范）
-            None => (line, ""),
-        };
-        match field {
-            "event" => {
-                self.event = Some(value.to_owned());
-                None
-            }
-            "data" => {
-                if self.has_data {
-                    self.data.push('\n');
-                }
-                self.data.push_str(value);
-                self.has_data = true;
-                None
-            }
-            // `id:` / `retry:` / 未知字段：我们对断线续传不感兴趣，忽略
-            _ => None,
-        }
-    }
-
-    fn dispatch(&mut self) -> Option<SseFrame> {
-        if !self.has_data && self.event.is_none() {
-            return None;
-        }
-        let frame = SseFrame {
-            event: self.event.take().unwrap_or_else(|| "message".to_owned()),
-            data: std::mem::take(&mut self.data),
-        };
-        self.has_data = false;
-        Some(frame)
+        let mut events = Vec::new();
+        self.framer.finish(&mut events);
+        events.into_iter().map(SseFrame::from).collect()
     }
 }
-
-/// 找第一行结束位置：返回 `(行内字节数, 分隔符字节数)`。
-///
-/// 行尾只有 `\r` 且**后面还没来数据**时返回 `None`——不能把 CRLF 拆成两行，
-/// 否则第二个包里的 `\n` 会被当成一个空行，凭空多派发一帧。
-fn line_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let i = buf.iter().position(|b| *b == b'\n' || *b == b'\r')?;
-    match buf[i] {
-        b'\n' => Some((i, 1)),
-        _ => match buf.get(i + 1) {
-            Some(b'\n') => Some((i, 2)),
-            Some(_) => Some((i, 1)),
-            None => None,
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +141,36 @@ mod tests {
         // `event: ping` + 空 data：套餐通道的心跳就是这样
         let mut d = SseDecoder::new();
         assert_eq!(d.push(b"event: ping\ndata:\n\n"), vec![frame("ping", "")]);
+    }
+
+    /// 与另外两处调用点**共用**的用例表（`yunong_shared::sse::SSE_CASES`）：
+    /// 端侧解码器的行为必须与表里每一条一致，否则收敛就白做了。
+    #[test]
+    fn shared_case_table_holds_here() {
+        for case in yunong_shared::sse::SSE_CASES {
+            let (wire, want) = (case.wire, case.frames);
+            let mut decoder = SseDecoder::new();
+            let mut frames = decoder.push(wire.as_bytes());
+            frames.extend(decoder.finish());
+            let got: Vec<(String, String)> = frames
+                .into_iter()
+                .map(|frame| (frame.event, frame.data))
+                .collect();
+            let expected: Vec<(String, String)> = want
+                .iter()
+                .map(|(event, data)| {
+                    (
+                        if event.is_empty() {
+                            "message".to_owned()
+                        } else {
+                            (*event).to_owned()
+                        },
+                        (*data).to_owned(),
+                    )
+                })
+                .collect();
+            assert_eq!(got, expected, "wire={wire:?}");
+        }
     }
 
     #[test]
