@@ -245,8 +245,8 @@ def preflight(base_url, timeout):
         raise ServiceUnavailable("cannot reach %s/healthz: %s" % (base_url, exc))
 
 
-def run_case(base_url, case, timeout, token=None):
-    """跑一条用例；返回 (result, 拼起来的回答文本)。连接级失败抛 ServiceUnavailable。"""
+def run_case_once(base_url, case, timeout, token=None):
+    """跑**一次**用例；返回 (result, 拼起来的回答文本)。连接级失败抛 ServiceUnavailable。"""
     case_id = case["id"]
     payload = build_payload(case_id, case["question"])
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -347,6 +347,42 @@ def run_case(base_url, case, timeout, token=None):
     return result, "".join(delta_parts)
 
 
+def _median(values):
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def run_case(base_url, case, timeout, token=None, repeats=1):
+    """跑一条用例：重复 `repeats` 次取**中位数**，回答取最后一次成功的。
+
+    为什么要取中位数：mock 场景下 TTFT 只有个位数毫秒，一次连接建立/调度抖动就能到 20ms；
+    P95 在 50 条样本上会被这一条拉高数倍（实测 3.2ms → 21.1ms，直接判退化，而 P50 反而更好）。
+    中位数把"偶发一次"过滤掉，只留"稳定变慢"——这才是门禁要抓的东西（run 42337511062 的教训）。
+    """
+    runs = max(1, int(repeats))
+    sampled = []
+    answer = ""
+    for _ in range(runs):
+        result, current_answer = run_case_once(base_url, case, timeout, token)
+        sampled.append(result)
+        if result["ok"] and current_answer:
+            answer = current_answer
+
+    ok_results = [r for r in sampled if r["ok"]]
+    if not ok_results:
+        return sampled[-1], answer
+
+    merged = dict(ok_results[len(ok_results) // 2])
+    merged["ttft_ms"] = round(_median([r["ttft_ms"] for r in ok_results]), 1)
+    merged["total_ms"] = round(_median([r["total_ms"] for r in ok_results]), 1)
+    token_ins = [r["tokens_in"] for r in ok_results if isinstance(r["tokens_in"], int)]
+    token_outs = [r["tokens_out"] for r in ok_results if isinstance(r["tokens_out"], int)]
+    merged["tokens_in"] = _median(token_ins) if token_ins else None
+    merged["tokens_out"] = _median(token_outs) if token_outs else None
+    merged["runs"] = len(ok_results)
+    return merged, answer
+
+
 def percentile(values, pct):
     """线性插值分位数（样本少时不至于被最近的极值吃掉）。"""
     ordered = sorted(values)
@@ -417,7 +453,9 @@ REGRESSION_TOLERANCE = 0.10  # 退化 > 10% 即阻断（延迟 / 成本 / 命中
 
 # 绝对噪声下限（t162）：mock 上游的延迟是个位数毫秒，+10% 只有 0.3ms，CI 调度抖动就能超过它。
 # 所以"相对 >10%"还要**同时**超过下面的绝对增量才阻断。真实上游是几百毫秒量级，这里永远不生效。
-NOISE_FLOOR_MS = 5.0
+# 实测（连续三次 CI run）P95 抖动幅度：2.6ms / 3.2ms / 21.1ms。10ms 能盖住 CI 调度毛刺，
+# 而真实上游是几百毫秒量级（10ms ≈ 2–5%），不会掩盖真退化。
+NOISE_FLOOR_MS = 10.0
 NOISE_FLOOR_CENTS = 0.01
 
 
@@ -479,7 +517,17 @@ def compare_with_baseline(summary, baseline):
     return reasons
 
 
-def write_report(path, summary, baseline, reasons, env_note):
+def slowest_cases(results, count=3):
+    """最慢的几条（按总耗时）。抖动时先看它们，能把"环境毛刺"和"某条用例真的变慢"分开。"""
+    ordered = sorted(
+        [r for r in results if r.get("ok") and isinstance(r.get("total_ms"), (int, float))],
+        key=lambda r: r["total_ms"],
+        reverse=True,
+    )
+    return ordered[:count]
+
+
+def write_report(path, summary, baseline, reasons, env_note, results=None):
     """写一份人可读的 Markdown 对比报告（PR 里直接贴）。"""
     base = (baseline or {}).get("summary") or {}
 
@@ -521,8 +569,20 @@ def write_report(path, summary, baseline, reasons, env_note):
         "- 用例数：%s（成功 %s）" % (summary.get("cases"), summary.get("cases_ok")),
         "- tokens：in=%s / out=%s" % (summary.get("tokens_in_total"), summary.get("tokens_out_total")),
         "- 总成本：%s 分" % summary.get("total_cost_cents"),
+        "- 采集方式：预热 + 每条用例重复取中位数（抗单次毛刺）",
         "",
     ]
+    if results:
+        slowest = slowest_cases(results)
+        if slowest:
+            lines.append("| 最慢用例（总耗时） | TTFT | 总耗时 |")
+            lines.append("|---|---|---|")
+            for item in slowest:
+                lines.append(
+                    "| %s | %.1f ms | %.1f ms |"
+                    % (item.get("id"), item["ttft_ms"], item["total_ms"])
+                )
+            lines.append("")
     if baseline is None:
         lines.append("**判定：无基线（首次采集）** —— 本次数字可直接作为基线。")
     elif (baseline or {}).get("bootstrap"):
@@ -585,6 +645,18 @@ def main(argv=None):
     parser.add_argument("--baseline", default=str(DEFAULT_BASELINE), help="基线 JSON（默认 bench/baseline.json）")
     parser.add_argument("--out", default=None, help="结果 JSON 路径（默认 bench/out/bench-<UTC 时间>.json）")
     parser.add_argument("--timeout", type=float, default=60.0, help="单条用例超时秒数（默认 %(default)s）")
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="每条用例重复次数，取中位数（默认 %(default)s；抗单次毛刺）",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=3,
+        help="正式测量前的预热请求数（默认 %(default)s；消掉首个连接的建连/冷缓存）",
+    )
     parser.add_argument("--token", default=None, help="可选 Bearer token；本地免鉴权服务不用传")
     parser.add_argument(
         "--report",
@@ -632,10 +704,22 @@ def main(argv=None):
         _print_unreachable(exc)
         return 2
 
+    # 预热（不计入结果）：首个请求要建连、走 DNS/冷缓存，不预热的话它的毛刺会直接进 P95
+    # ——那测的是"冷启动"，不是"稳态退化"。
+    for _ in range(max(0, args.warmup)):
+        try:
+            run_case_once(base_url, cases[0], args.timeout, args.token)
+        except ServiceUnavailable:
+            raise
+        except Exception:  # noqa: BLE001 - 预热失败不该中止正式测量
+            break
+    if args.warmup > 0:
+        print("warmup: %d 次预热完成（不计入结果）" % args.warmup)
+
     results = []
     for index, case in enumerate(cases, 1):
         try:
-            result, answer = run_case(base_url, case, args.timeout, args.token)
+            result, answer = run_case(base_url, case, args.timeout, args.token, args.repeats)
         except ServiceUnavailable as exc:
             _print_unreachable(exc)
             return 2
@@ -707,6 +791,7 @@ def main(argv=None):
                 baseline,
                 reasons,
                 "%s（%s）" % (args.env_note, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+                results,
             )
             print("report: %s" % args.report)
         except OSError as exc:
