@@ -373,6 +373,18 @@ def run_case(base_url, case, timeout, token=None, repeats=1):
         return sampled[-1], answer
 
     merged = dict(ok_results[len(ok_results) // 2])
+    # 原始值必须留：只有中位数时无法区分"3 次里 1 次慢"和"3 次都慢"，
+    # 事后排查只能靠重跑（run 42367996754 的教训）。这是诊断证据，不是冗余数据。
+    merged["samples"] = [
+        {
+            "ttft_ms": r["ttft_ms"],
+            "total_ms": r["total_ms"],
+            "tokens_in": r["tokens_in"],
+            "tokens_out": r["tokens_out"],
+            "ok": r["ok"],
+        }
+        for r in sampled
+    ]
     merged["ttft_ms"] = round(_median([r["ttft_ms"] for r in ok_results]), 1)
     merged["total_ms"] = round(_median([r["total_ms"] for r in ok_results]), 1)
     token_ins = [r["tokens_in"] for r in ok_results if isinstance(r["tokens_in"], int)]
@@ -517,6 +529,89 @@ def compare_with_baseline(summary, baseline):
     return reasons
 
 
+# D2：孤立尖刺允许重测一次（必须留痕）
+OUTLIER_FACTOR = 5.0  # 用例中位数 > 本轮"中位数的中位数"的 5 倍 ⇒ 疑似孤立尖刺
+OUTLIER_LIMIT = 3  # 一次 run 里有 ≥3 条触发重测 ⇒ 视为环境异常，直接判失败
+
+
+def retry_outliers(base_url, cases, results, args, baseline):
+    """对**孤立尖刺**重测一次；整轮变慢时不重测（照常阻断）。
+
+    触发条件（两个同时满足，captain 2026-11 批准）：
+      1. 该用例的 TTFT 中位数 > 本轮所有用例中位数的 `OUTLIER_FACTOR` 倍；
+      2. 本轮 P50 仍在基线 +10% 以内（即整轮没变慢）。
+    重测结果**两个值都写进结果与报告**（首次 / 重测 / 采用），不允许悄悄取小的。
+    返回重测过的用例数（≥ OUTLIER_LIMIT 时调用方判环境异常）。
+    """
+    if not results:
+        return 0
+    ok = [r for r in results if r.get("ok") and isinstance(r.get("ttft_ms"), (int, float))]
+    if len(ok) < 5:
+        return 0
+    run_median = _median([r["ttft_ms"] for r in ok])
+
+    base_p50 = None
+    if baseline:
+        base_p50 = _num((baseline.get("summary") or {}).get("p50_ttft_ms"))
+    run_p50 = _median([r["ttft_ms"] for r in ok])
+    whole_run_slow = bool(base_p50) and run_p50 > base_p50 * (1.0 + REGRESSION_TOLERANCE)
+    if whole_run_slow:
+        print(
+            "note: 本轮 P50 %.1fms 已超基线 +10%%（基线 %.1fms）⇒ 整轮变慢，不做尖刺重测"
+            % (run_p50, base_p50)
+        )
+        return 0
+
+    by_id = {r["id"]: r for r in results}
+    suspects = [r for r in ok if r["ttft_ms"] > run_median * OUTLIER_FACTOR]
+    if not suspects:
+        return 0
+
+    case_by_id = {c["id"]: c for c in cases}
+    for item in suspects:
+        case = case_by_id.get(item["id"])
+        if case is None:
+            continue
+        print(
+            "note: %s 疑似孤立尖刺（%.1fms > %.1f×%.1fms）→ 重测一次"
+            % (item["id"], item["ttft_ms"], OUTLIER_FACTOR, run_median)
+        )
+        again, answer = run_case(base_url, case, args.timeout, args.token, args.repeats)
+        first_median = item["ttft_ms"]
+        retry_median = again.get("ttft_ms")
+        adopted = "retry"
+        if not again.get("ok") or not isinstance(retry_median, (int, float)):
+            adopted = "first"
+        elif retry_median > first_median:
+            adopted = "first"
+        item["retry"] = {
+            "first_median_ttft_ms": first_median,
+            "retry_median_ttft_ms": retry_median,
+            "adopted": adopted,
+            "retry_samples": again.get("samples"),
+        }
+        if adopted == "retry":
+            item["ttft_ms"] = retry_median
+            item["total_ms"] = again.get("total_ms")
+            if isinstance(again.get("tokens_in"), int):
+                item["tokens_in"] = again["tokens_in"]
+            if isinstance(again.get("tokens_out"), int):
+                item["tokens_out"] = again["tokens_out"]
+            item["samples"] = again.get("samples")
+            item["hit"] = expect_hit(case, answer)
+        print(
+            "      首次=%s / 重测=%s / 采用=%s"
+            % (
+                _fmt_ms(item["retry"]["first_median_ttft_ms"]),
+                _fmt_ms(item["retry"]["retry_median_ttft_ms"]),
+                adopted,
+            )
+        )
+
+    by_id.clear()
+    return len(suspects)
+
+
 def slowest_cases(results, count=3):
     """最慢的几条（按总耗时）。抖动时先看它们，能把"环境毛刺"和"某条用例真的变慢"分开。"""
     ordered = sorted(
@@ -572,6 +667,26 @@ def write_report(path, summary, baseline, reasons, env_note, results=None):
         "- 采集方式：预热 + 每条用例重复取中位数（抗单次毛刺）",
         "",
     ]
+    retried_items = [r for r in (results or []) if r.get("retry")]
+    if retried_items:
+        lines.append("")
+        lines.append("### 尖刺重测记录（孤立尖刺只重测一次，两个值都留）")
+        lines.append("")
+        lines.append("| 用例 | 首次中位 TTFT | 重测中位 TTFT | 采用 |")
+        lines.append("|---|---|---|---|")
+        for item in retried_items:
+            retry = item["retry"]
+            lines.append(
+                "| %s | %.1f ms | %s | %s |"
+                % (
+                    item.get("id"),
+                    retry.get("first_median_ttft_ms") or 0.0,
+                    "-" if retry.get("retry_median_ttft_ms") is None else "%.1f ms" % retry["retry_median_ttft_ms"],
+                    retry.get("adopted"),
+                )
+            )
+        lines.append("")
+
     if results:
         slowest = slowest_cases(results)
         if slowest:
@@ -648,8 +763,8 @@ def main(argv=None):
     parser.add_argument(
         "--repeats",
         type=int,
-        default=3,
-        help="每条用例重复次数，取中位数（默认 %(default)s；抗单次毛刺）",
+        default=5,
+        help="每条用例重复次数，取中位数（默认 %(default)s；抗单次毛刺，原始值会全部记录）",
     )
     parser.add_argument(
         "--warmup",
@@ -741,6 +856,10 @@ def main(argv=None):
             % (index, len(cases), case["id"], ttft, total, tokens, status, _fmt_expect(case, answer))
         )
 
+    # D2：孤立尖刺重测（留痕）。≥3 条触发 ⇒ 环境异常，直接判失败，不靠重测硬凑绿。
+    retried = retry_outliers(base_url, cases, results, args, baseline)
+    env_anomaly = retried >= OUTLIER_LIMIT
+
     summary = summarize(results)
     try:
         write_result(out_path, results, summary)
@@ -782,7 +901,15 @@ def main(argv=None):
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print("baseline written: %s" % target)
 
-    reasons = compare_with_baseline(summary, baseline) if baseline else []
+    if env_anomaly:
+        print(
+            "ENV_ANOMALY: %d 条用例触发尖刺重测（上限 %d）——本机/本轮的测量环境不稳定，"
+            "请重跑；不要用重测把绿色凑出来。" % (retried, OUTLIER_LIMIT),
+            file=sys.stderr,
+        )
+        reasons = ["ENV_ANOMALY: %d 条用例触发尖刺重测（上限 %d），判环境异常" % (retried, OUTLIER_LIMIT)]
+    else:
+        reasons = compare_with_baseline(summary, baseline) if baseline else []
     if args.report:
         try:
             write_report(
