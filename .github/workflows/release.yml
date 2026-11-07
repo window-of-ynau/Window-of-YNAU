@@ -18,6 +18,10 @@ on:
         description: "只构建 + 冒烟，不推送到 GHCR"
         type: boolean
         default: true
+      build_android:
+        description: "干跑时也构建 Android APK（用于验证签名分支，不推 Release）"
+        type: boolean
+        default: false
 
 # 顶层最小权限；只有 server-image 为推 GHCR 提权（全仓唯一提权 workflow）
 permissions:
@@ -159,8 +163,8 @@ jobs:
   # 签名 secrets 一律先经 job 级 env 中转：secrets 上下文不能直接写进 if 表达式
   android:
     name: Android APK
-    # 干跑只验证镜像那一半（APK 与镜像发布无关、耗时 3~5 分钟）；标签发布时才出产物
-    if: github.event_name == 'push'
+    # 标签发布必跑；干跑时可用 build_android=true 单验签名分支（t164：否则这条链路只有打 tag 才被跑到）
+    if: github.event_name == 'push' || inputs.build_android == true
     needs: version-check
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -194,6 +198,7 @@ jobs:
         working-directory: app
         run: |
           set -euo pipefail
+          echo "using release keystore (KEYSTORE_BASE64 已配置，alias=$KEY_ALIAS)"
           mkdir -p android/app
           echo "$KEYSTORE_BASE64" | base64 -d > android/app/upload-keystore.jks
           {
@@ -212,8 +217,28 @@ jobs:
         if: env.KEYSTORE_BASE64 == ''
         working-directory: app
         run: |
-          echo "::warning::缺少 KEYSTORE_BASE64 等签名 secrets，只产出 debug APK，不可用于发布"
+          echo "fallback to debug signing (secrets missing)：未配置 KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD"
+          echo "::warning::缺少签名 secrets，只产出 debug APK，不可用于发布（配好 4 个 Secrets 后自动切换为正式签名）"
           flutter build apk --debug
+      # 护栏（t164）：配了 Secrets 却还是 debug 签名 → 直接失败，避免"以为签了其实没签"。
+      # 判据用 apksigner 打印的证书 DN：debug keystore 固定是 CN=Android Debug。
+      - name: 护栏：有 Secrets 时禁止产出 debug 签名
+        if: env.KEYSTORE_BASE64 != ''
+        working-directory: app
+        run: |
+          set -euo pipefail
+          apk=$(ls build/app/outputs/flutter-apk/*.apk | head -n 1)
+          echo "检查 APK 签名：$apk"
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1)
+          [ -x "$apksigner" ] || { echo "::error::找不到 apksigner（ANDROID_HOME=$ANDROID_HOME）"; exit 1; }
+          certs=$("$apksigner" verify --print-certs "$apk")
+          echo "$certs"
+          if echo "$certs" | grep -q "CN=Android Debug"; then
+            echo "::error::已配置 KEYSTORE_BASE64，但 APK 仍由 debug keystore 签名——检查 key.properties / signingConfigs"
+            exit 1
+          fi
+          echo "OK：APK 由 release keystore 签名（非 Android Debug）"
+
       # 产物校验和：下载方可以 sha256sum -c 验证，发布产物不带校验和等于让人盲信
       - name: 生成 APK 校验和
         working-directory: app/build/app/outputs/flutter-apk
