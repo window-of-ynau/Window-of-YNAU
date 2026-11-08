@@ -81,20 +81,31 @@ class ModelSelector extends StatelessWidget {
     return '$_providerName  ${effortText(effort)}';
   }
 
+  /// t174：窄屏只保留**模型名**（没有配置时直接不显示文字），把宽度让给输入框。
+  String get _compactSummary {
+    if (providers.isEmpty) {
+      return '';
+    }
+    final String name = model.trim().isEmpty ? _providerName : model.trim();
+    return name;
+  }
+
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
     final YunongTokens tokens = context.tokens;
-    // t172：窄屏再收一档（左让 48 后内容更窄），避免 composer 横向溢出。
+    // t174：窄屏（<600）**只留模型名 + ⌄**（未配置就只留 ⌄），宽度让给输入框。
     final bool compact = MediaQuery.sizeOf(context).width < 600;
+    final String compactText = _compactSummary;
     // 「文字 + 折角」：无背景、无边框，整体可点（打开三段弹层）。
     return ConstrainedBox(
-      constraints: BoxConstraints(maxWidth: compact ? 130 : 210),
+      // t174：窄屏把宽度压到最小（未配置=只留 ⌄=36；已配置=模型名 ≤96），把空间全让给输入框。
+      constraints: BoxConstraints(maxWidth: compact ? (providers.isEmpty ? 36 : 96) : 210),
       child: TextButton(
         key: const Key('model-selector-button'),
         onPressed: () => _openSheet(context),
         style: TextButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 4),
+          padding: EdgeInsets.symmetric(horizontal: compact ? 2 : 4),
           minimumSize: const Size(0, 32),
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           overlayColor: Colors.transparent,
@@ -104,17 +115,18 @@ class ModelSelector extends StatelessWidget {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            Flexible(
-              child: Text(
-                _summary,
-                key: const Key('model-selector-summary'),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: providers.isEmpty ? theme.hintColor : tokens.inkSoft,
+            if (!compact || compactText.isNotEmpty)
+              Flexible(
+                child: Text(
+                  compact ? compactText : _summary,
+                  key: const Key('model-selector-summary'),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: providers.isEmpty ? theme.hintColor : tokens.inkSoft,
+                  ),
                 ),
               ),
-            ),
             const SizedBox(width: 2),
             Icon(Icons.expand_more, size: 16, color: providers.isEmpty ? theme.hintColor : tokens.inkSoft),
           ],

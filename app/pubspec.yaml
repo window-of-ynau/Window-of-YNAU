@@ -12,6 +12,7 @@ dependencies:
   flutter_inappwebview: ^6.1.5
   # 纯 Dart 包（不是插件）：dart:ffi 的 Utf8/内存辅助
   ffi: ^2.1.0
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:
