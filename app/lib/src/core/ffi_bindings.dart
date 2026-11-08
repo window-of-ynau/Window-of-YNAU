@@ -8,6 +8,8 @@
 
 import 'dart:convert';
 import 'dart:ffi';
+
+import 'package:flutter/foundation.dart';
 import 'dart:io';
 
 import 'package:ffi/ffi.dart';
@@ -168,7 +170,80 @@ class CoreLibrary implements CoreApi {
       if (!Platform.isAndroid && !Platform.isIOS)
         '$exeDir${Platform.pathSeparator}$fileName',
       fileName,
+      // t174：Flutter 打包偶发会再套一层 `lib` 前缀（liblibyunong_core.so），
+      // 以及 Android 上部分 ROM 需要显式带 .so 后缀的绝对路径 → 一并尝试。
+      if (Platform.isAndroid || Platform.isIOS) ...<String>[
+        'liblibyunong_core.so',
+        for (final String dir in androidNativeLibDirs()) '$dir/libyunong_core.so',
+      ],
     ];
+  }
+
+  /// 【t174】Android 上可能的 native library 目录（`/data/app/<pkg>/lib/<abi>/`）。
+  ///
+  /// 没有插件时拿不到 `ApplicationInfo.nativeLibraryDir`，所以从两处**真实可读**的信息推断：
+  /// 1. `/proc/self/maps` 里已加载库的路径（Flutter 自己的 `libflutter.so` 就在同一个目录）；
+  /// 2. `Platform.resolvedExecutable` 附近的 `lib/` 目录。
+  static List<String> androidNativeLibDirs() {
+    if (!Platform.isAndroid) {
+      return const <String>[];
+    }
+    final Set<String> dirs = <String>{};
+    try {
+      final File maps = File('/proc/self/maps');
+      if (maps.existsSync()) {
+        for (final String line in maps.readAsLinesSync()) {
+          if (!line.contains('libflutter.so') && !line.contains('libapp.so')) {
+            continue;
+          }
+          final int slash = line.lastIndexOf('/');
+          if (slash > 0) {
+            dirs.add(line.substring(0, slash));
+          }
+        }
+      }
+    } on Object catch (failure) {
+      debugPrint('[core] 读 /proc/self/maps 失败：${failure.runtimeType} $failure');
+    }
+    try {
+      final String exe = Platform.resolvedExecutable;
+      final int idx = exe.indexOf('/lib/');
+      if (idx > 0) {
+        dirs.add(exe.substring(0, idx + 4));
+      }
+    } on Object {
+      // resolvedExecutable 在 Android 上可能不可用 → 忽略
+    }
+    return dirs.toList();
+  }
+
+  /// 【t174】设备 ABI 线索（用于"本机 ABI 不在支持列表"的明确提示）。
+  ///
+  /// Dart 侧没有 `Build.SUPPORTED_ABIS`，但 `/proc/self/maps` 的库路径里带 ABI 目录名
+  /// （`.../lib/arm64/`），`Platform.resolvedExecutable` 里也有 `app_process64` 之类的线索。
+  static String? androidAbiHint() {
+    if (!Platform.isAndroid) {
+      return null;
+    }
+    try {
+      final String exe = Platform.resolvedExecutable;
+      if (exe.contains('app_process64')) {
+        return 'arm64';
+      }
+      if (exe.contains('app_process32')) {
+        return 'arm';
+      }
+    } on Object {
+      // 忽略
+    }
+    for (final String dir in androidNativeLibDirs()) {
+      for (final String abi in <String>['arm64', 'arm', 'x86_64', 'x86']) {
+        if (dir.endsWith('/$abi')) {
+          return abi;
+        }
+      }
+    }
+    return null;
   }
 
   @override

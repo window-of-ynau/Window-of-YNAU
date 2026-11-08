@@ -45,14 +45,17 @@ void main() {
     });
   });
 
-  group('顶部只剩一行状态行（t172 #2）', () {
-    testWidgets('AppBar 无标题文字，高度 44', (WidgetTester tester) async {
+  group('顶部只剩一行状态行（t172/t174 #2）', () {
+    testWidgets('t174：不再有 AppBar；状态行就是内容区第一行', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(1280, 800));
       expect(find.byKey(const Key('app-title-main')), findsNothing);
       expect(find.byKey(const Key('app-title-sub')), findsNothing);
-      expect(find.descendant(of: find.byType(AppBar), matching: find.byType(Text)), findsNothing);
-      final AppBar appBar = tester.widget<AppBar>(find.byType(AppBar));
-      expect(appBar.toolbarHeight, 44);
+      expect(find.byType(AppBar), findsNothing);
+      // 状态行（对话页顶部 ChatTopBar）贴在内容区顶部（y≈0）
+      final Finder statusRow = find.byKey(const Key('chat-top-bar'));
+      if (statusRow.evaluate().isNotEmpty) {
+        expect(tester.getRect(statusRow.first).top, lessThanOrEqualTo(1));
+      }
     });
   });
 

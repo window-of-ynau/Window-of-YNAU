@@ -898,20 +898,27 @@ class ChatPageState extends State<ChatPage> {
         // t132：**两条分支结构必须一致** —— 之前玻璃分支只放 `_composer()`，
         // 导致深蓝玻璃主题缺少 provider/模型/effort 选择器（阻塞问题二）。
         // 现在选择器与发送按钮一起放进 `_composer()` 自己的 Row，两条分支都不会漏。
+        // t174：窄屏把输入区外层 padding 收到 4（宽度全部让给输入框）。
         if (context.tokens.glass != null)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-            child: GlassPanel(
-              role: GlassRole.composer,
-              padding: const EdgeInsets.all(8),
-              child: _composer(),
-            ),
-          )
+          Builder(builder: (BuildContext ctx) {
+            final bool narrowHere = MediaQuery.sizeOf(ctx).width < 600;
+            return Padding(
+              padding: EdgeInsets.fromLTRB(narrowHere ? 4 : 12, 4, narrowHere ? 4 : 12, 12),
+              child: GlassPanel(
+                role: GlassRole.composer,
+                padding: const EdgeInsets.all(8),
+                child: _composer(),
+              ),
+            );
+          })
         else
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-            child: _composer(),
-          ),
+          Builder(builder: (BuildContext ctx) {
+            final bool narrowHere = MediaQuery.sizeOf(ctx).width < 600;
+            return Padding(
+              padding: EdgeInsets.fromLTRB(narrowHere ? 4 : 12, 4, narrowHere ? 4 : 12, 12),
+              child: _composer(),
+            );
+          }),
       ],
     );
   }
@@ -930,12 +937,14 @@ class ChatPageState extends State<ChatPage> {
   /// ② 三块是并排的独立控件，不像聊天应用的输入区。
   Widget _composer() {
     final YunongTokens tokens = context.tokens;
-    // 未就绪（没 Key/没 Provider）或正在流式输出时置灰；空文本仍可点，由 _send() 内部拦截。
+    // t174：窄屏优先保证输入框宽度 —— 收紧边距、provider 只留模型名/⌄。
+    final bool compact = MediaQuery.sizeOf(context).width < 600;
+    // 未就绪（没 Key/没 Provider）或正在流式输出时置灰；空文本仍可点，由 `_send()` 内部拦截。
     final bool canSend = !_streaming && _channelState.ready;
     return Container(
       key: const Key('composer'),
-      margin: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      margin: EdgeInsets.fromLTRB(compact ? 0 : 16, 8, compact ? 0 : 16, 12),
+      padding: EdgeInsets.symmetric(horizontal: compact ? 6 : 10, vertical: compact ? 4 : 8),
       decoration: BoxDecoration(
         color: tokens.surface,
         borderRadius: BorderRadius.circular(14),
@@ -954,9 +963,14 @@ class ChatPageState extends State<ChatPage> {
                 maxLines: 4,
                 onChanged: (_) => setState(() {}),
                 onSubmitted: (_) => _send(),
+                style: const TextStyle(fontSize: 14),
+                textAlignVertical: TextAlignVertical.center,
+                // t174：单行输入只占 ~20px（否则 composer 会被默认内边距撑到 80+）
                 decoration: const InputDecoration(
                   hintText: '输入消息…',
                   isDense: true,
+                  isCollapsed: true,
+                  contentPadding: EdgeInsets.zero,
                   border: InputBorder.none,
                   enabledBorder: InputBorder.none,
                   focusedBorder: InputBorder.none,

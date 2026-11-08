@@ -16,6 +16,7 @@
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 
 /// 端侧数据目录与库文件路径。
 class AppPaths {
@@ -51,11 +52,46 @@ class AppPaths {
     return home.isEmpty ? '' : <String>[home, '.local', 'share'].join(Platform.pathSeparator);
   }
 
-  /// 默认数据目录（没有覆盖时）：`%LOCALAPPDATA%\yunong[-dev]` / `$HOME/.local/share/yunong[-dev]`。
+  /// 【t174】平台可写根：Android/iOS 用 `getApplicationSupportDirectory()`（path_provider）。
+  ///
+  /// 背景：手机上 `LOCALAPPDATA`/`APPDATA`/`USERPROFILE` **都不存在**，旧实现会拼出
+  /// `//yunong` 这种非法路径（owner 截图里的「数据目录：//yunong（默认）」）。
+  static String? _platformBase;
+  static bool _platformResolved = false;
+
+  /// 解析一次平台目录（`main()` 里 await；测试可直接注入）。
+  static Future<void> initPlatformDirs() async {
+    if (_platformResolved) {
+      return;
+    }
+    _platformResolved = true;
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      return;
+    }
+    try {
+      final Directory dir = await getApplicationSupportDirectory();
+      _platformBase = dir.path;
+    } on Object catch (failure) {
+      debugPrint('[paths] getApplicationSupportDirectory 失败：${failure.runtimeType} $failure');
+    }
+  }
+
+  /// 测试/启动注入。
+  @visibleForTesting
+  static void debugSetPlatformBase(String? path) {
+    _platformBase = path;
+    _platformResolved = true;
+  }
+
+  /// 默认数据目录（没有覆盖时）：桌面用环境变量根；手机用应用支持目录。
   static String get defaultDataDir {
     final String base = baseDirFrom(Platform.environment);
     if (base.isNotEmpty) {
       return dataDirUnder(base, debug: kDebugMode);
+    }
+    final String? mobile = _platformBase;
+    if (mobile != null && mobile.isNotEmpty) {
+      return dataDirUnder(mobile, debug: kDebugMode);
     }
     // 兜底：当前目录下的 `.yunong[-dev]`（至少读写一致；**不退回 exe 同级**）
     return <String>[Directory.current.path, '.$dirName'].join(Platform.pathSeparator);
