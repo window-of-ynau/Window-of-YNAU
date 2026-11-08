@@ -4,13 +4,13 @@
 // 既不能显示"这学期没课"，也不能把空结果覆盖掉旧课表。
 
 import 'package:flutter/material.dart';
+import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 
 import '../core/ffi_bindings.dart';
-import 'portal_api.dart';
-import 'dart:async';
-
 import 'campus_entries.dart';
+import 'portal_api.dart';
 import '../core/timetable_service.dart';
 import 'capture_cache.dart';
 import 'capture_log.dart';
@@ -58,6 +58,37 @@ class _TimetablePageState extends State<TimetablePage> {
   /// t167：抓取失败时最近 3 次尝试的诊断行（可展开）与日志文件路径。
   List<String> _captureDetailLines = const <String>[];
   String? _captureLogPath;
+  // t176：日志写入失败的原因（界面必须显示，不能静默）
+  String? _captureLogError;
+  // t176：接口路径的最近一次特征（复制诊断用）
+  CaptureApiRecord? _captureApiRecord;
+
+  /// t176：「复制诊断信息」的正文（错误码 + 尝试特征 + json/HTML 片段 + 日志路径）。
+  ///
+  /// 即使日志写不出来，owner 也能一键复制发给我们 —— 最后一道兜底。
+  String get _diagnosticsText {
+    final TimetableException? failure = _failure;
+    if (failure == null) {
+      return '';
+    }
+    final StringBuffer buffer = StringBuffer(CaptureLog.buildDiagnostics(
+      code: failure.code,
+      userHint: failure.userHint,
+      message: failure.message,
+      attempts: const <CaptureAttemptRecord>[],
+      api: _captureApiRecord,
+      writeResult: (_captureLogPath != null || _captureLogError != null)
+          ? CaptureWriteResult(path: _captureLogPath, error: _captureLogError)
+          : null,
+    ));
+    if (_captureDetailLines.isNotEmpty) {
+      buffer.writeln('--- 最近尝试 ---');
+      for (final String line in _captureDetailLines) {
+        buffer.writeln(line);
+      }
+    }
+    return buffer.toString();
+  }
 
 
   /// 最近一次 ICS 导出结果（成功时显示路径与事件数）。
@@ -300,6 +331,8 @@ class _TimetablePageState extends State<TimetablePage> {
             failure: _failure!,
             detailLines: _captureDetailLines,
             logPath: _captureLogPath,
+            logError: _captureLogError,
+            diagnostics: _diagnosticsText,
             onRetry: _retryFailedAction,
             onConfirmTermStart: _failure!.code == 'TERM_START_UNKNOWN'
                 ? () => unawaited(_goToTermStart())
@@ -619,16 +652,34 @@ class _TimetablePageState extends State<TimetablePage> {
     }
     _lastAction = _fetchFromCampus;
     // 主路径：门户接口（queryAWeekSchedule）；接口变了/抓不到模板再退回 DOM 抓取
+    //
+    // t176（P0）：接口路径以前**失败不写日志**（只有 DOM 路径写），owner 打开日志目录一片空。
+    // 现在：① 接口失败/返回 0 门都先落盘（记录 json 长度/elements/years/term/URL）；
+    //       ② `elements: []` 这类"接口没数据"**自动回退 DOM**（页面解析往往能成功）。
+    CaptureApiRecord? apiRecord;
+    String? apiLogPath;
     try {
       await _run(() async {
         final result = await fetcher.fetchSchedule(
           entryUrl: CampusEntry.timetable.url,
           term: _currentTerm,
         );
+        final String importJson = result.toImportJson(term: _currentTerm);
+        apiRecord = _buildApiRecord(result, importJson);
         final outcome = await widget.service.importScheduleJson(
-          scheduleJson: result.toImportJson(term: _currentTerm),
+          scheduleJson: importJson,
           term: _currentTerm,
         );
+        apiRecord = _buildApiRecord(result, importJson, imported: outcome.imported);
+        if (outcome.imported == 0) {
+          // 接口成功但**一门课都没有** → 落盘 + 自动回退（不要直接把错误甩给用户）
+          apiLogPath = _logApiEmpty(
+            record: apiRecord!,
+            hint: '接口返回 0 门课',
+            message: '接口 JSON 解析出 0 门课（elements 为空或数据未就绪）',
+          );
+          throw _ApiEmptyFallback(apiLogPath);
+        }
         // 学期开始日不做任何推算：默认值 + 用户确认，见卡片
         _weekcount = outcome.weekcount;
         _notice = _apiNotice(outcome);
@@ -638,19 +689,54 @@ class _TimetablePageState extends State<TimetablePage> {
           warnings: outcome.warnings,
         );
       }, notice: '已从门户接口抓取');
+    } on _ApiEmptyFallback catch (fallback) {
+      if (!mounted) {
+        return;
+      }
+      await _fetchFromCampusHtml(
+        fetcher,
+        hint: '接口未返回课程，已改用页面解析',
+        apiRecord: apiRecord,
+        apiLogPath: fallback.logPath,
+      );
     } on UnsupportedError {
       await _fetchFromCampusHtml(fetcher);
     } on TimetableException catch (failure) {
       // 接口没抓到模板（大多是因为用户还没在门户里打开课表卡片）：提示 + 退回 DOM 路径
-      if (failure.code == 'CARD_NOT_FOUND') {
-        await _fetchFromCampusHtml(fetcher, hint: '接口没抓到模板，已退回页面解析：${failure.userHint}');
+      final TimetableSourceDecision decision = decideAfterApi(
+        apiSucceeded: false,
+        imported: 0,
+        errorCode: failure.code,
+      );
+      if (decision == TimetableSourceDecision.fallbackToDom) {
+        await _fetchFromCampusHtml(
+          fetcher,
+          hint: '接口没抓到模板，已退回页面解析：${failure.userHint}',
+          apiRecord: apiRecord,
+          apiLogPath: apiLogPath,
+        );
         return;
+      }
+      // 接口侧任何其它失败也要落盘（这就是"日志目录空的"根因修复）
+      if (apiRecord != null) {
+        apiLogPath = _logApiEmpty(
+          record: apiRecord!,
+          hint: failure.userHint,
+          message: failure.message,
+        );
       }
       if (!mounted) {
         return;
       }
       setState(() => _failure = failure);
     } on FetchException catch (failure) {
+      if (apiRecord != null) {
+        apiLogPath = _logApiEmpty(
+          record: apiRecord!,
+          hint: failure.userHint,
+          message: failure.message ?? '',
+        );
+      }
       if (!mounted) {
         return;
       }
@@ -664,6 +750,82 @@ class _TimetablePageState extends State<TimetablePage> {
     }
   }
 
+  /// t176：把接口结果整理成日志记录（json 长度/首 500 字符/elements/years/term/URL）。
+  CaptureApiRecord _buildApiRecord(
+    ScheduleApiResult result,
+    String importJson, {
+    int? imported,
+  }) {
+    int? elements;
+    int? years;
+    try {
+      final Object? decoded = jsonDecode(importJson);
+      if (decoded is Map<String, dynamic>) {
+        final Object? rawWeeks = decoded['weeks'];
+        if (rawWeeks is List) {
+          int count = 0;
+          for (final Object? week in rawWeeks) {
+            if (week is Map && week['data'] is Map) {
+              final Object? rawElements = (week['data'] as Map)['elements'];
+              if (rawElements is List) {
+                count += rawElements.length;
+                elements = (elements ?? 0) + rawElements.length;
+              }
+            }
+          }
+          if (count == 0) {
+            elements ??= 0;
+          }
+        }
+        final Object? rawYears = decoded['years'];
+        years = rawYears is String
+            ? rawYears.split(',').where((String s) => s.trim().isNotEmpty).length
+            : rawYears is List
+                ? rawYears.length
+                : null;
+      }
+    } on Object {
+      // json 解不开时只记录长度（日志里已有前 500 字符）
+    }
+    return CaptureApiRecord(
+      jsonLength: importJson.length,
+      jsonHead: importJson.length <= 500 ? importJson : importJson.substring(0, 500),
+      elementsCount: elements,
+      yearsCount: years,
+      term: _currentTerm,
+      url: CampusEntry.timetable.url,
+      cardId: result.cardId ?? '',
+      weeksCount: result.weeks.length,
+      missingWeeks: result.missingWeeks,
+      imported: imported,
+    );
+  }
+
+  /// t176：接口路径失败/空数据也写日志（**这就是"日志目录空的"根因**）。
+  String? _logApiEmpty({
+    required CaptureApiRecord record,
+    required String hint,
+    required String message,
+  }) {
+    final CaptureWriteResult write = CaptureLog.writeFailure(
+      code: 'API_EMPTY',
+      html: '',
+      attempts: const <CaptureAttemptRecord>[],
+      userHint: hint,
+      message: message,
+      path: 'api',
+      api: record,
+    );
+    if (mounted) {
+      setState(() {
+        _captureLogPath = write.path ?? _captureLogPath;
+        _captureLogError = write.error;
+        _captureApiRecord = record;
+      });
+    }
+    return write.path;
+  }
+
   String _apiNotice(ScheduleImportOutcome outcome) {
     final parts = <String>[
       '已抓取 ${outcome.weeksSeen.length} 周',
@@ -674,7 +836,12 @@ class _TimetablePageState extends State<TimetablePage> {
   }
 
   /// 兜底路径：抓 `table#timetable` 的 HTML（接口改版/抓不到模板时用）。
-  Future<void> _fetchFromCampusHtml(SchoolFetcher fetcher, {String? hint}) async {
+  Future<void> _fetchFromCampusHtml(
+    SchoolFetcher fetcher, {
+    String? hint,
+    CaptureApiRecord? apiRecord,
+    String? apiLogPath,
+  }) async {
     await _run(() async {
       // t151：PARSE_EMPTY 也要可重试（最多 3 次、间隔 800ms）。
       // 页面常见"框架在、课程行还没渲染"的中间态：HTML 够长但解析 0 门课，重试即好。
@@ -713,17 +880,22 @@ class _TimetablePageState extends State<TimetablePage> {
               hasTimetableMark: lastHtml.contains('timetable'),
             ),
         ];
-        final String? logPath = CaptureLog.writeFailure(
+        final CaptureWriteResult write = CaptureLog.writeFailure(
           code: 'PARSE_EMPTY',
           html: lastHtml,
           attempts: records,
           userHint: '课表解析出 0 门课（已自动重试 ${result.attempts.length} 次）',
           message: result.diagnostics,
+          path: 'dom',
+          api: apiRecord,
+          apiLogPath: apiLogPath,
         );
         if (mounted) {
           setState(() {
             _captureDetailLines = recentAttemptLines(result.attempts);
-            _captureLogPath = logPath;
+            _captureLogPath = write.path ?? _captureLogPath;
+            _captureLogError = write.error;
+            _captureApiRecord = apiRecord;
           });
         }
         throw TimetableException(
@@ -1062,6 +1234,34 @@ bool _shouldShowRawMessage(String code) => const <String>{
       'TIMEOUT',
       'LOGIN_TIMEOUT',
     }.contains(code);
+/// t176：接口路径"成功但 0 门课"的内部信号 —— 先写日志再回退 DOM，不当作最终错误。
+/// t176：接口路径"成功但 0 门课"的内部信号 —— 先写日志再回退 DOM，不当作最终错误。
+class _ApiEmptyFallback implements Exception {
+  const _ApiEmptyFallback(this.logPath);
+
+  final String? logPath;
+}
+
+/// t176：接口路径跑完后的**决策**（继续用接口 / 回退 DOM / 直接报错）。
+///
+/// 抽成纯函数是为了可测：过去"接口 0 门课"直接把错误甩给用户，
+/// 而 DOM 路径往往能成功 —— 现在只在这三种情况里选，不允许静默。
+enum TimetableSourceDecision { useApi, fallbackToDom, fail }
+
+TimetableSourceDecision decideAfterApi({
+  required bool apiSucceeded,
+  required int imported,
+  String? errorCode,
+}) {
+  if (!apiSucceeded) {
+    if (errorCode == 'CARD_NOT_FOUND' || errorCode == 'API_EMPTY') {
+      return TimetableSourceDecision.fallbackToDom;
+    }
+    return TimetableSourceDecision.fail;
+  }
+  return imported > 0 ? TimetableSourceDecision.useApi : TimetableSourceDecision.fallbackToDom;
+}
+
 class _FailureCard extends StatelessWidget {
   const _FailureCard({
     required this.failure,
@@ -1069,8 +1269,9 @@ class _FailureCard extends StatelessWidget {
     this.onConfirmTermStart,
     this.detailLines = const <String>[],
     this.logPath,
+    this.logError,
+    this.diagnostics = '',
   });
-
   final TimetableException failure;
 
   /// t167：最近 3 次尝试的诊断行（可展开）。
@@ -1078,6 +1279,12 @@ class _FailureCard extends StatelessWidget {
 
   /// t167：失败诊断日志路径（可为空 = 没写成）。
   final String? logPath;
+
+  /// t176：写日志失败的原因（界面必须显示，不能静默）。
+  final String? logError;
+
+  /// t176：「复制诊断信息」的正文（日志写不出来时也能一键复制）。
+  final String diagnostics;
   final Future<void> Function() onRetry;
   final void Function()? onConfirmTermStart;
 
