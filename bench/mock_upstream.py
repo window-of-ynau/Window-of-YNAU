@@ -213,6 +213,11 @@ def main(argv=None):
         default="",
         help="逗号分隔的**问题文本**：命中时先 sleep --slow-ms（验证尖刺重测逻辑用）",
     )
+    parser.add_argument(
+        "--slow-ids-file",
+        default="",
+        help="从文件读慢注入的问题文本（一行一条）——问题里含空格时用这个，避免命令行被拆词",
+    )
     parser.add_argument("--slow-ms", type=float, default=300.0, help="慢注入的睡眠毫秒（默认 %(default)s）")
     parser.add_argument(
         "--slow-hits",
@@ -224,6 +229,13 @@ def main(argv=None):
 
     answers = load_answers(Path(args.cases))
     slow_ids = {item.strip() for item in args.slow_ids.split(",") if item.strip()}
+    if args.slow_ids_file:
+        from pathlib import Path as _Path
+
+        for line in _Path(args.slow_ids_file).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                slow_ids.add(line)
     server = MockServer(
         ("127.0.0.1", args.port),
         answers,

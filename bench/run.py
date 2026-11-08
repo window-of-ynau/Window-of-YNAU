@@ -479,6 +479,9 @@ P95_BLOCKING_MIN_BASELINE_MS = 100.0
 P95_WARN_FACTOR = 5.0  # 观测模式下，本轮 p95 > 基线 5 倍 ⇒ 报告打 ⚠️
 ENV_UNSTABLE_RATIO = 0.10  # 触发重测的用例占比 ≥10% ⇒ ENV_UNSTABLE
 ENV_UNSTABLE_MIN = 5  # 且至少 5 条
+# 极端兜底：≥25% 的用例都被拖慢 ⇒ 这轮数据本身就是废的。
+# 与其用不可信数据下结论，不如让它红一次、重跑（重跑 ~66s，比"拿废数据下结论"便宜得多）。
+ENV_ANOMALY_RATIO = 0.25
 
 
 def compare_with_baseline(summary, baseline, p95_blocking=False):
@@ -710,7 +713,14 @@ def write_report(path, summary, baseline, reasons, env_note, results=None, meta=
             % (meta["p95_note"], P95_BLOCKING_MIN_BASELINE_MS)
         )
         lines.append("")
-    if meta.get("env_unstable"):
+    if meta.get("env_anomaly"):
+        lines.append(
+            "> **ENV_ANOMALY**：本轮 %d 条用例触发尖刺重测（兜底阈值 ≥%d 条 = %.0f%%）——"
+            "**这轮数据不可信，判定为失败，请重跑**。重跑成本约 66s，比拿废数据下结论便宜。"
+            % (meta.get("retried") or 0, meta.get("env_anomaly_limit") or 0, ENV_ANOMALY_RATIO * 100.0)
+        )
+        lines.append("")
+    elif meta.get("env_unstable"):
         lines.append(
             "> **ENV_UNSTABLE**：本轮 %d 条用例触发尖刺重测（阈值 ≥%d 条且 ≥%.0f%%）——"
             "判定为整轮环境抖动，只按 **p50 / 命中率 / 错误率 / 成本** 判定，p95 不作为依据。"
@@ -916,9 +926,13 @@ def main(argv=None):
 
     # D2：孤立尖刺重测（留痕）。
     retried = retry_outliers(base_url, cases, results, args, baseline)
-    # ENV_UNSTABLE：触发重测的用例太多 ⇒ 整轮环境抖动（只影响"p95 能不能当依据"，不直接判失败）
+    # 环境抖动分两档：
+    #   ENV_UNSTABLE  —— 触发重测的用例多（≥5 且 ≥10%）：整轮 p95 不可信，只判 p50/命中率/错误率/成本；
+    #   ENV_ANOMALY   —— 触发重测的用例 ≥25%：这轮数据本身就是废的，直接判失败、请重跑。
     env_unstable_limit = max(ENV_UNSTABLE_MIN, int(len(cases) * ENV_UNSTABLE_RATIO + 0.999))
+    env_anomaly_limit = max(1, int(len(cases) * ENV_ANOMALY_RATIO + 0.999))
     env_unstable = retried >= env_unstable_limit
+    env_anomaly = retried >= env_anomaly_limit
 
     summary = summarize(results)
     try:
@@ -969,7 +983,20 @@ def main(argv=None):
     else:
         p95_blocking = bool(base_p95) and base_p95 >= P95_BLOCKING_MIN_BASELINE_MS
 
-    if env_unstable:
+    if env_anomaly:
+        print(
+            "ENV_ANOMALY: %d 条用例触发尖刺重测（占 %d/%d = %.0f%%，兜底阈值 ≥%.0f%%）——"
+            "本轮环境严重抖动，请重跑；不要用这一轮的数字下结论。"
+            % (
+                retried,
+                retried,
+                len(cases),
+                100.0 * retried / max(1, len(cases)),
+                ENV_ANOMALY_RATIO * 100.0,
+            ),
+            file=sys.stderr,
+        )
+    elif env_unstable:
         print(
             "ENV_UNSTABLE: %d 条用例触发尖刺重测（阈值 ≥%d 条且 ≥%.0f%%）——整轮环境抖动；%s"
             % (
@@ -993,6 +1020,11 @@ def main(argv=None):
             print("p95(观测,不阻断): %s" % observation[0])
 
     reasons = compare_with_baseline(summary, baseline, p95_blocking) if baseline else []
+    if env_anomaly:
+        reasons = reasons + [
+            "ENV_ANOMALY: %d/%d（%.0f%%）用例触发尖刺重测 ≥ 兜底阈值 %.0f%%，本轮环境严重抖动，请重跑"
+            % (retried, len(cases), 100.0 * retried / max(1, len(cases)), ENV_ANOMALY_RATIO * 100.0)
+        ]
     if args.report:
         try:
             write_report(
@@ -1005,6 +1037,8 @@ def main(argv=None):
                 {
                     "p95_note": observation[0] if observation else None,
                     "env_unstable": env_unstable,
+                    "env_anomaly": env_anomaly,
+                    "env_anomaly_limit": env_anomaly_limit,
                     "retried": retried,
                     "env_unstable_limit": env_unstable_limit,
                     "p95_blocking": p95_blocking,
