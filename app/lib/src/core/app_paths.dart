@@ -35,18 +35,47 @@ class AppPaths {
   static String get dirName => dirNameFor(debug: kDebugMode);
 
   /// 某个根目录下的数据目录（纯函数，便于测试）。
-  static String dataDirUnder(String base, {required bool debug}) =>
-      <String>[base, dirNameFor(debug: debug)].join(Platform.pathSeparator);
+  ///
+  /// t179：**必须归一化** —— Android 上 `HOME=/` 曾拼出 `//yunong`（不可写 → STORAGE 错误）。
+  /// 这里折叠重复分隔符、去掉尾部多余分隔符，任何情况下都不会产出以 `//` 开头的路径。
+  static String dataDirUnder(String base, {required bool debug}) {
+    final String cleaned = normalizeBase(base);
+    final String name = dirNameFor(debug: debug);
+    return cleaned.isEmpty ? name : <String>[cleaned, name].join(Platform.pathSeparator);
+  }
+
+  /// 归一化根目录：折叠重复分隔符（`//` → `/`）、去掉尾部 `/`（保留 `C:\` 这种盘符根）。
+  static String normalizeBase(String base) {
+    String out = base.trim();
+    if (out.isEmpty) {
+      return '';
+    }
+    final String sep = Platform.pathSeparator;
+    final String doubled = '$sep$sep';
+    while (out.contains(doubled)) {
+      out = out.replaceAll(doubled, sep);
+    }
+    while (out.length > 1 && out.endsWith(sep) && !(out.length == 3 && out.endsWith(':$sep'))) {
+      out = out.substring(0, out.length - 1);
+    }
+    return out;
+  }
+
 
   /// WebView2 用户数据目录（纯函数）：`<数据根>/webview2`（dev 与 release 也互不干扰）。
   static String webViewDataDirUnder(String base, {required bool debug}) =>
       <String>[dataDirUnder(base, debug: debug), 'webview2'].join(Platform.pathSeparator);
 
   /// 系统给的"每用户可写根"：Windows 用 `%LOCALAPPDATA%`，其它平台用 `$HOME/.local/share`。
-  static String baseDirFrom(Map<String, String> env, {bool? isWindows}) {
+  static String baseDirFrom(Map<String, String> env, {bool? isWindows, bool? isMobile}) {
     final bool windows = isWindows ?? Platform.isWindows;
+    final bool mobile = isMobile ?? (Platform.isAndroid || Platform.isIOS);
     if (windows) {
       return env['LOCALAPPDATA'] ?? env['APPDATA'] ?? env['USERPROFILE'] ?? '';
+    }
+    // t179：Android/iOS 的 HOME 往往是 `/`，拼出来是 `//yunong`（不可写）→ 手机一律走平台目录
+    if (mobile) {
+      return '';
     }
     final String home = env['HOME'] ?? '';
     return home.isEmpty ? '' : <String>[home, '.local', 'share'].join(Platform.pathSeparator);
@@ -71,9 +100,30 @@ class AppPaths {
     try {
       final Directory dir = await getApplicationSupportDirectory();
       _platformBase = dir.path;
+      _platformBaseError = null;
+      debugPrint('[paths] 手机数据根 = ${dir.path}');
     } on Object catch (failure) {
-      debugPrint('[paths] getApplicationSupportDirectory 失败：${failure.runtimeType} $failure');
+      _platformBaseError = '无法获取应用私有目录（path_provider）：'
+          '${failure.runtimeType} $failure';
+      debugPrint('[paths] getApplicationSupportDirectory 失败：$_platformBaseError');
     }
+  }
+
+  /// t179：手机取不到应用私有目录时的明确错误（**不再静默回落 `//yunong`**）。
+  static String? get platformBaseError => _platformBaseError;
+
+  static String? _platformBaseError;
+
+  /// 纯函数：手机分支缺少平台目录 → 返回错误文案（供 UI 与测试断言）。
+  static String? mobileRootProblem({required bool isMobile, required String? platformBase}) {
+    if (!isMobile) {
+      return null;
+    }
+    final String base = (platformBase ?? '').trim();
+    if (base.isEmpty) {
+      return '无法获取应用私有目录（path_provider 未就绪）；请重启应用或重新安装';
+    }
+    return null;
   }
 
   /// 测试/启动注入。
@@ -83,15 +133,19 @@ class AppPaths {
     _platformResolved = true;
   }
 
-  /// 默认数据目录（没有覆盖时）：桌面用环境变量根；手机用应用支持目录。
+  /// 默认数据目录（没有覆盖时）：桌面用环境变量根；**手机只用应用私有目录**。
+  ///
+  /// t179（P0）：手机上 `HOME=/` 曾把数据根拼成 `//yunong`（不可写 → STORAGE 错误）。
+  /// 现在手机分支**绝不**用环境变量根；取不到平台目录时交给 [dataRootError] 明确报错。
   static String get defaultDataDir {
+    final bool mobile = Platform.isAndroid || Platform.isIOS;
     final String base = baseDirFrom(Platform.environment);
-    if (base.isNotEmpty) {
+    if (!mobile && base.isNotEmpty) {
       return dataDirUnder(base, debug: kDebugMode);
     }
-    final String? mobile = _platformBase;
-    if (mobile != null && mobile.isNotEmpty) {
-      return dataDirUnder(mobile, debug: kDebugMode);
+    final String? platform = _platformBase;
+    if (platform != null && platform.isNotEmpty) {
+      return dataDirUnder(platform, debug: kDebugMode);
     }
     // 兜底：当前目录下的 `.yunong[-dev]`（至少读写一致；**不退回 exe 同级**）
     return <String>[Directory.current.path, '.$dirName'].join(Platform.pathSeparator);
@@ -107,7 +161,7 @@ class AppPaths {
   static bool get isOverridden => _overrideSource != DataRootSource.defaultLocation;
 
   /// 覆盖路径初始化失败时的错误（非 null 时 UI 必须显示并拒绝启动业务）。
-  static String? get dataRootError => _dataRootError;
+  static String? get dataRootError => _dataRootError ?? _platformBaseError;
 
   static String? _overridePath;
   static DataRootSource _overrideSource = DataRootSource.defaultLocation;

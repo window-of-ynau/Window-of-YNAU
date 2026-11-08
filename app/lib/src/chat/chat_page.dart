@@ -943,15 +943,17 @@ class ChatPageState extends State<ChatPage> {
     final bool canSend = !_streaming && _channelState.ready;
     return Container(
       key: const Key('composer'),
-      margin: EdgeInsets.fromLTRB(compact ? 0 : 16, 8, compact ? 0 : 16, 12),
-      padding: EdgeInsets.symmetric(horizontal: compact ? 6 : 10, vertical: compact ? 4 : 8),
+      // t179：单层胶囊 —— 左右外边距 12（窄屏 0）、底部 12；高度 52（内部不再套输入框边框）
+      margin: EdgeInsets.fromLTRB(compact ? 0 : 12, 8, compact ? 0 : 12, 12),
+      height: 52,
+      padding: EdgeInsets.symmetric(horizontal: compact ? 6 : 12, vertical: 0),
       decoration: BoxDecoration(
         color: tokens.surface,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(color: tokens.hairline),
       ),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: <Widget>[
           Expanded(
             child: Focus(
