@@ -25,7 +25,6 @@ import 'src/campus/webview_fetcher.dart';
 import 'src/core/timetable_service.dart';
 import 'src/settings/settings_page.dart';
 import 'src/theme/theme_controller.dart';
-import 'src/theme/glass_panel.dart';
 import 'src/theme/paper_texture.dart';
 import 'src/theme/glass_performance.dart';
 import 'src/theme/themes.dart';
@@ -267,7 +266,6 @@ class _HomeShellState extends State<HomeShell> {
   /// t172：顶部只剩一行状态行（高度 40–44，按 owner 要求固定 44）。
   static const double kStatusRowHeight = 44;
 
-  static double _appBarHeightOf(double windowWidth) => kStatusRowHeight;
 
 
   @override
@@ -275,11 +273,9 @@ class _HomeShellState extends State<HomeShell> {
     const entries = CampusEntry.values;
     final destination = _selected == 0 ? null : entries[_selected - 1];
     final double width = MediaQuery.sizeOf(context).width;
-    // t165：三档布局 —— 手机（<600）用底部导航；中宽（600–840）用窄 rail；
-    // 宽屏（≥840）保持「侧栏 + 内容」。手机档**完全不放侧栏**，内容自然不会被压住。
-    // owner 拍板窄屏用**变体 A**：保留左侧 rail 64，内容左让 64（不是浮层遮挡，也不是底部导航）。
+    final YunongTokens tokens = context.tokens;
+    // 布局 v2/v3（t171/t174）：窄屏 <600 恒定 rail 48；中屏 600–839 展开 200；宽屏 ≥840 展开 224。
     final bool narrow = width < kPhoneBreakpoint;
-    // 中屏（600–839）默认展开为 200；窄屏恒定 rail；宽屏 224。
     final bool collapsed = _collapsedOverride ?? narrow;
 
     final Widget panes = IndexedStack(
@@ -290,69 +286,52 @@ class _HomeShellState extends State<HomeShell> {
       ],
     );
 
-    final Widget sidebar = _Sidebar(
-      collapsed: collapsed,
-      narrow: narrow,
-      width: _sidebarWidthOf(width, collapsed),
-      selected: _selected,
-      entries: entries,
-      onSelect: _select,
-      onToggle: _toggleSidebar,
-      onOpenSettings: _openSettings,
+    // t174：汉堡**进左栏顶部**（与导航图标同列），不再占用内容区顶部。
+    // 结构：Row( Column[汉堡, 导航…, 底部设置], 细线, Expanded(内容) )。
+    final Widget rail = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        SizedBox(
+          height: kStatusRowHeight,
+          child: _IconColumnButton(
+            buttonKey: const Key('sidebar-toggle'),
+            icon: collapsed ? Icons.menu : Icons.menu_open,
+            tooltip: collapsed ? '展开侧栏' : '折叠侧栏',
+            onTap: _toggleSidebar,
+          ),
+        ),
+        Expanded(
+          child: _Sidebar(
+            collapsed: collapsed,
+            narrow: narrow,
+            width: _sidebarWidthOf(width, collapsed),
+            selected: _selected,
+            entries: entries,
+            onSelect: _select,
+            onToggle: _toggleSidebar,
+            onOpenSettings: _openSettings,
+          ),
+        ),
+      ],
     );
 
     return Scaffold(
-      // 玻璃主题：AppBar 底下垫一层玻璃（全屏只有这一层会真模糊）；
-      // A/C 的 tokens.glass == null，GlassPanel 退化成普通表面 → 0 个 BackdropFilter。
-      appBar: AppBar(
-        toolbarHeight: _appBarHeightOf(width),
-        backgroundColor: context.tokens.glass == null
-            ? context.tokens.canvas
-            : Colors.transparent,
-        flexibleSpace: context.tokens.glass == null
-            ? null
-            : const GlassPanel(
-                role: GlassRole.appBar,
-                borderRadius: BorderRadius.zero,
-                child: SizedBox.expand(),
-              ),
-        // t173：像素级对齐 —— 关掉 AppBar 自带 leading 推断，自己给 48 宽列 + 居中 36 按钮。
-        // 目标：`sidebar-toggle` 与 `sidebar-settings` 的 getCenter().dx **完全相等（24）**。
-        automaticallyImplyLeading: false,
-        leadingWidth: kIconColumn,
-        leading: SizedBox(
-          width: kIconColumn,
-          height: _appBarHeightOf(width),
-          child: Center(
-            child: SizedBox(
-              width: 36,
-              height: 36,
-              child: IconButton(
-                key: const Key('sidebar-toggle'),
-                padding: EdgeInsets.zero,
-                iconSize: 20,
-                constraints: const BoxConstraints.tightFor(width: 36, height: 36),
-                style: IconButton.styleFrom(tapTargetSize: MaterialTapTargetSize.shrinkWrap),
-                tooltip: collapsed ? '展开侧栏' : '折叠侧栏',
-                onPressed: _toggleSidebar,
-                icon: Icon(collapsed ? Icons.menu : Icons.menu_open),
-              ),
-            ),
-          ),
-        ),
-        // t172：owner 要求删掉标题行整块（「云农之窗」只出现在 OS 窗口标题栏）；
-        // 顶部只剩状态行（ChatTopBar / 页面自己的头部），高度压到 44。
-        title: const SizedBox.shrink(),
-        elevation: 0,
-        scrolledUnderElevation: 0,
-      ),
-      // 侧栏与内容**并排**：窄屏也左让 64，绝不遮挡内容。
+      // t174：不再用 AppBar —— 状态行（ChatTopBar / 页面自己的头部）就是内容区第一行。
       body: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          sidebar,
+          SizedBox(
+            width: _sidebarWidthOf(width, collapsed),
+            child: Material(
+              color: tokens.surface,
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 180),
+                child: rail,
+              ),
+            ),
+          ),
           // 两栏分界：1px 主题细线 + 侧栏底色差（双保险，三主题都稳定）
-          Container(width: 1, color: context.tokens.hairline),
+          Container(width: 1, color: tokens.hairline),
           Expanded(child: panes),
         ],
       ),
@@ -495,6 +474,50 @@ class _EntryPlaceholder extends StatelessWidget {
 ///
 /// 展开 256 / 折叠 64（rail 只留图标 + tooltip），用 `AnimatedContainer` 做平滑过渡。
 /// 底部「设置」在两种形态下都可用（rail 态是带 tooltip 的图标按钮）。
+/// t174：48dp 图标列里的 36×36 按钮（汉堡 / 侧栏项共用同一条竖线，中心 x=24）。
+class _IconColumnButton extends StatelessWidget {
+  const _IconColumnButton({
+    this.buttonKey,
+    required this.icon,
+    required this.tooltip,
+    required this.onTap,
+  });
+
+  final Key? buttonKey;
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final YunongTokens tokens = context.tokens;
+    return SizedBox(
+      width: _HomeShellState.kIconColumn,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 6),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          widthFactor: 1,
+          child: SizedBox(
+            width: 36,
+            height: 36,
+            child: IconButton(
+              key: buttonKey,
+              padding: EdgeInsets.zero,
+              iconSize: 20,
+              constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+              style: IconButton.styleFrom(tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+              tooltip: tooltip,
+              onPressed: onTap,
+              icon: Icon(icon, color: tokens.inkSoft),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _Sidebar extends StatelessWidget {
   const _Sidebar({
     required this.collapsed,
@@ -626,7 +649,7 @@ class _SidebarItem extends StatelessWidget {
         tooltip: label,
         onPressed: onTap,
         isSelected: selected,
-        icon: Icon(icon, color: selected ? tokens.accent : tokens.inkSoft),
+        icon: Icon(icon, color: tokens.inkSoft),
       ),
     );
     final Widget iconColumn = SizedBox(

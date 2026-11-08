@@ -51,12 +51,13 @@ void main() {
       expect(toggle, closeTo(settings, 0.5));
     });
 
-    testWidgets('AppBar 不再自带 leading 内边距（automaticallyImplyLeading=false）',
-        (WidgetTester tester) async {
+    testWidgets('t174：汉堡在左栏顶部（不再有 AppBar）', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(1280, 800));
-      final AppBar appBar = tester.widget<AppBar>(find.byType(AppBar));
-      expect(appBar.automaticallyImplyLeading, isFalse);
-      expect(appBar.leadingWidth, 48);
+      expect(find.byType(AppBar), findsNothing);
+      final Rect toggle = tester.getRect(find.byKey(const Key('sidebar-toggle')));
+      final Rect sidebar = tester.getRect(find.byKey(const Key('app-sidebar')));
+      expect(toggle.top, lessThan(sidebar.top + 44), reason: '汉堡应在 rail 顶部');
+      expect(toggle.left, lessThan(48), reason: '汉堡应在左栏内（x<48）');
     });
   });
 }
