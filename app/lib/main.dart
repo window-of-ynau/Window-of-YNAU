@@ -316,14 +316,14 @@ class _HomeShellState extends State<HomeShell> {
                 borderRadius: BorderRadius.zero,
                 child: SizedBox.expand(),
               ),
-        // 汉堡与底部设置同一条竖线：48 宽图标列（左内边距 6 + 36 按钮 + 6）→ 中心 x=24。
+        // t173：像素级对齐 —— 关掉 AppBar 自带 leading 推断，自己给 48 宽列 + 居中 36 按钮。
+        // 目标：`sidebar-toggle` 与 `sidebar-settings` 的 getCenter().dx **完全相等（24）**。
+        automaticallyImplyLeading: false,
         leadingWidth: kIconColumn,
         leading: SizedBox(
           width: kIconColumn,
-          child: Padding(
-            // 注意：AppBar 会给 leading 额外 ~3px 内边距（期望 x=24，实测 27）。
-            // 这里保持 6，保证与侧栏设置项**同一条竖线**（owner 的验收是 dx 偏差 <1dp）。
-            padding: const EdgeInsets.only(left: 6),
+          height: _appBarHeightOf(width),
+          child: Center(
             child: SizedBox(
               width: 36,
               height: 36,
@@ -631,7 +631,11 @@ class _SidebarItem extends StatelessWidget {
     );
     final Widget iconColumn = SizedBox(
       width: _HomeShellState.kIconColumn,
-      child: Padding(padding: const EdgeInsets.only(left: 6), child: button),
+      // t173：IconButton 会被 Material 撑满可用宽度（实测中心 27），Align(widthFactor:1) 把它钉在 36 宽。
+      child: Padding(
+        padding: const EdgeInsets.only(left: 6),
+        child: Align(alignment: Alignment.centerLeft, widthFactor: 1, child: button),
+      ),
     );
     if (collapsed) {
       return iconColumn;
