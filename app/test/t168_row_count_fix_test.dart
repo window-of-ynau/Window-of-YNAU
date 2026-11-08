@@ -120,14 +120,14 @@ void main() {
       final Directory temp = Directory.systemTemp.createTempSync('yunong_t168_');
       AppPaths.initDataRoot(env: const <String, String>{}, args: <String>['--data-dir=${temp.path}']);
       try {
-        final String? path = CaptureLog.writeFailure(
+        final CaptureWriteResult write = CaptureLog.writeFailure(
           code: 'PARSE_EMPTY',
           html: _headerOnlyHtml,
           attempts: const <CaptureAttemptRecord>[
             CaptureAttemptRecord(index: 1, htmlLength: 300, rowCount: 0, headerRowCount: 1),
           ],
         );
-        final String body = File(path!).readAsStringSync();
+        final String body = File(write.path!).readAsStringSync();
         expect(body, contains('表头行=1'));
         expect(body, contains('数据行=0'));
       } finally {
