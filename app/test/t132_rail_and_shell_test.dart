@@ -55,7 +55,7 @@ void main() {
       await _pumpApp(tester, id);
       expect(find.byType(ModelSelector), findsOneWidget, reason: '${id.label} 缺模型选择器');
       expect(find.byKey(const Key('model-selector-button')), findsOneWidget);
-      expect(find.byIcon(Icons.send), findsWidgets);
+      expect(find.byIcon(Icons.arrow_upward), findsWidgets);
     });
   }
 

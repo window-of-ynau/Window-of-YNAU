@@ -11,6 +11,7 @@
 import 'package:flutter/material.dart';
 
 import '../core/provider_store.dart';
+import '../theme/yunong_tokens.dart';
 
 class ModelSelector extends StatelessWidget {
   const ModelSelector({
@@ -70,42 +71,53 @@ class ModelSelector extends StatelessWidget {
     return providers.isEmpty ? ProviderStore.placeholderLabel : providers.first.name;
   }
 
-  /// 摘要行：未配置时只显示占位符（灰色），不显示 `DeepSeek · deepseek-flash`。
+  /// t172：composer 里的「文字 + 折角」样式（owner 图二）：
+  /// `DeepSeek V4.1 Flash  Default ⌄` —— 纯文字，无填充、无边框。
   String get _summary {
     if (providers.isEmpty) {
       return ProviderStore.placeholderLabel;
     }
-    return '$_providerName · $model · ${effortText(effort)}';
+    // 名字与 effort 之间留两个空格（owner 的图里就是这样排的）
+    return '$_providerName  ${effortText(effort)}';
   }
 
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
-    // t132：放在输入框右下角（发送按钮左侧）——必须可收缩：
-    // 图标始终可见，文字在窄窗省略（480/320 都不溢出）。
-    // 布局 v2：窄屏（<600）内容区左让 64 后更窄 —— 摘要按钮收成 120，避免横向溢出。
+    final YunongTokens tokens = context.tokens;
+    // t172：窄屏再收一档（左让 48 后内容更窄），避免 composer 横向溢出。
     final bool compact = MediaQuery.sizeOf(context).width < 600;
+    // 「文字 + 折角」：无背景、无边框，整体可点（打开三段弹层）。
     return ConstrainedBox(
-      constraints: BoxConstraints(maxWidth: compact ? 120 : 190),
-      child: TextButton.icon(
+      constraints: BoxConstraints(maxWidth: compact ? 130 : 210),
+      child: TextButton(
         key: const Key('model-selector-button'),
         onPressed: () => _openSheet(context),
-        icon: const Icon(Icons.tune, size: 16),
-        // 一行摘要：provider · 模型 · effort（窄窗靠 ellipsis，不溢出）
-        label: Text(
-          _summary,
-          key: const Key('model-selector-summary'),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: theme.textTheme.bodySmall?.copyWith(
-            // 未配置时用灰色占位，避免看起来"已经可用"
-            color: providers.isEmpty ? theme.hintColor : null,
-          ),
-        ),
         style: TextButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 4),
           minimumSize: const Size(0, 32),
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          overlayColor: Colors.transparent,
+          backgroundColor: Colors.transparent,
+          foregroundColor: tokens.inkSoft,
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Flexible(
+              child: Text(
+                _summary,
+                key: const Key('model-selector-summary'),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: providers.isEmpty ? theme.hintColor : tokens.inkSoft,
+                ),
+              ),
+            ),
+            const SizedBox(width: 2),
+            Icon(Icons.expand_more, size: 16, color: providers.isEmpty ? theme.hintColor : tokens.inkSoft),
+          ],
         ),
       ),
     );

@@ -67,7 +67,7 @@ void main() {
   testWidgets('P0-2：BYOK 未填 Key → 本地拦截，不发请求且给出可读原因', (WidgetTester tester) async {
     final backend = await _pump(tester);
     await tester.enterText(find.byType(TextField).first, '你好');
-    await tester.tap(find.text('发送'));
+    await tester.tap(find.byKey(const Key('send-button')));
     await tester.pumpAndSettle();
 
     expect(backend.starts, 0, reason: '未就绪时绝不能发请求');
@@ -78,7 +78,7 @@ void main() {
     final backend = await _pump(tester, settings: ChatSettings()..channel = 'cloud');
     // 行为断言：点发送 → 本地拦截，不产生任何请求；并显示未就绪原因
     await tester.enterText(find.byType(TextField).first, '你好');
-    await tester.tap(find.text('发送'), warnIfMissed: false);
+    await tester.tap(find.byKey(const Key('send-button')), warnIfMissed: false);
     await tester.pumpAndSettle();
     expect(find.textContaining('请先登录套餐账号'), findsWidgets);    expect(backend.starts, 0);
   });

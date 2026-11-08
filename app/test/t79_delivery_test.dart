@@ -62,7 +62,7 @@ void main() {
     final backend = _RecordingBackend();
     await _pump(tester, backend);
     await tester.enterText(find.byType(TextField).first, '你好');
-    await tester.tap(find.text('发送'));
+    await tester.tap(find.byKey(const Key('send-button')));
     await tester.pump();
 
     // 跨过 5s 看门狗
@@ -77,7 +77,7 @@ void main() {
     final backend = _RecordingBackend(emitOnStart: true);
     await _pump(tester, backend);
     await tester.enterText(find.byType(TextField).first, '你好');
-    await tester.tap(find.text('发送'));
+    await tester.tap(find.byKey(const Key('send-button')));
     await tester.pumpAndSettle();
 
     // 首帧文本必须出现在气泡里（此前会被丢弃 → 界面空白）

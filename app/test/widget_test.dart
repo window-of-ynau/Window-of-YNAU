@@ -1,3 +1,4 @@
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yunong/main.dart';
 
@@ -10,7 +11,7 @@ void main() {
     await tester.pumpWidget(YunongApp(themeController: ThemeController(store: MemorySettingsStore())));
     // W7 起对话区是真实会话页（流式 UI），不再是 W1 占位文案。
     expect(find.textContaining('问点什么吧'), findsOneWidget);
-    expect(find.text('发送'), findsOneWidget);
+    expect(find.byKey(const Key('send-button')), findsOneWidget);
   });
 
   testWidgets('侧栏能进入课表页', (WidgetTester tester) async {

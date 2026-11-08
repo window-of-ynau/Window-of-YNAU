@@ -67,7 +67,9 @@ void main() {
         effort: 'auto',
       )));
       await tester.pumpAndSettle();
-      expect(find.textContaining('GPT6.1Sol · GPT6.1Sol'), findsOneWidget);
+      expect(find.textContaining('GPT6.1Sol'), findsOneWidget);
+      // t172：文字+折角样式，名字与 effort 用空格分隔
+      expect(find.textContaining('GPT6.1Sol  自动'), findsOneWidget);
       expect(find.text('请选择或添加你的 Provider'), findsNothing);
     });
   });
@@ -99,7 +101,7 @@ void main() {
       await tester.tap(find.byKey(const Key('model-selector-button')));
       await tester.pumpAndSettle();
       // 三个维度都在，且 provider 行显示当前 provider
-      expect(find.text('deepseek-flash · deepseek-flash · 自动'), findsWidgets);
+      expect(find.textContaining('deepseek-flash  自动'), findsWidgets);
       expect(find.text('供应商'), findsWidgets);
     });
   });
