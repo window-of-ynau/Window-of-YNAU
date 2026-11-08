@@ -32,6 +32,9 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            // ABI 收敛（t177）：Flutter 的 universal APK 总会带三套引擎库，而 Rust 核心只有 arm64-v8a。
+            // 直接把其它 ABI 的原生库从 APK 里剔掉——这条规则与 splits/abiFilters 都无冲突。
+            excludes += listOf("lib/armeabi-v7a/**", "lib/x86/**", "lib/x86_64/**")
         }
     }
 
