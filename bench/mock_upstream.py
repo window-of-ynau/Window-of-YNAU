@@ -104,6 +104,21 @@ class Handler(BaseHTTPRequestHandler):
         if messages and isinstance(messages[-1], dict):
             question = (messages[-1].get("content") or "").strip()
         answer = self.server.answers.get(question)
+
+        # 可控慢注入（测试 D2 的尖刺重测逻辑；生产/正常评测不启用）
+        slow_ids = self.server.slow_ids
+        if slow_ids and question in slow_ids:
+            budget = self.server.slow_hits
+            with self.server.lock:
+                used = self.server.slow_seen.get(question, 0)
+                if budget is None or used < budget:
+                    self.server.slow_seen[question] = used + 1
+                    should_slow = True
+                else:
+                    should_slow = False
+            if should_slow:
+                time.sleep(self.server.slow_ms / 1000.0)
+
         if answer is None:
             # 找不到就诚实地回显问题（不要编一个看着像答案的句子，否则命中率会骗人）
             answer = "关于「%s」：暂时没有更多信息。" % question
@@ -159,11 +174,16 @@ class Handler(BaseHTTPRequestHandler):
 class MockServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, addr, answers, chunk_chars, tokens_in):
+    def __init__(self, addr, answers, chunk_chars, tokens_in, slow_ids=None, slow_ms=300.0, slow_hits=None):
         super().__init__(addr, Handler)
         self.answers = answers
         self.chunk_chars = chunk_chars
         self.tokens_in = tokens_in
+        self.slow_ids = slow_ids or set()
+        self.slow_ms = slow_ms
+        self.slow_hits = slow_hits
+        self.slow_seen = {}
+        self.lock = threading.Lock()
 
 
 def main(argv=None):
@@ -188,10 +208,43 @@ def main(argv=None):
         default=0.0,
         help="每个 delta 帧额外的睡眠毫秒（仅用于人为制造延迟，验证门禁能抓到退化）",
     )
+    parser.add_argument(
+        "--slow-ids",
+        default="",
+        help="逗号分隔的**问题文本**：命中时先 sleep --slow-ms（验证尖刺重测逻辑用）",
+    )
+    parser.add_argument(
+        "--slow-ids-file",
+        default="",
+        help="从文件读慢注入的问题文本（一行一条）——问题里含空格时用这个，避免命令行被拆词",
+    )
+    parser.add_argument("--slow-ms", type=float, default=300.0, help="慢注入的睡眠毫秒（默认 %(default)s）")
+    parser.add_argument(
+        "--slow-hits",
+        type=int,
+        default=None,
+        help="每个慢 id 只慢前 N 次；不设则一直慢（前者=环境瞬停，后者=真退化）",
+    )
     args = parser.parse_args(argv)
 
     answers = load_answers(Path(args.cases))
-    server = MockServer(("127.0.0.1", args.port), answers, max(1, args.chunk_chars), args.tokens_in)
+    slow_ids = {item.strip() for item in args.slow_ids.split(",") if item.strip()}
+    if args.slow_ids_file:
+        from pathlib import Path as _Path
+
+        for line in _Path(args.slow_ids_file).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                slow_ids.add(line)
+    server = MockServer(
+        ("127.0.0.1", args.port),
+        answers,
+        max(1, args.chunk_chars),
+        args.tokens_in,
+        slow_ids=slow_ids,
+        slow_ms=args.slow_ms,
+        slow_hits=args.slow_hits,
+    )
     if args.delay_ms > 0:
         original = Handler._send_event
 
@@ -202,8 +255,14 @@ def main(argv=None):
         Handler._send_event = slow_send
 
     print(
-        "mock upstream: http://127.0.0.1:%d (%d 条标准答案, chunk=%d chars, tokens_in=%d)"
-        % (args.port, len(answers), args.chunk_chars, args.tokens_in),
+        "mock upstream: http://127.0.0.1:%d (%d 条标准答案, chunk=%d chars, tokens_in=%d%s)"
+        % (
+            args.port,
+            len(answers),
+            args.chunk_chars,
+            args.tokens_in,
+            "" if not slow_ids else ", 慢注入 %d 条 / %sms" % (len(slow_ids), args.slow_ms),
+        ),
         flush=True,
     )
     try:
