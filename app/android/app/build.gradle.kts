@@ -32,9 +32,6 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
-            // ABI 收敛（t177）：Flutter 的 universal APK 总会带三套引擎库，而 Rust 核心只有 arm64-v8a。
-            // 直接把其它 ABI 的原生库从 APK 里剔掉——这条规则与 splits/abiFilters 都无冲突。
-            excludes += listOf("lib/armeabi-v7a/**", "lib/x86/**", "lib/x86_64/**")
         }
     }
 
@@ -43,10 +40,13 @@ android {
         applicationId = "cn.ynau.yunong"
         // 只打包 arm64-v8a：体积可控（单个 .so 约 6 MB），且 2018 年后的真机基本都是 arm64。
         // 需要模拟器联调时可把 x86_64 加进来，并在 scripts/build-android-core.ps1 里多编一个 ABI。
-        // ⚠️ 这里不设 ndk.abiFilters（t177 结论）：它和 `--split-per-abi` 生成的 splits.abi 互斥，
-        // AGP 会直接报 "Conflicting configuration ... cannot be present when splits abi filters are set"。
-        // ABI 收敛统一由命令行负责：`flutter build apk --release --split-per-abi --target-platform android-arm64`，
-        // 产物是 app-arm64-v8a-release.apk；护栏断言该包里只有 arm64-v8a 且含 libyunong_core.so。
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+        // You can update the following values to match your application needs.
+        // For more information, see: https://flutter.dev/to/review-gradle-config.
+        minSdk = flutter.minSdkVersion
+        targetSdk = flutter.targetSdkVersion
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
         // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
         // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`
