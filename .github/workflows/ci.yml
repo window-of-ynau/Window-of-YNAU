@@ -607,13 +607,57 @@ jobs:
       # 将来若出现"暂时无法升级"的条目，写法有两种（都要求可复审）：
       #   a) deny.toml 的 [advisories].ignore 写 ID + 原因；
       #   b) 临时给本 step 加 continue-on-error，同时在这里与 deploy/README 记一笔，别变成永久。
+      # 【t180】版本必须 ≥0.20：`error[custom]: expected a <bare-gnu-license>` 是旧版（0.16/0.18）
+      # 解析 deny.toml 里 `Apache-2.0 WITH LLVM-exception` 这类 SPDX 表达式时报的；本地用 0.20.2
+      # 跑 `cargo deny --all-features check advisories licenses bans sources` 全绿
+      # （advisories ok, bans ok, licenses ok, sources ok）。deny.toml 本身没有放宽。
+      # 不再用 EmbarkStudios/cargo-deny-action：它在 Docker 里用 `curl --silent | tar -x`
+      # 现下二进制，GitHub Release 抖动（504 / 截断 HTML）时会直接 `tar: Error is not recoverable`，
+      # 而且 Docker 层不缓存 → 每次 run 都重新承担网络风险。改为：缓存二进制 + 带重试下载 + tar 校验。
+      - name: 缓存 cargo-deny 二进制
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-0.20.2
+      - name: 安装 cargo-deny（缺失时下载，带重试与 tar 校验）
+        env:
+          DENY_VERSION: "0.20.2"
+        run: |
+          set -euo pipefail
+          bin="$HOME/.local/bin/cargo-deny"
+          mkdir -p "$HOME/.local/bin"
+          if [ -x "$bin" ]; then
+            echo "cargo-deny 已在缓存中：$($bin --version)"
+            exit 0
+          fi
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${DENY_VERSION}/cargo-deny-${DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          tmp="$(mktemp -d)"
+          for attempt in 1 2 3 4 5; do
+            echo "下载 cargo-deny（第 $attempt 次）：$url"
+            # -f：HTTP 4xx/5xx 直接失败（不会把错误页喂给 tar）；--retry-all-errors：504 也重试
+            if curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 --max-time 300 -o "$tmp/deny.tgz" "$url"; then
+              if tar -tzf "$tmp/deny.tgz" > /dev/null 2>&1; then
+                tar -xzf "$tmp/deny.tgz" -C "$tmp"
+                found="$(find "$tmp" -type f -name cargo-deny | head -n 1)"
+                if [ -n "$found" ]; then
+                  install -m 0755 "$found" "$bin"
+                  "$bin" --version
+                  exit 0
+                fi
+              fi
+              echo "::warning::下载内容不是有效 tar（可能是错误页/截断），重试"
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "::error::cargo-deny 下载失败（GitHub Release 资产连续 5 次不可用）。"
+          echo "这不是代码问题：稍后用 gh run rerun --failed 重跑本 job 即可；缓存命中后不会再下载。"
+          exit 1
       - name: cargo-deny（RustSec 漏洞 / 许可证 / 禁用依赖 / 来源）
         id: deny
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-          arguments: --all-features
-          manifest-path: ./Cargo.toml
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          cargo deny --all-features check advisories licenses bans sources
       # 命中时的定位提示：明细在上一 step 的输出里（crate / version / RUSTSEC-ID /
       # Solution 是否给出修复版本），这里只补充"接下来怎么处理"。
       - name: 命中时的处理指引
@@ -696,7 +740,38 @@ jobs:
         with:
           channel: stable
           cache: true
-      # 多数 runner 镜像已带 NDK；没有就装一个（NDK 很大，只在缺的时候装）
+      # 【t180】gradle 分发（wrapper 下载 gradle-8.14.3-all.zip）会因 GitHub Release 504 直接失败。
+      # setup-gradle 负责缓存/复用 ~/.gradle；wrapper 自身的下载在下一步用 curl 重试兜住。
+      - uses: gradle/actions/setup-gradle@v4
+      # wrapper 自己的下载**不带重试**，504 时整个 job 直接崩（t180 实测）。
+      # 这里先用 curl（-f + 重试）把分发包下到本地，再把 distributionUrl 指向本地文件：
+      # wrapper 走 file:// 安装，完全不碰网络。
+      - name: 预热 gradle 分发包（curl 重试 + file:// 分发）
+        run: |
+          set -euo pipefail
+          props=app/android/gradle/wrapper/gradle-wrapper.properties
+          ver=$(grep -oE 'gradle-[0-9.]+-all\.zip' "$props" | head -n1 | sed -E 's/gradle-([0-9.]+)-all\.zip/\1/')
+          [ -n "$ver" ] || { echo "::error::读不到 gradle 版本"; exit 1; }
+          zip="$RUNNER_TEMP/gradle-${ver}-all.zip"
+          ok=0
+          used=""
+          # 三源按优先级尝试：官方 → GitHub Release → 腾讯云镜像（captain 实测镜像在 504 期间可用）
+          for url in "https://services.gradle.org/distributions/gradle-${ver}-all.zip" \
+                     "https://github.com/gradle/gradle-distributions/releases/download/v${ver}/gradle-${ver}-all.zip" \
+                     "https://mirrors.cloud.tencent.com/gradle/gradle-${ver}-all.zip"; do
+            echo "尝试源：$url"
+            if curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors --connect-timeout 20 --max-time 600 -o "$zip" "$url" \
+               && unzip -tqq "$zip" > /dev/null 2>&1; then
+              ok=1; used="$url"; break
+            fi
+            echo "::warning::该源不可用或包不完整，换下一个"
+          done
+          [ "$ok" -eq 1 ] || { echo "::error::gradle ${ver} 分发包三个源均不可用（外部故障）；恢复后 gh run rerun --failed 即可"; exit 1; }
+          # 明确打印实际使用的源：排查“为什么这次慢/失败”时先看这一行
+          echo "gradle 分发包来源：$used"
+          gh_annot="${used}"; echo "::notice::gradle ${ver} 分发包来自 ${gh_annot}"
+          sed -i "s#^distributionUrl=.*#distributionUrl=file://${zip}#" "$props"
+          grep distributionUrl "$props"
       - name: 确保 NDK 可用
         run: |
           set -euo pipefail
