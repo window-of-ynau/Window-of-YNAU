@@ -241,8 +241,8 @@ jobs:
           fi
           echo "--- gradle 里的 abiFilters（构建前打印）---"
           grep -A2 'ndk {' android/app/build.gradle.kts || true
-          # ABI 收敛靠 gradle 的 packaging.jniLibs.excludes（剔掉非 arm64 原生库），不用 --split-per-abi：
-          # 后者与 abiFilters 互斥，且在本 AGP+Kotlin 组合下会报 KotlinJvmAndroidCompilation not found（t177）。
+          # ABI 收敛：gradle 的 ndk.abiFilters（t175 已验证该组合产出单 ABI 包）+ release 构建才认 --target-platform。
+          # 不用 --split-per-abi：它与 abiFilters 互斥（AGP 直接报 conflicting configuration）。
           flutter build apk --release --target-platform android-arm64
       # 护栏（t175/t177）：APK 必须内含 lib/arm64-v8a/libyunong_core.so，且 native libs 只能有一个 ABI。
       # 这是"CI 绿但发出去的包缺库"的最后一道防线；对目录里**每个** APK 都检查（不只看第一个）。
@@ -253,7 +253,7 @@ jobs:
           shopt -s nullglob
           # 只校验要发布的那个 arm64 包（其它 ABI 的包不会上传）
           apks=(build/app/outputs/flutter-apk/app-release.apk)
-          if [ ! -f "${apks[0]}" ]; then echo "::error::没有产出 app-release.apk（--split-per-abi 没生效？）"; ls -l build/app/outputs/flutter-apk/ || true; exit 1; fi
+          if [ ! -f "${apks[0]}" ]; then echo "::error::没有产出 app-release.apk"; ls -l build/app/outputs/flutter-apk/ || true; exit 1; fi
           failed=0
           for apk in "${apks[@]}"; do
             echo "检查：$apk ($(du -h "$apk" | cut -f1))"
