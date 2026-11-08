@@ -41,14 +41,9 @@ android {
         // 只打包 arm64-v8a：体积可控（单个 .so 约 6 MB），且 2018 年后的真机基本都是 arm64。
         // 需要模拟器联调时可把 x86_64 加进来，并在 scripts/build-android-core.ps1 里多编一个 ABI。
         ndk {
-            // ⚠️ 这是 ABI 的**唯一真相**：Rust 核心只编了 arm64-v8a，多打一个 ABI 就会出现
-            // "有 libapp.so / libflutter.so、没有 libyunong_core.so" 的残缺包（t175/t177）。
-            // 注意：`flutter build apk --debug` **会忽略** --target-platform，只有 release 构建
-            // 才真正按 ABI 收敛，所以流水线统一走 --release（无 keystore 时 gradle 回退 debug 签名）。
-            abiFilters += listOf("arm64-v8a")
+            // 这里只是兜底声明；**真正生效的是文件末尾的 afterEvaluate**，原因见那里。
+            abiFilters.add("arm64-v8a")
         }
-        // 构建日志里直接可见，失败时不用再猜（t177 要求）
-        println("ynau abiFilters = " + ndk.abiFilters)
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -97,4 +92,16 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+// ⚠️ ABI 的**唯一真相**（t175/t177）：
+//   Flutter 的 gradle 插件在 AGP 配置完之后会把 defaultConfig.ndk.abiFilters 设成它自己的
+//   全量列表（armeabi-v7a / arm64-v8a / x86_64），我们在 defaultConfig 里 `+=` 只会**追加**，
+//   实测打印出来是 `[armeabi-v7a, arm64-v8a, x86_64]`，于是打出的 APK 三 ABI 齐全，
+//   而 Rust 核心只编了 arm64-v8a → "有 libapp.so / libflutter.so、没有 libyunong_core.so" 的残缺包。
+//   所以在 afterEvaluate 里**清空再设**，保证最终只有一个 ABI；顺带打印，构建日志一眼可见。
+afterEvaluate {
+    android.defaultConfig.ndk.abiFilters.clear()
+    android.defaultConfig.ndk.abiFilters.add("arm64-v8a")
+    println("ynau abiFilters (afterEvaluate) = " + android.defaultConfig.ndk.abiFilters)
 }
