@@ -50,6 +50,58 @@ class CaptureAttemptRecord {
       '含课表关键字=$hasTimetableMark / 解析出=${parsedCourses == null ? '未解析' : '$parsedCourses 门课'}';
 }
 
+/// t176：**接口路径**（`queryAWeekSchedule`）的一次抓取特征。
+///
+/// 为什么单独一类：接口经常返回 `elements: []`（页面没打开 / 缓存冷），
+/// 而 DOM 抓取往往能成功 —— 这条记录是判断"该回退还是该重试"的关键证据。
+class CaptureApiRecord {
+  const CaptureApiRecord({
+    required this.jsonLength,
+    this.jsonHead = '',
+    this.elementsCount,
+    this.yearsCount,
+    this.term = '',
+    this.url = '',
+    this.cardId = '',
+    this.weeksCount,
+    this.missingWeeks = const <int>[],
+    this.imported,
+  });
+
+  final int jsonLength;
+  final String jsonHead;
+  final int? elementsCount;
+  final int? yearsCount;
+  final String term;
+  final String url;
+  final String cardId;
+  final int? weeksCount;
+  final List<int> missingWeeks;
+  final int? imported;
+
+  String get line =>
+      '路径=api / json 长度=$jsonLength / '
+      'elements=${elementsCount == null ? '未知' : '$elementsCount 个'} / '
+      'years=${yearsCount == null ? '未知' : '$yearsCount 个'} / '
+      '周数=${weeksCount == null ? '未知' : weeksCount} / '
+      '缺周=${missingWeeks.isEmpty ? '无' : missingWeeks.join(',')} / '
+      'cardId="${cardId.trim()}" / term="$term" / URL="${url.trim()}" / '
+      '入库=${imported == null ? '未入库' : '$imported 门课'}';
+}
+
+/// t176：写日志的结果 —— **把"写失败"也带出来**，不再静默返回 null。
+class CaptureWriteResult {
+  const CaptureWriteResult({this.path, this.error});
+
+  final String? path;
+  final String? error;
+
+  bool get ok => path != null;
+
+  /// 界面用：成功给绝对路径，失败给「日志写入失败：…」。
+  String get describe => ok ? '日志：$path' : '日志写入失败：${error ?? '未知错误'}';
+}
+
 /// 抓取诊断日志（失败一次一文件；成功追加一行）。
 class CaptureLog {
   const CaptureLog._();
@@ -70,17 +122,22 @@ class CaptureLog {
   static String successPath() =>
       <String>[logsDir(), 'capture-success.log'].join(Platform.pathSeparator);
 
-  /// 写失败日志，返回文件路径（写失败返回 null，不抛给 UI）。
-  static String? writeFailure({
+  /// 写失败日志，返回 [CaptureWriteResult]（**写失败也带错误**，不静默）。
+  ///
+  /// [path] 记录是哪条路径失败（`api` / `dom`）；[api] 非空时把接口特征一并落盘。
+  static CaptureWriteResult writeFailure({
     required String code,
     required String html,
     required List<CaptureAttemptRecord> attempts,
     String userHint = '',
     String message = '',
+    String path = 'dom',
+    CaptureApiRecord? api,
+    String? apiLogPath,
     DateTime? now,
   }) {
     final DateTime at = now ?? DateTime.now();
-    final String path = failurePath(now: at);
+    final String filePath = failurePath(now: at);
     final StringBuffer buffer = StringBuffer()
       ..writeln('# 云农之窗 · 抓取失败诊断')
       ..writeln('时间：${at.toIso8601String()}')
@@ -90,6 +147,23 @@ class CaptureLog {
       ..writeln('平台：${Platform.operatingSystem} ${Platform.operatingSystemVersion}')
       ..writeln('数据根：${AppPaths.dataDir}')
       ..writeln()
+      ..writeln('路径=$path')
+      ..writeln();
+    if (api != null) {
+      buffer
+        ..writeln('## 接口路径（先走的那条）')
+        ..writeln(sanitize(api.line));
+      if (api.jsonHead.isNotEmpty) {
+        buffer
+          ..writeln('json 前 500 字符：')
+          ..writeln(sanitize(api.jsonHead));
+      }
+      if (apiLogPath != null && apiLogPath.isNotEmpty) {
+        buffer.writeln('接口路径日志：$apiLogPath');
+      }
+      buffer.writeln();
+    }
+    buffer
       ..writeln('## 每次尝试的结构特征')
       ..writeln('# 行数=0 → 选择器/表结构变了；行数>0 但 0 门 → 解析器与页面不匹配');
     for (final CaptureAttemptRecord attempt in attempts) {
@@ -104,13 +178,47 @@ class CaptureLog {
       ..writeln(sanitize(_tail(html)));
     try {
       Directory(logsDir()).createSync(recursive: true);
-      File(path).writeAsStringSync(buffer.toString(), flush: true);
-      debugPrint('[capture] 诊断已写入 $path');
-      return path;
+      File(filePath).writeAsStringSync(buffer.toString(), flush: true);
+      debugPrint('[capture] 诊断已写入 $filePath');
+      return CaptureWriteResult(path: filePath);
     } on Object catch (failure) {
       debugPrint('[capture] 写诊断失败：${failure.runtimeType} $failure');
-      return null;
+      return CaptureWriteResult(error: '${failure.runtimeType}: $failure');
     }
+  }
+
+  /// t176：**复制诊断信息**的正文（日志写不出来时，用户也能一键复制发给我们）。
+  static String buildDiagnostics({
+    required String code,
+    required String userHint,
+    required String message,
+    required List<CaptureAttemptRecord> attempts,
+    CaptureApiRecord? api,
+    CaptureWriteResult? writeResult,
+    DateTime? now,
+  }) {
+    final DateTime at = now ?? DateTime.now();
+    final StringBuffer buffer = StringBuffer()
+      ..writeln('云农之窗 · 抓取诊断（${at.toIso8601String()}）')
+      ..writeln('错误码：$code')
+      ..writeln('提示：${sanitize(userHint)}')
+      ..writeln('原始消息：${sanitize(message)}')
+      ..writeln('数据根：${AppPaths.dataDir}')
+      ..writeln(writeResult == null ? '日志：未写' : sanitize(writeResult.describe));
+    if (api != null) {
+      buffer
+        ..writeln('--- 接口路径 ---')
+        ..writeln(sanitize(api.line));
+      if (api.jsonHead.isNotEmpty) {
+        buffer.writeln(sanitize(api.jsonHead));
+      }
+    }
+    for (final CaptureAttemptRecord attempt in attempts) {
+      buffer
+        ..writeln('--- 尝试 ---')
+        ..writeln(sanitize(attempt.line));
+    }
+    return buffer.toString();
   }
 
   /// 成功时也记一行结构特征（便于和失败对比）。

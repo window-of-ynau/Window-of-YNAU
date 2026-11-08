@@ -35,7 +35,7 @@ void main() {
         '<html><head><title>我的课表</title></head><body><table id="timetable">'
         '${'<tr><td>课</td></tr>' * 300}'
         '</table></body></html>';
-    final String? path = CaptureLog.writeFailure(
+    final CaptureWriteResult write = CaptureLog.writeFailure(
       code: 'PARSE_EMPTY',
       html: html,
       userHint: '课表解析出 0 门课',
@@ -52,11 +52,11 @@ void main() {
         ),
       ],
     );
-    expect(path, isNotNull);
-    expect(path, contains('logs'));
-    expect(File(path!).existsSync(), isTrue);
+    expect(write.path, isNotNull);
+    expect(write.path, contains('logs'));
+    expect(File(write.path!).existsSync(), isTrue);
 
-    final String body = File(path).readAsStringSync();
+    final String body = File(write.path!).readAsStringSync();
     expect(body, contains('错误码：PARSE_EMPTY'));
     expect(body, contains('数据行=0'));
     expect(body, contains('数据行=3'));
@@ -72,7 +72,7 @@ void main() {
   });
 
   test('脱敏：Cookie / token / ticket 的值不落盘', () {
-    final String? path = CaptureLog.writeFailure(
+    final CaptureWriteResult write = CaptureLog.writeFailure(
       code: 'PARSE_EMPTY',
       html: '<html>Cookie: JSESSIONID=abc123; token=secret-token-value</html>',
       attempts: const <CaptureAttemptRecord>[
@@ -84,7 +84,7 @@ void main() {
       ],
       message: 'authorization=Bearer abc.def',
     );
-    final String body = File(path!).readAsStringSync();
+    final String body = File(write.path!).readAsStringSync();
     expect(body, isNot(contains('JSESSIONID=abc123')));
     expect(body, isNot(contains('secret-token-value')));
     expect(body, isNot(contains('ST-123')));
