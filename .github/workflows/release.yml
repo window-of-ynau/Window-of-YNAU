@@ -244,34 +244,37 @@ jobs:
           # ABI 收敛：gradle 的 ndk.abiFilters（t175 已验证该组合产出单 ABI 包）+ release 构建才认 --target-platform。
           # 不用 --split-per-abi：它与 abiFilters 互斥（AGP 直接报 conflicting configuration）。
           flutter build apk --release --target-platform android-arm64
-      # 护栏（t175/t177）：APK 必须内含 lib/arm64-v8a/libyunong_core.so，且 native libs 只能有一个 ABI。
-      # 这是"CI 绿但发出去的包缺库"的最后一道防线；对目录里**每个** APK 都检查（不只看第一个）。
-      - name: 护栏：APK 内含 libyunong_core.so 且只有单 ABI
+      # 护栏（t175/t177，captain 裁决方案 b）：接受 universal APK，但必须满足：
+      #   ① lib/arm64-v8a/libyunong_core.so 必须存在；
+      #   ② 其它 ABI 目录里**不得**出现 libyunong_core.so（防止"以为支持、其实没打"）；
+      #   ③ 打印每个 APK 的 lib/ 列表与最终 abis，便于事后核对。
+      # 背景：Flutter 3.47 的 universal APK 固定带三套引擎库，而 Rust 核心只编了 arm64；
+      # 单 ABI 收敛在 AGP 8.11 + Kotlin 2.2 组合下不可用（见 issue #?，PR #81 描述有原文）。
+      - name: 护栏：arm64 必须有 libyunong_core.so，其它 ABI 不得有
         working-directory: app
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # 只校验要发布的那个 arm64 包（其它 ABI 的包不会上传）
-          apks=(build/app/outputs/flutter-apk/app-release.apk)
-          if [ ! -f "${apks[0]}" ]; then echo "::error::没有产出 app-release.apk"; ls -l build/app/outputs/flutter-apk/ || true; exit 1; fi
+          apks=(build/app/outputs/flutter-apk/*.apk)
+          if [ ${#apks[@]} -eq 0 ]; then echo "::error::没有产出 APK"; exit 1; fi
           failed=0
           for apk in "${apks[@]}"; do
-            echo "检查：$apk ($(du -h "$apk" | cut -f1))"
-            echo "--- APK 里的 lib/ ---"
+            echo "===== $apk ($(du -h "$apk" | cut -f1)) ====="
+            echo "--- lib/ 列表 ---"
             unzip -l "$apk" | awk '$4 ~ /^lib\// {print}'
-            if ! unzip -l "$apk" | grep -q 'lib/arm64-v8a/libyunong_core.so'; then
-              echo "::error::$apk 里没有 lib/arm64-v8a/libyunong_core.so —— 装到手机会 dlopen 失败"
-              failed=1
-              continue
-            fi
             abis=$(unzip -l "$apk" | awk '$4 ~ /^lib\// {split($4,a,"/"); print a[2]}' | sort -u | tr '\n' ' ')
-            echo "ABI：$abis"
-            if [ "$(echo $abis | wc -w)" -ne 1 ] || [ "$(echo $abis | tr -d ' ')" != "arm64-v8a" ]; then
-              echo "::error::$apk 含多个 ABI（$abis）：Rust 核心只有 arm64-v8a，混合包在其它 ABI 上必坏"
+            echo "abis: $abis"
+            if ! unzip -l "$apk" | grep -q 'lib/arm64-v8a/libyunong_core.so'; then
+              echo "::error::① $apk 缺 lib/arm64-v8a/libyunong_core.so（arm64 真机会 dlopen 失败）"
               failed=1
-              continue
             fi
-            echo "OK：$apk 内含 libyunong_core.so，且只有 arm64-v8a"
+            for abi in armeabi-v7a x86 x86_64; do
+              if unzip -l "$apk" | grep -q "lib/$abi/libyunong_core.so"; then
+                echo "::error::② $apk 在 $abi 里也有 libyunong_core.so，但 Rust 核心只编了 arm64-v8a —— 该 ABI 上会加载到残缺库"
+                failed=1
+              fi
+            done
+            [ "$failed" -eq 0 ] && echo "OK：$apk 的 arm64 含核心库，其它 ABI 不含"
           done
           exit $failed
 
