@@ -90,6 +90,11 @@ jobs:
         with:
           channel: stable
           cache: true
+      # 【t180】gradle 分发（wrapper 下载 gradle-8.14.3-all.zip）会因 GitHub Release 504 直接失败。
+      # setup-gradle 自带 distribution 缓存 + 重试，比裸 wrapper 稳；缓存命中后不碰网络。
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
       - name: flutter pub get
         working-directory: app
         run: flutter pub get
@@ -607,13 +612,53 @@ jobs:
       # 将来若出现"暂时无法升级"的条目，写法有两种（都要求可复审）：
       #   a) deny.toml 的 [advisories].ignore 写 ID + 原因；
       #   b) 临时给本 step 加 continue-on-error，同时在这里与 deploy/README 记一笔，别变成永久。
+      # 【t180】不再用 EmbarkStudios/cargo-deny-action：它在 Docker 里用 `curl --silent | tar -x`
+      # 现下二进制，GitHub Release 抖动（504 / 截断 HTML）时会直接 `tar: Error is not recoverable`，
+      # 而且 Docker 层不缓存 → 每次 run 都重新承担网络风险。改为：缓存二进制 + 带重试下载 + tar 校验。
+      - name: 缓存 cargo-deny 二进制
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-0.18.3
+      - name: 安装 cargo-deny（缺失时下载，带重试与 tar 校验）
+        env:
+          DENY_VERSION: "0.18.3"
+        run: |
+          set -euo pipefail
+          bin="$HOME/.local/bin/cargo-deny"
+          mkdir -p "$HOME/.local/bin"
+          if [ -x "$bin" ]; then
+            echo "cargo-deny 已在缓存中：$($bin --version)"
+            exit 0
+          fi
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${DENY_VERSION}/cargo-deny-${DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          tmp="$(mktemp -d)"
+          for attempt in 1 2 3 4 5; do
+            echo "下载 cargo-deny（第 $attempt 次）：$url"
+            # -f：HTTP 4xx/5xx 直接失败（不会把错误页喂给 tar）；--retry-all-errors：504 也重试
+            if curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 --max-time 300 -o "$tmp/deny.tgz" "$url"; then
+              if tar -tzf "$tmp/deny.tgz" > /dev/null 2>&1; then
+                tar -xzf "$tmp/deny.tgz" -C "$tmp"
+                found="$(find "$tmp" -type f -name cargo-deny | head -n 1)"
+                if [ -n "$found" ]; then
+                  install -m 0755 "$found" "$bin"
+                  "$bin" --version
+                  exit 0
+                fi
+              fi
+              echo "::warning::下载内容不是有效 tar（可能是错误页/截断），重试"
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "::error::cargo-deny 下载失败（GitHub Release 资产连续 5 次不可用）。"
+          echo "这不是代码问题：稍后用 gh run rerun --failed 重跑本 job 即可；缓存命中后不会再下载。"
+          exit 1
       - name: cargo-deny（RustSec 漏洞 / 许可证 / 禁用依赖 / 来源）
         id: deny
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-          arguments: --all-features
-          manifest-path: ./Cargo.toml
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          cargo deny --all-features check advisories licenses bans sources
       # 命中时的定位提示：明细在上一 step 的输出里（crate / version / RUSTSEC-ID /
       # Solution 是否给出修复版本），这里只补充"接下来怎么处理"。
       - name: 命中时的处理指引

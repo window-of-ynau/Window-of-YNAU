@@ -350,6 +350,11 @@ jobs:
         with:
           channel: stable
           cache: true
+      # 【t180】gradle 分发（wrapper 下载 gradle-8.14.3-all.zip）会因 GitHub Release 504 直接失败。
+      # setup-gradle 自带 distribution 缓存 + 重试，比裸 wrapper 稳；缓存命中后不碰网络。
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
       # flutter_inappwebview 的 Windows 实现要 nuget 拉 nlohmann.json，缺了会 MSB3073
       - name: 安装 nuget 与 Inno Setup 6
         run: choco install nuget.commandline innosetup -y --no-progress
