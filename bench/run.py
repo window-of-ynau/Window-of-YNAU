@@ -470,8 +470,18 @@ REGRESSION_TOLERANCE = 0.10  # 退化 > 10% 即阻断（延迟 / 成本 / 命中
 NOISE_FLOOR_MS = 10.0
 NOISE_FLOOR_CENTS = 0.01
 
+# p95 的测量能力取决于量级：mock 上游是 1–2ms，而 CI runner 的偶发抖动是 10–40ms
+# ——抖动比被测信号大一个数量级，这个指标在 mock 场景**没有测量能力**（不是阈值问题）。
+# 规则：基线 p95 < 100ms ⇒ p95 只观测（写进报告并标 ⚠️），不参与退出码；
+#      基线 p95 ≥ 100ms（真实上游是几百毫秒量级）⇒ 自动恢复为阻断项。
+# 也可用 `--p95-gate on|off` 强制覆盖。详见 bench/README「恢复 p95 阻断的条件」。
+P95_BLOCKING_MIN_BASELINE_MS = 100.0
+P95_WARN_FACTOR = 5.0  # 观测模式下，本轮 p95 > 基线 5 倍 ⇒ 报告打 ⚠️
+ENV_UNSTABLE_RATIO = 0.10  # 触发重测的用例占比 ≥10% ⇒ ENV_UNSTABLE
+ENV_UNSTABLE_MIN = 5  # 且至少 5 条
 
-def compare_with_baseline(summary, baseline):
+
+def compare_with_baseline(summary, baseline, p95_blocking=False):
     """返回退化原因列表；空列表表示通过。
 
     判定口径（t162，写死在代码里，避免"改基线把门禁改松"）：
@@ -505,10 +515,12 @@ def compare_with_baseline(summary, baseline):
             )
 
     worse_high("p50_ttft_ms", "p50_ttft_ms", NOISE_FLOOR_MS)
-    worse_high("p95_ttft_ms", "p95_ttft_ms", NOISE_FLOOR_MS)
     worse_high("p50_total_ms", "p50_total_ms", NOISE_FLOOR_MS)
-    worse_high("p95_total_ms", "p95_total_ms", NOISE_FLOOR_MS)
     worse_high("est_cost_per_case_cents", "est_cost_per_case_cents", NOISE_FLOOR_CENTS)
+    if p95_blocking:
+        # 仅"真实上游量级"（基线 p95 ≥ 100ms）或显式 --p95-gate on 时才阻断
+        worse_high("p95_ttft_ms", "p95_ttft_ms", NOISE_FLOOR_MS)
+        worse_high("p95_total_ms", "p95_total_ms", NOISE_FLOOR_MS)
 
     base_hit = _num(base.get("hit_rate"))
     current_hit = _num(summary.get("hit_rate"))
@@ -531,7 +543,9 @@ def compare_with_baseline(summary, baseline):
 
 # D2：孤立尖刺允许重测一次（必须留痕）
 OUTLIER_FACTOR = 5.0  # 用例中位数 > 本轮"中位数的中位数"的 5 倍 ⇒ 疑似孤立尖刺
-OUTLIER_LIMIT = 3  # 一次 run 里有 ≥3 条触发重测 ⇒ 视为环境异常，直接判失败
+# 注：早期规则是"≥3 条触发重测 ⇒ 直接判失败"。captain 2026-11 修订后改为
+# "≥5 条（≥10%）⇒ 标 ENV_UNSTABLE + p95 不作依据"（因为 p95 在 mock 场景已不阻断，
+# 再保留硬失败只会把环境抖动误判成 PR 问题）。
 
 
 def retry_outliers(base_url, cases, results, args, baseline):
@@ -541,7 +555,7 @@ def retry_outliers(base_url, cases, results, args, baseline):
       1. 该用例的 TTFT 中位数 > 本轮所有用例中位数的 `OUTLIER_FACTOR` 倍；
       2. 本轮 P50 仍在基线 +10% 以内（即整轮没变慢）。
     重测结果**两个值都写进结果与报告**（首次 / 重测 / 采用），不允许悄悄取小的。
-    返回重测过的用例数（≥ OUTLIER_LIMIT 时调用方判环境异常）。
+    返回重测过的用例数（调用方据此判断是否 ENV_UNSTABLE，见 ENV_UNSTABLE_RATIO）。
     """
     if not results:
         return 0
@@ -612,6 +626,24 @@ def retry_outliers(base_url, cases, results, args, baseline):
     return len(suspects)
 
 
+def p95_observation(summary, baseline):
+    """p95 观测结果（不阻断）：返回 (文本, 是否 ⚠️)；无数据时 None。"""
+    base = (baseline or {}).get("summary") or {}
+    base_p95 = _num(base.get("p95_ttft_ms"))
+    current = _num(summary.get("p95_ttft_ms"))
+    if current is None:
+        return None
+    if not base_p95:
+        return ("%.1f ms（无基线）" % current, False)
+    delta = current / base_p95 - 1.0
+    warn = current > base_p95 * P95_WARN_FACTOR
+    return (
+        "%.1f ms vs 基线 %.1f ms（%+.1f%%）%s"
+        % (current, base_p95, delta * 100.0, " ⚠️ 异常尖刺" if warn else ""),
+        warn,
+    )
+
+
 def slowest_cases(results, count=3):
     """最慢的几条（按总耗时）。抖动时先看它们，能把"环境毛刺"和"某条用例真的变慢"分开。"""
     ordered = sorted(
@@ -622,7 +654,7 @@ def slowest_cases(results, count=3):
     return ordered[:count]
 
 
-def write_report(path, summary, baseline, reasons, env_note, results=None):
+def write_report(path, summary, baseline, reasons, env_note, results=None, meta=None):
     """写一份人可读的 Markdown 对比报告（PR 里直接贴）。"""
     base = (baseline or {}).get("summary") or {}
 
@@ -654,9 +686,9 @@ def write_report(path, summary, baseline, reasons, env_note, results=None):
         "| 指标 | 本次 | 基线 | 变化 | 方向 |",
         "|---|---|---|---|---|",
         row("TTFT P50", "p50_ttft_ms", " ms"),
-        row("TTFT P95", "p95_ttft_ms", " ms"),
+        row("TTFT P95（观测，不阻断）", "p95_ttft_ms", " ms"),
         row("总耗时 P50", "p50_total_ms", " ms"),
-        row("总耗时 P95", "p95_total_ms", " ms"),
+        row("总耗时 P95（观测，不阻断）", "p95_total_ms", " ms"),
         row("单条成本", "est_cost_per_case_cents", " 分"),
         row("要点命中率", "hit_rate", "", "越大越好"),
         row("错误率", "error_rate", "", "越小越好"),
@@ -667,6 +699,25 @@ def write_report(path, summary, baseline, reasons, env_note, results=None):
         "- 采集方式：预热 + 每条用例重复取中位数（抗单次毛刺）",
         "",
     ]
+    meta = meta or {}
+    if meta.get("p95_note"):
+        lines.append("")
+        lines.append("### p95 观测（mock 场景不阻断）")
+        lines.append("")
+        lines.append(
+            "本轮 p95 = %s。基线 p95 < %.0f ms 时，CI runner 的抖动量级（10–40ms）大于被测信号，"
+            "该指标没有测量能力 ⇒ **只记录、不阻断**；接真实上游（几百毫秒量级）后自动恢复为阻断项。"
+            % (meta["p95_note"], P95_BLOCKING_MIN_BASELINE_MS)
+        )
+        lines.append("")
+    if meta.get("env_unstable"):
+        lines.append(
+            "> **ENV_UNSTABLE**：本轮 %d 条用例触发尖刺重测（阈值 ≥%d 条且 ≥%.0f%%）——"
+            "判定为整轮环境抖动，只按 **p50 / 命中率 / 错误率 / 成本** 判定，p95 不作为依据。"
+            % (meta.get("retried") or 0, meta.get("env_unstable_limit") or 0, ENV_UNSTABLE_RATIO * 100.0)
+        )
+        lines.append("")
+
     retried_items = [r for r in (results or []) if r.get("retry")]
     if retried_items:
         lines.append("")
@@ -767,6 +818,13 @@ def main(argv=None):
         help="每条用例重复次数，取中位数（默认 %(default)s；抗单次毛刺，原始值会全部记录）",
     )
     parser.add_argument(
+        "--p95-gate",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="p95 是否参与阻断：auto=基线 p95 ≥%.0f ms 时阻断（真实上游量级），on=强制阻断，off=只观测"
+        % P95_BLOCKING_MIN_BASELINE_MS,
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=3,
@@ -856,9 +914,11 @@ def main(argv=None):
             % (index, len(cases), case["id"], ttft, total, tokens, status, _fmt_expect(case, answer))
         )
 
-    # D2：孤立尖刺重测（留痕）。≥3 条触发 ⇒ 环境异常，直接判失败，不靠重测硬凑绿。
+    # D2：孤立尖刺重测（留痕）。
     retried = retry_outliers(base_url, cases, results, args, baseline)
-    env_anomaly = retried >= OUTLIER_LIMIT
+    # ENV_UNSTABLE：触发重测的用例太多 ⇒ 整轮环境抖动（只影响"p95 能不能当依据"，不直接判失败）
+    env_unstable_limit = max(ENV_UNSTABLE_MIN, int(len(cases) * ENV_UNSTABLE_RATIO + 0.999))
+    env_unstable = retried >= env_unstable_limit
 
     summary = summarize(results)
     try:
@@ -901,15 +961,38 @@ def main(argv=None):
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print("baseline written: %s" % target)
 
-    if env_anomaly:
-        print(
-            "ENV_ANOMALY: %d 条用例触发尖刺重测（上限 %d）——本机/本轮的测量环境不稳定，"
-            "请重跑；不要用重测把绿色凑出来。" % (retried, OUTLIER_LIMIT),
-            file=sys.stderr,
-        )
-        reasons = ["ENV_ANOMALY: %d 条用例触发尖刺重测（上限 %d），判环境异常" % (retried, OUTLIER_LIMIT)]
+    base_p95 = _num(((baseline or {}).get("summary") or {}).get("p95_ttft_ms"))
+    if args.p95_gate == "on":
+        p95_blocking = True
+    elif args.p95_gate == "off":
+        p95_blocking = False
     else:
-        reasons = compare_with_baseline(summary, baseline) if baseline else []
+        p95_blocking = bool(base_p95) and base_p95 >= P95_BLOCKING_MIN_BASELINE_MS
+
+    if env_unstable:
+        print(
+            "ENV_UNSTABLE: %d 条用例触发尖刺重测（阈值 ≥%d 条且 ≥%.0f%%）——整轮环境抖动；%s"
+            % (
+                retried,
+                env_unstable_limit,
+                ENV_UNSTABLE_RATIO * 100.0,
+                # 只有 p95 本来就不阻断时，"p95 不作依据"才是如实描述
+                "本轮只按 p50 / 命中率 / 错误率 / 成本判定，p95 不作依据。"
+                if not p95_blocking
+                else "但 p95 仍作为阻断项（--p95-gate on 或真实上游量级基线）。",
+            )
+        )
+
+    observation = p95_observation(summary, baseline)
+    if baseline and not p95_blocking:
+        print(
+            "p95 gating: OFF（基线 p95 %s ms < %.0f ms ⇒ mock 量级，p95 仅观测）"
+            % ("-" if not base_p95 else "%.1f" % base_p95, P95_BLOCKING_MIN_BASELINE_MS)
+        )
+        if observation:
+            print("p95(观测,不阻断): %s" % observation[0])
+
+    reasons = compare_with_baseline(summary, baseline, p95_blocking) if baseline else []
     if args.report:
         try:
             write_report(
@@ -919,6 +1002,13 @@ def main(argv=None):
                 reasons,
                 "%s（%s）" % (args.env_note, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
                 results,
+                {
+                    "p95_note": observation[0] if observation else None,
+                    "env_unstable": env_unstable,
+                    "retried": retried,
+                    "env_unstable_limit": env_unstable_limit,
+                    "p95_blocking": p95_blocking,
+                },
             )
             print("report: %s" % args.report)
         except OSError as exc:
