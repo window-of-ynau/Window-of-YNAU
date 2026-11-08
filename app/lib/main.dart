@@ -250,12 +250,12 @@ class _HomeShellState extends State<HomeShell> {
   // 布局 v2（t171）：左栏 224（宽）/ 200（中）/ 64（折叠，也是窄屏）。
   static const double kSidebarWidth = 224;
   static const double kSidebarMedium = 200;
-  static const double kRailWidth = 64;
+  static const double kRailWidth = 48;
   static const double kPhoneBreakpoint = 600;
   static const double kWideBreakpoint = 840;
 
   /// 统一 64dp 图标列：汉堡与底部设置的图标中心都在 x = 32。
-  static const double kIconColumn = 64;
+  static const double kIconColumn = 48;
 
   static double _sidebarWidthOf(double windowWidth, bool collapsed) {
     if (collapsed) {
@@ -264,12 +264,10 @@ class _HomeShellState extends State<HomeShell> {
     return windowWidth >= kWideBreakpoint ? kSidebarWidth : kSidebarMedium;
   }
 
-  static double _appBarHeightOf(double windowWidth) {
-    if (windowWidth >= kWideBreakpoint) {
-      return 60;
-    }
-    return windowWidth >= kPhoneBreakpoint ? 56 : 52;
-  }
+  /// t172：顶部只剩一行状态行（高度 40–44，按 owner 要求固定 44）。
+  static const double kStatusRowHeight = 44;
+
+  static double _appBarHeightOf(double windowWidth) => kStatusRowHeight;
 
 
   @override
@@ -318,18 +316,23 @@ class _HomeShellState extends State<HomeShell> {
                 borderRadius: BorderRadius.zero,
                 child: SizedBox.expand(),
               ),
-        // 汉堡与底部设置同一条竖线：64 宽图标列 + 居中 40×40 按钮 → 中心 x=32。
+        // 汉堡与底部设置同一条竖线：48 宽图标列（左内边距 6 + 36 按钮 + 6）→ 中心 x=24。
         leadingWidth: kIconColumn,
         leading: SizedBox(
           width: kIconColumn,
-          child: Center(
+          child: Padding(
+            // 注意：AppBar 会给 leading 额外 ~3px 内边距（期望 x=24，实测 27）。
+            // 这里保持 6，保证与侧栏设置项**同一条竖线**（owner 的验收是 dx 偏差 <1dp）。
+            padding: const EdgeInsets.only(left: 6),
             child: SizedBox(
-              width: 40,
-              height: 40,
+              width: 36,
+              height: 36,
               child: IconButton(
                 key: const Key('sidebar-toggle'),
                 padding: EdgeInsets.zero,
                 iconSize: 20,
+                constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+                style: IconButton.styleFrom(tapTargetSize: MaterialTapTargetSize.shrinkWrap),
                 tooltip: collapsed ? '展开侧栏' : '折叠侧栏',
                 onPressed: _toggleSidebar,
                 icon: Icon(collapsed ? Icons.menu : Icons.menu_open),
@@ -337,33 +340,11 @@ class _HomeShellState extends State<HomeShell> {
             ),
           ),
         ),
-        titleSpacing: 0,
-        title: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Text(
-              '云农之窗',
-              key: const Key('app-title-main'),
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    fontSize: 17,
-                    fontWeight: FontWeight.w600,
-                    color: context.tokens.ink,
-                    height: 1.25,
-                  ),
-            ),
-            if (!narrow)
-              Text(
-                destination?.label ?? '对话',
-                key: const Key('app-title-sub'),
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      fontSize: 12,
-                      color: context.tokens.inkSoft,
-                      height: 1.3,
-                    ),
-              ),
-          ],
-        ),
+        // t172：owner 要求删掉标题行整块（「云农之窗」只出现在 OS 窗口标题栏）；
+        // 顶部只剩状态行（ChatTopBar / 页面自己的头部），高度压到 44。
+        title: const SizedBox.shrink(),
+        elevation: 0,
+        scrolledUnderElevation: 0,
       ),
       // 侧栏与内容**并排**：窄屏也左让 64，绝不遮挡内容。
       body: Row(
@@ -632,13 +613,16 @@ class _SidebarItem extends StatelessWidget {
   Widget build(BuildContext context) {
     final YunongTokens tokens = context.tokens;
     // 统一 64dp 图标列：40×40 按钮居中（图标 20）→ 图标中心 x = 32。
+    // 48 宽图标列：左内边距 6 + 36×36 按钮 + 6 → 图标中心 x = 24。
     final Widget button = SizedBox(
-      width: 40,
-      height: 40,
+      width: 36,
+      height: 36,
       child: IconButton(
         key: buttonKey,
         padding: EdgeInsets.zero,
         iconSize: 20,
+        constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+        style: IconButton.styleFrom(tapTargetSize: MaterialTapTargetSize.shrinkWrap),
         tooltip: label,
         onPressed: onTap,
         isSelected: selected,
@@ -647,7 +631,7 @@ class _SidebarItem extends StatelessWidget {
     );
     final Widget iconColumn = SizedBox(
       width: _HomeShellState.kIconColumn,
-      child: Center(child: button),
+      child: Padding(padding: const EdgeInsets.only(left: 6), child: button),
     );
     if (collapsed) {
       return iconColumn;
@@ -686,7 +670,7 @@ class _DrawerSectionLabel extends StatelessWidget {
   Widget build(BuildContext context) {
     final YunongTokens t = context.tokens;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(72, 12, 16, 4),
+      padding: const EdgeInsets.fromLTRB(56, 12, 16, 4),
       child: Text(
         text,
         style: Theme.of(context).textTheme.labelSmall?.copyWith(

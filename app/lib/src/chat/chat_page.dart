@@ -82,6 +82,7 @@ class ChatPage extends StatefulWidget {
     this.keyValidator,
     this.authService,
     this.dbPath = '',
+    this.providerStore,
   });
 
   final ChatService? service;
@@ -100,6 +101,9 @@ class ChatPage extends StatefulWidget {
 
   final AuthService? authService;
   final String dbPath;
+
+  /// t172：测试可注入（默认自己建一个）。
+  final ProviderStore? providerStore;
 
   @override
   State<ChatPage> createState() => ChatPageState();
@@ -148,7 +152,7 @@ class ChatPageState extends State<ChatPage> {
   String _effort = 'auto';
 
   /// t123：供应商列表（与设置页共用同一份存储；对话里可直接切换）。
-  late final ProviderStore _providers = ProviderStore();
+  late final ProviderStore _providers = widget.providerStore ?? ProviderStore();
   /// t146：预设 + 自定义**按名字去重、预设优先**。
   /// 旧实现是直接拼接 → 同名模型出现两次、两处都打勾（`option.value == current` 命中两条）。
   /// 【t168】模型候选 = 当前 provider 自己的模型（预设已各自带 modelId）。
@@ -920,65 +924,115 @@ class ChatPageState extends State<ChatPage> {
     });
   }
 
+  /// composer（t172）：**一个圆角容器内**装 `[输入框] [provider/model] [↑]`。
+  ///
+  /// owner 反馈了两点：① provider 以前是个填充按钮、发送是文字按钮，都很丑；
+  /// ② 三块是并排的独立控件，不像聊天应用的输入区。
   Widget _composer() {
-    return Row(
-      children: <Widget>[
-        Expanded(
-          child: Focus(
-            onKeyEvent: (FocusNode node, KeyEvent event) => _handleInputKey(event),
-            child: TextField(
-              controller: _input,
-              minLines: 1,
-              maxLines: 4,
-              onSubmitted: (_) => _send(),
-              decoration: const InputDecoration(
-                hintText: '输入消息…',
-                isDense: true,
-                border: OutlineInputBorder(),
+    final YunongTokens tokens = context.tokens;
+    // 未就绪（没 Key/没 Provider）或正在流式输出时置灰；空文本仍可点，由 _send() 内部拦截。
+    final bool canSend = !_streaming && _channelState.ready;
+    return Container(
+      key: const Key('composer'),
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: tokens.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: tokens.hairline),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: <Widget>[
+          Expanded(
+            child: Focus(
+              onKeyEvent: (FocusNode node, KeyEvent event) => _handleInputKey(event),
+              child: TextField(
+                key: const Key('composer-input'),
+                controller: _input,
+                minLines: 1,
+                maxLines: 4,
+                onChanged: (_) => setState(() {}),
+                onSubmitted: (_) => _send(),
+                decoration: const InputDecoration(
+                  hintText: '输入消息…',
+                  isDense: true,
+                  border: InputBorder.none,
+                  enabledBorder: InputBorder.none,
+                  focusedBorder: InputBorder.none,
+                ),
               ),
             ),
           ),
-        ),
-        const SizedBox(width: 8),
-        // t132：provider / 模型 / effort 放到输入框右下角（发送按钮左侧），
-        // 并在窄窗收成可收缩的按钮（文字省略，弹层从该位置向上展开）。
-        Flexible(
-          flex: 0,
-          child: ModelSelector(
-            providers: _providers.providers,
-            activeProviderId: _providers.activeId,
-            models: _models,
-            model: _model,
-            effort: _effort,
-            signedIn: _auth.signedIn,
-            accountLabel: _auth.signedIn ? _auth.maskedEmail : '',
-            onProviderChanged: (String id) => unawaited(_providers.setActive(id)),
-            onModelChanged: (String value) => setState(() => _model = value),
-            onEffortChanged: (String value) => setState(() => _effort = value),
-            onUseCloud: () => unawaited(_signInCloud()),
-            onPresetSelected: (ProviderPreset preset) async {
-              await _providers.selectPreset(preset);
-              final List<String> models = _providers.activeModels;
-              if (mounted && models.isNotEmpty) {
-                setState(() => _model = models.first);
-              }
-            },
+          const SizedBox(width: 8),
+          // 「文字 + 折角」：DeepSeek V4.1 Flash  Default ⌄（无填充、无边框）
+          Flexible(
+            flex: 0,
+            child: ModelSelector(
+              providers: _providers.providers,
+              activeProviderId: _providers.activeId,
+              models: _models,
+              model: _model,
+              effort: _effort,
+              signedIn: _auth.signedIn,
+              accountLabel: _auth.signedIn ? _auth.maskedEmail : '',
+              onProviderChanged: (String id) => unawaited(_providers.setActive(id)),
+              onModelChanged: (String value) => setState(() => _model = value),
+              onEffortChanged: (String value) => setState(() => _effort = value),
+              onUseCloud: () => unawaited(_signInCloud()),
+              onPresetSelected: (ProviderPreset preset) async {
+                await _providers.selectPreset(preset);
+                final List<String> models = _providers.activeModels;
+                if (mounted && models.isNotEmpty) {
+                  setState(() => _model = models.first);
+                }
+              },
+            ),
           ),
-        ),
-        const SizedBox(width: 4),
-        if (_streaming)
-          OutlinedButton.icon(
-            onPressed: _stop,
-            icon: const Icon(Icons.stop, size: 18),
-            label: const Text('停止'),
-          )
-        else
-          FilledButton.icon(
-            onPressed: _send,
-            icon: const Icon(Icons.send, size: 18),
-            label: const Text('发送'),
+          const SizedBox(width: 8),
+          // 圆形发送键：实心圆 + 白色向上箭头，直径 36，无文字
+          _RoundActionButton(
+            key: _streaming ? const Key('stop-button') : const Key('send-button'),
+            icon: _streaming ? Icons.stop : Icons.arrow_upward,
+            onPressed: _streaming ? _stop : (canSend ? _send : null),
+            background: _streaming || canSend ? tokens.accent : tokens.surfaceAlt,
+            foreground: _streaming || canSend ? Colors.white : tokens.inkSoft,
           ),
-      ],
+        ],
+      ),
+    );
+  }
+}
+
+/// t172：composer 里的圆形动作按钮（发送 / 停止），直径 36，无文字。
+class _RoundActionButton extends StatelessWidget {
+  const _RoundActionButton({
+    super.key,
+    required this.icon,
+    required this.onPressed,
+    required this.background,
+    required this.foreground,
+  });
+
+  final IconData icon;
+  final VoidCallback? onPressed;
+  final Color background;
+  final Color foreground;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 36,
+      height: 36,
+      child: Material(
+        color: background,
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onPressed,
+          child: Icon(icon, size: 20, color: foreground),
+        ),
+      ),
     );
   }
 }

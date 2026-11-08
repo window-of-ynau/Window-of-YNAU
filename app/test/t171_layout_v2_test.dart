@@ -21,17 +21,20 @@ double _dx(WidgetTester tester, String key) =>
 
 void main() {
   group('标题（t171 #1）', () {
-    testWidgets('宽屏：主标题「云农之窗」+ 副标题当前页名', (WidgetTester tester) async {
+    testWidgets('t172：AppBar 不再有标题行（「云农之窗」只在 OS 窗口标题栏）', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(1280, 800));
-      expect(find.byKey(const Key('app-title-main')), findsOneWidget);
-      expect(tester.widget<Text>(find.byKey(const Key('app-title-main'))).data, '云农之窗');
-      expect(find.byKey(const Key('app-title-sub')), findsOneWidget);
-      expect(tester.widget<Text>(find.byKey(const Key('app-title-sub'))).data, '对话');
+      expect(find.byKey(const Key('app-title-main')), findsNothing);
+      expect(find.byKey(const Key('app-title-sub')), findsNothing);
+      // AppBar 里只剩汉堡（无任何 Text）
+      expect(
+        find.descendant(of: find.byType(AppBar), matching: find.byType(Text)),
+        findsNothing,
+      );
     });
 
-    testWidgets('窄屏：只留主标题（无副标题）', (WidgetTester tester) async {
+    testWidgets('t172：窄屏同样没有 AppBar 标题行', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(360, 800));
-      expect(tester.widget<Text>(find.byKey(const Key('app-title-main'))).data, '云农之窗');
+      expect(find.byKey(const Key('app-title-main')), findsNothing);
       expect(find.byKey(const Key('app-title-sub')), findsNothing);
     });
 
@@ -101,7 +104,7 @@ void main() {
     testWidgets('360×800：内容左边界 ≥ 64', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(360, 800));
       final Rect content = tester.getRect(find.byType(IndexedStack).first);
-      expect(content.left, greaterThanOrEqualTo(64));
+      expect(content.left, greaterThanOrEqualTo(48));
     });
   });
 }

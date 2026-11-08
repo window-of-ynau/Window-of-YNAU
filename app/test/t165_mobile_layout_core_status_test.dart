@@ -21,29 +21,25 @@ Future<void> _pumpApp(WidgetTester tester, Size size) async {
 void main() {
   tearDown(() => CoreStatus.debugLatest = null);
 
-  group('窄屏（手机）布局：rail 64，内容左让 64（t171 v2）', () {
+  group('窄屏（手机）布局：rail 48，内容左让 48（t172）', () {
     for (final Size size in const <Size>[Size(360, 800), Size(412, 915)]) {
-      testWidgets('${size.width.toInt()}×${size.height.toInt()}：rail 64 + 内容左边界 ≥ 64',
+      testWidgets('${size.width.toInt()}×${size.height.toInt()}：rail 48 + 内容左边界 ≥ 48',
           (WidgetTester tester) async {
         await _pumpApp(tester, size);
 
         // 1) 窄屏保留左侧 rail（v2 变体 A）
         expect(find.byKey(const Key('app-sidebar')), findsOneWidget);
-        expect(tester.getRect(find.byKey(const Key('app-sidebar'))).width, lessThanOrEqualTo(72));
+        expect(tester.getRect(find.byKey(const Key('app-sidebar'))).width, lessThanOrEqualTo(52));
         // 2) 不再有底部导航
         expect(find.byKey(const Key('app-bottom-nav')), findsNothing);
 
         // 3) 内容区左边界 ≥ 64（不被 rail 遮挡）
         final Rect content = tester.getRect(find.byType(IndexedStack).first);
-        expect(content.left, greaterThanOrEqualTo(64),
-            reason: '内容左边界应 ≥ 64，实际 ${content.left}');
+        expect(content.left, greaterThanOrEqualTo(48),
+            reason: '内容左边界应 ≥ 48，实际 ${content.left}');
 
-        // 4) 主标题在视口内
-        final Finder title = find.byKey(const Key('app-title-main'));
-        expect(title, findsOneWidget);
-        final Rect titleRect = tester.getRect(title);
-        expect(titleRect.left, greaterThanOrEqualTo(0));
-        expect(titleRect.right, lessThanOrEqualTo(size.width));
+        // 4) t172：AppBar 不再有标题行
+        expect(find.byKey(const Key('app-title-main')), findsNothing);
       });
     }
   });

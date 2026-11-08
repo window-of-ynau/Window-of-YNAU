@@ -86,7 +86,7 @@ void main() {
     expect(find.textContaining('本地凭据已损坏'), findsWidgets);
     // 行为断言：点发送不会发请求（broken 视为不可用）
     await tester.enterText(find.byType(TextField).first, '你好');
-    await tester.tap(find.text('发送'), warnIfMissed: false);
+    await tester.tap(find.byKey(const Key('send-button')), warnIfMissed: false);
     await tester.pumpAndSettle();
     expect(find.textContaining('本地凭据已损坏'), findsWidgets);
   });

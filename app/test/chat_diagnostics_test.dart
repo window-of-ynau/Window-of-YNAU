@@ -69,7 +69,7 @@ void main() {
     await _pump(tester, backend);
 
     await tester.enterText(find.byType(TextField).first, '你好');
-    await tester.tap(find.text('发送'));
+    await tester.tap(find.byKey(const Key('send-button')));
     await tester.pump();
     await tester.pump(const Duration(seconds: 6));
     await tester.pumpAndSettle();
@@ -81,7 +81,7 @@ void main() {
   testWidgets('有事件时不出现“对话没有启动”横幅', (WidgetTester tester) async {
     await _pump(tester, ChattyBackend());
     await tester.enterText(find.byType(TextField).first, '你好');
-    await tester.tap(find.text('发送'));
+    await tester.tap(find.byKey(const Key('send-button')));
     await tester.pump();
     await tester.pump(const Duration(seconds: 4));
     await tester.pumpAndSettle();
@@ -93,7 +93,7 @@ void main() {
     final backend = SilentBackend();
     await _pump(tester, backend);
     await tester.enterText(find.byType(TextField).first, '你好');
-    await tester.tap(find.text('发送'));
+    await tester.tap(find.byKey(const Key('send-button')));
     await tester.pump();
     await tester.pump(const Duration(seconds: 4));
     await tester.pumpAndSettle();

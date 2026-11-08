@@ -120,7 +120,7 @@ void main() {
         // Rect.contains 对右/下边界是**排他**的，rail 正好贴到 900 会被判越界 → 用容差比较
         for (final Finder finder in <Finder>[
           find.byType(TextField).first,
-          find.byIcon(Icons.send),
+          find.byIcon(Icons.arrow_upward),
           find.byKey(const Key('app-sidebar')),
         ]) {
           expect(finder, findsWidgets);

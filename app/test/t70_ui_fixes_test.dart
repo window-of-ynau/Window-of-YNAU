@@ -131,7 +131,7 @@ void main() {
   testWidgets('诊断里能看到 delta 计数（P0-1 观测口径）', (WidgetTester tester) async {
     await _pumpChat(tester, backend: _PartialStreamBackend(), keySet: true);
     await tester.enterText(find.byType(TextField).first, '你好');
-    await tester.tap(find.text('发送'));
+    await tester.tap(find.byKey(const Key('send-button')));
     await tester.pumpAndSettle();
     await tester.tap(find.byIcon(Icons.more_vert));
     await tester.pumpAndSettle();
