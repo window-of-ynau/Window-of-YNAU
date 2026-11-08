@@ -50,8 +50,10 @@ typedef _FreeNative = Void Function(Pointer<Utf8>);
 typedef _FreeDart = void Function(Pointer<Utf8>);
 typedef _VersionNative = Pointer<Utf8> Function();
 typedef _VersionDart = Pointer<Utf8> Function();
-typedef _ThreeArgsNative = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
-typedef _ThreeArgsDart = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _ThreeArgsNative = Pointer<Utf8> Function(
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _ThreeArgsDart = Pointer<Utf8> Function(
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
 
 /// 核心能力接口：生产实现是 [CoreLibrary]，测试用 fake（不需要真 DLL）。
 abstract class CoreApi {
@@ -96,18 +98,20 @@ class CoreLibrary implements CoreApi {
             'yunong_import_timetable'),
         _listCourses = library.lookupFunction<_TwoArgsNative, _TwoArgsDart>(
             'yunong_list_courses'),
-        _listTerms =
-            library.lookupFunction<_OneArgNative, _OneArgDart>('yunong_list_terms'),
-        _free = library.lookupFunction<_FreeNative, _FreeDart>(
-            'yunong_free_string'),
-        _version =
-            library.lookupFunction<_VersionNative, _VersionDart>('yunong_core_version'),
-        _importSchedule = library
-            .lookupFunction<_ThreeArgsNative, _ThreeArgsDart>('yunong_import_schedule_json'),
-        _setTermStart = library
-            .lookupFunction<_ThreeArgsNative, _ThreeArgsDart>('yunong_set_term_start'),
-        _exportIcs = library
-            .lookupFunction<_ThreeArgsNative, _ThreeArgsDart>('yunong_export_ics');
+        _listTerms = library
+            .lookupFunction<_OneArgNative, _OneArgDart>('yunong_list_terms'),
+        _free = library
+            .lookupFunction<_FreeNative, _FreeDart>('yunong_free_string'),
+        _version = library.lookupFunction<_VersionNative, _VersionDart>(
+            'yunong_core_version'),
+        _importSchedule =
+            library.lookupFunction<_ThreeArgsNative, _ThreeArgsDart>(
+                'yunong_import_schedule_json'),
+        _setTermStart =
+            library.lookupFunction<_ThreeArgsNative, _ThreeArgsDart>(
+                'yunong_set_term_start'),
+        _exportIcs = library.lookupFunction<_ThreeArgsNative, _ThreeArgsDart>(
+            'yunong_export_ics');
 
   final _ImportDart _import;
   final _TwoArgsDart _listCourses;
@@ -173,8 +177,9 @@ class CoreLibrary implements CoreApi {
       // t174：Flutter 打包偶发会再套一层 `lib` 前缀（liblibyunong_core.so），
       // 以及 Android 上部分 ROM 需要显式带 .so 后缀的绝对路径 → 一并尝试。
       if (Platform.isAndroid || Platform.isIOS) ...<String>[
-        'liblibyunong_core.so',
-        for (final String dir in androidNativeLibDirs()) '$dir/libyunong_core.so',
+        ...androidExtraCandidates,
+        for (final String dir in androidNativeLibDirs())
+          '$dir/libyunong_core.so',
       ],
     ];
   }
@@ -215,6 +220,57 @@ class CoreLibrary implements CoreApi {
       // resolvedExecutable 在 Android 上可能不可用 → 忽略
     }
     return dirs.toList();
+  }
+
+  /// 【t178】Android 上额外尝试的库名（Flutter 打包偶发再套一层 `lib` 前缀）。
+  ///
+  /// 抽成常量是为了能测：真实失败路径上它必须真的出现在候选里。
+  static const List<String> androidExtraCandidates = <String>[
+    'liblibyunong_core.so'
+  ];
+
+  /// 我们**只打包**的 ABI（release APK 收敛到单 ABI，见 #81/#82）。
+  static const Set<String> supportedAbis = <String>{'arm64'};
+
+  /// ABI 目录名 → 用户能看懂的 ABI 名。
+  static const Map<String, String> abiLabels = <String, String>{
+    'arm64': 'arm64-v8a',
+    'arm': 'armeabi-v7a',
+    'x86_64': 'x86_64',
+    'x86': 'x86',
+  };
+
+  /// 【t178】把 ABI 线索转成一句人话；受支持（或无线索）时返回 null —— **绝不误报**。
+  static String? unsupportedAbiMessage(String? hint) {
+    if (hint == null || hint.isEmpty) {
+      return null;
+    }
+    if (supportedAbis.contains(hint)) {
+      return null;
+    }
+    final String label = abiLabels[hint] ?? hint;
+    final String supported =
+        supportedAbis.map((String a) => abiLabels[a] ?? a).join('/');
+    return '不支持本机 ABI（本机=$label，仅支持 $supported）';
+  }
+
+  /// 【t178】`/proc/self/maps` 里是否已映射我们的库（Android 上最稳的"打包了没"证据）。
+  static bool mapsContainsCore() {
+    if (!Platform.isAndroid) {
+      return false;
+    }
+    try {
+      final File maps = File('/proc/self/maps');
+      if (!maps.existsSync()) {
+        return false;
+      }
+      return maps
+          .readAsLinesSync()
+          .any((String line) => line.contains('yunong_core'));
+    } on Object catch (failure) {
+      debugPrint('[core] 读 /proc/self/maps 失败：${failure.runtimeType} $failure');
+      return false;
+    }
   }
 
   /// 【t174】设备 ABI 线索（用于"本机 ABI 不在支持列表"的明确提示）。
@@ -328,7 +384,8 @@ class CoreLibrary implements CoreApi {
 /// owner 反馈"v0.9 没有『端侧核心已就绪』"：加载失败时只有一条黄色横幅，
 /// 看不到失败原因（哪个路径、什么错误）。这里把 dlopen 的真实过程记下来。
 class CoreStatus {
-  const CoreStatus._({required this.ok, required this.detail, this.sizeBytes, this.version});
+  const CoreStatus._(
+      {required this.ok, required this.detail, this.sizeBytes, this.version});
 
   /// 测试用构造（不触发真实 dlopen）。
   const CoreStatus.testOnly({
@@ -392,18 +449,53 @@ class CoreStatus {
     } on CoreUnavailable catch (failure) {
       final CoreStatus status = CoreStatus._(
         ok: false,
-        detail: '未加载（尝试过：${candidates.join(' / ')}；错误：${failure.detail}）',
+        detail: failureDetail(
+          candidates: candidates,
+          error: failure.detail,
+          abiHint: CoreLibrary.androidAbiHint(),
+        ),
       );
       _latest = status;
       return status;
     } on Object catch (failure) {
       final CoreStatus status = CoreStatus._(
         ok: false,
-        detail: '未加载（尝试过：${candidates.join(' / ')}；错误：${failure.runtimeType}: $failure）',
+        detail: failureDetail(
+          candidates: candidates,
+          error: '${failure.runtimeType}: $failure',
+          abiHint: CoreLibrary.androidAbiHint(),
+        ),
       );
       _latest = status;
       return status;
     }
+  }
+
+  /// 【t178】失败文案（**唯一口径**，纯函数便于测试）：
+  ///
+  /// - 本机 ABI 不在支持列表 → 直接说「不支持本机 ABI（本机=…，仅支持 arm64-v8a）」，
+  ///   而不是笼统的 `library not found`；
+  /// - ABI 受支持（或拿不到线索）→ 完整诊断：候选路径 + nativeLib 目录 + ABI + maps 已映射与否 + 原始错误。
+  static String failureDetail({
+    required List<String> candidates,
+    required String error,
+    String? abiHint,
+  }) {
+    final String? abiProblem = CoreLibrary.unsupportedAbiMessage(abiHint);
+    if (abiProblem != null) {
+      debugPrint('[core] 端侧核心加载失败：$abiProblem（候选：${candidates.join(' / ')}）');
+      return abiProblem;
+    }
+    final String abiLabel = abiHint == null || abiHint.isEmpty
+        ? '未知'
+        : (CoreLibrary.abiLabels[abiHint] ?? abiHint);
+    final List<String> dirs = CoreLibrary.androidNativeLibDirs();
+    final bool mapsHit = CoreLibrary.mapsContainsCore();
+    final String detail = '未加载（ABI=$abiLabel；尝试过：${candidates.join(' / ')}；'
+        'nativeLib 目录=${dirs.isEmpty ? '未找到' : dirs.join(' / ')}；'
+        '/proc/self/maps 含 yunong_core=$mapsHit；错误：$error）';
+    debugPrint('[core] 端侧核心加载失败：$detail');
+    return detail;
   }
 
   /// 设置页/关于页显示的一行文案。
