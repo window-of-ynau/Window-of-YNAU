@@ -21,55 +21,47 @@ Future<void> _pumpApp(WidgetTester tester, Size size) async {
 void main() {
   tearDown(() => CoreStatus.debugLatest = null);
 
-  group('窄屏（手机）布局：内容不被导航压住（t165）', () {
+  group('窄屏（手机）布局：rail 64，内容左让 64（t171 v2）', () {
     for (final Size size in const <Size>[Size(360, 800), Size(412, 915)]) {
-      testWidgets('${size.width.toInt()}×${size.height.toInt()}：用底部导航，无侧栏，内容占满整宽',
+      testWidgets('${size.width.toInt()}×${size.height.toInt()}：rail 64 + 内容左边界 ≥ 64',
           (WidgetTester tester) async {
         await _pumpApp(tester, size);
 
-        // 1) 手机档不该有侧栏（更不该有浮在内容上的 rail）
-        expect(find.byKey(const Key('app-sidebar')), findsNothing);
-        // 2) 改成底部导航
-        expect(find.byKey(const Key('app-bottom-nav')), findsOneWidget);
+        // 1) 窄屏保留左侧 rail（v2 变体 A）
+        expect(find.byKey(const Key('app-sidebar')), findsOneWidget);
+        expect(tester.getRect(find.byKey(const Key('app-sidebar'))).width, lessThanOrEqualTo(72));
+        // 2) 不再有底部导航
+        expect(find.byKey(const Key('app-bottom-nav')), findsNothing);
 
-        // 3) 内容区左边界贴到 0（AppBar/导航栏之外没有遮挡）
+        // 3) 内容区左边界 ≥ 64（不被 rail 遮挡）
         final Rect content = tester.getRect(find.byType(IndexedStack).first);
-        expect(content.left, lessThanOrEqualTo(0.5),
-            reason: '内容区左边界应为 0，实际 ${content.left}');
+        expect(content.left, greaterThanOrEqualTo(64),
+            reason: '内容左边界应 ≥ 64，实际 ${content.left}');
 
-        // 4) 关键文本完整可见、不被裁切：标题占满可用宽度
-        final Finder title = find.text('云农之窗');
+        // 4) 主标题在视口内
+        final Finder title = find.byKey(const Key('app-title-main'));
         expect(title, findsOneWidget);
         final Rect titleRect = tester.getRect(title);
-        expect(titleRect.left, greaterThanOrEqualTo(0), reason: '标题左侧被裁');
-        expect(titleRect.right, lessThanOrEqualTo(size.width), reason: '标题右侧出界');
-
-        // 5) 底部导航不覆盖内容（内容底边 ≤ 导航栏顶边）
-        final Rect nav = tester.getRect(find.byKey(const Key('app-bottom-nav')));
-        expect(content.bottom, lessThanOrEqualTo(nav.top + 0.5),
-            reason: '内容被底部导航覆盖：content.bottom=${content.bottom} nav.top=${nav.top}');
+        expect(titleRect.left, greaterThanOrEqualTo(0));
+        expect(titleRect.right, lessThanOrEqualTo(size.width));
       });
     }
   });
 
-  group('中/宽屏保持 rail / 侧栏（t165）', () {
-    testWidgets('700 宽：窄 rail（64）+ 内容并排，内容左边界 = rail 右边界',
-        (WidgetTester tester) async {
+  group('中/宽屏（t171 v2）：200 / 224 与内容并排', () {
+    testWidgets('700 宽：中屏侧栏 200 与内容并排', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(700, 800));
-      expect(find.byKey(const Key('app-bottom-nav')), findsNothing);
       final Rect rail = tester.getRect(find.byKey(const Key('app-sidebar')));
       final Rect content = tester.getRect(find.byType(IndexedStack).first);
-      expect(rail.width, lessThanOrEqualTo(72), reason: '中宽应为窄 rail');
-      expect(content.left, greaterThanOrEqualTo(rail.right),
-          reason: '内容左边界(${content.left}) 必须 ≥ rail 右边界(${rail.right})');
+      expect(rail.width, closeTo(200, 1), reason: '中屏应为 200');
+      expect(content.left, greaterThanOrEqualTo(rail.right));
     });
 
-    testWidgets('1280 宽：宽侧栏（256）与内容并排', (WidgetTester tester) async {
+    testWidgets('1280 宽：宽侧栏 224 与内容并排', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(1280, 800));
-      expect(find.byKey(const Key('app-bottom-nav')), findsNothing);
       final Rect sidebar = tester.getRect(find.byKey(const Key('app-sidebar')));
       final Rect content = tester.getRect(find.byType(IndexedStack).first);
-      expect(sidebar.width, greaterThan(200), reason: '宽屏应为展开侧栏');
+      expect(sidebar.width, closeTo(224, 1), reason: '宽屏应为 224');
       expect(content.left, greaterThanOrEqualTo(sidebar.right));
     });
   });

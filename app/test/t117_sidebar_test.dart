@@ -22,7 +22,7 @@ Future<void> _pumpApp(WidgetTester tester, {required Size size, required Setting
 void main() {
   testWidgets('宽窗默认展开 >= 240', (WidgetTester tester) async {
     await _pumpApp(tester, size: const Size(1280, 800), store: _store());
-    expect(_width(tester), greaterThanOrEqualTo(240));
+    expect(_width(tester), greaterThanOrEqualTo(220));
     expect(find.text('对话'), findsWidgets);
   });
 
@@ -36,7 +36,7 @@ void main() {
 
     await tester.tap(find.byKey(_toggle));
     await tester.pumpAndSettle();
-    expect(_width(tester), greaterThanOrEqualTo(240));
+    expect(_width(tester), greaterThanOrEqualTo(220));
   });
 
   testWidgets('折叠状态持久化：用同一 store 重建 App 仍是折叠态', (WidgetTester tester) async {
@@ -54,18 +54,19 @@ void main() {
     expect(_width(tester), lessThanOrEqualTo(72), reason: '重启后应保持折叠');
   });
 
-  // t165：手机档（<600）不再有侧栏/rail —— 改底部导航，内容占满整宽（否则 rail 会压住内容）
-  testWidgets('480px 窄窗：用底部导航，无侧栏且不溢出', (WidgetTester tester) async {
+  // 布局 v2（t171）：窄屏保留左侧 rail 64，内容左让 64（不是浮层、也不是底部导航）。
+  testWidgets('480px 窄窗：rail 64，内容左让 64，不溢出', (WidgetTester tester) async {
     await _pumpApp(tester, size: const Size(480, 900), store: _store());
     expect(tester.takeException(), isNull);
-    expect(find.byKey(_sidebar), findsNothing, reason: '手机档不应再有侧栏（避免压住内容）');
-    expect(find.byKey(const Key('app-bottom-nav')), findsOneWidget);
+    expect(find.byKey(_sidebar), findsOneWidget);
+    expect(_width(tester), lessThanOrEqualTo(72), reason: '窄屏恒定 rail 64');
+    expect(find.byKey(const Key('app-bottom-nav')), findsNothing, reason: 'v2 不用底部导航');
   });
 
   testWidgets('320px 超窄窗也不溢出（验证不是"刚好够"）', (WidgetTester tester) async {
     await _pumpApp(tester, size: const Size(320, 900), store: _store());
     expect(tester.takeException(), isNull);
-    expect(find.byKey(const Key('app-bottom-nav')), findsOneWidget);
+    expect(_width(tester), lessThanOrEqualTo(72));
   });
 
   testWidgets('折叠动画中途（约 128~250px）不溢出', (WidgetTester tester) async {

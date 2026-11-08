@@ -121,7 +121,7 @@ void main() {
         for (final Finder finder in <Finder>[
           find.byType(TextField).first,
           find.byIcon(Icons.send),
-          find.byKey(const Key('app-bottom-nav')),
+          find.byKey(const Key('app-sidebar')),
         ]) {
           expect(finder, findsWidgets);
           final Rect rect = tester.getRect(finder.first);

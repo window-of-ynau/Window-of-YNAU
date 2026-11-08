@@ -68,12 +68,12 @@ void main() {
 
       final Finder settingsTile = find.byKey(const Key('sidebar-settings'));
       expect(settingsTile, findsOneWidget);
-      expect(find.descendant(of: settingsTile, matching: find.text('设置')), findsOneWidget);
+      // t171：设置按钮 key 打在图标按钮上；展开态同一行右侧显示「设置」文字
+    expect(find.text('设置'), findsWidgets);
 
-      // 整行撑满：宽度接近侧栏宽度
-      final Size sidebarSize = tester.getSize(find.byKey(const Key('app-sidebar')));
+      // t171：设置项是「64 图标列 + 文字」的行，图标按钮本身宽 40（不再是整行 ListTile）
       final Size tileSize = tester.getSize(settingsTile);
-      expect(tileSize.width, greaterThan(sidebarSize.width * 0.9));
+      expect(tileSize.width, closeTo(40, 1), reason: '图标按钮 40×40，中心 x=32');
     });
   });
 }

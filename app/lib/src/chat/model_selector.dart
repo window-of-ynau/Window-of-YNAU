@@ -83,8 +83,10 @@ class ModelSelector extends StatelessWidget {
     final ThemeData theme = Theme.of(context);
     // t132：放在输入框右下角（发送按钮左侧）——必须可收缩：
     // 图标始终可见，文字在窄窗省略（480/320 都不溢出）。
+    // 布局 v2：窄屏（<600）内容区左让 64 后更窄 —— 摘要按钮收成 120，避免横向溢出。
+    final bool compact = MediaQuery.sizeOf(context).width < 600;
     return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 190),
+      constraints: BoxConstraints(maxWidth: compact ? 120 : 190),
       child: TextButton.icon(
         key: const Key('model-selector-button'),
         onPressed: () => _openSheet(context),
