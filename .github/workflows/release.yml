@@ -192,6 +192,22 @@ jobs:
       - name: flutter pub get
         working-directory: app
         run: flutter pub get
+      # t175 P0：发布 APK 必须自带 Rust 端侧核心（之前这里漏了，发出去的 APK 里没有
+      # libyunong_core.so → 手机上 dlopen 失败、端侧核心不可用）。与 ci.yml 的 android-apk 保持同一套。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: 确保 NDK 可用
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          if [ -n "${ANDROID_NDK_HOME:-}" ] && [ -d "${ANDROID_NDK_HOME:-}" ]; then echo "NDK: $ANDROID_NDK_HOME"; exit 0; fi
+          if [ -d "$sdk/ndk" ] && [ -n "$(ls -A "$sdk/ndk" 2>/dev/null)" ]; then echo "NDK: $(ls -A "$sdk/ndk")"; exit 0; fi
+          echo "::notice::runner 无预装 NDK，安装 ndk;27.2.12479018"
+          yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" > /dev/null
+      - name: 交叉编译 Rust 端侧核心（arm64-v8a）
+        run: pwsh scripts/build-android-core.ps1 -Abi arm64-v8a
       # 四个签名 secret 齐备才走 release 签名
       - name: 解码 keystore 并写 key.properties
         if: env.KEYSTORE_BASE64 != ''
@@ -211,7 +227,8 @@ jobs:
       - name: 构建 release APK（已配置签名）
         if: env.KEYSTORE_BASE64 != ''
         working-directory: app
-        run: flutter build apk --release
+        # 只打 arm64-v8a：Rust 核心只编了 arm64，Flutter 若出三 ABI 会得到"有 libapp.so 没有 libyunong_core.so"的残缺包
+        run: flutter build apk --release --target-platform android-arm64
       # 缺少签名 secrets 时只出 debug 产物：不伪造签名，也不让发布流程变红
       - name: 构建 debug APK（未配置签名，降级产物）
         if: env.KEYSTORE_BASE64 == ''
@@ -219,7 +236,29 @@ jobs:
         run: |
           echo "fallback to debug signing (secrets missing)：未配置 KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD"
           echo "::warning::缺少签名 secrets，只产出 debug APK，不可用于发布（配好 4 个 Secrets 后自动切换为正式签名）"
-          flutter build apk --debug
+          flutter build apk --debug --target-platform android-arm64
+      # 护栏（t175）：APK 必须内含 lib/arm64-v8a/libyunong_core.so，且 native libs 只应有一个 ABI。
+      # 这是"CI 绿但发出去的包缺库"的直接防线（P0 就是它漏了）。
+      - name: 护栏：APK 内含 libyunong_core.so（缺失即失败）
+        working-directory: app
+        run: |
+          set -euo pipefail
+          apk=$(ls build/app/outputs/flutter-apk/*.apk | head -n 1)
+          echo "检查：$apk ($(du -h "$apk" | cut -f1))"
+          echo "--- APK 里的 lib/ ---"
+          unzip -l "$apk" | awk '$4 ~ /^lib\// {print}'
+          if ! unzip -l "$apk" | grep -q 'lib/arm64-v8a/libyunong_core.so'; then
+            echo "::error::APK 里没有 lib/arm64-v8a/libyunong_core.so —— 装到手机会 dlopen 失败"
+            exit 1
+          fi
+          abis=$(unzip -l "$apk" | awk '$4 ~ /^lib\// {split($4,a,"/"); print a[2]}' | sort -u | tr '\n' ' ')
+          echo "ABI：$abis"
+          if [ "$(echo $abis | wc -w)" -ne 1 ] || [ "$(echo $abis | tr -d ' ')" != "arm64-v8a" ]; then
+            echo "::error::APK 里出现多个 ABI（$abis）：Rust 核心只有 arm64-v8a，混合包在其它 ABI 上必坏"
+            exit 1
+          fi
+          echo "OK：APK 内含 libyunong_core.so，且只有 arm64-v8a"
+
       # 护栏（t164）：配了 Secrets 却还是 debug 签名 → 直接失败，避免"以为签了其实没签"。
       # 判据用 apksigner 打印的证书 DN：debug keystore 固定是 CN=Android Debug。
       - name: 护栏：有 Secrets 时禁止产出 debug 签名
