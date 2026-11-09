@@ -2543,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "yunong-core"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "regex",
  "reqwest",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "yunong-server"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2587,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "yunong-shared"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",

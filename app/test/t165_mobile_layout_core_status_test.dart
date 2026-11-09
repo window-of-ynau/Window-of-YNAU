@@ -66,9 +66,9 @@ void main() {
     test('成功：显示大小（yunong_core 6.85 MB）', () {
       const CoreStatus ok = CoreStatus.testOnly(
         ok: true,
-        detail: '已就绪（yunong_core 0.9.0）',
+        detail: '已就绪（yunong_core 0.9.1）',
         sizeBytes: 7182745,
-        version: '0.9.0',
+        version: '0.9.1',
       );
       expect(ok.label, contains('已就绪'));
       expect(ok.label, contains('MB'));
