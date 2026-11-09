@@ -615,7 +615,7 @@ jobs:
       # 现下二进制，GitHub Release 抖动（504 / 截断 HTML）时会直接 `tar: Error is not recoverable`，
       # 而且 Docker 层不缓存 → 每次 run 都重新承担网络风险。改为：缓存二进制 + 带重试下载 + tar 校验。
       - name: 缓存 cargo-deny 二进制
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.local/bin/cargo-deny
           key: cargo-deny-${{ runner.os }}-0.20.2
