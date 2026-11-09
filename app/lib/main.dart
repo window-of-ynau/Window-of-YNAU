@@ -30,8 +30,12 @@ import 'src/theme/glass_performance.dart';
 import 'src/theme/themes.dart';
 import 'src/theme/yunong_tokens.dart';
 
-void main(List<String> args) {
+Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
+  // t179（P0）：**必须在任何 AppPaths 取值之前**解析手机的应用私有目录。
+  // 否则 Android 上 HOME=/ 会把数据根拼成 `//yunong`（不可写）→ STORAGE / 本地课表保存失败。
+  // 依赖它的 getter：dataDir / databasePath / settingsPath / webViewDataDir / secretsDir / logsDir。
+  await AppPaths.initPlatformDirs();
   // t156：数据根覆盖（命令行 > 环境变量 > 默认）。
   //
   // 为什么两处都收：Flutter Windows 的 `main(List<String> args)` 在 release 里通常拿不到
@@ -324,15 +328,31 @@ class _HomeShellState extends State<HomeShell> {
             width: _sidebarWidthOf(width, collapsed),
             child: Material(
               color: tokens.surface,
-              child: AnimatedSwitcher(
-                duration: const Duration(milliseconds: 180),
-                child: rail,
+              // t179：rail 与内容区一起避让状态栏 / 手势条
+              child: SafeArea(
+                top: true,
+                bottom: true,
+                left: false,
+                right: false,
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 180),
+                  child: rail,
+                ),
               ),
             ),
           ),
           // 两栏分界：1px 主题细线 + 侧栏底色差（双保险，三主题都稳定）
           Container(width: 1, color: tokens.hairline),
-          Expanded(child: panes),
+          // t179：手机端内容不再顶到系统状态栏下面
+          Expanded(
+            child: SafeArea(
+              top: true,
+              bottom: true,
+              left: false,
+              right: false,
+              child: panes,
+            ),
+          ),
         ],
       ),
     );

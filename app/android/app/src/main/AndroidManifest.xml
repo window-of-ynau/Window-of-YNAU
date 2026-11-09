@@ -1,4 +1,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- t179（P0）：release 包必须自带联网权限。Flutter 模板只把 INTERNET 放在
+         src/debug 与 src/profile 的 manifest 里，`src/main` 里没有 → release 包
+         根本没有联网权限，WebView 一片空白（换任何网络都加载不出来）。
+         ACCESS_NETWORK_STATE：WebView / 网络状态判断需要，一并声明。 -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <!-- t165：端侧核心（libyunong_core.so）用 DynamicLibrary.open 加载，dlopen 只能找到
          **已解压**到 /data/app/.../lib/<abi>/ 的 .so。AGP 4+ 默认 extractNativeLibs=false
          （.so 只留在 APK 内，不落盘）→ dlopen 必然失败，表现为「核心不可用，暂时无法读取本地课表」。
