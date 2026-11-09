@@ -742,7 +742,7 @@ jobs:
           cache: true
       # 【t180】gradle 分发（wrapper 下载 gradle-8.14.3-all.zip）会因 GitHub Release 504 直接失败。
       # setup-gradle 负责缓存/复用 ~/.gradle；wrapper 自身的下载在下一步用 curl 重试兜住。
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
       # wrapper 自己的下载**不带重试**，504 时整个 job 直接崩（t180 实测）。
       # 这里先用 curl（-f + 重试）把分发包下到本地，再把 distributionUrl 指向本地文件：
       # wrapper 走 file:// 安装，完全不碰网络。
