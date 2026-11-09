@@ -31,7 +31,7 @@ class SettingsPage extends StatelessWidget {
       this.providerStore,
       this.keyValidator,
       this.onKeySaved,
-      this.version = '0.9.0（W2b）'});
+      this.version = '0.9.1（W2b）'});
 
 
   /// 主题控制器（设置页改主题立即生效）

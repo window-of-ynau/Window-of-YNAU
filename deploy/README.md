@@ -214,8 +214,8 @@ git push origin v0.1.0
 
 ```bash
 # 本机打安装包（先构建 exe + DLL，再过护栏 → 白名单暂存 → ISCC）
-pwsh scripts/build-windows-installer.ps1 -Version 0.9.0
-# 产物：dist/WindowOfYNAU-0.9.0-setup.exe + dist/SHA256SUMS
+pwsh scripts/build-windows-installer.ps1 -Version 0.9.1
+# 产物：dist/WindowOfYNAU-0.9.1-setup.exe + dist/SHA256SUMS
 ```
 
 **⚠️ 不要直接对 `app/build/windows/x64/runner/Release/` 打整包**——这是 2026-11 真实发生过的事故：
