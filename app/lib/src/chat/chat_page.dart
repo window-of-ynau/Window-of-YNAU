@@ -943,10 +943,9 @@ class ChatPageState extends State<ChatPage> {
     final bool canSend = !_streaming && _channelState.ready;
     return Container(
       key: const Key('composer'),
-      // t179：单层胶囊 —— 左右外边距 12（窄屏 0）、底部 12；高度 52（内部不再套输入框边框）
+      // t182：用 minHeight 而不是固定 height —— 单行 52，多行自然长高（固定高度会把首行顶到上沿）
       margin: EdgeInsets.fromLTRB(compact ? 0 : 12, 8, compact ? 0 : 12, 12),
-      height: 52,
-      padding: EdgeInsets.symmetric(horizontal: compact ? 6 : 12, vertical: 0),
+      constraints: const BoxConstraints(minHeight: 52),
       decoration: BoxDecoration(
         color: tokens.surface,
         borderRadius: BorderRadius.circular(14),
@@ -966,10 +965,14 @@ class ChatPageState extends State<ChatPage> {
                 onChanged: (_) => setState(() {}),
                 onSubmitted: (_) => _send(),
                 style: const TextStyle(fontSize: 14),
+                // t182：固定行盒高度 —— 真实字体下 hint 才不会"浮"在行盒上沿
+                strutStyle: const StrutStyle(fontSize: 14, height: 1.0, forceStrutHeight: true),
                 textAlignVertical: TextAlignVertical.center,
                 // t174：单行输入只占 ~20px（否则 composer 会被默认内边距撑到 80+）
                 decoration: const InputDecoration(
                   hintText: '输入消息…',
+                  // t182：内部不再有填充色（整条 composer 只有外层一层底色）
+                  filled: false,
                   isDense: true,
                   isCollapsed: true,
                   contentPadding: EdgeInsets.zero,
