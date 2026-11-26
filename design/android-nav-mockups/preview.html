@@ -1,0 +1,21 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Android 导航两态</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;background:#0f1115;color:#e7ecf3;font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif}
+.wrap{padding:20px 22px}
+h1{font-size:16px;margin:0 0 4px}
+p.sub{font-size:12px;opacity:.62;margin:0 0 16px}
+.row{display:flex;gap:18px;align-items:flex-start}
+.cell{background:#171a20;border-radius:12px;padding:10px}
+.cell img{display:block;width:372px;border-radius:10px}
+.cap{font-size:11.5px;opacity:.78;margin:8px 2px 2px;line-height:1.6}
+.cap b{display:block;font-size:12.5px;opacity:1;margin-bottom:2px}
+</style></head><body><div class="wrap">
+<h1>Android 分层导航 · 两态（390 × 844）</h1>
+<p class="sub">手机档：无 rail，内容全宽；点汉堡 → 覆盖层抽屉（320dp，含图标 + 文字 + 选中态）。桌面档不变。</p>
+<div class="row">
+  <div class="cell"><img src="phone-closed-a.png"><div class="cap"><b>关闭（默认）</b>极简黑白 · 无 rail，内容左右 padding 16；汉堡在状态行左侧 48×48</div></div>
+  <div class="cell"><img src="phone-open-a.png"><div class="cap"><b>打开</b>极简黑白 · 抽屉 320 + 遮罩 32%；选中项 surfaceAlt 底 + 左侧 3dp 条</div></div>
+  <div class="cell"><img src="phone-open-c.png"><div class="cap"><b>打开</b>书本质感 · 抽屉纸面 #FAF9F5，强调条 #A9583E</div></div>
+</div>
+</div></body></html>
