@@ -202,6 +202,6 @@
 | `design/android-nav-mockups/phone-open-a.png` | **打开态**（A 主题）：抽屉 320 + 遮罩 32%，选中项 `surfaceAlt` 底 + 左侧 3dp 条 |
 | `design/android-nav-mockups/phone-open-c.png` | **打开态**（C 主题）：抽屉纸面 `#FAF9F5`、强调条 `#A9583E` |
 | `design/android-nav-mockups/preview.png` | 三张并排总览 |
-| `design/android-nav-mockups/phone.html` | 源文件（`?open=0|1&t=a|c`），尺寸即规格数值 |
+| `design/android-nav-mockups/phone.html` | 源文件（`?open=0` 或 `?open=1`，`t=a` 或 `t=c`），尺寸即规格数值 |
 
 视觉稿里**抽屉是 320、遮罩 32%、行高 44、选中条 3dp**——这四个数值请直接照抄，不要在实现时"看着差不多"再调。
