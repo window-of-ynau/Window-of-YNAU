@@ -71,9 +71,9 @@ void main() {
       // t171：设置按钮 key 打在图标按钮上；展开态同一行右侧显示「设置」文字
     expect(find.text('设置'), findsWidgets);
 
-      // t171：设置项是「64 图标列 + 文字」的行，图标按钮本身宽 40（不再是整行 ListTile）
+      // t6：设置项是「64 图标列 + 文字」的行，图标按钮 40×40，图标中心 x=32
       final Size tileSize = tester.getSize(settingsTile);
-      expect(tileSize.width, closeTo(36, 1), reason: 't173：图标按钮 36×36（Align 钉住宽度），中心 x=24');
+      expect(tileSize.width, closeTo(40, 1), reason: '图标按钮 40×40（居 64 列，图标中心 x=32）');
     });
   });
 }

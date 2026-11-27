@@ -54,19 +54,22 @@ void main() {
     expect(_width(tester), lessThanOrEqualTo(72), reason: '重启后应保持折叠');
   });
 
-  // 布局 v2（t171）：窄屏保留左侧 rail 64，内容左让 64（不是浮层、也不是底部导航）。
-  testWidgets('480px 窄窗：rail 64，内容左让 64，不溢出', (WidgetTester tester) async {
+  // #90（t6）：手机 <600 不再有常驻 rail，改为无侧栏 + 覆盖抽屉。
+  testWidgets('480px 手机档：无常驻侧栏，汉堡可开抽屉，不溢出', (WidgetTester tester) async {
     await _pumpApp(tester, size: const Size(480, 900), store: _store());
     expect(tester.takeException(), isNull);
-    expect(find.byKey(_sidebar), findsOneWidget);
-    expect(_width(tester), lessThanOrEqualTo(72), reason: '窄屏恒定 rail 64');
+    expect(find.byKey(_sidebar), findsNothing, reason: '手机档没有常驻侧栏');
     expect(find.byKey(const Key('app-bottom-nav')), findsNothing, reason: 'v2 不用底部导航');
+    await tester.tap(find.byKey(_toggle));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('nav-drawer')), findsOneWidget);
   });
 
   testWidgets('320px 超窄窗也不溢出（验证不是"刚好够"）', (WidgetTester tester) async {
     await _pumpApp(tester, size: const Size(320, 900), store: _store());
     expect(tester.takeException(), isNull);
-    expect(_width(tester), lessThanOrEqualTo(72));
+    expect(find.byKey(_sidebar), findsNothing);
+    expect(find.byKey(_toggle), findsOneWidget);
   });
 
   testWidgets('折叠动画中途（约 128~250px）不溢出', (WidgetTester tester) async {

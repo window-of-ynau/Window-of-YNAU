@@ -15,6 +15,7 @@ import 'package:flutter/services.dart' show rootBundle;
 
 import '../campus/capture_cache.dart';
 import '../campus/portal_api.dart';
+import 'app_paths.dart';
 import 'ffi_bindings.dart';
 
 /// 一门已入库的课。
@@ -402,20 +403,21 @@ class TimetableService {
   final String? _exportDir;
   final bool Function(String path)? _pathExists;
 
-  /// 数据库路径（Windows: %LOCALAPPDATA%\yunong\timetable.db）。
+  /// 数据库路径：与设置页 / 聊天 / 凭据**同一个数据根**（[AppPaths.dataDir]），
+  /// 文件名沿用 `timetable.db`（Windows 老库不迁移、不丢数据）。
   ///
-  /// 用环境变量而不是 path_provider：后者是插件，会把 Windows 构建绑到符号链接上。
+  /// #91 根因：旧实现用 `LOCALAPPDATA/APPDATA/HOME` 自己拼
+  /// `<base>/yunong/timetable.db`。Android 上这些环境变量都不存在（`HOME=/`），
+  /// 于是拼出 `//yunong/timetable.db` 这种不可写路径 —— 与设置页显示的
+  /// `AppPaths.dataDir`（`/data/user/0/<pkg>/files/yunong`）**不同根**。
+  /// Rust 侧建库目录失败 → `STORAGE` / 「本地课表保存失败」，点「确认开学日」看似无反应。
+  /// 现在固定走 [AppPaths.dataDir]，和设置页同源，不再各拼各的。
   String get dbPath {
     final override = _dbPath;
     if (override != null) {
       return override;
     }
-    final env = Platform.environment;
-    final base = env['LOCALAPPDATA'] ??
-        env['APPDATA'] ??
-        env['HOME'] ??
-        Directory.current.path;
-    return <String>[base, 'yunong', 'timetable.db'].join(Platform.pathSeparator);
+    return <String>[AppPaths.dataDir, 'timetable.db'].join(Platform.pathSeparator);
   }
 
   CoreApi get _library => _core ?? CoreLibrary.instance();
@@ -494,10 +496,29 @@ class TimetableService {
   }
 
   /// 设置/修正学期开始日（`YYYY-MM-DD`，空串=清空）。
+  ///
+  /// #91：失败时把**数据库绝对路径**和 **Rust 原始错误**一起带出去，
+  /// 不再只给一句「本地课表保存失败」而把细节吞掉。
   Future<void> setTermStart({required String term, required String startsOn}) async {
-    final envelope = _library.setTermStart(term: term, startsOn: startsOn, dbPath: dbPath);
+    final String path = dbPath;
+    final CoreEnvelope envelope;
+    try {
+      envelope = _library.setTermStart(term: term, startsOn: startsOn, dbPath: path);
+    } on CoreUnavailable catch (failure) {
+      throw TimetableException(
+        code: 'CORE_UNAVAILABLE',
+        userHint: '端侧核心未就绪，无法保存学期开始日',
+        message: '${failure.detail}（数据库：$path）',
+      );
+    } on Object catch (err) {
+      throw describeFailure('INTERNAL', '调用端侧核心失败：$err（数据库：$path）');
+    }
     if (!envelope.ok) {
-      throw describeFailure(envelope.code, envelope.message);
+      final String detail = (envelope.message ?? '').trim();
+      throw describeFailure(
+        envelope.code,
+        '${detail.isEmpty ? '未知原因' : detail}（数据库：$path）',
+      );
     }
   }
 

@@ -1221,8 +1221,10 @@ class _TimetablePageState extends State<TimetablePage> {
 }
 
 /// 失败卡片：大字号给用户看的那句 + 小字原始信息 + 明确"这不是空课表"。
-/// 只有"抓取/诊断"类错误才把原始信息显示给用户；导出/存储类只给可读文案
-/// （需求：导出失败不要显示原始错误串）。
+///
+/// 默认只把"抓取/诊断"类原始信息显示给用户；#91 起 **存储类（STORAGE）也必须显示
+/// 原始错误与数据库绝对路径** —— 否则真机上只能看到「本地课表保存失败」，
+/// 无法判断是哪个路径 / 哪条 Rust 错误（导出失败仍只给可读文案）。
 bool _shouldShowRawMessage(String code) => const <String>{
       'CAPTURE_TIMEOUT',
       'HTML_CHANGED',
@@ -1233,6 +1235,9 @@ bool _shouldShowRawMessage(String code) => const <String>{
       'CERT',
       'TIMEOUT',
       'LOGIN_TIMEOUT',
+      // #91：本地库读写失败要带出 Rust 原始错误 + db 绝对路径，便于真机定位
+      'STORAGE',
+      'INTERNAL',
     }.contains(code);
 /// t176：接口路径"成功但 0 门课"的内部信号 —— 先写日志再回退 DOM，不当作最终错误。
 /// t176：接口路径"成功但 0 门课"的内部信号 —— 先写日志再回退 DOM，不当作最终错误。

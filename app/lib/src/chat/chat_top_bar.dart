@@ -13,6 +13,7 @@
 import 'package:flutter/material.dart';
 
 import '../core/debug_flags.dart';
+import '../l10n/strings.dart';
 
 /// 顶栏。
 class ChatTopBar extends StatelessWidget {
@@ -92,7 +93,7 @@ class ChatTopBar extends StatelessWidget {
           // t132：搜索/Key/状态信息统一收进 ⓘ（不再占一整条横幅）。
           IconButton(
             key: const Key('chat-info'),
-            tooltip: '状态与联网搜索',
+            tooltip: ChatS.statusTooltip,
             onPressed: onInfo,
             iconSize: 20,
             icon: Icon(
@@ -103,7 +104,7 @@ class ChatTopBar extends StatelessWidget {
           const SizedBox(width: 4),
           PopupMenuButton<String>(
             key: const Key('chat-menu'),
-            tooltip: '更多',
+            tooltip: ChatS.more,
             icon: const Icon(Icons.more_vert),
             onSelected: (String value) {
               switch (value) {
@@ -118,13 +119,13 @@ class ChatTopBar extends StatelessWidget {
               }
             },
             itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
-              const PopupMenuItem<String>(value: 'local', child: Text('搜索本地资料（不联网）')),
-              const PopupMenuItem<String>(value: 'memory', child: Text('记忆')),
+              const PopupMenuItem<String>(value: 'local', child: Text(ChatS.menuLocalSearch)),
+              const PopupMenuItem<String>(value: 'memory', child: Text(ChatS.menuMemory)),
               // t153：诊断入口在 **release 构建里隐藏**（调试用途），代码保留。
               if (_showDebug)
-                const PopupMenuItem<String>(value: 'diagnostics', child: Text('对话诊断')),
+                const PopupMenuItem<String>(value: 'diagnostics', child: Text(ChatS.menuDiagnostics)),
               const PopupMenuDivider(),
-              const PopupMenuItem<String>(value: 'clear', child: Text('清空当前对话历史')),
+              const PopupMenuItem<String>(value: 'clear', child: Text(ChatS.menuClear)),
             ],
           ),
         ],

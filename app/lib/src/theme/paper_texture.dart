@@ -18,6 +18,8 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 
+import '../l10n/strings.dart';
+
 import 'yunong_tokens.dart';
 
 /// 静态纸纹层：铺在内容下方，不参与滚动重绘。
@@ -57,7 +59,7 @@ class _PaperTextureState extends State<PaperTexture> {
       }
     } catch (error) {
       // 资源缺失不该让整个界面挂掉：没有纸纹就退回纯纸色（观感损失 <性能风险）
-      debugPrint('纸纹加载失败，退回纯色：$error');
+      debugPrint(CommonS.paperTextureLoadFailed(error));
       _cache.remove(widget.spec.asset);
     }
   }
