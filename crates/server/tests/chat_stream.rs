@@ -590,16 +590,8 @@ async fn wait_until(mut condition: impl FnMut() -> bool, budget: Duration) -> bo
 }
 
 /// 轮询等待"某条 count SQL 至少到 `expected`"（记账是 fire-and-forget，落库有延迟）。
-async fn wait_for_rows(db: &TestDb, sql: &str, expected: i64) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let rows = count(&db.pool, sql).await;
-        if rows >= expected || Instant::now() >= deadline {
-            return rows >= expected;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
+///
+/// 复用 `common::wait_for_rows`（全仓库单一实现）；本文件不再保留副本。
 
 // ============ 用例 ============
 
@@ -1130,7 +1122,7 @@ async fn pg_sample_writes_one_row_with_merged_usage() {
     assert_eq!(events.last().map(|(name, _)| name.as_str()), Some("done"));
 
     assert!(
-        wait_for_rows(&db, "SELECT count(*) FROM usage_samples", 1).await,
+        common::wait_for_rows(&db.pool, "SELECT count(*) FROM usage_samples", 1).await,
         "抽样命中却没有写 usage_samples"
     );
     // 一轮 = 一行：逐事件写会把成本显著高估；4 轮循环才有 4 行（见下一条用例）
@@ -1161,8 +1153,8 @@ async fn pg_sample_writes_one_row_with_merged_usage() {
 
     // 放行也要留审计（不含正文，只有动作与目标）
     assert!(
-        wait_for_rows(
-            &db,
+        common::wait_for_rows(
+            &db.pool,
             "SELECT count(*) FROM audit_logs WHERE decision = 'allow' AND action = 'chat.stream'",
             1
         )
@@ -1207,7 +1199,7 @@ async fn pg_sample_is_idempotent_per_round() {
         if round == 0 {
             // 第一轮的写入必须真的落库，再发第二轮——这样"先后顺序"由测试控制，不靠调度
             assert!(
-                wait_for_rows(&db, "SELECT count(*) FROM usage_samples", 1).await,
+                common::wait_for_rows(&db.pool, "SELECT count(*) FROM usage_samples", 1).await,
                 "第一轮应写一行"
             );
             let stored: String = sqlx::query_scalar("SELECT req_id FROM usage_samples")
@@ -1254,7 +1246,12 @@ async fn pg_sample_is_idempotent_per_round() {
     assert_eq!(response.status(), StatusCode::OK);
     let _ = read_events(response).await;
     assert!(
-        wait_for_rows(&db, "SELECT count(*) FROM usage_samples WHERE round = 2", 1).await,
+        common::wait_for_rows(
+            &db.pool,
+            "SELECT count(*) FROM usage_samples WHERE round = 2",
+            1
+        )
+        .await,
         "第 2 轮应有自己的一行"
     );
     assert_eq!(
@@ -1289,8 +1286,8 @@ async fn pg_sample_is_isolated_per_user() {
     }
 
     assert!(
-        wait_for_rows(
-            &db,
+        common::wait_for_rows(
+            &db.pool,
             "SELECT count(*) FROM usage_samples WHERE turn_id = 'turn-shared'",
             2
         )
@@ -1426,7 +1423,7 @@ async fn pg_sample_marks_estimated_when_upstream_omits_usage() {
     );
 
     assert!(
-        wait_for_rows(&db, "SELECT count(*) FROM usage_samples", 1).await,
+        common::wait_for_rows(&db.pool, "SELECT count(*) FROM usage_samples", 1).await,
         "抽样命中却没有写 usage_samples"
     );
     let row = sqlx::query("SELECT tokens_in, tokens_out, estimated FROM usage_samples")
@@ -1469,8 +1466,8 @@ async fn pg_auth_failure_is_audited() {
     let _ = read_json(response).await;
 
     assert!(
-        wait_for_rows(
-            &db,
+        common::wait_for_rows(
+            &db.pool,
             "SELECT count(*) FROM audit_logs \
              WHERE action = 'auth.authenticate' AND decision = 'deny' \
                AND reason = 'token_invalid'",
@@ -1532,8 +1529,8 @@ async fn pg_upstream_failure_is_audited_as_error() {
     let _ = read_json(response).await;
 
     assert!(
-        wait_for_rows(
-            &db,
+        common::wait_for_rows(
+            &db.pool,
             "SELECT count(*) FROM audit_logs \
              WHERE decision = 'error' AND reason = 'upstream_status_500'",
             1
@@ -1574,8 +1571,8 @@ async fn pg_upstream_stream_error_is_audited() {
     let _ = read_events(response).await;
 
     assert!(
-        wait_for_rows(
-            &db,
+        common::wait_for_rows(
+            &db.pool,
             "SELECT count(*) FROM audit_logs \
              WHERE decision = 'error' AND reason LIKE 'upstream_error_frame_%'",
             1
@@ -1670,8 +1667,8 @@ async fn pg_gate_rejection_is_audited_as_deny() {
     assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
 
     assert!(
-        wait_for_rows(
-            &db,
+        common::wait_for_rows(
+            &db.pool,
             "SELECT count(*) FROM audit_logs \
              WHERE decision = 'deny' AND reason = 'user_in_flight'",
             1
@@ -1680,8 +1677,8 @@ async fn pg_gate_rejection_is_audited_as_deny() {
         "闸门拒绝必须留 deny 审计"
     );
     assert!(
-        wait_for_rows(
-            &db,
+        common::wait_for_rows(
+            &db.pool,
             "SELECT count(*) FROM audit_logs WHERE decision = 'allow'",
             1
         )
@@ -2291,8 +2288,8 @@ async fn pg_audit_records_tool_count_not_tool_content() {
 
     // 审计里必须有"几个工具 + 什么策略"
     assert!(
-        wait_for_rows(
-            &db,
+        common::wait_for_rows(
+            &db.pool,
             "SELECT count(*) FROM audit_logs \
              WHERE action = 'chat.stream' AND decision = 'allow' \
                AND reason = 'tools=1,choice=required'",
