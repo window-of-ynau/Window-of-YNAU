@@ -181,6 +181,42 @@ fn has_user_tables(conn: &Connection) -> CoreResult<bool> {
     Ok(count > 0)
 }
 
+/// 把 rusqlite 的"文件不是数据库 / 库已损坏"翻译成**可操作**的中文提示。
+///
+/// 关键：坏库时**绝不**删除原文件、也**绝不**新建空库——用户的课表/记忆全在那一个文件里，
+/// "静默建新库"等于把仅存的数据一起抹掉。这里只返回错误，由上层把提示原样透传到界面，
+/// 提示里带上备份目录，作为用户可执行的恢复路径。
+fn storage_error(err: rusqlite::Error, action: &str, db_path: Option<&Path>) -> CoreError {
+    let is_corrupt = matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseCorrupt) | Some(rusqlite::ErrorCode::NotADatabase)
+    );
+    if is_corrupt {
+        return CoreError::Storage(corrupt_database_message(db_path, &err.to_string()));
+    }
+    CoreError::Storage(format!("{action}：{err}"))
+}
+
+/// 数据库损坏时给用户看的提示：说清楚"哪里坏了 / 不会自动建新库 / 从哪份备份恢复"。
+fn corrupt_database_message(db_path: Option<&Path>, detail: &str) -> String {
+    let db_display = db_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<内存库>".to_owned());
+    let backup_dir = db_path
+        .and_then(|path| path.parent())
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join("backups"))
+        .unwrap_or_else(|| std::path::PathBuf::from("backups"))
+        .display()
+        .to_string();
+    format!(
+        "本地数据库已损坏，无法打开：{db_display}（{detail}）。\
+         \n为避免覆盖你现有的课表/记忆，云农之窗不会自动新建空库。\
+         \n恢复路径：备份目录 {backup_dir} 里留有迁移前的 yunong.db.bak-*，\
+         挑最近一份复制回 {db_display} 后重试；若没有可用备份，请联系支持，且不要删除原文件。"
+    )
+}
+
 /// 迁移前备份：`<db 父目录>\backups\yunong.db.bak-v{N}-{yyyyMMddHHmmss}`。
 ///
 /// **失败必须中止迁移**（返回 `Err`，调用方不会再往下走）——用户的课表/记忆全在这个文件里，
@@ -266,7 +302,7 @@ fn cleanup_old_backups(dir: &Path) {
 /// 6. 写 `schema_version`。
 fn apply_schema_migrations(conn: &mut Connection, db_path: Option<&Path>) -> CoreResult<()> {
     conn.execute_batch(SCHEMA_META_DDL)
-        .map_err(|err| CoreError::Storage(format!("建 schema_meta 失败：{err}")))?;
+        .map_err(|err| storage_error(err, "建 schema_meta 失败", db_path))?;
     let current = read_schema_version(conn)?;
     if current > SCHEMA_VERSION {
         return Err(CoreError::Storage(format!(
@@ -282,16 +318,16 @@ fn apply_schema_migrations(conn: &mut Connection, db_path: Option<&Path>) -> Cor
     if current == 0 && has_user_tables(conn)? {
         let Some(path) = db_path else {
             // 内存库：没有文件可备份，也没有"老库升级"的语义
-            return migrate_to_latest(conn, current);
+            return migrate_to_latest(conn, current, None);
         };
         backup_before_migration(conn, path, current)?;
     }
-    migrate_to_latest(conn, current)
+    migrate_to_latest(conn, current, db_path)
 }
 
-fn migrate_to_latest(conn: &mut Connection, from: i64) -> CoreResult<()> {
+fn migrate_to_latest(conn: &mut Connection, from: i64, db_path: Option<&Path>) -> CoreResult<()> {
     conn.execute_batch(SCHEMA)
-        .map_err(|err| CoreError::Storage(format!("建表失败：{err}")))?;
+        .map_err(|err| storage_error(err, "建表失败", db_path))?;
     for (version, sql) in MIGRATIONS {
         if *version <= from {
             continue;
@@ -337,7 +373,7 @@ impl CourseStore {
         }
         Self::from_connection(
             Connection::open(path)
-                .map_err(|err| CoreError::Storage(format!("打开 SQLite 失败：{err}")))?,
+                .map_err(|err| storage_error(err, "打开 SQLite 失败", Some(path)))?,
             Some(path),
         )
     }
@@ -625,40 +661,79 @@ mod tests {
         assert!(temp.backups().join(&names[0]).is_file());
     }
 
-    /// 备份失败 → **中止迁移**：open 报错，且库的版本号仍然停在 0（迁移没发生）。
+    /// 备份失败 → **中止迁移**，且**端到端**可恢复：修好文件系统后重试能成功迁移并留下备份。
+    ///
+    /// 拆成"失败—修复—重试"三步，确保：失败时既没迁移、也没动数据；重试时迁移与备份都真正发生。
     #[test]
     fn backup_failure_aborts_migration() {
         let temp = TempDb::new("backup-fail");
         let path = temp.path();
         make_legacy_db(&path);
-        // 把 `backups` 占成一个**文件**：create_dir_all 必然失败
-        std::fs::write(temp.backups(), b"not a directory").unwrap();
 
+        // 迁移前数据基线：1 个学期
+        let terms_before: i64 = {
+            let conn = Connection::open(&path).unwrap();
+            conn.query_row("SELECT count(*) FROM terms", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(terms_before, 1);
+
+        // 1) 把 `backups` 占成一个**文件**：create_dir_all 必然失败 → 迁移必须中止
+        std::fs::write(temp.backups(), b"not a directory").unwrap();
         let error = match CourseStore::open(&path) {
             Ok(_) => panic!("备份失败时必须中止迁移"),
             Err(error) => error,
         };
         let message = format!("{error}");
         assert!(message.contains("已中止迁移"), "{message}");
+        assert!(
+            message.contains("备份"),
+            "提示要说清是备份环节失败：{message}"
+        );
 
-        // 迁移确实没发生：版本仍是 0（没有 schema_version 行）
+        // 迁移确实没发生：版本仍是 0（没有 schema_version 行），数据也没动
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(read_schema_version(&conn).unwrap(), 0);
+            let terms: i64 = conn
+                .query_row("SELECT count(*) FROM terms", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(terms, 1, "中止迁移不许动数据");
+        }
+
+        // 2) 修好文件系统（删掉占位的文件）后重试：迁移应成功，并留下一份真实备份
+        std::fs::remove_file(temp.backups()).unwrap();
+        let store = CourseStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+
+        let names = temp.backup_names();
+        assert_eq!(names.len(), 1, "重试成功后应有 1 份备份：{names:?}");
+        assert!(temp.backups().join(&names[0]).is_file());
+
+        // 迁移后数据仍在，版本已抬到最新
         let conn = Connection::open(&path).unwrap();
-        assert_eq!(read_schema_version(&conn).unwrap(), 0);
+        assert_eq!(read_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let terms: i64 = conn
+            .query_row("SELECT count(*) FROM terms", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(terms, 1, "迁移不许丢数据");
     }
 
-    /// 备份只保留最近 3 份（按文件名里的时间戳），更早的自动清理。
+    /// 备份只保留最近 3 份（按文件名里的时间戳），更早的自动清理；
+    /// 且保留下来的是**真实可打开的库文件**（不是占位），能读到迁移前的数据。
     #[test]
     fn backups_are_pruned_to_the_latest_three() {
         let temp = TempDb::new("prune");
         std::fs::create_dir_all(temp.backups()).unwrap();
-        // 预先放 5 份"旧备份"，时间戳递增
-        for stamp in [
-            "20260101000000",
-            "20260102000000",
-            "20260103000000",
-            "20260104000000",
-            "20260105000000",
-        ] {
+        // 预先放 5 份旧备份，时间戳递增（用 2020 年，保证一定早于"现在生成"的那份）
+        let seeded = [
+            "20200101000000",
+            "20200102000000",
+            "20200103000000",
+            "20200104000000",
+            "20200105000000",
+        ];
+        for stamp in seeded {
             std::fs::write(
                 temp.backups().join(format!("yunong.db.bak-v0-{stamp}")),
                 b"old",
@@ -672,17 +747,155 @@ mod tests {
 
         let names = temp.backup_names();
         assert_eq!(names.len(), BACKUP_KEEP, "只该留 3 份：{names:?}");
-        // 最新的三份保留（新建的那份时间戳最大，一定在里面）
+
+        // 找出本次真实生成的那份（不在预置列表里的）
+        let new_names: Vec<&String> = names
+            .iter()
+            .filter(|name| !seeded.iter().any(|stamp| name.ends_with(*stamp)))
+            .collect();
+        assert_eq!(new_names.len(), 1, "应恰有一份本次新建的备份：{names:?}");
+        let new_backup = temp.backups().join(new_names[0]);
+        assert!(new_backup.is_file(), "{}", new_backup.display());
         assert!(
-            names
-                .iter()
-                .any(|name| name.starts_with("yunong.db.bak-v0-2")),
-            "{names:?}"
+            std::fs::metadata(&new_backup).unwrap().len() > 0,
+            "备份不能是空文件"
+        );
+
+        // 保留的是最新三份：本次新建 + 20200105 + 20200104；更早的应被清掉
+        for keep in ["20200104000000", "20200105000000"] {
+            assert!(
+                names.iter().any(|name| name.ends_with(keep)),
+                "较新的应保留 {keep}：{names:?}"
+            );
+        }
+        for gone in ["20200101000000", "20200102000000", "20200103000000"] {
+            assert!(
+                !names.iter().any(|name| name.ends_with(gone)),
+                "最早的应被清掉 {gone}：{names:?}"
+            );
+        }
+
+        // 备份是真实的迁移前副本：能打开，且含迁移前的那个学期
+        let backup_conn = Connection::open(&new_backup).unwrap();
+        let terms: i64 = backup_conn
+            .query_row("SELECT count(*) FROM terms", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(terms, 1, "备份里应有迁移前的数据");
+    }
+
+    /// 数据库文件损坏时：**报错并给出恢复路径**，绝不静默新建空库、绝不改写原文件。
+    #[test]
+    fn corrupt_database_is_reported_not_silently_recreated() {
+        let temp = TempDb::new("corrupt");
+        let path = temp.path();
+        // 一段明显不是 SQLite 的内容（模拟磁盘损坏 / 被别的程序写坏）
+        let garbage = b"this is not a sqlite database, just garbage bytes 0123456789".repeat(8);
+        std::fs::write(&path, &garbage).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let error = match CourseStore::open(&path) {
+            Ok(_) => panic!("损坏的库必须报错，不能当成新库静默建表"),
+            Err(error) => error,
+        };
+        let message = format!("{error}");
+        assert!(message.contains("损坏"), "提示要说明是库损坏：{message}");
+        assert!(
+            message.contains("不会自动新建空库"),
+            "必须明确不会静默建新库：{message}"
+        );
+        assert!(message.contains("备份"), "提示要给恢复路径：{message}");
+        assert!(
+            message.contains("backups"),
+            "恢复路径要指向备份目录：{message}"
+        );
+
+        // 关键：原文件一个字节都不许被改写（没被替换成合法的空库）
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "损坏库原文件不能被覆盖/重建");
+        // 损坏场景没有可备份的数据，不该凭空生成备份目录
+        assert!(!temp.backups().exists(), "损坏库不该产生备份目录");
+    }
+
+    /// 恢复路径可走通：把最近一份备份复制回主库后，能重新打开且数据还在。
+    #[test]
+    fn corrupt_database_is_recoverable_from_backup() {
+        let temp = TempDb::new("corrupt-recover");
+        let path = temp.path();
+        make_legacy_db(&path);
+        // 正常迁移一次：生成一份真实的迁移前备份
+        {
+            let store = CourseStore::open(&path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        }
+        let names = temp.backup_names();
+        assert_eq!(names.len(), 1, "应有一份迁移前备份：{names:?}");
+        let backup = temp.backups().join(&names[0]);
+
+        // 模拟主库文件损坏
+        std::fs::write(&path, b"corrupted!".repeat(64)).unwrap();
+        assert!(CourseStore::open(&path).is_err(), "损坏库应先报错");
+
+        // 按提示的恢复路径：把最近一份备份复制回主库，重新打开成功且数据还在
+        std::fs::copy(&backup, &path).unwrap();
+        let store = CourseStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let terms = store.list_terms().unwrap();
+        assert_eq!(terms.len(), 1, "从备份恢复后数据应还在");
+        assert_eq!(terms[0].term, "2026 秋");
+    }
+
+    /// 程序版本低于库版本：**硬失败、不降级**，且不动用户数据、不做无谓迁移。
+    #[test]
+    fn newer_schema_version_is_rejected_without_downgrade() {
+        let temp = TempDb::new("newer-schema");
+        let path = temp.path();
+        // 先建一个正常库并写入数据
+        {
+            let mut store = CourseStore::open(&path).unwrap();
+            store
+                .import_report("2026-2027-1", &report(vec![course("高等数学A", 1, 1, 2)]))
+                .unwrap();
+        }
+        // 模拟"更新的程序"已经把库升到 v(SCHEMA_VERSION + 1)
+        let newer = SCHEMA_VERSION + 1;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                params![newer.to_string()],
+            )
+            .unwrap();
+        }
+
+        // 老程序强行打开：必须硬失败，提示升级而不是降级
+        let error = match CourseStore::open(&path) {
+            Ok(_) => panic!("库版本比程序新时必须硬失败"),
+            Err(error) => error,
+        };
+        let message = format!("{error}");
+        assert!(message.contains("不降级"), "{message}");
+        assert!(
+            message.contains(&newer.to_string()),
+            "要报出库的版本：{message}"
         );
         assert!(
-            !names.iter().any(|name| name.ends_with("20260101000000")),
-            "最旧的应被清掉：{names:?}"
+            message.contains(&SCHEMA_VERSION.to_string()),
+            "要报出程序支持的版本：{message}"
         );
+
+        // 没有降级：版本号仍是 newer，用户数据也还在
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            read_schema_version(&conn).unwrap(),
+            newer,
+            "拒绝打开时不许把版本号改回低版本"
+        );
+        let courses: i64 = conn
+            .query_row("SELECT count(*) FROM courses", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(courses, 1, "拒绝打开时不许动用户数据");
+        // 只是拒绝打开，没发生迁移，不该产生备份
+        assert!(!temp.backups().exists(), "未迁移不应产生备份目录");
     }
 
     fn course(name: &str, weekday: u8, start: u8, end: u8) -> Course {
