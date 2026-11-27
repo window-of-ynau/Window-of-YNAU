@@ -1368,6 +1368,153 @@ mod tests {
         assert!(text.contains("fetched=1"));
         assert!(!text.contains("user"), "摘要里不该出现用户概念");
     }
+
+    // ===== 抓取失败重试语义（不依赖数据库；`try_fetch` 只用 fetcher + config） =====
+    //
+    // 变异验证：把 `try_fetch` 里的 `while attempts <= self.config.retries` 改成只跑一次
+    // （或把 `Err(error)` 分支的 `if !error.retryable { break; }` 删掉），下面四条必红。
+    // 这几条正是 gap-matrix「抓取失败重试语义」的契约：
+    //   * 可重试错误 → 总共重试 `retries + 1` 次，成功即停；
+    //   * 永久错误（404/类型不支持）→ 立刻停，不浪费重试；
+    //   * 重试预算用尽 → 返回最后一次错误，attempts 精确等于预算。
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// 按脚本返回结果的抓取器；脚本用完后一直返回成功。
+    struct ScriptedFetcher {
+        script: Mutex<VecDeque<Result<FetchedDoc, FetchError>>>,
+        calls: Mutex<u32>,
+    }
+
+    impl ScriptedFetcher {
+        fn new(script: Vec<Result<FetchedDoc, FetchError>>) -> Arc<Self> {
+            Arc::new(Self {
+                script: Mutex::new(script.into()),
+                calls: Mutex::new(0),
+            })
+        }
+        fn calls(&self) -> u32 {
+            *self.calls.lock().expect("锁")
+        }
+    }
+
+    impl Fetcher for ScriptedFetcher {
+        fn fetch<'a>(&'a self, _target: &'a FetchTarget) -> FetchFuture<'a> {
+            *self.calls.lock().expect("锁") += 1;
+            let outcome = self
+                .script
+                .lock()
+                .expect("锁")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(FetchedDoc {
+                        content_type: "text/plain".to_owned(),
+                        body: b"ok".to_vec(),
+                    })
+                });
+            Box::pin(async move { outcome })
+        }
+    }
+
+    /// 造一条不连库的管线：`try_fetch` 不碰 `pool`/`rag`，用 lazy pool 即可。
+    fn pipeline_with(fetcher: Arc<ScriptedFetcher>, retries: u32) -> FetchPipeline {
+        let pool = sqlx::PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .expect("lazy pool 不该连接");
+        let rag = Arc::new(RagService::new(
+            &crate::config::Config::for_tests(),
+            None,
+        ));
+        FetchPipeline::new(
+            pool,
+            rag,
+            fetcher,
+            FetchConfig {
+                top_n: 1,
+                retries,
+                backoff: Duration::ZERO,
+                retry_failed: false,
+                min_interval: Duration::ZERO,
+                stale_after: Duration::from_secs(1_800),
+                max_body_bytes: 1024 * 1024,
+                doi_allowed_hosts: Vec::new(),
+            },
+        )
+    }
+
+    fn plain(text: &str) -> FetchedDoc {
+        FetchedDoc {
+            content_type: "text/plain".to_owned(),
+            body: text.as_bytes().to_vec(),
+        }
+    }
+
+    fn target() -> FetchTarget {
+        FetchTarget {
+            identifier: "10.1/x".to_owned(),
+            source: "doi".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_fetch_retries_retryable_until_success() {
+        let fetcher = ScriptedFetcher::new(vec![
+            Err(FetchError::retryable("timeout-1")),
+            Err(FetchError::retryable("timeout-2")),
+            Ok(plain("第三次成功")),
+        ]);
+        let pipeline = pipeline_with(fetcher.clone(), 3);
+        let (attempts, error, text) = pipeline.try_fetch(&target()).await;
+        assert_eq!(attempts, 3, "应在第 3 次成功，且 attempts 精确");
+        assert_eq!(fetcher.calls(), 3);
+        assert_eq!(text.as_deref(), Some("第三次成功"));
+        assert!(error.is_empty(), "成功后不该携带错误：{error}");
+    }
+
+    #[tokio::test]
+    async fn try_fetch_permanent_error_stops_immediately() {
+        let fetcher = ScriptedFetcher::new(vec![
+            Err(FetchError::permanent("404：资源不存在")),
+            Ok(plain("不该被调用")),
+        ]);
+        let pipeline = pipeline_with(fetcher.clone(), 3);
+        let (attempts, error, text) = pipeline.try_fetch(&target()).await;
+        assert_eq!(attempts, 1, "永久失败 1 次就停，不浪费重试");
+        assert_eq!(fetcher.calls(), 1);
+        assert!(text.is_none());
+        assert!(error.contains("404"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn try_fetch_exhausts_exactly_the_retry_budget() {
+        // retries = 3 ⇒ 总尝试 4 次（1 + 3 次重试），第 5 次不该发生。
+        let fetcher = ScriptedFetcher::new(vec![
+            Err(FetchError::retryable("boom-1")),
+            Err(FetchError::retryable("boom-2")),
+            Err(FetchError::retryable("boom-3")),
+            Err(FetchError::retryable("boom-4")),
+            Ok(plain("永远到不了")),
+        ]);
+        let pipeline = pipeline_with(fetcher.clone(), 3);
+        let (attempts, error, text) = pipeline.try_fetch(&target()).await;
+        assert_eq!(attempts, 4, "1 次 + 3 次重试 = 4");
+        assert_eq!(fetcher.calls(), 4);
+        assert!(text.is_none());
+        assert_eq!(error, "boom-4", "应保留最后一次错误");
+    }
+
+    #[tokio::test]
+    async fn try_fetch_zero_retries_is_single_attempt() {
+        let fetcher = ScriptedFetcher::new(vec![
+            Err(FetchError::retryable("boom")),
+            Ok(plain("不该被调用")),
+        ]);
+        let pipeline = pipeline_with(fetcher.clone(), 0);
+        let (attempts, _error, text) = pipeline.try_fetch(&target()).await;
+        assert_eq!(attempts, 1, "retries=0 只尝试一次");
+        assert_eq!(fetcher.calls(), 1);
+        assert!(text.is_none());
+    }
 }
 
 /// **跨语言 RAG 向量的事实源**（端侧 Flutter 的 `canonical()` / `hashIdentifier()` 与这里对齐）。

@@ -7,8 +7,6 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
-
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
@@ -108,15 +106,11 @@ fn fake_hash(seed: &str) -> String {
 /// 为什么必须轮询：审计是**异步写**（`record_audit_detached` 里 `tokio::spawn`），
 /// HTTP 响应返回时那一行可能还没落库。本地常常抢在写之前跑完、CI 上却会输掉竞速
 /// （PR #39 的 pg job 就是这样红的）。固定 `sleep` 只是把竞态窗口挪小，不能消除。
+///
+/// 具体轮询实现在 `common::wait_for_rows`（与 `chat_stream.rs` 共用同一份，
+/// 避免每个测试二进制各写一套、行为漂移）。
 async fn wait_for_count(pool: &sqlx::PgPool, sql: &str, expected: i64) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if common::count(pool, sql).await >= expected {
-            return;
-        }
-        assert!(Instant::now() < deadline, "5s 内没等到异步写入落库：{sql}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    common::wait_for_rows_or_panic(pool, sql, expected).await;
 }
 
 fn current_month() -> String {
@@ -887,6 +881,40 @@ async fn pg_rag_tables_have_no_user_id_column() {
     db.finish().await;
 }
 
+/// 审计/记账是 fire-and-forget：响应返回后立刻 `count` 会抢跑（旧断言实测 3 跑挂 1 跑）。
+/// 这条用例**确定性**地复现这个竞态：先证明"立即读 = 0"（旧写法必红），
+/// 再证明 `common::wait_for_rows` 能等到异步写入（修复后必绿）。
+///
+/// 变异验证：把第二次断言换成 `common::count(...)` 的一次性读取，本用例必红。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_wait_for_rows_tolerates_fire_and_forget_visibility() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    db.execute("CREATE TABLE IF NOT EXISTS probe_async_visibility (id integer)")
+        .await;
+    let writer = db.pool.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = sqlx::query("INSERT INTO probe_async_visibility VALUES (1)")
+            .execute(&writer)
+            .await;
+    });
+    // 旧写法（响应后立刻单次断言）：此刻行还没落库 → 0
+    assert_eq!(
+        common::count(&db.pool, "SELECT count(*) FROM probe_async_visibility").await,
+        0,
+        "异步写入还没来得及落库（这正是旧断言抢跑的窗口）"
+    );
+    // 修复写法（轮询）：等到落库 → 1
+    assert!(
+        common::wait_for_rows(&db.pool, "SELECT count(*) FROM probe_async_visibility", 1).await,
+        "wait_for_rows 应等到 fire-and-forget 写入落库"
+    );
+    db.finish().await;
+}
+
 /// 迁移可重入：把 0005 再跑一遍（老库升级 / 重入场景）不应报错。
 #[tokio::test]
 #[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
@@ -925,6 +953,110 @@ async fn pg_migration_0005_is_idempotent() {
     .execute(&db.pool)
     .await;
     assert!(rejected.is_err(), "非法 status 应被 CHECK 约束拒绝");
+
+    db.finish().await;
+}
+
+/// 迁移幂等（**全量**）：把 `crates/server/migrations/*.sql` 按文件名顺序**整批再跑一遍**
+/// 必须（a）不报错，（b）不重复写数据（种子/业务行数不变），（c）状态机 CHECK 约束仍在。
+///
+/// 这条用例覆盖的是运维最真实的动作——`for f in migrations/*.sql; psql -f $f`：
+/// 迁移不是只在新库跑一次，老库升级 / 手工补跑 / 重放都会再执行一遍。
+///
+/// # 变异验证（去掉下面的幂等保护后，本用例必须变红）
+///
+/// - 把 `0001_init.sql` 末尾的 `INSERT INTO plans ... ON CONFLICT (code) DO NOTHING`
+///   改成**普通 INSERT** → 重跑后 `plans` 从 2 变 4，`plans` 断言红；
+/// - 把 `0005_rag_referrals.sql` 里 `DO $$ IF NOT EXISTS ... ADD CONSTRAINT` 改回
+///   旧的 `DROP CONSTRAINT` + `ADD CONSTRAINT`，且库里有 `fetching` 行 → 重跑抛
+///   check_violation，`raw_sql` 那步直接 panic；
+/// - 把 `0006` 的 `DO` 守卫去掉、无条件 `DROP+ADD` → 同上丢失约束 / 报错。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
+async fn pg_migrations_are_idempotent_and_do_not_duplicate_data() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+
+    // 造两类"重跑时容易出事"的真实数据：
+    // 1) 业务行（重跑不得翻倍）；
+    // 2) 一条 fetching 行——旧版 0005 的 "DROP 后 ADD" 在这里会 ADD 失败并永久丢约束。
+    db.execute("INSERT INTO users (email) VALUES ('idem@example.com')")
+        .await;
+    db.execute(
+        "INSERT INTO rag_referrals (month, hash, count) VALUES ('2026-11', 'idem-hash', 3)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO rag_candidates (month, hash, count, status) VALUES ('2026-11', 'idem-hash', 3, 'pending')",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO rag_candidates (month, hash, count, status, claimed_at) \
+         VALUES ('2026-11', 'fetching-idem', 1, 'fetching', now())",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO rag_known_docs (month, identifier, source) VALUES ('2026-11', '10.1/idem', 'doi')",
+    )
+    .await;
+
+    // 每个被观察的表的行数基线（重跑前后必须一致）。
+    let probes: [(&str, &str); 7] = [
+        ("plans", "SELECT count(*) FROM plans"),
+        ("users", "SELECT count(*) FROM users"),
+        ("audit_logs", "SELECT count(*) FROM audit_logs"),
+        ("rag_referrals", "SELECT count(*) FROM rag_referrals"),
+        ("rag_candidates", "SELECT count(*) FROM rag_candidates"),
+        ("rag_known_docs", "SELECT count(*) FROM rag_known_docs"),
+        ("invite_codes", "SELECT count(*) FROM invite_codes"),
+    ];
+    let mut before = Vec::with_capacity(probes.len());
+    for (_, sql) in &probes {
+        before.push(common::count(&db.pool, sql).await);
+    }
+    assert_eq!(before[0], 2, "0001 应种入 2 条示例套餐（当前是 {}）", before[0]);
+    assert_eq!(before[4], 2, "两条候选（pending + fetching）");
+
+    // 真正把**每一份迁移**再执行一遍（含 0001 的套餐种子、0005/0006 的约束守卫）。
+    let names = common::migration_names();
+    assert!(names.len() >= 8, "迁移文件数看起来不对：{names:?}");
+    for name in &names {
+        let sql = common::migration_sql(name);
+        sqlx::raw_sql(&sql)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(|error| panic!("重跑 {name} 失败（迁移必须可重入）：{error}"));
+    }
+
+    // (b) 不重复写数据：所有被观察表的行数必须和重跑前完全一致。
+    for (index, (label, sql)) in probes.iter().enumerate() {
+        assert_eq!(
+            common::count(&db.pool, sql).await,
+            before[index],
+            "重跑迁移后 {label} 行数变了（说明迁移重复写数据）"
+        );
+    }
+
+    // (c) 状态机 CHECK 约束仍在，且非法值仍被拒（旧版 0005 重跑会把它丢掉）。
+    assert_eq!(
+        common::count(
+            &db.pool,
+            "SELECT count(*) FROM pg_constraint \
+             WHERE conname = 'rag_candidates_status_check' \
+               AND conrelid = 'rag_candidates'::regclass"
+        )
+        .await,
+        1,
+        "全量重跑后 rag_candidates 的 status CHECK 约束丢了"
+    );
+    let illegal = sqlx::query(
+        "INSERT INTO rag_candidates (month, hash, count, status) \
+         VALUES ('2026-11', 'illegal', 1, 'weird_status')",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(illegal.is_err(), "重跑后非法 status 仍必须被 CHECK 拒绝");
 
     db.finish().await;
 }
