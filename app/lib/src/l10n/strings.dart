@@ -34,9 +34,14 @@ class CampusS {
   static const String software = '正版软件';
   static const String captureCacheTooShort = '（过短）';
   static const String captureCacheNever = 'cardId: 尚未抓取过（需要先成功抓取一次课表，之后这里会显示缓存值）';
+  static const String redacted = '<已脱敏>';
 
   static String captureCacheSummary(String maskedCardId, String capturedAtLabel, String years) =>
       'cardId: $maskedCardId（来自上次抓取，缓存于 $capturedAtLabel） · 学期: $years';
+
+  static String studentIdMasked(String masked) => '学号：$masked';
+
+  static String nameMasked() => '姓名：$redacted';
 }
 
 class SettingsS {

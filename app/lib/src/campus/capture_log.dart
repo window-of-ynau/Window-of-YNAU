@@ -12,6 +12,8 @@ import 'package:flutter/foundation.dart';
 
 import '../core/app_paths.dart';
 import '../core/timetable_service.dart';
+import '../l10n/strings.dart';
+import 'redact.dart';
 
 /// 一次抓取尝试的结构特征（不依赖 `ParseAttempt`，便于 UI 与日志复用）。
 class CaptureAttemptRecord {
@@ -79,14 +81,16 @@ class CaptureApiRecord {
   final List<int> missingWeeks;
   final int? imported;
 
-  String get line =>
-      '路径=api / json 长度=$jsonLength / '
-      'elements=${elementsCount == null ? '未知' : '$elementsCount 个'} / '
-      'years=${yearsCount == null ? '未知' : '$yearsCount 个'} / '
-      '周数=${weeksCount == null ? '未知' : weeksCount} / '
-      '缺周=${missingWeeks.isEmpty ? '无' : missingWeeks.join(',')} / '
-      'cardId="${cardId.trim()}" / term="$term" / URL="${url.trim()}" / '
-      '入库=${imported == null ? '未入库' : '$imported 门课'}';
+  /// 一行诊断文本：**出口统一脱敏**（cardId 已在字段上掩码，URL 里可能还有查询参数）。
+  String get line => CaptureLog.sanitize(
+        '路径=api / json 长度=$jsonLength / '
+        'elements=${elementsCount == null ? '未知' : '$elementsCount 个'} / '
+        'years=${yearsCount == null ? '未知' : '$yearsCount 个'} / '
+        '周数=${weeksCount == null ? '未知' : weeksCount} / '
+        '缺周=${missingWeeks.isEmpty ? '无' : missingWeeks.join(',')} / '
+        'cardId="${maskIdentifier(cardId)}" / term="$term" / URL="${url.trim()}" / '
+        '入库=${imported == null ? '未入库' : '$imported 门课'}',
+      );
 }
 
 /// t176：写日志的结果 —— **把"写失败"也带出来**，不再静默返回 null。
@@ -296,24 +300,77 @@ class CaptureLog {
     }
   }
 
-  /// 脱敏：去掉 Cookie / Set-Cookie / token / ticket / authorization 的值。
+  /// 脱敏：Cookie / token / **学号** / **姓名** / **cardId**。
+  ///
+  /// security R7 M1：整页 HTML 回退时 head/tail 可能带出「学号：20231122 姓名：张三」，
+  /// 所以这里按上下文掩码（宁严勿松）；M2：cardId 与 [maskIdentifier] 同口径。
+  ///
+  /// 注意：Dart 的 `replaceAll` **不做 `$1` 分组回填**，这里一律用 `replaceAllMapped`
+  /// （R7-L2：旧实现会把字面 `$1` 写进日志）。
   static String sanitize(String text) {
     if (text.isEmpty) {
       return text;
     }
     String out = text;
-    // Dart 的 RegExp 不支持内联 `(?i)`，用 caseSensitive: false。
-    out = out.replaceAll(
+
+    // 1) Cookie / Set-Cookie：值整段去掉（可能跨行 base64）。
+    out = out.replaceAllMapped(
       RegExp(r'(cookie|set-cookie)\s*[:=]\s*[^\r\n]*', caseSensitive: false),
-      r'$1: <已脱敏>',
+      (Match m) => '${m.group(1)}: ${CampusS.redacted}',
     );
-    out = out.replaceAll(
-      RegExp(
-        r'\b(token|ticket|authorization|access_token|id_token|password)\b\s*[:=]\s*[^\s;&,"<>]+',
-        caseSensitive: false,
-      ),
-      r'$1=<已脱敏>',
+
+    // 2) token / ticket / authorization / password：`key=value` 与 JSON 引号形态都要覆盖。
+    const String secretKeys =
+        'token|ticket|authorization|access_token|id_token|refresh_token|password|session';
+    out = out.replaceAllMapped(
+      RegExp('\\b($secretKeys)\\b\\s*[:=]\\s*"[^"]*"', caseSensitive: false),
+      (Match m) => '${m.group(1)}=${CampusS.redacted}',
     );
+    out = out.replaceAllMapped(
+      RegExp('\\b($secretKeys)\\b\\s*[:=]\\s*[^\\s;&,"<>]+', caseSensitive: false),
+      (Match m) => '${m.group(1)}=${CampusS.redacted}',
+    );
+    out = out.replaceAllMapped(
+      RegExp('"($secretKeys)"\\s*:\\s*"[^"]*"', caseSensitive: false),
+      (Match m) => '"${m.group(1)}":"${CampusS.redacted}"',
+    );
+    // URL 编码形态：`%3Fticket%3DST-...` / `ticket%3D...`
+    out = out.replaceAllMapped(
+      RegExp('(ticket|access_token)(%3D|=)[^&\\s"\'<>]+', caseSensitive: false),
+      (Match m) => '${m.group(1)}=${CampusS.redacted}',
+    );
+
+    // 3) cardId：先按 key 掩码，再把裸露的 32-hex 统一掩码（URL/JSON 里都常见）。
+    out = out.replaceAllMapped(
+      RegExp(r'(cardId|card_id)\s*[:=]\s*"?([0-9A-Za-z_-]{8,})"?', caseSensitive: false),
+      (Match m) => '${m.group(1)}="${maskIdentifier(m.group(2)!)}"',
+    );
+    out = out.replaceAllMapped(
+      RegExp(r'\b[0-9a-fA-F]{32}\b'),
+      (Match m) => maskIdentifier(m.group(0)!),
+    );
+
+    // 4) 学号：中文上下文（学号：20231122）+ 字段名（studentId / student_id / xh）。
+    out = out.replaceAllMapped(
+      RegExp(r'学号\s*[：:]\s*(\d{6,20})'),
+      (Match m) => CampusS.studentIdMasked(maskStudentId(m.group(1)!)),
+    );
+    out = out.replaceAllMapped(
+      RegExp("\\b(studentId|student_id|xh)\\b\\s*[:=]\\s*[\"']?(\\d{6,20})",
+          caseSensitive: false),
+      (Match m) => '${m.group(1)}=${maskStudentId(m.group(2)!)}',
+    );
+
+    // 5) 姓名：中文上下文（姓名：张三）+ JSON/字段名 name（宁严勿松）。
+    out = out.replaceAllMapped(
+      RegExp('姓名\\s*[：:]\\s*[\\u4e00-\\u9fa5]{2,4}'),
+      (Match _) => CampusS.nameMasked(),
+    );
+    out = out.replaceAllMapped(
+      RegExp('\\bname\\b\\s*[:=]\\s*["\']?[\\u4e00-\\u9fa5]{2,4}["\']?', caseSensitive: false),
+      (Match _) => 'name=${CampusS.redacted}',
+    );
+
     return out;
   }
 

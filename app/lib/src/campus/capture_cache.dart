@@ -8,6 +8,7 @@
 import 'package:flutter/foundation.dart';
 
 import '../l10n/strings.dart';
+import 'redact.dart';
 
 /// 一次成功抓取留下的标识缓存。
 @immutable
@@ -22,10 +23,10 @@ class CaptureCacheEntry {
   final String years;
   final DateTime capturedAt;
 
-  /// 脱敏展示：前 6 位 + … + 后 4 位。
+  /// 脱敏展示：前 6 位 + … + 后 4 位（与诊断日志共用 [maskIdentifier]）。
   String get maskedCardId => cardId.length <= 10
       ? CampusS.captureCacheTooShort
-      : '${cardId.substring(0, 6)}…${cardId.substring(cardId.length - 4)}';
+      : maskIdentifier(cardId);
 
   String get capturedAtLabel {
     String two(int value) => value.toString().padLeft(2, '0');
