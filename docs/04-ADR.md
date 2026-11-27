@@ -715,7 +715,7 @@ W6 要求"重启免二次登录"，而 ADR-02 / ADR-11 要求凭据不出端、�
 
 ### 决策
 
-采用 ②。Windows 用 WebView2 user data folder（`%LOCALAPPDATA%\yunong\webview\`），
+采用 ②。Windows 用 WebView2 user data folder（`%LOCALAPPDATA%\yunong\webview2\`），
 Android 用系统 CookieManager（应用私有目录）。端侧代码**从不读取** Cookie 值。
 
 ### 边界
