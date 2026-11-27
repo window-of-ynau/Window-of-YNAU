@@ -217,3 +217,36 @@ services/
 - `crates/server/src/rag_fetch.rs` 的 `canonical_identifier` / `hash_identifier` / `extract_text` / `store_fetch_result` 是**行为金标准**；Go 试点只允许「等价复刻」，不允许改语义。
 - 状态机终态：`fetched` / `skipped` 不再重入；`failed` 仅在 `RAG_FETCH_RETRY_FAILED=true` 时重选；`fetching` 只有超时才回收。Go 必须完全同构。
 - `rag_candidates.doc_id` 实际存的是**规范化 identifier**（列名历史遗留），不是外键；Go 不得据此做 FK 假设。
+
+---
+
+## §5 度量基线（t16，2026-11，Windows 16 vCPU / 15.2 GB / cargo 1.97.1）
+
+> 引入新语言前先量化「迭代慢」到底慢在哪。以下为实测数据。
+
+### 本地 Rust 迭代
+
+| 操作 | 耗时 |
+|---|---|
+| 冷构建 `cargo build --workspace`（空 target） | **77.3s** |
+| 空转（target 已热） | 0.7s |
+| 改一行 → 编译：core / server / shared | 30.5s / 15.1s / 11.1s |
+| 改一行 → 测试绿：core（测试执行仅 2.2s） | **37.4s** |
+| `clippy --workspace` | 21.9s |
+
+### CI 关键路径（main 绿跑 42592541191，整轮 212s）
+
+| Job | 耗时 | 是否关键路径 |
+|---|---|---|
+| **Android APK** | **212s**（`assembleRelease` 111.6s + rust-android 28.4s + NDK/CMake/下载） | **是** |
+| Flutter（analyze/test） | 109s | 是（并行） |
+| PostgreSQL | 96s | 并行 |
+| **Rust（fmt/clippy/test）** | **66s**（命中 rust-cache） | **否** |
+| 其它（dll-e2e / e2e / 镜像 / 迁移 / cargo-deny / secret / docs） | 8–61s | 并行 |
+
+### 结论（对 ADR-20 的影响）
+
+1. **Rust 不是 CI 的关键路径**（66s，且被 Android 212s 盖过）；**Go 不会改善 CI 总时长**。
+2. 本地 Rust 的痛点是**编译+链接**，不是语言抽象；先做 sccache / lld / workspace 拆分 / Gradle 预热，收益更高、成本更低。
+3. Go 的收益因此**限定在「新增控制面与外部 IO 的开发速度」**，不能拿「CI 太慢」作为引入理由。
+4. 若后续度量显示 Go 试点在开发速度上没有优势，按 ADR-20 的退出条件退回 Rust。
