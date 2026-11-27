@@ -32,6 +32,13 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            // ABI 收敛（#82）：只保留 arm64-v8a。`ndk.abiFilters` / `--target-platform` 只约束
+            // Flutter 引擎（libflutter/libapp）与 NDK 编译产物，**不约束**依赖 AAR 里预编译的
+            // 多 ABI 原生库——`jni` 包（path_provider_android 2.3.1 的传递依赖）自带
+            // armeabi-v7a/arm64-v8a/x86_64 三套 libdartjni.so，会被原样合并进 APK，
+            // 形成"arm64 有核心库、其它 ABI 只有 libdartjni"的混合包（t175 时无 jni 依赖故为纯单 ABI）。
+            // 在打包阶段直接剔掉其它 ABI 的所有原生库，与 splits/abiFilters 均无冲突。
+            excludes += listOf("lib/armeabi-v7a/**", "lib/x86/**", "lib/x86_64/**")
         }
     }
 
