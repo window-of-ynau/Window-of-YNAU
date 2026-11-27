@@ -8,13 +8,21 @@
 
 mod common;
 
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use http_body_util::BodyExt;
+use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
 use time::OffsetDateTime;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 use common::{count, sha256_hex, TestDb};
+use yunong_server::app;
 use yunong_server::auth::{AuthService, ACCESS_TOKEN_TTL_SECS, REFRESH_TOKEN_TTL_SECS};
+use yunong_server::config::Config;
+use yunong_server::state::AppState;
 use yunong_shared::ErrorCode;
 
 const EMAIL: &str = "student@ynau.edu.cn";
@@ -726,7 +734,7 @@ async fn invite_is_single_use_under_concurrency() {
     db.finish().await;
 }
 
-/// 邮箱冲突时**不消耗**邀请码（事务回滚的证据）。
+/// 邮箱冲突时**不消耗**邀请码（事务回滚的证据），且响应与"无效码"不可区分（security r7 H1）。
 #[tokio::test]
 #[ignore = "需要 PostgreSQL（DATABASE_URL），见文件头"]
 async fn invite_is_not_burned_by_an_email_conflict() {
@@ -743,8 +751,9 @@ async fn invite_is_not_burned_by_an_email_conflict() {
     let error = auth
         .register_with_invite(EMAIL, PASSWORD, invite_use("ynau-second"))
         .await
-        .expect_err("重复邮箱必须 422");
-    assert_eq!(error.code, ErrorCode::ValidationError);
+        .expect_err("重复邮箱必须拒绝");
+    assert_eq!(error.code, ErrorCode::InviteInvalid);
+    assert_eq!(error.message, "邀请码无效或已不可用");
 
     assert_eq!(
         auth.invite_batch_stats("b1").await.expect("用量"),
@@ -813,6 +822,117 @@ async fn invite_redemption_records_hashes_only() {
         .await,
         0,
         "invite_codes 不允许有明文列"
+    );
+
+    db.finish().await;
+}
+
+// ============ security r7 H1：邀请码有效性预言机 ============
+
+/// 一个最小的 HTTP 响应快照（只取对外可观察的三项：status / code / message）。
+#[derive(Debug)]
+struct HttpSnapshot {
+    status: StatusCode,
+    code: String,
+    message: String,
+}
+
+/// 真 HTTP 层（不是直接调 `AuthService`）打一次注册，取信封里的三项对外判据。
+async fn register_http(state: &AppState, email: &str, invite: &str) -> HttpSnapshot {
+    let payload = json!({
+        "email": email,
+        "password": PASSWORD,
+        "invite_code": invite,
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/register")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::USER_AGENT, "ynau-pg-auth-test/1.0")
+        .body(Body::from(payload.to_string()))
+        .expect("构造注册请求");
+    let response = app(state.clone())
+        .oneshot(request)
+        .await
+        .expect("服务端应能处理注册请求");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("读取响应体")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    HttpSnapshot {
+        status,
+        code: body["error"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        message: body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    }
+}
+
+/// 「有效码 + 已占邮箱」与「无效码」的 **HTTP 状态 + 错误码 + message 必须完全一致**。
+///
+/// 修前（security r7 H1 实测）：前者 422 `VALIDATION_ERROR "该邮箱已注册"`，
+/// 后者 403 `INVITE_INVALID` —— 拿一个已注册邮箱就能不消耗码地逐码验货。
+/// 这条用例是**内存后端测不出**的 PG 独有行为，必须真库 + 真 HTTP 层。
+#[tokio::test]
+#[ignore = "需要 PostgreSQL（DATABASE_URL），见文件头"]
+async fn invite_validity_is_not_an_oracle_for_registered_email() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let auth = AuthService::new(Some(db.pool.clone()));
+
+    // 1) 用一张有效码占住邮箱 EMAIL（成功路径）
+    issue_invite(&auth, "ynau-h1-seed", "h1", 1, None).await;
+    auth.register_with_invite(EMAIL, PASSWORD, invite_use("ynau-h1-seed"))
+        .await
+        .expect("首次注册应成功");
+
+    // 2) 再发一张**未使用**的有效码：探针拿它配已占邮箱验货（修前会返回 422）
+    issue_invite(&auth, "ynau-h1-valid-probe", "h1", 1, None).await;
+
+    let mut config = Config::for_tests();
+    config.auth_invite_required = true;
+    let state = AppState::new(config, Some(db.pool.clone()));
+
+    let taken_valid = register_http(&state, EMAIL, "ynau-h1-valid-probe").await;
+    let unknown_code = register_http(&state, "fresh@ynau.edu.cn", "ynau-h1-no-such-code").await;
+    let taken_unknown = register_http(&state, EMAIL, "ynau-h1-no-such-code").await;
+
+    for probe in [&taken_valid, &unknown_code, &taken_unknown] {
+        assert_eq!(probe.status, StatusCode::FORBIDDEN, "{probe:?}");
+        assert_eq!(probe.code, "INVITE_INVALID", "{probe:?}");
+        assert_eq!(probe.message, "邀请码无效或已不可用", "{probe:?}");
+    }
+    assert_eq!(taken_valid.status, unknown_code.status);
+    assert_eq!(taken_valid.code, unknown_code.code);
+    assert_eq!(taken_valid.message, unknown_code.message);
+    assert_eq!(taken_valid.status, taken_unknown.status);
+    assert_eq!(taken_valid.code, taken_unknown.code);
+    assert_eq!(taken_valid.message, taken_unknown.message);
+
+    // 3) 注册仍须失败：没多建号；有效探针码也没被烧
+    assert_eq!(
+        count(&db.pool, "SELECT count(*) FROM users").await,
+        1,
+        "预言机探测不得建号"
+    );
+    assert_eq!(
+        auth.invite_batch_stats("h1").await.expect("批次用量"),
+        (1, 2, 2),
+        "探针码不能被烧：只有 seed 那一张被用掉"
+    );
+    assert_eq!(
+        count(&db.pool, "SELECT count(*) FROM invite_redemptions").await,
+        1,
+        "失败探测不得留核销记录"
     );
 
     db.finish().await;

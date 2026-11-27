@@ -112,10 +112,12 @@ pub(crate) struct InviteUse<'a> {
 /// 带邀请码的注册：**核销与建号在同一个事务里**（t141）。
 ///
 /// 原子性体现在三处：
-/// 1. 核销用一条 `UPDATE ... WHERE used_count < max_uses RETURNING` 完成
+/// 1. 邮箱占用**预检在核销之前**（security r7 H1）：已注册邮箱对任何码都返回与
+///    "无效码"完全相同的 403 `INVITE_INVALID`，响应不能用来判断候选码是否有效；
+/// 2. 核销用一条 `UPDATE ... WHERE used_count < max_uses RETURNING` 完成
 ///    "存在 / 未撤销 / 未过期 / 未用完"四道检查与自增——不是"先查后写"；
-/// 2. 邮箱撞唯一约束时**整个事务回滚**，邀请码不会被白吃（否则攻击者用已注册邮箱就能烧掉别人的码）；
 /// 3. 令牌与核销记录同事务提交，不会出现"账号建了但没记账"或"记账了但没建号"。
+///    并发窗口内撞唯一约束时整个事务回滚，邀请码不会被白吃。
 pub(crate) async fn register_with_invite(
     pool: &PgPool,
     email: &str,
@@ -123,6 +125,22 @@ pub(crate) async fn register_with_invite(
     invite: InviteUse<'_>,
 ) -> Result<AuthSession, AuthError> {
     let mut tx = pool.begin().await.map_err(db_error)?;
+
+    // security r7 H1（邀请码有效性预言机）：
+    // 旧顺序先核销再建号，撞唯一键才 422 —— 拿一个已注册邮箱就能"验货"任意候选码：
+    // 422 = 码有效（且事务回滚，不烧码），403 = 码无效。批次撤销/停发因此失去确定性。
+    // 现在把邮箱占用预检挪到核销之前，命中与四类无效码**共用**同一个错误码 + 文案，
+    // 外部无法从响应判断码是否有效；注册仍然失败，不会静默成功。
+    let taken: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM users WHERE lower(email) = lower($1)")
+            .bind(email)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_error)?;
+    if taken.is_some() {
+        tx.rollback().await.ok();
+        return Err(AuthError::invite_invalid());
+    }
 
     let batch: Option<String> = sqlx::query_scalar(
         "UPDATE invite_codes SET used_count = used_count + 1 \
@@ -155,8 +173,11 @@ pub(crate) async fn register_with_invite(
     let user_id: Uuid = match inserted {
         Ok(row) => row.try_get("id").map_err(row_error)?,
         Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            // 并发窗口：预检之后、INSERT 之前被另一个请求占住了邮箱。
+            // 与预检命中、四类无效码保持同一个错误，不留 422 这个可区分的旁路口；
+            // 事务回滚仍然保证邀请码不被烧掉。
             tx.rollback().await.ok();
-            return Err(AuthError::validation("该邮箱已注册"));
+            return Err(AuthError::invite_invalid());
         }
         Err(error) => return Err(db_error(error)),
     };
