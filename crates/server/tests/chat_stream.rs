@@ -1365,7 +1365,7 @@ async fn pg_migration_0003_is_reentrant() {
 
     // 重入两次：第二次必须也是 ok（IF NOT EXISTS / DROP IF EXISTS / 幂等 UPDATE）
     for round in 1..=2 {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(&*sql))
             .execute(&db.pool)
             .await
             .unwrap_or_else(|error| panic!("第 {round} 次执行 0003 失败（不可重入）：{error}"));
