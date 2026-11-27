@@ -902,7 +902,7 @@ async fn pg_migration_0005_is_idempotent() {
     // 重入两次：约束"先删后加"、建表/索引 IF NOT EXISTS、视图 CREATE OR REPLACE。
     // 注意用 `raw_sql`：迁移文件是多条语句，预编译协议（`sqlx::query`）一次只能一条。
     for attempt in 0..2 {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(&*sql))
             .execute(&db.pool)
             .await
             .unwrap_or_else(|error| panic!("第 {} 次重入迁移失败：{error}", attempt + 1));
