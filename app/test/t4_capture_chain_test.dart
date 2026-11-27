@@ -84,13 +84,15 @@ void main() {
         "noteError('hook.fetch'",
         "noteError('hook.xhr'",
         "noteError('observer'",
-        "noteError('probe.json'",
         "'week.' + week",
+        "':0:badjson'",
         'silentErrors: DIAG.silentErrors || []',
       ]) {
         expect(kPortalScheduleScript.contains(needle), isTrue,
             reason: '缺少关键路径上报标记：$needle');
       }
+      // t12 F9：探测 JSON 解析失败是噪音，不得进 silentErrors。
+      expect(kPortalScheduleScript.contains("noteError('probe.json'"), isFalse);
     });
 
     test('CampusBridge 失败详情显示“静默错误”（用户可复制）', () {

@@ -1237,7 +1237,9 @@ bool _shouldShowRawMessage(String code) => const <String>{
       'LOGIN_TIMEOUT',
       // #91：本地库读写失败要带出 Rust 原始错误 + db 绝对路径，便于真机定位
       'STORAGE',
-      'INTERNAL',
+      // t12 F3：setTermStart 的通用异常用专用码；INTERNAL 不再整体放开，
+      // 否则导出的 `describeFailure('INTERNAL', …)` 会把原始异常串显示给用户。
+      'TERM_START_WRITE_FAILED',
     }.contains(code);
 /// t176：接口路径"成功但 0 门课"的内部信号 —— 先写日志再回退 DOM，不当作最终错误。
 /// t176：接口路径"成功但 0 门课"的内部信号 —— 先写日志再回退 DOM，不当作最终错误。
@@ -1406,7 +1408,9 @@ class _FailureCard extends StatelessWidget {
           // 错误码始终显示（便于反馈）；原始错误串只对"抓取/诊断"类错误展示，
           // 导出/存储类只给可读文案（需求：不要显示原始错误串）。
           SelectableText(
-            _shouldShowRawMessage(failure.code) && failure.message.trim().isNotEmpty
+            failure.showRaw &&
+            _shouldShowRawMessage(failure.code) &&
+            failure.message.trim().isNotEmpty
                 ? '错误码 ${failure.code} · ${failure.message}'
                 : '错误码 ${failure.code}',
             style: theme.textTheme.bodySmall?.copyWith(

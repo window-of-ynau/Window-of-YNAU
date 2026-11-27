@@ -15,6 +15,7 @@ import 'package:flutter/services.dart' show rootBundle;
 
 import '../campus/capture_cache.dart';
 import '../campus/portal_api.dart';
+import '../l10n/strings.dart';
 import 'app_paths.dart';
 import 'ffi_bindings.dart';
 
@@ -157,11 +158,15 @@ class TimetableException implements Exception {
     required this.code,
     required this.userHint,
     required this.message,
+    this.showRaw = true,
   });
 
   final String code;
   final String userHint;
   final String message;
+
+  /// 是否允许 UI 展开原始错误串（导出类错误恒 false：只给可读文案）。
+  final bool showRaw;
 
   @override
   String toString() => 'TimetableException($code): $message';
@@ -212,7 +217,13 @@ TimetableException describeFailure(String? code, String? message) {
     case 'STORAGE':
       return TimetableException(
         code: code!,
-        userHint: '本地课表保存失败',
+        userHint: CommonS.localSaveFailed,
+        message: detail,
+      );
+    case 'TERM_START_WRITE_FAILED':
+      return TimetableException(
+        code: code!,
+        userHint: CommonS.localSaveFailed,
         message: detail,
       );
     default:
@@ -223,6 +234,14 @@ TimetableException describeFailure(String? code, String? message) {
       );
   }
 }
+
+/// 导出失败只给用户可读提示：原始异常串留在日志/诊断里，不进失败卡片。
+TimetableException readableExportFailure(TimetableException failure) => TimetableException(
+      code: failure.code,
+      userHint: failure.userHint,
+      message: failure.message,
+      showRaw: false,
+    );
 
 /// 校务页面取数入口（WebView 版 / 调试导入都实现它）。
 abstract class SchoolFetcher {
@@ -511,12 +530,18 @@ class TimetableService {
         message: '${failure.detail}（数据库：$path）',
       );
     } on Object catch (err) {
-      throw describeFailure('INTERNAL', '调用端侧核心失败：$err（数据库：$path）');
+      // t12 F3：不要用宽泛的 INTERNAL（那会把原始异常串暴露给用户），
+      // 用专用错误码，诊断里仍保留原始错误与数据库绝对路径。
+      throw describeFailure('TERM_START_WRITE_FAILED', '调用端侧核心失败：$err（数据库：$path）');
     }
     if (!envelope.ok) {
       final String detail = (envelope.message ?? '').trim();
+      final String rawCode = envelope.code ?? '';
+      final String code = rawCode == 'INTERNAL' || rawCode.isEmpty
+          ? 'TERM_START_WRITE_FAILED'
+          : rawCode;
       throw describeFailure(
-        envelope.code,
+        code,
         '${detail.isEmpty ? '未知原因' : detail}（数据库：$path）',
       );
     }
@@ -537,27 +562,15 @@ class TimetableService {
     }).where((TermSummary item) => item.term.isNotEmpty).toList(growable: false);
   }
 
-  /// ICS 导出目录。
+  /// ICS 导出目录（t12 F2）：**与 dbPath 同一个数据根** `<AppPaths.dataDir>/exports`。
   ///
-  /// Windows 优先 `%USERPROFILE%\Downloads`：用户能在资源管理器里直接找到、双击导入日历；
-  /// 没有该目录时退回应用数据目录 `<base>\yunong\exports`（不往用户目录乱写）。
-  /// 其它平台用应用数据目录（沙箱内，避免申请存储权限）。
-  String get exportDirectory {
-    final override = _exportDir;
-    if (override != null) {
-      return override;
-    }
-    final env = Platform.environment;
-    if (Platform.isWindows) {
-      final profile = env['USERPROFILE'] ?? '';
-      final downloads = <String>[profile, 'Downloads'].join(Platform.pathSeparator);
-      if (profile.isNotEmpty && Directory(downloads).existsSync()) {
-        return downloads;
-      }
-    }
-    final base = env['LOCALAPPDATA'] ?? env['APPDATA'] ?? env['HOME'] ?? Directory.current.path;
-    return <String>[base, 'yunong', 'exports'].join(Platform.pathSeparator);
-  }
+  /// 旧实现自拼 `LOCALAPPDATA/APPDATA/HOME/cwd`，Android 上回落到 cwd（`/`）且未走
+  /// `AppPaths.normalizeBase`，产出 `//yunong/exports` → STORAGE 失败。现在统一走
+  /// [AppPaths.dataDir]，纯函数 [exportDirectoryUnder] 便于离线断言 Android 形状。
+  static String exportDirectoryUnder(String dataDir) =>
+      <String>[dataDir, 'exports'].join(Platform.pathSeparator);
+
+  String get exportDirectory => _exportDir ?? exportDirectoryUnder(AppPaths.dataDir);
 
   /// 导出某学期课表为 `.ics`（W7）。
   ///
@@ -575,10 +588,10 @@ class TimetableService {
     } on CoreUnavailable {
       rethrow;
     } on Object catch (err) {
-      throw describeFailure('INTERNAL', '调用端侧核心失败：$err');
+      throw readableExportFailure(describeFailure('INTERNAL', '调用端侧核心失败：$err'));
     }
     if (!envelope.ok) {
-      throw describeFailure(envelope.code, envelope.message);
+      throw readableExportFailure(describeFailure(envelope.code, envelope.message));
     }
     final data = envelope.data ?? const <String, dynamic>{};
     return IcsExportResult(
