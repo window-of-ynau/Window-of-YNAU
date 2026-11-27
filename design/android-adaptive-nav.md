@@ -1,6 +1,6 @@
-# Android 分层导航方案（v0.9.2 规格）
+# Android 分层导航方案（v0.9.2 规格 · 定稿）
 
-> 状态：**只出规格与线框，未改代码**。
+> 状态：**定稿（t5/d1，#90 + #84）**，只出规格与线框，**未改代码**。配套图标规范见 `design/android-nav-icons.md`；实现见 t6。
 > 依据：`design/layout-spec-v2.md`（桌面布局） + 现有实现 `app/lib/main.dart`（`_HomeShellState` / `_Sidebar` / `_SidebarItem` / `_IconColumnButton`）。
 > 单位一律 **dp**；断点为**窗口宽度**（`MediaQuery.sizeOf(context).width`，不含安全区）。
 
@@ -53,19 +53,25 @@
 
 ### 抽屉内部结构（与桌面 `_Sidebar` 同源，只改尺寸）
 
+> **条目 = `CampusEntry.values`（当前 5 个）+ 对话；设置贴底。**
+> 图标见 `android-nav-icons.md`（#84 定稿，20dp 语义图标）；分组计数 `校园 · N` 随 `entries.length` 实时变，**不要照抄示例里的数字**。
+
 ```
 ┌──────────────────────────────┐ ← paddingTop = statusBar
 │  云农之窗            ✕       │ 44  品牌行（点 ✕ 或遮罩关闭）
 │  对话                        │ 20  当前页名（inkSoft 12）
 ├──────────────────────────────┤
 │  功能                        │ 12  分组标签（10/600/字距 .12em）
-│  ▢  对话                     │ 44  ← 选中：surfaceAlt 底 + 左侧 3dp 强调条
-│  校园 · 3                    │
-│  ▦  我的课表                 │ 44
-│  ▤  成绩查询                 │ 44
-│  ▧  门户通知                 │ 44
-│  ⚙  设置                     │ 44  ← 贴底
+│  [chat]   对话               │ 44  ← 选中：surfaceAlt 底 + 左侧 3dp 强调条
+│  校园 · 5                    │ 12  分组标签（条目数实时 = CampusEntry.values.length）
+│  [portal] 教务门户           │ 44  account_balance_outlined
+│  [scores] 成绩查询           │ 44  assessment_outlined
+│  [timetable] 我的课表        │ 44  calendar_month_outlined
+│  [library] 图书馆            │ 44  local_library_outlined
+│  [software] 正版软件         │ 44  verified_outlined
+│  [settings] 设置             │ 44  ← 贴底（settings_outlined）
 └──────────────────────────────┘
+  行高 44 / 图标 20 / 图标槽 20+8 / 文字 14 / 左 padding 16（= android-nav-icons.md §5）
 ```
 
 ---
@@ -103,14 +109,15 @@
 ││ 对话                       ││ 内容  ││
 │├───────────────────────────┤│ 被遮罩 ││
 ││ 功能                       ││ 盖住  ││
-││ ▐▢  对话                   ││（32%  ││
-││ 校园 · 3                   ││ 黑）  ││
-││  ▦  我的课表               ││       ││
-││  ▤  成绩查询               ││       ││
-││  ▧  门户通知               ││       ││
+││ ▐[chat]  对话              ││（32%  ││ ← 选中：3dp 条 + surfaceAlt
+││ 校园 · 5                   ││ 黑）  ││
+││  [portal]  教务门户        ││       ││
+││  [scores]  成绩查询        ││       ││  （行高 44，图标 20，
+││  [timetable] 我的课表      ││       ││    文字 14；结构见 §2）
+││  [library] 图书馆          ││       ││
+││  [software] 正版软件       ││       ││
 ││                            ││       ││
-││                            ││       ││
-││ ⚙  设置                    ││       ││
+││ [settings] 设置            ││       ││
 │└───────────────────────────┘└───────┘│
 │   composer 被抽屉 + 遮罩整体覆盖      │ ← 见 §5 的取舍
 └──────────────────────────────────────┘
@@ -191,6 +198,9 @@
 5. **选中态**：抽屉里当前页有 `surfaceAlt` 底 + 左侧 3dp 强调条；
 6. **640 平板**：仍是 rail 64（不是抽屉）；**1024 桌面**：侧栏 224；
 7. **安全区**：iPhone 式/安卓手势条下 composer 不被遮挡（`paddingBottom = inset + 12`）。
+8. **图标唯一（#84 回归）**：抽屉 / rail / 侧栏里所有入口的 `IconData` **两两不同**（`tester.widgetList<Icon>(...).map((i) => i.icon).toSet().length == 入口数`），不再出现"6 个入口 5 个同款"；
+9. **图标色**：默认 == `tokens.inkSoft`、选中 == `tokens.ink`（A/B/C 三主题各取一次）；图标不得出现字面量颜色（`grep -R "Icon(.*color: *Color(" app/lib` 无命中）；
+10. **图标尺寸**：每个入口图标 20×20dp；选中条 3dp（抽屉）/ 3×24（rail）。详见 `android-nav-icons.md` §8。
 
 ---
 
@@ -200,8 +210,43 @@
 |---|---|
 | `design/android-nav-mockups/phone-closed-a.png` | 手机 390×844 **关闭态**（A 主题）：无 rail、内容全宽、汉堡在状态行左侧 48×48 |
 | `design/android-nav-mockups/phone-open-a.png` | **打开态**（A 主题）：抽屉 320 + 遮罩 32%，选中项 `surfaceAlt` 底 + 左侧 3dp 条 |
+| `design/android-nav-mockups/phone-open-b.png` | **打开态**（B 深蓝玻璃）：抽屉玻璃面、选中 `surfaceAlt`（rgba 白 .10）、强调条 `#3F68E4` |
 | `design/android-nav-mockups/phone-open-c.png` | **打开态**（C 主题）：抽屉纸面 `#FAF9F5`、强调条 `#A9583E` |
-| `design/android-nav-mockups/preview.png` | 三张并排总览 |
-| `design/android-nav-mockups/phone.html` | 源文件（`?open=0` 或 `?open=1`，`t=a` 或 `t=c`），尺寸即规格数值 |
+| `design/android-nav-mockups/tablet-rail-a.png` | **平板 700×800**：常驻 rail 64 + 选中 3×24 条 + 长按/悬停文字提示（600–839 档） |
+| `design/android-nav-mockups/icons-sheet.png` | **导航图标规范（#84）**：三主题 × 9 槽位（默认 20dp / 选中态行片段 / 48dp）+ token 配色表 |
+| `design/android-nav-mockups/preview.png` | 四张手机态并排总览 |
+| `design/android-nav-mockups/phone.html` `tablet.html` `icons.html` | 源文件（`?open=0`/`?open=1`，`t=a`/`b`/`c`），尺寸即规格数值 |
+| `design/android-nav-mockups/nav-icons.js` | 9 槽位 codepoint + 中文名 + 语义理由（图标唯一来源） |
+| `design/android-nav-mockups/assets/materialicons-regular.otf` | 与 Flutter 同源的 MaterialIcons 字体（视觉稿 == 实现；Apache-2.0） |
 
-视觉稿里**抽屉是 320、遮罩 32%、行高 44、选中条 3dp**——这四个数值请直接照抄，不要在实现时"看着差不多"再调。
+视觉稿里**抽屉是 320、遮罩 32%、行高 44、选中条 3dp、图标 20dp**——这五个数值请直接照抄，不要在实现时"看着差不多"再调。
+
+---
+
+## 9. 定稿决议（v0.9.2，t5/d1）
+
+> 本文前 8 节为规格本体；本节把 t6 实现前必须拍板的口径一次冻结，并修正与原稿示例的出入。
+
+### 9.1 分层导航（#90）——冻结
+
+| 档 | 窗口宽度 | 导航形态 | 内容 padding | 汉堡位置 |
+|---|---|---|---|---|
+| **手机** | `< 600` | **无 rail**；`Scaffold(drawer: _CoverDrawer)` 全高抽屉（宽 `min(320, w−56)`、遮罩 `0x52000000`、打开 246ms / 关闭 200ms、行高 44、选中 `surfaceAlt` + 3dp 条、边缘拖拽 20、返回键关闭） | 16 | 状态行左侧 48×48 |
+| **平板** | `600 – 839` | **常驻 rail 64**（图标 20 / 按钮 40×40 / 图标中心 x=32；选中 3×24 条 + `ink`；长按或悬停显示文字） | 20 | rail 顶部 44 行 |
+| **桌面** | `≥ 840` | 侧栏 **224**（展开）/ **64**（折叠），与 `layout-spec-v2.md` 一致 | 24 | 侧栏顶部（保持不变） |
+
+- **抽屉形态：采用「全高抽屉（方案 A）」**（§5 推荐项）：composer 被覆盖，打开时自动收起键盘；**不采用**半高上推方案（B 备选）。理由见 §5 三条。
+- 常量：`kRailWidth = 64`（平板档，原代码 48 需改）、`kIconColumn = 64`（与 layout-spec-v2 §2 对齐）、`kBpMedium = 600`、`kBpWide = 840`。
+
+### 9.2 与原稿示例的出入修正（实现请按这里）
+
+1. **抽屉条目数以 `CampusEntry.values` 为准**：现在是 **5 个**（教务门户 / 成绩查询 / 我的课表 / 图书馆 / 正版软件）+ 对话 + 设置 = **6 条导航 + 设置**。§2 线框里的「校园 · 3 / 门户通知」只是示例字样，**不是**规格；分组计数用 `entries.length`。
+2. **每个入口一枚独立图标**（#84）：`_Sidebar` 里 `Icons.school_outlined` 的共用写法必须改，映射见 `android-nav-icons.md` §2/§7。
+3. **选中态图标要变色**：`_SidebarItem` 的 `Icon` 颜色由恒 `inkSoft` 改为 `selected ? tokens.ink : tokens.inkSoft`。
+4. **`kIconColumn` 由 48 → 64**：桌面展开侧栏的图标中心 x=32（与汉堡同一竖线）；rail 态不变式（中心 x=32）随之成立。
+
+### 9.3 保留建议（不阻塞 t6，择机做）
+
+- `sidebar.collapsed` **按平台分键**存（`sidebar.collapsed.desktop` / `.tablet`），手机档不读不写。
+- 首次安装自动展开一次抽屉做引导（`nav.onboarded` 一次性标记）——缓解「入口不可见」（§6 风险表）。
+- 图标 P2 增强「今日格」（`android-nav-icons.md` §7.7）不列入 t6 验收。
