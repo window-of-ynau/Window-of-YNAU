@@ -35,7 +35,7 @@ time = { workspace = true }
 futures-core = "0.3"
 dotenvy = "0.15"
 anyhow = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "migrate"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "migrate"] }
 # 上游转发用的 HTTP 客户端：生产上游（DeepSeek / Anthropic）都是 https，
 # TLS 走 rustls + webpki 根证书；刻意不加 `stream` feature——SSE 用 `response.chunk()` 循环读。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
