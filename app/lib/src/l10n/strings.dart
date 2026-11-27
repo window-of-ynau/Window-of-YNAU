@@ -101,6 +101,7 @@ class CommonS {
   const CommonS._();
 
   static const String buildDev = '构建 dev';
+  static const String localSaveFailed = '本地课表保存失败';
 
   static String buildCommit(String commit) => '构建 $commit';
 
