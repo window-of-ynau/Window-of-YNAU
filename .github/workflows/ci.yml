@@ -55,7 +55,11 @@ jobs:
       - name: 安装 Flutter（stable + 缓存 SDK）
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # 钉死 Flutter 版本（#t14）：subosito 的 `channel: stable` 不钉版本，会随 stable
+          # 漂移（11-09=3.47.4，11-26 已漂到 3.50.1）——3.50.x 把 package:flutter/material.dart
+          # 标记为 deprecated（新增 70 条 info）使 `flutter analyze` 变红，并要求 Gradle ≥9.3.1
+          # 使 Android job 变红。本机/基线为 3.47.4，故钉到 3.47.4，杜绝"仓库没改、CI 自己变红"。
+          flutter-version: '3.47.4'
           cache: true
       - name: flutter pub get
         run: flutter pub get
@@ -88,7 +92,11 @@ jobs:
           ls -l target/debug/libyunong_core.so target/debug/examples/fake_sse
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # 钉死 Flutter 版本（#t14）：subosito 的 `channel: stable` 不钉版本，会随 stable
+          # 漂移（11-09=3.47.4，11-26 已漂到 3.50.1）——3.50.x 把 package:flutter/material.dart
+          # 标记为 deprecated（新增 70 条 info）使 `flutter analyze` 变红，并要求 Gradle ≥9.3.1
+          # 使 Android job 变红。本机/基线为 3.47.4，故钉到 3.47.4，杜绝"仓库没改、CI 自己变红"。
+          flutter-version: '3.47.4'
           cache: true
       - name: flutter pub get
         working-directory: app
@@ -738,7 +746,11 @@ jobs:
           java-version: "21"
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # 钉死 Flutter 版本（#t14）：subosito 的 `channel: stable` 不钉版本，会随 stable
+          # 漂移（11-09=3.47.4，11-26 已漂到 3.50.1）——3.50.x 把 package:flutter/material.dart
+          # 标记为 deprecated（新增 70 条 info）使 `flutter analyze` 变红，并要求 Gradle ≥9.3.1
+          # 使 Android job 变红。本机/基线为 3.47.4，故钉到 3.47.4，杜绝"仓库没改、CI 自己变红"。
+          flutter-version: '3.47.4'
           cache: true
       # 【t180】gradle 分发（wrapper 下载 gradle-8.14.3-all.zip）会因 GitHub Release 504 直接失败。
       # setup-gradle 负责缓存/复用 ~/.gradle；wrapper 自身的下载在下一步用 curl 重试兜住。
@@ -794,7 +806,7 @@ jobs:
       - name: 构建 APK
         working-directory: app
         run: flutter build apk --release --target-platform android-arm64
-      - name: 验证 APK 内含 lib/arm64-v8a/libyunong_core.so
+      - name: 验证 APK 含 lib/arm64-v8a/libyunong_core.so 且为严格单 ABI
         run: |
           set -euo pipefail
           apk=app/build/app/outputs/flutter-apk/app-release.apk
@@ -806,7 +818,15 @@ jobs:
             echo "::error::APK 里没有 lib/arm64-v8a/libyunong_core.so —— 装上去 FFI 会加载失败"
             exit 1
           fi
-          echo "OK：APK 内含 lib/arm64-v8a/libyunong_core.so"
+          # #82：混合 ABI（如 jni 包带来的 armeabi-v7a/x86_64 libdartjni.so）必须被
+          # packaging.jniLibs.excludes 剔除；这里断言最终 APK 有且仅有 arm64-v8a 一个 ABI。
+          abis=$(unzip -l "$apk" | awk '$4 ~ /^lib\// {split($4,a,"/"); print a[2]}' | sort -u | tr '\n' ' ')
+          echo "ABI：$abis"
+          if [ "$(echo $abis | wc -w)" -ne 1 ] || [ "$(echo $abis | tr -d ' ')" != "arm64-v8a" ]; then
+            echo "::error::APK 出现多个/非 arm64 ABI（$abis）：必须严格只有 arm64-v8a"
+            exit 1
+          fi
+          echo "OK：APK 内含 lib/arm64-v8a/libyunong_core.so，且只有 arm64-v8a"
       - name: 上传 APK
         uses: actions/upload-artifact@v7
         with:

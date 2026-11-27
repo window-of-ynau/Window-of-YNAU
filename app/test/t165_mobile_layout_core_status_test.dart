@@ -21,35 +21,33 @@ Future<void> _pumpApp(WidgetTester tester, Size size) async {
 void main() {
   tearDown(() => CoreStatus.debugLatest = null);
 
-  group('窄屏（手机）布局：rail 48，内容左让 48（t172）', () {
+  group('手机（<600）布局：无侧栏 + 全宽内容（t6 #90）', () {
     for (final Size size in const <Size>[Size(360, 800), Size(412, 915)]) {
-      testWidgets('${size.width.toInt()}×${size.height.toInt()}：rail 48 + 内容左边界 ≥ 48',
+      testWidgets('${size.width.toInt()}×${size.height.toInt()}：无 rail、内容全宽、汉堡在状态行',
           (WidgetTester tester) async {
         await _pumpApp(tester, size);
 
-        // 1) 窄屏保留左侧 rail（v2 变体 A）
-        expect(find.byKey(const Key('app-sidebar')), findsOneWidget);
-        expect(tester.getRect(find.byKey(const Key('app-sidebar'))).width, lessThanOrEqualTo(52));
+        // 1) 手机档没有任何常驻侧栏
+        expect(find.byKey(const Key('app-sidebar')), findsNothing);
         // 2) 不再有底部导航
         expect(find.byKey(const Key('app-bottom-nav')), findsNothing);
-
-        // 3) 内容区左边界 ≥ 64（不被 rail 遮挡）
+        // 3) 内容全宽（不再左让 48）
         final Rect content = tester.getRect(find.byType(IndexedStack).first);
-        expect(content.left, greaterThanOrEqualTo(48),
-            reason: '内容左边界应 ≥ 48，实际 ${content.left}');
-
-        // 4) t172：AppBar 不再有标题行
+        expect(content.left, lessThan(1), reason: '手机内容应全宽，实际 ${content.left}');
+        // 4) 汉堡在状态行（y<60）
+        expect(tester.getRect(find.byKey(const Key('sidebar-toggle'))).top, lessThan(60));
+        // 5) t172：AppBar 不再有标题行
         expect(find.byKey(const Key('app-title-main')), findsNothing);
       });
     }
   });
 
-  group('中/宽屏（t171 v2）：200 / 224 与内容并排', () {
-    testWidgets('700 宽：中屏侧栏 200 与内容并排', (WidgetTester tester) async {
+  group('中/宽屏（t6 #90）：平板 rail 64 / 桌面 224', () {
+    testWidgets('700 宽：平板 rail 64 与内容并排', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(700, 800));
       final Rect rail = tester.getRect(find.byKey(const Key('app-sidebar')));
       final Rect content = tester.getRect(find.byType(IndexedStack).first);
-      expect(rail.width, closeTo(200, 1), reason: '中屏应为 200');
+      expect(rail.width, closeTo(64, 1), reason: '平板应为 rail 64');
       expect(content.left, greaterThanOrEqualTo(rail.right));
     });
 

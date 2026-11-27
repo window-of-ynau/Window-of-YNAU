@@ -404,6 +404,13 @@ String _formatDiagnostics(  Object? raw, {  int dartScheduleApiCount = 0,  int p
   } else {
     parts.add('探测未发出');
   }
+  // 【#54】页面脚本关键路径里曾经被 `catch(e){}` 吞掉的异常（hook 安装/桥接写入/探测解析/
+  // 按周取数...）。现在由脚本写进 `silentErrors` 一并在失败详情里显示，便于用户复制反馈。
+  final silentErrors = raw['silentErrors'];
+  if (silentErrors is List && silentErrors.isNotEmpty) {
+    final shown = silentErrors.take(5).map((dynamic item) => '[$item]').join(' ');
+    parts.add('静默错误 $shown');
+  }
   final years = raw['years'];
   if (years is String && years.isNotEmpty) {
     parts.add('学期 $years');

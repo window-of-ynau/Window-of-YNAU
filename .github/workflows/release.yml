@@ -187,7 +187,9 @@ jobs:
       - name: 安装 Flutter（stable + 缓存 SDK）
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # 钉死 Flutter 版本（#t14）：避免 stable 漂移到 3.50.x 后要求 Gradle ≥9.3.1、
+          # 并把 package:flutter/material.dart 标记 deprecated。基线版本 3.47.4。
+          flutter-version: '3.47.4'
           cache: true
       - name: flutter pub get
         working-directory: app
@@ -241,16 +243,17 @@ jobs:
           fi
           echo "--- gradle 里的 abiFilters（构建前打印）---"
           grep -A2 'ndk {' android/app/build.gradle.kts || true
-          # ABI 收敛：gradle 的 ndk.abiFilters（t175 已验证该组合产出单 ABI 包）+ release 构建才认 --target-platform。
+          # ABI 收敛（#82）：引擎层由 --target-platform 收成 arm64；依赖 AAR 里的多 ABI 预编译库
+          # （jni 包的 libdartjni.so）由 build.gradle.kts 的 packaging.jniLibs.excludes 在打包阶段剔除，
+          # 因此最终 APK 只剩 lib/arm64-v8a/（严格单 ABI，见下方护栏）。
           # 不用 --split-per-abi：它与 abiFilters 互斥（AGP 直接报 conflicting configuration）。
           flutter build apk --release --target-platform android-arm64
-      # 护栏（t175/t177，captain 裁决方案 b）：接受 universal APK，但必须满足：
-      #   ① lib/arm64-v8a/libyunong_core.so 必须存在；
-      #   ② 其它 ABI 目录里**不得**出现 libyunong_core.so（防止"以为支持、其实没打"）；
-      #   ③ 打印每个 APK 的 lib/ 列表与最终 abis，便于事后核对。
-      # 背景：Flutter 3.47 的 universal APK 固定带三套引擎库，而 Rust 核心只编了 arm64；
-      # 单 ABI 收敛在 AGP 8.11 + Kotlin 2.2 组合下不可用（见 issue #?，PR #81 描述有原文）。
-      - name: 护栏：arm64 必须有 libyunong_core.so，其它 ABI 不得有
+      # 护栏（#82，严格单 ABI）：APK 里 **有且仅有** arm64-v8a 一个 ABI，且必须内含 libyunong_core.so。
+      # 背景：t175（run 42449402603）在无 jni 依赖时产出纯 arm64 单 ABI 包（14,578,311 B）；
+      #   PR #79 引入 path_provider → path_provider_android 2.3.1 → jni，其预编译 libdartjni.so 带
+      #   armeabi-v7a/x86_64 两套，绕过 abiFilters 混进 APK；本护栏不允许用"放宽护栏"掩盖该混合包，
+      #   而是要求 build.gradle.kts 的 packaging.jniLibs.excludes 真正把它们剔掉。
+      - name: 护栏：APK 必须严格只有 arm64-v8a 一个 ABI 且含 libyunong_core.so
         working-directory: app
         run: |
           set -euo pipefail
@@ -265,16 +268,14 @@ jobs:
             abis=$(unzip -l "$apk" | awk '$4 ~ /^lib\// {split($4,a,"/"); print a[2]}' | sort -u | tr '\n' ' ')
             echo "abis: $abis"
             if ! unzip -l "$apk" | grep -q 'lib/arm64-v8a/libyunong_core.so'; then
-              echo "::error::① $apk 缺 lib/arm64-v8a/libyunong_core.so（arm64 真机会 dlopen 失败）"
+              echo "::error::$apk 缺 lib/arm64-v8a/libyunong_core.so（arm64 真机会 dlopen 失败）"
               failed=1
             fi
-            for abi in armeabi-v7a x86 x86_64; do
-              if unzip -l "$apk" | grep -q "lib/$abi/libyunong_core.so"; then
-                echo "::error::② $apk 在 $abi 里也有 libyunong_core.so，但 Rust 核心只编了 arm64-v8a —— 该 ABI 上会加载到残缺库"
-                failed=1
-              fi
-            done
-            [ "$failed" -eq 0 ] && echo "OK：$apk 的 arm64 含核心库，其它 ABI 不含"
+            if [ "$(echo $abis | wc -w)" -ne 1 ] || [ "$(echo $abis | tr -d ' ')" != "arm64-v8a" ]; then
+              echo "::error::$apk 出现多个/非 arm64 ABI（$abis）：必须是严格单 ABI arm64-v8a（混合包在其它 ABI 上必坏）"
+              failed=1
+            fi
+            [ "$failed" -eq 0 ] && echo "OK：$apk 严格只有 arm64-v8a 且含 libyunong_core.so"
           done
           exit $failed
 
@@ -348,7 +349,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # 钉死 Flutter 版本（#t14）：避免 stable 漂移到 3.50.x 后要求 Gradle ≥9.3.1、
+          # 并把 package:flutter/material.dart 标记 deprecated。基线版本 3.47.4。
+          flutter-version: '3.47.4'
           cache: true
       # Windows 构建不需要 gradle：这里不需要 setup-gradle / 分发预热。
       # （曾误把 Android 的预热步骤插进本 job，在 PowerShell 下解析 bash 语法直接 ParserError。）
