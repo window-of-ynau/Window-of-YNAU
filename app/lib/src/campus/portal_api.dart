@@ -665,7 +665,8 @@ const String kPortalScheduleScript = r'''
   // 诊断用：owner/我们据此判断卡在哪一步（不含任何凭据）
   var DIAG = {
     xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0,
-    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: [], probeParams: null, steps: [], probeAttempts: 0
+    hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: [], probeParams: null, steps: [], probeAttempts: 0,
+    silentErrors: []
   };
   // **没有任何"从页面打开算起"的绝对超时**：只有"无进展兜底"（见 watchdog）
   var LAST_PROGRESS = { at: Date.now(), what: 'start' };
@@ -675,6 +676,26 @@ const String kPortalScheduleScript = r'''
   function progress(what) {
     LAST_PROGRESS = { at: Date.now(), what: what };
     timeoutPosted = false;
+  }
+
+  // 【#54】关键路径的异常**不再 `catch (e) {}` 静默吞**：统一记进 `DIAG.silentErrors`，
+  // 由 `__yunongDiagnostics()` 上报，Dart 侧写进失败详情（用户可「复制诊断信息」发给我们）。
+  //
+  // 只给**关键路径**用：hook 安装/捕获、桥接状态写入、MutationObserver、探测 JSON 解析、
+  // 按周取数失败。以下这些 catch 仍刻意保持静默（有回退或纯诊断，逐条上报只会淹没关键错误）：
+  // termFromDom / cardIdFromPage / scanSources（跨域 iframe）/ autoTrigger 的 DOM 点击 /
+  // document.title / 滚动选中 —— 失败时仍有其它路径产出结果。
+  function noteError(where, e) {
+    try {
+      var name = (e && e.name) ? String(e.name) : 'Error';
+      var msg = (e && e.message) ? String(e.message) : String(e == null ? '' : e);
+      msg = msg.replace(/\s+/g, ' ').slice(0, 120);
+      DIAG.silentErrors = DIAG.silentErrors || [];
+      if (DIAG.silentErrors.length < 20) {
+        DIAG.silentErrors.push(where + ':' + name + ':' + msg);
+      }
+      DIAG.steps.push('err ' + where + '：' + name + ' ' + msg);
+    } catch (e2) {}
   }
 
   // t94：注入脚本可能早于 flutter_inappwebview 的 polyfill（AT_DOCUMENT_START），
@@ -701,7 +722,7 @@ const String kPortalScheduleScript = r'''
         st.updatedAt = Date.now();
         st.diag = DIAG;
       }
-    } catch (e) {}
+    } catch (e) { noteError('post.state', e); }
     // 兜底：桥可用时仍照旧推送（失败入队，不再静默丢弃）
     try {
       if (!window.flutter_inappwebview) {
@@ -767,7 +788,7 @@ const String kPortalScheduleScript = r'''
   var rawFetch = window.fetch;
   if (rawFetch) {
     window.fetch = function (input) {
-      try { capture(typeof input === 'string' ? input : (input && input.url)); } catch (e) {}
+      try { capture(typeof input === 'string' ? input : (input && input.url)); } catch (e) { noteError('hook.fetch', e); }
       return rawFetch.apply(this, arguments);
     };
   }
@@ -775,7 +796,7 @@ const String kPortalScheduleScript = r'''
   if (window.XMLHttpRequest) {
     var rawOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (method, url) {
-      try { capture(url); } catch (e) {}
+      try { capture(url); } catch (e) { noteError('hook.xhr', e); }
       return rawOpen.apply(this, arguments);
     };
   }
@@ -839,7 +860,8 @@ const String kPortalScheduleScript = r'''
       probeResults: DIAG.probeResults,
       probeParams: DIAG.probeParams,
       steps: DIAG.steps,
-      probeAttempts: DIAG.probeAttempts
+      probeAttempts: DIAG.probeAttempts,
+      silentErrors: DIAG.silentErrors || []
     });
   };
 
@@ -1042,7 +1064,7 @@ const String kPortalScheduleScript = r'''
       if (!window.MutationObserver || !document.body) { return; }
       var observer = new MutationObserver(function () { watchStage(); });
       observer.observe(document.body, { childList: true, subtree: true });
-    } catch (e) {}
+    } catch (e) { noteError('observer', e); }
   }
 
   // 无进展兜底：登录页阶段永不报；其它阶段 15s 没进展才报（诊断里写最后进展）
@@ -1162,7 +1184,7 @@ const String kPortalScheduleScript = r'''
           var body = JSON.parse(trimmed);
           var data = body && body.data ? body.data : null;
           return !!(data && data.resultsJsonArr && data.resultsJsonArr.length);
-        } catch (e) { return false; }
+        } catch (e) { noteError('probe.json', e); return false; }
       });
     }).catch(function (err) {
       DIAG.probeResults.push((cardId ? cardId.slice(0, 8) : '(none)') + ':ERR');
@@ -1361,7 +1383,7 @@ const String kPortalScheduleScript = r'''
             }
           }).catch(function (err) {
             if (err && err.code === 'AUTH_REQUIRED') { auth = true; }
-            else { missing.push(week); }
+            else { missing.push(week); noteError('week.' + week, err); }
           }).then(function () {
             active -= 1;
             pump();
