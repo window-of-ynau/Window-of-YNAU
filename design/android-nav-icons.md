@@ -142,7 +142,7 @@
 | `design/android-nav-mockups/phone-closed-a.png` | 手机无 rail 关闭态（仅汉堡 + 设置，无入口图标） |
 | `design/android-nav-mockups/tablet-rail-a.png` | 平板 700×800：常驻 rail 64 + 选中 3×24 条 + 长按/悬停 tooltip |
 | `design/android-nav-mockups/preview.png` | 四张手机态并排总览 |
-| `design/android-nav-mockups/icons.html` / `phone.html` / `tablet.html` | 源文件（`?open=0|1&t=a|b|c`），尺寸即规格数值 |
+| `design/android-nav-mockups/icons.html` / `phone.html` / `tablet.html` | 源文件（`?open=0` 或 `?open=1`；`t=a` / `t=b` / `t=c`），尺寸即规格数值 |
 | `design/android-nav-mockups/nav-icons.js` | 9 槽位 codepoint + 中文名 + 语义理由（**图标唯一来源**） |
 | `design/android-nav-mockups/assets/materialicons-regular.otf` | 与 Flutter 同源的 MaterialIcons 字体（Apache-2.0，许可证同目录） |
 
