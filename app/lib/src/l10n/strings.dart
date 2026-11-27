@@ -76,6 +76,20 @@ class SettingsS {
 
   static String providerSubtitleCoreUnavailable(String baseUrl) =>
       '$baseUrl · $coreUnavailableSuffix';
+
+  // security M3：清除校务登录态
+  static const String clearCampusSession = '清除校务登录态';
+  static const String schoolLoginStateTitle = '学校登录态（课表导入获得）';
+  static const String schoolLoginStateSubtitle = '当前使用：从校务 WebView 会话取出，只存本机';
+  static const String clearCampusSessionConfirm = '清除';
+  static const String clearCampusSessionTitle = '清除校务登录态？';
+  static const String clearCampusSessionBody =
+      '会退出校务登录，下次抓取需重新登录；已入库的课表数据不受影响。';
+  static const String clearingCampusSession = '清除中…';
+  static const String clearCampusSessionSuccess = '校务登录态已清除';
+  static const String clearSessionBadPath = '拒绝清除：会话目录不在数据根下';
+
+  static String clearCampusSessionFailure(Object? error) => '清除失败：$error';
 }
 
 class CommonS {

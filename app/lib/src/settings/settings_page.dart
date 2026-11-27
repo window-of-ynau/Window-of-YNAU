@@ -8,6 +8,7 @@
 import 'package:flutter/material.dart';
 
 import '../chat/chat_settings_section.dart';
+import '../campus/session_clear.dart';
 import '../core/build_info.dart';
 import '../core/ffi_bindings.dart';
 import '../core/auth_service.dart';
@@ -15,6 +16,7 @@ import '../core/secret_service.dart';
 import '../core/app_paths.dart';
 import 'provider_card.dart';
 import '../core/provider_store.dart';
+import '../l10n/strings.dart';
 
 import '../theme/theme_controller.dart';
 import '../theme/glass_panel.dart';
@@ -31,6 +33,7 @@ class SettingsPage extends StatelessWidget {
       this.providerStore,
       this.keyValidator,
       this.onKeySaved,
+      this.sessionClearService = const CampusSessionClearService(),
       this.version = '0.9.1（W2b）'});
 
 
@@ -52,6 +55,10 @@ class SettingsPage extends StatelessWidget {
   static final ProviderStore _fallbackProviders = ProviderStore();
   final Future<String?> Function(String apiKey)? keyValidator;
   final void Function(SecretStatus status)? onKeySaved;
+
+  /// security M3：清除校务会话的服务（测试可注入带假 Cookie 回调的实例）。
+  final CampusSessionClearService sessionClearService;
+
   final String version;
 
   /// t153：是否显示调试/诊断入口（null = 跟随构建模式：debug 显示、release 隐藏）。
@@ -85,15 +92,10 @@ class SettingsPage extends StatelessWidget {
               ),
               // t132：账号分区（结构先立起来；第三/四条是**显式占位**，标「即将支持」，
               // 不做成点了没反应的假按钮）。
-              const _Group(
+              _Group(
                 title: '账号',
                 children: <Widget>[
-                  const _Row(
-                    icon: Icons.school_outlined,
-                    title: '学校登录态（课表导入获得）',
-                    subtitle: '当前使用：从校务 WebView 会话取出，只存本机',
-                    trailing: Icon(Icons.check_circle_outline, size: 18),
-                  ),
+                  _CampusSessionRow(service: sessionClearService),
                   const _Row(
                     icon: Icons.person_outline,
                     title: '云农账号（自有账号体系）',
@@ -399,6 +401,73 @@ class _Group extends StatelessWidget {
       ),
     );
   }
+}
+
+/// security M3：「学校登录态」行的清除动作（二次确认 + 明确结果提示）。
+class _CampusSessionRow extends StatefulWidget {
+  const _CampusSessionRow({required this.service});
+
+  final CampusSessionClearService service;
+
+  @override
+  State<_CampusSessionRow> createState() => _CampusSessionRowState();
+}
+
+class _CampusSessionRowState extends State<_CampusSessionRow> {
+  bool _busy = false;
+
+  Future<void> _clear() async {
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => AlertDialog(
+        key: const Key('clear-campus-session-dialog'),
+        title: const Text(SettingsS.clearCampusSessionTitle),
+        content: const Text(SettingsS.clearCampusSessionBody),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text(SettingsS.cancel),
+          ),
+          FilledButton(
+            key: const Key('clear-campus-session-confirm'),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(SettingsS.clearCampusSessionConfirm),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) {
+      return;
+    }
+    setState(() => _busy = true);
+    final CampusSessionClearResult result = await widget.service.clear();
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        key: const Key('clear-campus-session-result'),
+        content: Text(
+          result.ok
+              ? SettingsS.clearCampusSessionSuccess
+              : SettingsS.clearCampusSessionFailure(result.error),
+        ),
+      ),
+    );
+    setState(() => _busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) => _Row(
+        icon: Icons.school_outlined,
+        title: SettingsS.schoolLoginStateTitle,
+        subtitle: SettingsS.schoolLoginStateSubtitle,
+        trailing: TextButton(
+          key: const Key('clear-campus-session'),
+          onPressed: _busy ? null : _clear,
+          child: Text(_busy ? SettingsS.clearingCampusSession : SettingsS.clearCampusSession),
+        ),
+      );
 }
 
 class _Row extends StatelessWidget {
