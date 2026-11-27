@@ -927,7 +927,7 @@ ADR-19 决策 2 原文要求"同一标识至少 2 个不同账户引用才进候
 
 ## ADR-20 语言分层：Rust 为内核，Go 只做新增控制面，Python 只在开发机
 
-**状态**：已决定（2026-11）
+**状态**：已定稿（2026-11，lead-server 评审通过；模块清单 / Go 工程规范 / RAG 试点契约见 [`docs/adr/0020-language-layering-rollout.md`](adr/0020-language-layering-rollout.md)）
 **背景**：后端目前是纯 Rust（`crates/server` + `crates/core` + `crates/shared`）；端侧是 Dart + Rust（FFI）。实际开发中，**胶水类与外部集成类改动**在 Rust 里迭代明显偏慢（编译时间、生命周期与泛型成本），但这类代码并不需要 Rust 级别的性能。端侧则相反：性能敏感的部分（HTML 解析、SQLite、BM25、压缩、ICS、凭据）已经在 Rust 里，剩余胶水由 Dart 承担，没有第三层的需求。
 
 **决策**：
@@ -987,3 +987,13 @@ ADR-19 决策 2 原文要求"同一标识至少 2 个不同账户引用才进候
 | 全部 Go | 热路径 P99 与内存不可接受 |
 | 端侧加 Python 运行时 | 包体/构建/平台限制，收益低 |
 | cgo 把 Go 与 Rust 编进同一进程 | 崩溃域与部署耦合，排障困难，不采用 |
+
+### ADR-20 评审结论（lead-server，2026-11）
+
+**结论：决策维持不变，边界按下述澄清后判定为「可执行」。**
+
+- **只做「新增」，不是搬家**：Go 承接的是**新增**的管理面端点与外部 IO 进程；现有 `auth / gate / quota / chat / rag` 一律留在 Rust。边界表里"认证、邀请码、配额"必须读成"**新增的**管理面端点"，不是把已有实现迁过去。
+- **明确不迁（正确性/长尾敏感，收益低风险高）**：SSE 流式代理（`api/chat` + `upstream`）、并发闸门（`gate.rs` 的 turn 去重 / `Retry-After`）、token 记账（`accounting`）、RAG 检索与哈希 join / 两段式落库（`rag` / `rag_fetch` 的 `canonical`/`hash`/`store_fetch_result` 不变量）、不透明令牌鉴权（ADR-15）。详见落地清单 §2 的模块矩阵。
+- **数据与契约所有权**：PG schema 仍由 `crates/server/migrations` **唯一拥有**，Go 只读写、**不建表 / 不跑迁移**；错误信封 `{ok:false,error:{code,message,request_id,details}}` 与 `ErrorCode`（`crates/shared/src/error.rs`）是唯一契约，Go 侧以常量 + 契约测试对齐；`/api/v1/*` 以 OpenAPI 为单一事实源，Go 新增路由必须进同一份 spec。
+- **可行性风险（已知并接受）**：双语言 CI/依赖/安全扫描成本、Go GC 的 P99 尖刺（只要不用于数据面即可接受）、团队双栈负担。用度量门（改一次需求的端到端时间、cold/incremental build、CI 时长、P50/P99、每连接内存）决定是否扩大 Go 范围。
+- **试点选择**：第一个试点 = **RAG 外部抓取 worker**（纯外部 IO、不在用户在线路径、改动频繁），以 **PG 表为契约**独立进程运行，Rust 的检索/哈希/落库不变量保持不变，且带一键回退开关（见落地清单 §4）。
