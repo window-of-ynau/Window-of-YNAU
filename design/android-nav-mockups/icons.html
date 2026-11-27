@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>导航图标规范 · 三主题对照（#84 定稿）</title>
+<style>
+  @font-face{font-family:'MI';src:url('assets/materialicons-regular.otf') format('opentype');font-weight:normal;font-style:normal}
+  .mi{font-family:'MI';display:inline-block;line-height:1;font-weight:normal;font-style:normal;-webkit-font-smoothing:antialiased;text-rendering:geometricPrecision}
+  *{box-sizing:border-box}
+  html,body{margin:0;background:#0F1115;color:#E7ECF3;font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif}
+  .wrap{padding:22px 24px}
+  h1{font-size:16.5px;margin:0 0 4px;letter-spacing:.2px}
+  .sub{font-size:11.5px;color:#98A2B3;margin:0 0 16px;line-height:1.6}
+  .sub b{color:#E7ECF3;font-weight:600}
+  .panels{display:flex;gap:18px;align-items:flex-start}
+  .panel{width:540px;border-radius:14px;overflow:hidden;background:var(--canvas);color:var(--ink);
+         box-shadow:0 0 0 1px rgba(255,255,255,.10)}
+  .phead{padding:12px 16px 10px;background:var(--surface);border-bottom:1px solid var(--line)}
+  .phead .n{font-size:13.5px;font-weight:700;letter-spacing:.2px}
+  .phead .d{font-size:10.5px;color:var(--soft);margin-top:2px}
+  .phead .tok{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+  .tok .k{font-size:9.5px;color:var(--soft);background:var(--alt);border-radius:5px;padding:3px 6px;line-height:1}
+  .cols{display:flex;padding:4px 16px 0;font-size:9.5px;color:var(--soft);letter-spacing:.02em}
+  .cols .c1{flex:1}
+  .cols .c2{width:34px;text-align:center}
+  .cols .c3{width:78px;text-align:center}
+  .cols .c4{width:60px;text-align:center}
+  .rows{padding:2px 16px 12px}
+  .row{display:flex;align-items:center;height:44px;border-top:1px solid var(--line)}
+  .row:first-child{border-top:0}
+  .row .nm{flex:1;min-width:0}
+  .row .nm .t{font-size:12.5px;font-weight:600}
+  .row .nm .w{font-size:9.5px;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .d20{width:34px;display:grid;place-items:center;color:var(--soft)}
+  .row .sel{width:78px;display:grid;place-items:center}
+  .selbox{position:relative;width:66px;height:32px;border-radius:6px;background:var(--alt);display:grid;place-items:center;color:var(--ink)}
+  .selbox::before{content:"";position:absolute;left:0;top:8px;bottom:8px;width:3px;border-radius:2px;background:var(--accent)}
+  .row .d48{width:60px;display:grid;place-items:center;color:var(--soft)}
+  /* 三个主题面板的 token */
+  .pa{--canvas:#FFFFFF;--surface:#F7F7F7;--alt:#F0F0F0;--ink:#0D0D0D;--soft:#6B6B6B;--line:#E8E8E8;--accent:#0D0D0D}
+  .pb{--canvas:#08101F;--surface:#0E1830;--alt:rgba(255,255,255,.10);--ink:#E8EEFC;--soft:#A9BFF0;--line:rgba(255,255,255,.10);--accent:#3F68E4}
+  .pc{--canvas:#F5F4ED;--surface:#FAF9F5;--alt:#EFEEE4;--ink:#141413;--soft:#6C6A64;--line:#E6DFD8;--accent:#A9583E}
+  /* 底部配色表 */
+  .table{margin-top:18px;background:#171A20;border-radius:12px;padding:12px 16px}
+  .table h2{font-size:12.5px;margin:0 0 8px;font-weight:600;color:#E7ECF3}
+  table{border-collapse:collapse;width:100%;font-size:10.5px}
+  th{color:#98A2B3;font-weight:600;text-align:left;padding:5px 8px;border-bottom:1px solid #262B36}
+  td{padding:5px 8px;border-bottom:1px solid #20242C;vertical-align:middle}
+  .sw{display:inline-flex;align-items:center;gap:6px}
+  .chip{width:14px;height:14px;border-radius:4px;box-shadow:0 0 0 1px rgba(255,255,255,.16)}
+  .mono{font-family:Consolas,monospace;font-size:10px;color:#C7CFDB}
+  .foot{font-size:10.5px;color:#8B95A7;margin-top:10px;line-height:1.6}
+</style>
+</head>
+<body>
+<script src="nav-icons.js"></script>
+<script>
+  const MAIN = ['chat','timetable','scores','regulations','campus','settings'];
+  const AUX  = ['portal','library','software'];
+  const themes = [
+    { cls:'pa', n:'A · 极简黑白（浅）', d:'accent = ink（黑白层级靠线宽/字重）',
+      tokens:'inkSoft #6B6B6B · ink #0D0D0D · accent #0D0D0D · surfaceAlt #F0F0F0' },
+    { cls:'pb', n:'B · 深蓝玻璃（深）', d:'玻璃面 rgba(255,255,255,.05)，单蓝强调',
+      tokens:'inkSoft #A9BFF0 · ink #E8EEFC · accent #3F68E4 · surfaceAlt rgba(255,255,255,.10)' },
+    { cls:'pc', n:'C · 书本质感（浅）', d:'accent 只在选中/图标/3dp 条，绝不大面积',
+      tokens:'inkSoft #6C6A64 · ink #141413 · accent #A9583E · surfaceAlt #EFEEE4' }
+  ];
+  const rowsOf = (ids) => ids.map((id,i)=>`
+    <div class="row">
+      <div class="nm"><div class="t">${NAV.NAME[id]}</div><div class="w">${NAV.WHY[id]}</div></div>
+      <div class="d20">${NAV.icon(id, 20)}</div>
+      <div class="sel"><div class="selbox">${NAV.icon(id, 20)}</div></div>
+      <div class="d48">${NAV.icon(id, 48)}</div>
+    </div>`).join('');
+
+  const panels = themes.map(t=>`
+    <div class="panel ${t.cls}">
+      <div class="phead"><div class="n">${t.n}</div><div class="d">${t.d}</div>
+        <div class="tok"><span class="k">${t.tokens}</span></div></div>
+      <div class="cols"><div class="c1">槽位 / 语义</div><div class="c2">20dp</div>
+        <div class="c3">选中态（行片段）</div><div class="c4">48dp</div></div>
+      <div class="rows">${rowsOf(MAIN)}
+        <div class="row" style="height:26px"><div class="nm"><div class="w">—— 现有 CampusEntry 其余入口（同一语言）——</div></div></div>
+        ${rowsOf(AUX)}
+      </div>
+    </div>`).join('');
+
+  const palette = [
+    ['A 极简黑白 · 浅','#6B6B6B','#0D0D0D','#0D0D0D','#F0F0F0'],
+    ['A 极简黑白 · 深','#A8A8A8','#F5F5F5','#F5F5F5','#1C1C1C'],
+    ['B 深蓝玻璃 · 浅','#3C5170','#0B1A33','#2E56CE','#E6EEFF'],
+    ['B 深蓝玻璃 · 深','#A9BFF0','#E8EEFC','#3F68E4','rgba(255,255,255,.10)'],
+    ['C 书本质感 · 浅','#6C6A64','#141413','#A9583E','#EFEEE4'],
+    ['C 书本质感 · 深','#B9A88E','#F0E6D8','#DA7756','#2E271E']
+  ];
+  const cell = (hex) => `<span class="sw"><span class="chip" style="background:${hex}"></span><span class="mono">${hex}</span></span>`;
+  const table = `
+    <div class="table"><h2>三主题 × 明暗 · 图标 token 绑定（不新增任何色值，全部取自已实现 token）</h2>
+      <table>
+        <tr><th style="width:190px">主题 / 亮度</th><th>默认图标 inkSoft</th><th>选中图标 ink</th><th>强调元素 accent</th><th>选中行底 surfaceAlt</th></tr>
+        ${palette.map(r=>`<tr><td>${r[0]}</td><td>${cell(r[1])}</td><td>${cell(r[2])}</td><td>${cell(r[3])}</td><td>${cell(r[4])}</td></tr>`).join('')}
+      </table>
+    </div>`;
+
+  document.body.innerHTML = `
+    <div class="wrap">
+      <h1>云农之窗 · 导航图标规范（#84 定稿）</h1>
+      <p class="sub">共 <b>9 个语义槽位</b>（6 主入口 + 3 现有校务入口）· 渲染尺寸 <b>20dp</b> · 字重/线宽取 Material Outlined 固有值（24dp 网格 ≈2dp → 20dp 时 ≈<b>1.67dp</b>）· 单色，无填充（选中只换色，不改形状）。
+        下图与 Flutter <span class="mono">IconData</span> 同源（同一 MaterialIcons 字体），视觉稿 == 实现。</p>
+      <div class="panels">${panels}</div>
+      ${table}
+      <div class="foot">左→右：默认（inkSoft）/ 选中态行片段（surfaceAlt 底 + 左 3dp accent 条 + 图标 ink）/ 48dp 放大检视。选中态与设计稿抽屉行一致（行高 44、条高 24）。</div>
+    </div>`;
+</script>
+</body>
+</html>
