@@ -29,6 +29,7 @@ import 'tool_call_card.dart';
 // 保持既有调用方/测试的 `import chat_page.dart` 不变（纯搬迁，行为不变）。
 export 'chat_settings_section.dart' show ChatSettings;
 import 'chat_top_bar.dart';
+import '../l10n/strings.dart';
 
 /// 会话设置（MVP：密钥只在内存里，进程退出即失效）。
 ///
@@ -965,12 +966,13 @@ class ChatPageState extends State<ChatPage> {
                 onChanged: (_) => setState(() {}),
                 onSubmitted: (_) => _send(),
                 style: const TextStyle(fontSize: 14),
-                // t182：固定行盒高度 —— 真实字体下 hint 才不会"浮"在行盒上沿
-                strutStyle: const StrutStyle(fontSize: 14, height: 1.0, forceStrutHeight: true),
+                // t2：不再用 `forceStrutHeight: true, height: 1.0` 硬压行盒——
+                // 那会把真实字体（尤其中文/回退字体）的字形挤到行盒上沿，视觉偏上。
+                // 交给字体自身度量 + textAlignVertical.center 垂直居中即可。
                 textAlignVertical: TextAlignVertical.center,
                 // t174：单行输入只占 ~20px（否则 composer 会被默认内边距撑到 80+）
                 decoration: const InputDecoration(
-                  hintText: '输入消息…',
+                  hintText: ChatS.inputHint,
                   // t182：内部不再有填充色（整条 composer 只有外层一层底色）
                   filled: false,
                   isDense: true,

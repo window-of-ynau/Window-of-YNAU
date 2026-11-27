@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 
 import '../core/provider_store.dart';
 import '../core/secret_service.dart';
+import '../l10n/strings.dart';
 
 class ProviderCard extends StatefulWidget {
   const ProviderCard({super.key, required this.store, required this.secrets});
@@ -63,14 +64,18 @@ class _ProviderCardState extends State<ProviderCard> {
   Future<void> _edit({ProviderConfig? provider}) async {
     final _ProviderDraft? draft = await showDialog<_ProviderDraft>(
       context: context,
-      builder: (BuildContext context) => _ProviderDialog(provider: provider),
+      builder: (BuildContext context) =>
+          _ProviderDialog(provider: provider, store: widget.store),
     );
     if (draft == null || !mounted) {
       return;
     }
     setState(() => _busy = true);
     try {
-      final String id = provider?.id ?? DateTime.now().millisecondsSinceEpoch.toRadixString(36);
+      // #77：从内置预设进来的沿用 `preset-<id>`（这样「已添加」判断/Key 名都稳定）；
+      // 自定义走原来的时间戳 id。
+      final String id =
+          provider?.id ?? draft.id ?? DateTime.now().millisecondsSinceEpoch.toRadixString(36);
       final ProviderConfig next = ProviderConfig(
         id: id,
         name: draft.name,
@@ -88,7 +93,9 @@ class _ProviderCardState extends State<ProviderCard> {
       await _refreshKeys();
     } on Object catch (failure) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('保存失败：$failure')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(SettingsS.saveFailed(failure))),
+        );
       }
     } finally {
       if (mounted) {
@@ -101,11 +108,17 @@ class _ProviderCardState extends State<ProviderCard> {
     final bool? ok = await showDialog<bool>(
       context: context,
       builder: (BuildContext context) => AlertDialog(
-        title: Text('删除供应商「${provider.name}」？'),
-        content: const Text('只删除本机保存的配置与 Key，不影响账号。'),
+        title: Text(SettingsS.deleteProviderTitle(provider.name)),
+        content: const Text(SettingsS.deleteConfirmBody),
         actions: <Widget>[
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('删除')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text(SettingsS.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text(SettingsS.delete),
+          ),
         ],
       ),
     );
@@ -122,9 +135,13 @@ class _ProviderCardState extends State<ProviderCard> {
     final bool hasKey = (status?.set ?? false) ||
         (provider.id == ProviderStore.defaultProviderId && _legacyKey);
     if (widget.secrets == null) {
-      return '${provider.baseUrl} · 端侧核心不可用';
+      return SettingsS.providerSubtitleCoreUnavailable(provider.baseUrl);
     }
-    return '${provider.baseUrl} · ${hasKey ? (status?.broken ?? false ? 'Key 密文损坏，请重填' : 'Key 已保存') : '未配置 Key'}';
+    return SettingsS.providerSubtitle(
+      provider.baseUrl,
+      hasKey: hasKey,
+      broken: status?.broken ?? false,
+    );
   }
 
   @override
@@ -148,12 +165,12 @@ class _ProviderCardState extends State<ProviderCard> {
                 mainAxisSize: MainAxisSize.min,
                 children: <Widget>[
                   IconButton(
-                    tooltip: '编辑',
+                    tooltip: SettingsS.edit,
                     onPressed: _busy ? null : () => _edit(provider: provider),
                     icon: const Icon(Icons.edit_outlined, size: 18),
                   ),
                   IconButton(
-                    tooltip: '删除',
+                    tooltip: SettingsS.delete,
                     onPressed: _busy || providers.length <= 1 ? null : () => _delete(provider),
                     icon: const Icon(Icons.delete_outline, size: 18),
                   ),
@@ -174,7 +191,7 @@ class _ProviderCardState extends State<ProviderCard> {
                 TextButton.icon(
                   onPressed: _busy ? null : () => _edit(),
                   icon: const Icon(Icons.add, size: 18),
-                  label: const Text('添加供应商'),
+                  label: const Text(SettingsS.addProvider),
                 ),
               ],
             ),
@@ -191,18 +208,25 @@ class _ProviderDraft {
     required this.baseUrl,
     required this.apiKey,
     required this.models,
+    this.id,
   });
 
   final String name;
   final String baseUrl;
   final String apiKey;
   final List<String> models;
+
+  /// 非空 = 从内置预设填出来的配置，沿用稳定 id（`preset-<预设id>`）。
+  final String? id;
 }
 
 class _ProviderDialog extends StatefulWidget {
-  const _ProviderDialog({this.provider});
+  const _ProviderDialog({this.provider, required this.store});
 
   final ProviderConfig? provider;
+
+  /// #77：用来判断哪些内置预设已经添加过（标「已添加」）。
+  final ProviderStore store;
 
   @override
   State<_ProviderDialog> createState() => _ProviderDialogState();
@@ -216,6 +240,10 @@ class _ProviderDialogState extends State<_ProviderDialog> {
   final TextEditingController _key = TextEditingController();
   late final TextEditingController _models =
       TextEditingController(text: (widget.provider?.models ?? const <String>[]).join(', '));
+  final FocusNode _keyFocus = FocusNode();
+
+  /// #77：当前从哪个内置预设填的（null = 自定义）。
+  String? _selectedPresetId;
 
   @override
   void dispose() {
@@ -223,38 +251,82 @@ class _ProviderDialogState extends State<_ProviderDialog> {
     _baseUrl.dispose();
     _key.dispose();
     _models.dispose();
+    _keyFocus.dispose();
     super.dispose();
+  }
+
+  /// #77：点选预设 → 填 name/baseUrl/modelId，只留 API Key 给用户补。
+  void _applyPreset(ProviderPreset preset) {
+    setState(() {
+      _selectedPresetId = preset.id;
+      _name.text = preset.displayName;
+      _baseUrl.text = preset.baseUrl;
+      _models.text = preset.modelId;
+    });
+    _keyFocus.requestFocus();
   }
 
   @override
   Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
     return AlertDialog(
-      title: Text(widget.provider == null ? '添加供应商' : '编辑供应商'),
+      key: const Key('provider-dialog'),
+      title: Text(widget.provider == null ? SettingsS.addProvider : SettingsS.editProvider),
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            TextField(controller: _name, decoration: const InputDecoration(labelText: '名称')),
-            TextField(controller: _baseUrl, decoration: const InputDecoration(labelText: 'Base URL')),
+            // #77：内置预设只在「添加」时出现；编辑已有配置不显示，避免误解为改名。
+            if (widget.provider == null) ...<Widget>[
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(SettingsS.builtinPresets, style: theme.textTheme.labelLarge),
+              ),
+              const SizedBox(height: 4),
+              for (final ProviderPreset preset in ProviderPreset.all)
+                _presetTile(theme, preset),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Divider(height: 1, color: theme.dividerColor),
+              ),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(SettingsS.orCustom, style: theme.textTheme.labelLarge),
+              ),
+              const SizedBox(height: 4),
+            ],
             TextField(
+              key: const Key('provider-name'),
+              controller: _name,
+              decoration: const InputDecoration(labelText: SettingsS.fieldName),
+            ),
+            TextField(
+              key: const Key('provider-base-url'),
+              controller: _baseUrl,
+              decoration: const InputDecoration(labelText: SettingsS.fieldBaseUrl),
+            ),
+            TextField(
+              key: const Key('provider-api-key'),
               controller: _key,
+              focusNode: _keyFocus,
               obscureText: true,
               decoration: InputDecoration(
-                labelText: 'API Key',
-                hintText: widget.provider == null ? '' : '已保存则留空不改',
+                labelText: SettingsS.fieldApiKey,
+                hintText: widget.provider == null ? '' : SettingsS.keepBlankIfSaved,
               ),
             ),
             TextField(
+              key: const Key('provider-models'),
               controller: _models,
               decoration: const InputDecoration(
-                labelText: '自定义模型（可选，逗号分隔）',
+                labelText: SettingsS.fieldModels,
               ),
             ),
           ],
         ),
       ),
       actions: <Widget>[
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text(SettingsS.cancel)),
         FilledButton(
           onPressed: () {
             final String name = _name.text.trim();
@@ -267,9 +339,24 @@ class _ProviderDialogState extends State<_ProviderDialog> {
                 .map((String item) => item.trim())
                 .where((String item) => item.isNotEmpty)
                 .toList();
+            // 只有仍与原预设一致时才认作「该预设」（用户改了名字/地址 = 自定义）。
+            String? presetId;
+            final String? selected = _selectedPresetId;
+            if (selected != null) {
+              final ProviderPreset preset =
+                  ProviderPreset.all.firstWhere((ProviderPreset item) => item.id == selected);
+              final bool unchanged = name == preset.displayName &&
+                  baseUrl == preset.baseUrl &&
+                  models.length == 1 &&
+                  models.first == preset.modelId;
+              if (unchanged) {
+                presetId = 'preset-${preset.id}';
+              }
+            }
             Navigator.pop(
               context,
               _ProviderDraft(
+                id: presetId,
                 name: name,
                 baseUrl: baseUrl,
                 apiKey: _key.text.trim(),
@@ -277,9 +364,46 @@ class _ProviderDialogState extends State<_ProviderDialog> {
               ),
             );
           },
-          child: const Text('保存'),
+          child: const Text(SettingsS.save),
         ),
       ],
+    );
+  }
+
+  /// 一个内置预设行：显示名 + baseUrl；已添加的置灰并标「已添加」。
+  Widget _presetTile(ThemeData theme, ProviderPreset preset) {
+    final String configId = 'preset-${preset.id}';
+    final bool added = widget.store.hasProvider(configId);
+    final bool selected = !added && _selectedPresetId == preset.id;
+    return ListTile(
+      key: Key('preset-${preset.id}'),
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      enabled: !added,
+      onTap: added ? null : () => _applyPreset(preset),
+      leading: Icon(
+        selected ? Icons.check_circle : Icons.bolt_outlined,
+        size: 20,
+        color: added ? theme.disabledColor : (selected ? theme.colorScheme.primary : null),
+      ),
+      title: Text(
+        preset.displayName,
+        style: theme.textTheme.bodyMedium?.copyWith(
+          color: added ? theme.disabledColor : null,
+          fontWeight: FontWeight.w500,
+        ),
+      ),
+      subtitle: Text(preset.baseUrl, maxLines: 1, overflow: TextOverflow.ellipsis),
+      trailing: added
+          ? Text(
+              SettingsS.alreadyAdded,
+              key: Key('preset-added-${preset.id}'),
+              style: theme.textTheme.bodySmall?.copyWith(color: theme.disabledColor),
+            )
+          : (selected
+              ? Text(SettingsS.selected,
+                  style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.primary))
+              : null),
     );
   }
 }

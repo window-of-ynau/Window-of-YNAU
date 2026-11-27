@@ -169,6 +169,9 @@ class CaptureLog {
     for (final CaptureAttemptRecord attempt in attempts) {
       buffer.writeln(sanitize(attempt.line));
     }
+    if (code == 'PARSE_EMPTY') {
+      buffer.writeln('PARSE_EMPTY 归因：${sanitize(classifyParseEmpty(attempts))}');
+    }
     buffer
       ..writeln()
       ..writeln('## HTML 前 2000 字符')
@@ -217,6 +220,10 @@ class CaptureLog {
       buffer
         ..writeln('--- 尝试 ---')
         ..writeln(sanitize(attempt.line));
+    }
+    if (code == 'PARSE_EMPTY') {
+      buffer.writeln('--- PARSE_EMPTY 归因 ---');
+      buffer.writeln(sanitize(classifyParseEmpty(attempts)));
     }
     return buffer.toString();
   }
@@ -313,6 +320,36 @@ class CaptureLog {
   static String _head(String html) => html.length <= 2000 ? html : html.substring(0, 2000);
 
   static String _tail(String html) => html.length <= 2000 ? '' : html.substring(html.length - 2000);
+}
+
+/// 【#53】把 `PARSE_EMPTY` 归因成可读的一句话（用**最后一次**尝试的结构特征）：
+///
+/// - 数据行=0 且只有表头 → 页面还没渲染出课程行（抓早了/空壳），不是解析器问题；
+/// - 数据行=0 且连表头都没有 → 选择器/表结构变了（找不到 `table#timetable` 的行）；
+/// - 数据行>0 但解析 0 门 → 解析器与页面不匹配（该看 HTML 片段核对列）。
+///
+/// 这正是 owner 用「复制诊断信息」时要一眼回答的问题，不用再靠猜。
+String classifyParseEmpty(List<CaptureAttemptRecord> attempts) {
+  if (attempts.isEmpty) {
+    return '未记录尝试（无法归类）';
+  }
+  final CaptureAttemptRecord last = attempts.last;
+  final int dataRows = last.rowCount;
+  final int headerRows = last.headerRowCount ?? 0;
+  if (dataRows < 0) {
+    return '数据行未知（页面侧计数没取到）';
+  }
+  if (dataRows == 0) {
+    if (headerRows > 0) {
+      return '数据行=0（只有 $headerRows 行表头、没有 <td> 课程行 → 页面未渲染出课程 = 抓早了/空壳，非解析器问题）';
+    }
+    return '数据行=0（表内没有任何课程行 → 选择器/表结构变了）';
+  }
+  final int? parsed = last.parsedCourses;
+  if (parsed == 0) {
+    return '数据行=$dataRows 但解析 0 门 → 解析器与页面不匹配（对照 HTML 片段看列）';
+  }
+  return '数据行=$dataRows，解析=${parsed == null ? '未解析' : '$parsed 门'}';
 }
 
 /// 失败提示的**短消息**（详情放在可展开面板与日志里）。

@@ -9,6 +9,8 @@
 //   --dart-define=BUILD_TIME=<打包时间>
 // 未注入（本地 `flutter run`）→ 显示 `dev`。
 
+import '../l10n/strings.dart';
+
 abstract final class BuildInfo {
   /// 构建时的 git commit（短哈希）；未注入为 `dev`。
   static const String commit = String.fromEnvironment('BUILD_COMMIT', defaultValue: 'dev');
@@ -22,10 +24,10 @@ abstract final class BuildInfo {
   /// 一行展示：`构建 abc1234 · 11-03 16:30`；未注入时 `构建 dev`。
   static String get label {
     if (!isRelease) {
-      return '构建 dev';
+      return CommonS.buildDev;
     }
     final List<String> parts = <String>[
-      if (commit != 'dev') '构建 $commit',
+      if (commit != 'dev') CommonS.buildCommit(commit),
       if (time != 'dev') time,
     ];
     return parts.join(' · ');

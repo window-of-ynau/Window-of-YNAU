@@ -25,6 +25,7 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
+import '../l10n/strings.dart';
 import '../theme/theme_controller.dart';
 import 'secret_service.dart';
 
@@ -227,7 +228,7 @@ class ProviderStore extends ChangeNotifier {
   String _activeId = '';
 
   /// 未配置时选择器里的占位文案。
-  static const String placeholderLabel = '请选择或添加你的 Provider';
+  static const String placeholderLabel = ChatS.providerPlaceholder;
 
   /// 是否已有可用配置（有 Key 的供应商由 SecretService 另行判断）。
   bool get hasConfigured => _providers.isNotEmpty;
@@ -309,7 +310,7 @@ class ProviderStore extends ChangeNotifier {
         for (final String model in provider.models) {
           final ({String model, String? migratedFrom}) result = migrateModelName(model);
           if (result.migratedFrom != null) {
-            _migrationNotes.add('已把旧模型名 ${result.migratedFrom} 迁移为 ${result.model}');
+            _migrationNotes.add(ChatS.modelMigrationNote(result.migratedFrom!, result.model));
           }
           if (!next.contains(result.model)) {
             next.add(result.model);
@@ -394,4 +395,4 @@ class ProviderStore extends ChangeNotifier {
 /// 协议自动协商的展示文案（只读）。
 ///
 /// 真正的解析在 Rust 侧（responses → messages → completions）；客户端**不提供选择**。
-String protocolAutoLabel(String providerName) => '当前生效：自动（$providerName）';
+String protocolAutoLabel(String providerName) => ChatS.protocolAutoLabel(providerName);

@@ -10,9 +10,10 @@ import 'package:yunong/src/core/timetable_service.dart';
 
 /// 按队列返回响应的假核心。
 class ScriptedCore implements CoreApi {
-  ScriptedCore(this.importResponses);
+  ScriptedCore(this.importResponses, {this.setTermStartResponse});
 
   final List<CoreEnvelope> importResponses;
+  final CoreEnvelope? setTermStartResponse;
   List<StoredCourse> courses = const <StoredCourse>[];
 
   @override
@@ -43,6 +44,7 @@ class ScriptedCore implements CoreApi {
     required String startsOn,
     required String dbPath,
   }) =>
+      setTermStartResponse ??
       const CoreEnvelope(ok: true, data: <String, dynamic>{'term': '', 'starts_on': ''});
   @override
   String get version => 'test';
@@ -288,4 +290,37 @@ void main() {
 
     expect(find.textContaining('高等数学A'), findsNothing, reason: '旧学期的课不能留在新学期');
     expect(find.text('还没有课表'), findsOneWidget);
-  });}
+  });
+
+  testWidgets('#91 确认开学日保存失败：红卡显示 db 绝对路径与 Rust 原始错误',
+      (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1200, 1600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    const String db = '/data/user/0/cn.ynau.yunong/files/yunong/yunong.db';
+    final core = ScriptedCore(
+      <CoreEnvelope>[],
+      setTermStartResponse: const CoreEnvelope(
+        ok: false,
+        code: 'STORAGE',
+        message: '建库目录失败：Permission denied (os error 13)',
+      ),
+    );
+    final service = TimetableService(core: core, dbPath: db);
+
+    await tester.pumpWidget(
+      _wrap(TimetablePage(service: service, initialTerm: '2026-2027-1')),
+    );
+    await tester.pumpAndSettle();
+
+    // 校历锚点 2026-09-07 → 琥珀横幅上有一键「确认 09-07」。
+    await tester.tap(find.text('确认 09-07'));
+    await tester.pumpAndSettle();
+
+    // 用户可见的大字提示 + 小字里的 Rust 原始错误 + 数据库绝对路径（#91 要求）
+    expect(find.text('本地课表保存失败'), findsOneWidget);
+    expect(find.textContaining('建库目录失败：Permission denied'), findsOneWidget);
+    expect(find.textContaining(db), findsOneWidget);
+  });
+}

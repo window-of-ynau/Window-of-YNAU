@@ -59,23 +59,19 @@ void main() {
     });
   });
 
-  group('rail 48（t172 #3）', () {
-    testWidgets('rail 宽度实际渲染 = 48（窄屏）', (WidgetTester tester) async {
+  group('rail 64（t172 → t6）', () {
+    testWidgets('手机 360：无常驻 rail（改为抽屉）', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(360, 800));
-      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, closeTo(48, 1));
+      expect(find.byKey(const Key('app-sidebar')), findsNothing);
+      expect(find.byKey(const Key('sidebar-toggle')), findsOneWidget);
     });
 
-    for (final Size size in const <Size>[Size(360, 800), Size(1280, 800)]) {
-      testWidgets('${size.width.toInt()}：汉堡与设置 dx 偏差 <1dp', (WidgetTester tester) async {
-        await _pumpApp(tester, size);
-        if (size.width < 600) {
-          expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, closeTo(48, 1));
-        }
-        final double toggle = tester.getCenter(find.byKey(const Key('sidebar-toggle'))).dx;
-        final double settings = tester.getCenter(find.byKey(const Key('sidebar-settings'))).dx;
-        expect(toggle, closeTo(settings, 1));
-      });
-    }
+    testWidgets('1280：汉堡与设置 dx 偏差 <1dp', (WidgetTester tester) async {
+      await _pumpApp(tester, const Size(1280, 800));
+      final double toggle = tester.getCenter(find.byKey(const Key('sidebar-toggle'))).dx;
+      final double settings = tester.getCenter(find.byKey(const Key('sidebar-settings'))).dx;
+      expect(toggle, closeTo(settings, 1));
+    });
 
     testWidgets('1280 展开态：侧栏仍 224，dx 偏差 <1dp', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(1280, 800));
@@ -85,10 +81,10 @@ void main() {
       expect(toggle, closeTo(settings, 1));
     });
 
-    testWidgets('窄屏内容左让 48', (WidgetTester tester) async {
+    testWidgets('手机内容全宽（无 rail 左让）', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(360, 800));
       final Rect content = tester.getRect(find.byType(IndexedStack).first);
-      expect(content.left, greaterThanOrEqualTo(48));
+      expect(content.left, lessThan(1));
     });
   });
 }
