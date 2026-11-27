@@ -167,7 +167,10 @@ impl MemoryState {
     ) -> Result<AuthSession, AuthError> {
         let _ = (ip_hash, ua_hash); // 内存后端不落指纹，仅为与 PG 签名对齐
         if self.emails.contains_key(&email) {
-            return Err(AuthError::validation("该邮箱已注册"));
+            // security r7 H1：与"无效码"共用同一个 403 + 同一文案。
+            // 内存后端本来就是"先查邮箱再查码"，这里只把错误从 422 并到邀请码那一类，
+            // 避免两个后端对外响应分叉（PG 侧预检见 pg::register_with_invite）。
+            return Err(AuthError::invite_invalid());
         }
         let now = OffsetDateTime::now_utc();
         let Some(invite) = self.invite_codes.get(code_hash) else {
@@ -580,7 +583,7 @@ mod invite_tests {
         );
     }
 
-    /// 邮箱冲突不消耗邀请码（与 PG 的事务回滚同语义）。
+    /// 邮箱冲突不消耗邀请码（与 PG 的事务回滚同语义）；错误与"无效码"一致（H1）。
     #[test]
     fn email_conflict_does_not_consume_invite() {
         let mut state = MemoryState::default();
@@ -589,7 +592,8 @@ mod invite_tests {
 
         state.add_invite("ynau-2", "b1", 1, None);
         let error = redeem(&mut state, "a@x.com", "ynau-2").expect_err("重复邮箱必须拒绝");
-        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(error.code, ErrorCode::InviteInvalid);
+        assert_eq!(error.message, "邀请码无效或已不可用");
         assert_eq!(
             state.invite_batch_stats("b1"),
             (1, 2, 2),
