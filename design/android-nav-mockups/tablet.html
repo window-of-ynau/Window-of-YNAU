@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>平板档 · 常驻 rail 64（700 × 800）</title>
+<style>
+  @font-face{font-family:'MI';src:url('assets/materialicons-regular.otf') format('opentype');font-weight:normal;font-style:normal}
+  .mi{font-family:'MI';display:inline-block;line-height:1;font-weight:normal;font-style:normal;-webkit-font-smoothing:antialiased;text-rendering:geometricPrecision}
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;overflow:hidden;background:#fff;
+    font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif}
+  body{--canvas:#FFFFFF;--surface:#F7F7F7;--alt:#F0F0F0;--ink:#0D0D0D;--soft:#6B6B6B;--faint:#8A8A8A;--line:#E8E8E8;--accent:#0D0D0D}
+  .tablet{position:relative;width:700px;height:800px;background:var(--canvas);color:var(--ink);display:flex;flex-direction:column;overflow:hidden}
+  .statusbar{height:24px;flex:0 0 auto}
+  .shell{flex:1;min-height:0;display:flex}
+  /* 常驻 rail 64：底色差 + 1px 主题细线 */
+  .rail{width:64px;flex:0 0 auto;background:var(--surface);border-right:1px solid var(--line);
+        display:flex;flex-direction:column;align-items:stretch}
+  .rail .ham{height:44px;display:grid;place-items:center;color:var(--ink)}
+  .rail .item{position:relative;height:48px;display:grid;place-items:center;color:var(--soft)}
+  .rail .item .btn{width:40px;height:40px;display:grid;place-items:center;border-radius:8px}
+  .rail .item.on{color:var(--ink)}
+  .rail .item.on::before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:3px;background:var(--accent);border-radius:2px}
+  .rail .spacer{flex:1}
+  .rail .foot{height:60px;display:grid;place-items:center;color:var(--soft);padding-bottom:12px}
+  /* 长按/悬停提示：图标旁显示文字（rail 无文字，靠它辨认） */
+  .tip{position:absolute;left:64px;background:#141413;color:#FFF;font-size:11.5px;line-height:1;
+       padding:6px 9px;border-radius:6px;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.28);z-index:5}
+  .tip::before{content:"";position:absolute;left:-4px;top:50%;margin-top:-4px;width:8px;height:8px;background:#141413;transform:rotate(45deg)}
+  /* 内容区：padding 20（600–839 档口径） */
+  .content{flex:1;min-width:0;padding:16px 20px 20px 20px;display:flex;flex-direction:column}
+  .hd .t{font-size:17px;font-weight:600;line-height:1.25}
+  .hd .s{font-size:12px;color:var(--soft);margin-top:2px}
+  .grid{margin-top:14px;border:1px solid var(--line);border-radius:10px;overflow:hidden;display:flex;flex-direction:column}
+  .gr{display:flex;height:132px;flex:0 0 auto}
+  .gh{display:flex;background:var(--surface);border-bottom:1px solid var(--line);flex:0 0 auto}
+  .gh .c{flex:1;padding:8px 0;text-align:center;font-size:11px;color:var(--soft);font-weight:600;
+         border-right:1px solid var(--line)}
+  .gh .c:last-child{border-right:0}
+  .gcol{flex:1;border-right:1px solid var(--line);border-bottom:1px solid var(--line);padding:6px;display:flex;flex-direction:column}
+  .gcol:last-child{border-right:0}
+  .blk{border-radius:6px;padding:7px 8px;font-size:10.5px;line-height:1.35;background:var(--alt);color:var(--ink);height:100%}
+  .blk .m{display:block;color:var(--soft);font-size:9.5px;margin-top:3px}
+  .blk.hollow{background:transparent}
+</style>
+</head>
+<body>
+<script src="nav-icons.js"></script>
+<script>
+  const items = [
+    { id:'chat',      label:'对话',     on:false },
+    { id:'portal',    label:'教务门户', on:false },
+    { id:'scores',    label:'成绩查询', on:false, tip:true },
+    { id:'timetable', label:'我的课表', on:true  },
+    { id:'library',   label:'图书馆',   on:false },
+    { id:'software',  label:'正版软件', on:false }
+  ];
+  const days = ['周一','周二','周三','周四','周五'];
+  const plan = [
+    [{n:'高等数学',m:'1-2节 · A302'}, null, {n:'大学英语',m:'1-2节 · B105'}, null, {n:'形势与政策',m:'1-2节 · 报告厅'}],
+    [null, {n:'数据结构',m:'3-4节 · C210'}, null, {n:'数据结构',m:'3-4节 · C210'}, null],
+    [{n:'线性代数',m:'5-6节 · A108'}, null, {n:'体育',m:'5-6节 · 东操场'}, null, {n:'数据库原理',m:'5-6节 · C305'}],
+    [null, {n:'操作系统',m:'7-8节 · C210'}, null, null, null]
+  ];
+  const blk = (b) => b ? `<div class="blk">${b.n}<span class="m">${b.m}</span></div>` : `<div class="blk hollow"></div>`;
+  const grid = `
+    <div class="grid">
+      <div class="gh"><div class="c" style="flex:0 0 44px">节次</div>${days.map(d=>`<div class="c">${d}</div>`).join('')}</div>
+      ${plan.map((row,i)=>`<div class="gr">
+        <div class="gh" style="flex:0 0 44px;border-bottom:0;background:transparent"><div class="c" style="border-right:1px solid var(--line);border-bottom:0">${i*2+1}-${i*2+2}</div></div>
+        ${row.map(b=>`<div class="gcol">${blk(b)}</div>`).join('')}
+      </div>`).join('')}
+    </div>`;
+  document.body.innerHTML = `
+    <div class="tablet">
+      <div class="statusbar"></div>
+      <div class="shell">
+        <div class="rail">
+          <div class="ham">${NAV.icon('menu_open', 20)}</div>
+          ${items.map(it=>`<div class="item${it.on?' on':''}">
+              <div class="btn">${NAV.icon(it.id, 20)}</div>
+              ${it.tip ? `<div class="tip">${it.label}</div>` : ''}
+            </div>`).join('')}
+          <div class="spacer"></div>
+          <div class="foot">${NAV.icon('settings', 20)}</div>
+        </div>
+        <div class="content">
+          <div class="hd"><div class="t">我的课表</div><div class="s">第 8 周 · 2026 秋季学期 · 共 9 门课</div></div>
+          ${grid}
+        </div>
+      </div>
+    </div>`;
+</script>
+</body>
+</html>
