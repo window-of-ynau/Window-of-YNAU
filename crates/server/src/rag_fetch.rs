@@ -1421,10 +1421,7 @@ mod tests {
     fn pipeline_with(fetcher: Arc<ScriptedFetcher>, retries: u32) -> FetchPipeline {
         let pool = sqlx::PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none")
             .expect("lazy pool 不该连接");
-        let rag = Arc::new(RagService::new(
-            &crate::config::Config::for_tests(),
-            None,
-        ));
+        let rag = Arc::new(RagService::new(&crate::config::Config::for_tests(), None));
         FetchPipeline::new(
             pool,
             rag,

@@ -882,10 +882,10 @@ async fn pg_rag_tables_have_no_user_id_column() {
 }
 
 /// 审计/记账是 fire-and-forget：响应返回后立刻 `count` 会抢跑（旧断言实测 3 跑挂 1 跑）。
-/// 这条用例**确定性**地复现这个竞态：先证明"立即读 = 0"（旧写法必红），
-/// 再证明 `common::wait_for_rows` 能等到异步写入（修复后必绿）。
+/// 这条用例用**门闩**确定性地复现竞态：写者被 oneshot 拦住时计数恒为 0（旧写法必红），
+/// 放行后再轮询到落库、断言最终计数（修复写法必绿）。不依赖任何固定时间窗口。
 ///
-/// 变异验证：把第二次断言换成 `common::count(...)` 的一次性读取，本用例必红。
+/// 变异验证：把最后一步换成 `common::count(...)` 的一次性读取，本用例必红。
 #[tokio::test]
 #[ignore = "需要 PostgreSQL（DATABASE_URL），见 tests/common/mod.rs"]
 async fn pg_wait_for_rows_tolerates_fire_and_forget_visibility() {
@@ -894,23 +894,31 @@ async fn pg_wait_for_rows_tolerates_fire_and_forget_visibility() {
     };
     db.execute("CREATE TABLE IF NOT EXISTS probe_async_visibility (id integer)")
         .await;
+    // 门闩：测试放行前，写者绝不会插入——不靠 sleep 赌调度。
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let writer = db.pool.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = release_rx.await;
         let _ = sqlx::query("INSERT INTO probe_async_visibility VALUES (1)")
             .execute(&writer)
             .await;
     });
-    // 旧写法（响应后立刻单次断言）：此刻行还没落库 → 0
+    // 门闩未放行：计数恒为 0（确定性断言，不是"500ms 内"）。
     assert_eq!(
         common::count(&db.pool, "SELECT count(*) FROM probe_async_visibility").await,
         0,
-        "异步写入还没来得及落库（这正是旧断言抢跑的窗口）"
+        "门闩未放行时写者不应落库"
     );
-    // 修复写法（轮询）：等到落库 → 1
+    release_tx.send(()).expect("放行写者");
+    // 放行后轮询到落库，再断言最终计数（轮询而非固定窗口）。
     assert!(
         common::wait_for_rows(&db.pool, "SELECT count(*) FROM probe_async_visibility", 1).await,
         "wait_for_rows 应等到 fire-and-forget 写入落库"
+    );
+    assert_eq!(
+        common::count(&db.pool, "SELECT count(*) FROM probe_async_visibility").await,
+        1,
+        "放行后应恰好落库一行"
     );
     db.finish().await;
 }
@@ -983,10 +991,8 @@ async fn pg_migrations_are_idempotent_and_do_not_duplicate_data() {
     // 2) 一条 fetching 行——旧版 0005 的 "DROP 后 ADD" 在这里会 ADD 失败并永久丢约束。
     db.execute("INSERT INTO users (email) VALUES ('idem@example.com')")
         .await;
-    db.execute(
-        "INSERT INTO rag_referrals (month, hash, count) VALUES ('2026-11', 'idem-hash', 3)",
-    )
-    .await;
+    db.execute("INSERT INTO rag_referrals (month, hash, count) VALUES ('2026-11', 'idem-hash', 3)")
+        .await;
     db.execute(
         "INSERT INTO rag_candidates (month, hash, count, status) VALUES ('2026-11', 'idem-hash', 3, 'pending')",
     )
@@ -1015,7 +1021,11 @@ async fn pg_migrations_are_idempotent_and_do_not_duplicate_data() {
     for (_, sql) in &probes {
         before.push(common::count(&db.pool, sql).await);
     }
-    assert_eq!(before[0], 2, "0001 应种入 2 条示例套餐（当前是 {}）", before[0]);
+    assert_eq!(
+        before[0], 2,
+        "0001 应种入 2 条示例套餐（当前是 {}）",
+        before[0]
+    );
     assert_eq!(before[4], 2, "两条候选（pending + fetching）");
 
     // 真正把**每一份迁移**再执行一遍（含 0001 的套餐种子、0005/0006 的约束守卫）。
@@ -1023,7 +1033,7 @@ async fn pg_migrations_are_idempotent_and_do_not_duplicate_data() {
     assert!(names.len() >= 8, "迁移文件数看起来不对：{names:?}");
     for name in &names {
         let sql = common::migration_sql(name);
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(&*sql))
             .execute(&db.pool)
             .await
             .unwrap_or_else(|error| panic!("重跑 {name} 失败（迁移必须可重入）：{error}"));

@@ -202,11 +202,7 @@ async fn exec(conn: &mut PgConnection, sql: &str) {
 async fn apply_migrations(pool: &PgPool) {
     let dir = migrations_dir();
     let mut files = migration_files(&dir);
-    assert!(
-        !files.is_empty(),
-        "迁移目录里没有 .sql：{}",
-        dir.display()
-    );
+    assert!(!files.is_empty(), "迁移目录里没有 .sql：{}", dir.display());
     files.sort();
     for file in files {
         let sql = std::fs::read_to_string(&file)
