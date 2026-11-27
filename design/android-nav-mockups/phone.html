@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Android 导航两态 · 真实图标</title>
+<!-- 与 Flutter 同源的 MaterialIcons 字体（视觉稿 == 实现） -->
+<style>
+  @font-face{font-family:'MI';src:url('assets/materialicons-regular.otf') format('opentype');font-weight:normal;font-style:normal}
+  .mi{font-family:'MI';display:inline-block;line-height:1;font-weight:normal;font-style:normal;
+      -webkit-font-smoothing:antialiased;text-rendering:geometricPrecision}
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;overflow:hidden;background:#fff;
+    font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif}
+
+  /* A · 极简黑白（浅） */
+  body[data-t="a"]{--canvas:#FFFFFF;--surface:#F7F7F7;--alt:#F0F0F0;--ink:#0D0D0D;--soft:#6B6B6B;
+    --faint:#8A8A8A;--line:#E8E8E8;--accent:#0D0D0D;--chip:#FFFFFF;--chipRing:#ECECF1;--field:#F7F7F7;--fieldRing:#ECECF1;--sendFg:#FFFFFF}
+  /* B · 深蓝玻璃（深） */
+  body[data-t="b"]{--canvas:#070D1C;--surface:#0C1428;--alt:rgba(255,255,255,.10);--ink:#E8EEFC;--soft:#A9BFF0;
+    --faint:#7E92C4;--line:rgba(255,255,255,.10);--accent:#3F68E4;--chip:rgba(255,255,255,.06);--chipRing:rgba(255,255,255,.12);
+    --field:rgba(12,22,44,.52);--fieldRing:rgba(255,255,255,.18);--sendFg:#FFFFFF}
+  /* C · 书本质感（浅） */
+  body[data-t="c"]{--canvas:#F5F4ED;--surface:#FAF9F5;--alt:#EFEEE4;--ink:#141413;--soft:#6C6A64;
+    --faint:#8E8B82;--line:#E6DFD8;--accent:#A9583E;--chip:#FAF9F5;--chipRing:#E6DFD8;--field:#FAF9F5;--fieldRing:#E6DFD8;--sendFg:#FFFFFF}
+  body[data-t="b"] .phone{background:linear-gradient(135deg,#0E1C3A,#070D1C 55%,#04070F)}
+
+  .phone{position:relative;width:390px;height:844px;background:var(--canvas);color:var(--ink);overflow:hidden;display:flex;flex-direction:column}
+  .statusbar{height:24px;flex:0 0 auto;background:transparent}
+  .statusrow{height:44px;flex:0 0 auto;display:flex;align-items:center;padding:0 16px;gap:4px}
+  .icbtn{width:48px;height:48px;display:grid;place-items:center;color:var(--ink)}
+  .ttl{font-size:16px;font-weight:600}
+  .grow{flex:1}
+  .content{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 16px;text-align:center}
+  .greet{font-size:25px;font-weight:600;letter-spacing:-.3px;line-height:1.28}
+  .tagline{font-size:14px;color:var(--soft);margin-top:8px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:18px}
+  .chip{font-size:12.5px;padding:7px 12px;border-radius:999px;background:var(--chip);box-shadow:0 0 0 1px var(--chipRing)}
+  .composer{flex:0 0 auto;padding:0 16px 16px}
+  .field{height:52px;border-radius:12px;background:var(--field);box-shadow:0 0 0 1px var(--fieldRing);
+    display:flex;align-items:center;padding:0 8px 0 14px;gap:8px}
+  .ph{flex:1;font-size:14px;color:var(--faint)}
+  .send{height:34px;padding:0 13px;border-radius:8px;background:var(--accent);color:var(--sendFg);font-size:13px;font-weight:600;display:grid;place-items:center}
+  .gesture{height:16px;flex:0 0 auto;background:transparent}
+
+  /* 抽屉：全高、320、遮罩 32%、右侧 1px 分界 + 投影 */
+  .scrim{position:absolute;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,.32);z-index:3}
+  .drawer{position:absolute;left:0;top:0;bottom:0;width:320px;background:var(--surface);
+    border-right:1px solid var(--line);
+    box-shadow:2px 0 16px rgba(0,0,0,.18);display:flex;flex-direction:column;z-index:4}
+  .dbrand{padding:32px 16px 4px;display:flex;align-items:center}
+  .dbrand .b{font-size:17px;font-weight:600}
+  .dbrand .x{color:var(--soft);display:grid;place-items:center;width:32px;height:32px}
+  .dsub{font-size:12px;color:var(--soft);padding:0 16px 10px}
+  .grp{font-size:10px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--soft);
+    padding:12px 16px 4px}
+  .drow{height:44px;display:flex;align-items:center;padding:0 16px;position:relative;color:var(--soft)}
+  .drow .ic{width:20px;display:grid;place-items:center;margin-right:8px}
+  .drow .lb{font-size:14px}
+  .drow.on{background:var(--alt);font-weight:600;color:var(--ink)}
+  .drow.on::before{content:"";position:absolute;left:0;top:10px;bottom:10px;width:3px;background:var(--accent);border-radius:2px}
+  .dfoot{margin-top:auto;border-top:1px solid var(--line)}
+</style>
+</head>
+<body>
+<script src="nav-icons.js"></script>
+<script>
+  const p = new URLSearchParams(location.search);
+  const open = p.get('open') === '1';
+  const theme = p.get('t') || 'a';
+  document.body.dataset.t = theme;
+
+  // 入口 = CampusEntry.values（教务门户 / 成绩查询 / 我的课表 / 图书馆 / 正版软件）+ 对话；设置贴底
+  const rows = [
+    { id: 'chat',      label: '对话',     on: true  },
+    { id: 'portal',    label: '教务门户', on: false },
+    { id: 'scores',    label: '成绩查询', on: false },
+    { id: 'timetable', label: '我的课表', on: false },
+    { id: 'library',   label: '图书馆',   on: false },
+    { id: 'software',  label: '正版软件', on: false }
+  ];
+  const rowHtml = (r) =>
+    `<div class="drow${r.on ? ' on' : ''}"><div class="ic">${NAV.icon(r.id, 20)}</div><div class="lb">${r.label}</div></div>`;
+
+  const screen = `
+    <div class="statusbar"></div>
+    <div class="statusrow">
+      <div class="icbtn">${NAV.icon('menu', 20)}</div>
+      <div class="ttl">云农之窗</div>
+      <div class="grow"></div>
+      <div class="icbtn">${NAV.icon('settings', 20)}</div>
+    </div>
+    <div class="content">
+      <div class="greet">今天想从哪儿开始？</div>
+      <div class="tagline">问点什么吧——课表、成绩、校园生活都行。</div>
+      <div class="chips">
+        <div class="chip">第 8 周哪天最累？</div><div class="chip">把课表导出成日历</div>
+        <div class="chip">这门课的考核方式</div><div class="chip">这学期一共几门课？</div>
+      </div>
+    </div>
+    <div class="composer"><div class="field"><div class="ph">输入消息…</div><div class="send">发送</div></div></div>
+    <div class="gesture"></div>`;
+
+  const drawer = `
+    <div class="scrim"></div>
+    <div class="drawer">
+      <div class="dbrand"><div class="b">云农之窗</div><div class="grow"></div><div class="x">${NAV.icon('close', 16)}</div></div>
+      <div class="dsub">对话</div>
+      <div class="grp">功能</div>${rowHtml(rows[0])}
+      <div class="grp">校园 · ${rows.length - 1}</div>${rows.slice(1).map(rowHtml).join('')}
+      <div class="dfoot"><div class="drow"><div class="ic">${NAV.icon('settings', 20)}</div><div class="lb">设置</div></div></div>
+    </div>`;
+
+  document.body.innerHTML = `<div class="phone">${screen}${open ? drawer : ''}</div>`;
+</script>
+</body>
+</html>
