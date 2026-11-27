@@ -549,7 +549,7 @@ async fn pg_migration_0006_is_idempotent() {
     .expect("读迁移文件");
     // 多语句必须用 raw_sql（预编译协议一次只能一条）
     for attempt in 0..2 {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(&*sql))
             .execute(&db.pool)
             .await
             .unwrap_or_else(|error| panic!("第 {} 次重入 0006 失败：{error}", attempt + 1));
@@ -638,7 +638,7 @@ async fn pg_rag_migrations_are_safe_to_rerun_with_fetching_rows() {
     // 重跑 0005 与 0006（迁移文件本身，原样执行）
     for name in ["0005_rag_referrals.sql", "0006_rag_known_docs.sql"] {
         let sql = common::migration_sql(name);
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(&*sql))
             .execute(&fx.pool())
             .await
             .unwrap_or_else(|error| panic!("{name} 必须能在有 fetching 行时重跑：{error}"));
