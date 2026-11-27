@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 // 云农之窗 · 客户端骨架（W1）
 //
@@ -224,6 +225,25 @@ class _YunongAppState extends State<YunongApp> {
   }
 }
 
+/// 导航档位（#90 分层导航）：**这是三种布局，不是一套布局的缩放**。
+///
+/// - 手机 `<600`：无 rail，`Scaffold.drawer` 全高抽屉（汉堡在状态行左侧）；
+/// - 折叠屏/平板 `600–839`：常驻 rail 64；
+/// - 桌面 `≥840`：侧栏 224（展开）/ 64（折叠）。
+///
+/// 纯函数集中判档，避免 `width < 600` 这种散落判断再次混用"折叠侧栏"和"手机布局"。
+enum NavMode { phoneDrawer, tabletRail, desktopSidebar }
+
+NavMode navModeOf(double width) {
+  if (width < _HomeShellState.kPhoneBreakpoint) {
+    return NavMode.phoneDrawer;
+  }
+  if (width < _HomeShellState.kWideBreakpoint) {
+    return NavMode.tabletRail;
+  }
+  return NavMode.desktopSidebar;
+}
+
 /// 左侧导航 + 右侧主区（PRD §4 信息架构）。
 class HomeShell extends StatefulWidget {
   const HomeShell({super.key, required this.themeController});
@@ -250,37 +270,34 @@ class _HomeShellState extends State<HomeShell> {
   /// `null` = 用户从未手动设置过 → 窄窗（< 600）自动折叠；手动设置过则一直尊重它。
   bool? _collapsedOverride;
   static const String _collapsedKey = 'sidebar.collapsed';
-  // 布局 v2（t171）：左栏 224（宽）/ 200（中）/ 64（折叠，也是窄屏）。
+  /// #90 分层导航常量（v0.9.2 定稿，见 design/android-adaptive-nav.md §9）。
   static const double kSidebarWidth = 224;
-  static const double kSidebarMedium = 200;
-  static const double kRailWidth = 48;
+  static const double kRailWidth = 64;
   static const double kPhoneBreakpoint = 600;
   static const double kWideBreakpoint = 840;
 
-  /// 统一 64dp 图标列：汉堡与底部设置的图标中心都在 x = 32。
-  static const double kIconColumn = 48;
-
-  static double _sidebarWidthOf(double windowWidth, bool collapsed) {
-    if (collapsed) {
-      return kRailWidth;
-    }
-    return windowWidth >= kWideBreakpoint ? kSidebarWidth : kSidebarMedium;
-  }
+  /// 统一 64dp 图标列：汉堡 / 侧栏项 / 底部设置的图标中心都在 x = 32。
+  static const double kIconColumn = 64;
 
   /// t172：顶部只剩一行状态行（高度 40–44，按 owner 要求固定 44）。
   static const double kStatusRowHeight = 44;
+
+  /// 打开手机抽屉用（不依赖 BuildContext 层级）。
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
 
 
   @override
   Widget build(BuildContext context) {
     const entries = CampusEntry.values;
-    final destination = _selected == 0 ? null : entries[_selected - 1];
+    final CampusEntry? destination = _selected == 0 ? null : entries[_selected - 1];
     final double width = MediaQuery.sizeOf(context).width;
     final YunongTokens tokens = context.tokens;
-    // 布局 v2/v3（t171/t174）：窄屏 <600 恒定 rail 48；中屏 600–839 展开 200；宽屏 ≥840 展开 224。
-    final bool narrow = width < kPhoneBreakpoint;
-    final bool collapsed = _collapsedOverride ?? narrow;
+    // #90：三档布局。手机不再有"折叠的 rail"，而是没有 rail + 覆盖抽屉。
+    final NavMode mode = navModeOf(width);
+    final bool phone = mode == NavMode.phoneDrawer;
+    final bool tablet = mode == NavMode.tabletRail;
+    final bool collapsed = mode == NavMode.desktopSidebar && (_collapsedOverride ?? false);
 
     final Widget panes = IndexedStack(
       index: destination == null ? 0 : 1,
@@ -290,25 +307,33 @@ class _HomeShellState extends State<HomeShell> {
       ],
     );
 
-    // t174：汉堡**进左栏顶部**（与导航图标同列），不再占用内容区顶部。
-    // 结构：Row( Column[汉堡, 导航…, 底部设置], 细线, Expanded(内容) )。
+    final double sideWidth = tablet
+        ? kRailWidth
+        : (collapsed ? kRailWidth : kSidebarWidth);
+
+    // 平板 / 桌面：常驻侧栏（平板固定 rail 64；桌面 224/64）。
     final Widget rail = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
         SizedBox(
           height: kStatusRowHeight,
-          child: _IconColumnButton(
-            buttonKey: const Key('sidebar-toggle'),
-            icon: collapsed ? Icons.menu : Icons.menu_open,
-            tooltip: collapsed ? '展开侧栏' : '折叠侧栏',
-            onTap: _toggleSidebar,
+          // Column 的 crossAxisAlignment.stretch 会把子项拉到整栏宽 —— 用 Align 包一层，
+          // 让 64dp 图标列保持 64（汉堡图标中心 x=32，与侧栏项同一竖线）。
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: _IconColumnButton(
+              buttonKey: const Key('sidebar-toggle'),
+              icon: tablet ? Icons.menu : (collapsed ? Icons.menu : Icons.menu_open),
+              tooltip: tablet ? '导航' : (collapsed ? '展开侧栏' : '折叠侧栏'),
+              onTap: tablet ? () {} : _toggleSidebar,
+            ),
           ),
         ),
         Expanded(
           child: _Sidebar(
             collapsed: collapsed,
-            narrow: narrow,
-            width: _sidebarWidthOf(width, collapsed),
+            narrow: tablet,
+            width: sideWidth,
             selected: _selected,
             entries: entries,
             onSelect: _select,
@@ -319,16 +344,29 @@ class _HomeShellState extends State<HomeShell> {
       ],
     );
 
-    return Scaffold(
-      // t174：不再用 AppBar —— 状态行（ChatTopBar / 页面自己的头部）就是内容区第一行。
-      body: Row(
+    final Widget body;
+    if (phone) {
+      // 手机：没有常驻侧栏；汉堡在状态行左侧，点开全高抽屉（Drawer 自带 246ms/200ms 动效）。
+      body = SafeArea(
+        top: true,
+        bottom: true,
+        left: false,
+        right: false,
+        child: Column(
+          children: <Widget>[
+            _PhoneAppBar(onMenu: _openDrawer),
+            Expanded(child: panes),
+          ],
+        ),
+      );
+    } else {
+      body = Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
           SizedBox(
-            width: _sidebarWidthOf(width, collapsed),
+            width: sideWidth,
             child: Material(
               color: tokens.surface,
-              // t179：rail 与内容区一起避让状态栏 / 手势条
               child: SafeArea(
                 top: true,
                 bottom: true,
@@ -341,9 +379,7 @@ class _HomeShellState extends State<HomeShell> {
               ),
             ),
           ),
-          // 两栏分界：1px 主题细线 + 侧栏底色差（双保险，三主题都稳定）
           Container(width: 1, color: tokens.hairline),
-          // t179：手机端内容不再顶到系统状态栏下面
           Expanded(
             child: SafeArea(
               top: true,
@@ -354,14 +390,35 @@ class _HomeShellState extends State<HomeShell> {
             ),
           ),
         ],
-      ),
+      );
+    }
+
+    return Scaffold(
+      key: _scaffoldKey,
+      // 手机档才挂抽屉；平板/桌面为 null。
+      drawer: phone
+          ? _CoverDrawer(
+              selected: _selected,
+              entries: entries,
+              onSelect: _select,
+              onOpenSettings: _openSettings,
+            )
+          : null,
+      drawerScrimColor: const Color(0x52000000),
+      drawerEdgeDragWidth: 20,
+      drawerEnableOpenDragGesture: true,
+      body: body,
     );
   }
 
+  void _openDrawer() => _scaffoldKey.currentState?.openDrawer();
+
   void _toggleSidebar() {
-    // 窄屏永远是 rail 64；汉堡只在中/宽屏有意义（窄屏点了也保持 rail，避免把内容挤没）。
-    final bool narrow = MediaQuery.sizeOf(context).width < kPhoneBreakpoint;
-    final bool next = narrow ? true : !(_collapsedOverride ?? false);
+    // 只有桌面档可折叠；平板固定 rail 64，手机没有 rail。
+    if (navModeOf(MediaQuery.sizeOf(context).width) != NavMode.desktopSidebar) {
+      return;
+    }
+    final bool next = !(_collapsedOverride ?? false);
     setState(() => _collapsedOverride = next);
     // 持久化：与主题同级（settings.json）
     unawaited(widget.themeController.store.set(_collapsedKey, next ? 'true' : 'false'));
@@ -494,7 +551,7 @@ class _EntryPlaceholder extends StatelessWidget {
 ///
 /// 展开 256 / 折叠 64（rail 只留图标 + tooltip），用 `AnimatedContainer` 做平滑过渡。
 /// 底部「设置」在两种形态下都可用（rail 态是带 tooltip 的图标按钮）。
-/// t174：48dp 图标列里的 36×36 按钮（汉堡 / 侧栏项共用同一条竖线，中心 x=24）。
+/// t174：64dp 图标列里的 40×40 按钮（汉堡 / 侧栏项共用同一条竖线，中心 x=32）。
 class _IconColumnButton extends StatelessWidget {
   const _IconColumnButton({
     this.buttonKey,
@@ -511,26 +568,23 @@ class _IconColumnButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final YunongTokens tokens = context.tokens;
+    // 64 列里居中放 40×40 按钮 → 图标中心 x = 32。
     return SizedBox(
       width: _HomeShellState.kIconColumn,
-      child: Padding(
-        padding: const EdgeInsets.only(left: 6),
-        child: Align(
-          alignment: Alignment.centerLeft,
-          widthFactor: 1,
-          child: SizedBox(
-            width: 36,
-            height: 36,
-            child: IconButton(
-              key: buttonKey,
-              padding: EdgeInsets.zero,
-              iconSize: 20,
-              constraints: const BoxConstraints.tightFor(width: 36, height: 36),
-              style: IconButton.styleFrom(tapTargetSize: MaterialTapTargetSize.shrinkWrap),
-              tooltip: tooltip,
-              onPressed: onTap,
-              icon: Icon(icon, color: tokens.inkSoft),
-            ),
+      height: 40,
+      child: Center(
+        child: SizedBox(
+          width: 40,
+          height: 40,
+          child: IconButton(
+            key: buttonKey,
+            padding: EdgeInsets.zero,
+            iconSize: 20,
+            constraints: const BoxConstraints.tightFor(width: 40, height: 40),
+            style: IconButton.styleFrom(tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+            tooltip: tooltip,
+            onPressed: onTap,
+            icon: Icon(icon, color: tokens.inkSoft),
           ),
         ),
       ),
@@ -604,7 +658,7 @@ class _Sidebar extends StatelessWidget {
                 for (var i = 0; i < entries.length; i++)
                   _SidebarItem(
                     collapsed: narrow || collapsed,
-                    icon: Icons.school_outlined,
+                    icon: entries[i].icon,
                     label: entries[i].label,
                     selected: selected == i + 1,
                     onTap: () => onSelect(i + 1),
@@ -655,55 +709,73 @@ class _SidebarItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final YunongTokens tokens = context.tokens;
-    // 统一 64dp 图标列：40×40 按钮居中（图标 20）→ 图标中心 x = 32。
-    // 48 宽图标列：左内边距 6 + 36×36 按钮 + 6 → 图标中心 x = 24。
+    // #84：默认 inkSoft，选中 ink（不再恒 inkSoft）。
+    final Color iconColor = selected ? tokens.ink : tokens.inkSoft;
     final Widget button = SizedBox(
-      width: 36,
-      height: 36,
+      width: 40,
+      height: 40,
       child: IconButton(
         key: buttonKey,
         padding: EdgeInsets.zero,
         iconSize: 20,
-        constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+        constraints: const BoxConstraints.tightFor(width: 40, height: 40),
         style: IconButton.styleFrom(tapTargetSize: MaterialTapTargetSize.shrinkWrap),
         tooltip: label,
         onPressed: onTap,
         isSelected: selected,
-        icon: Icon(icon, color: tokens.inkSoft),
+        icon: Icon(icon, color: iconColor),
       ),
     );
+    // 64dp 图标列：40×40 按钮居中（图标 20）→ 图标中心 x = 32；
+    // 选中时左缘 3×24 强调条（rail 与侧栏展开共用同一套语言）。
     final Widget iconColumn = SizedBox(
       width: _HomeShellState.kIconColumn,
-      // t173：IconButton 会被 Material 撑满可用宽度（实测中心 27），Align(widthFactor:1) 把它钉在 36 宽。
-      child: Padding(
-        padding: const EdgeInsets.only(left: 6),
-        child: Align(alignment: Alignment.centerLeft, widthFactor: 1, child: button),
+      child: Stack(
+        alignment: Alignment.center,
+        children: <Widget>[
+          if (selected)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Container(
+                width: 3,
+                height: 24,
+                decoration: BoxDecoration(
+                  color: tokens.accent,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+          Center(child: button),
+        ],
       ),
     );
     if (collapsed) {
       return iconColumn;
     }
-    return InkWell(
-      onTap: onTap,
-      child: Row(
-        children: <Widget>[
-          iconColumn,
-          // 展开态：文字起点 x = 72（64 图标列 + 8 左内边距）
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.only(left: 8),
-              child: Text(
-                label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: selected ? tokens.ink : tokens.inkSoft,
-                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-                    ),
+    return Material(
+      color: selected ? tokens.surfaceAlt : Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        child: Row(
+          children: <Widget>[
+            iconColumn,
+            // 展开态文字起点 x = 64 图标列 + 8 = 72
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: selected ? tokens.ink : tokens.inkSoft,
+                        fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                      ),
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -725,6 +797,258 @@ class _DrawerSectionLabel extends StatelessWidget {
           fontSize: 10,
           fontWeight: FontWeight.w600,
           letterSpacing: 1.2,
+        ),
+      ),
+    );
+  }
+}
+
+/// 手机档顶部状态行（高度 44）：汉堡 48×48（左 padding 16，中心 x=40）+ 品牌名。
+///
+/// 手机没有 rail，所以汉堡从 rail 顶部移到这里；点击打开 [Scaffold] 的 drawer。
+class _PhoneAppBar extends StatelessWidget {
+  const _PhoneAppBar({required this.onMenu});
+
+  final VoidCallback onMenu;
+
+  @override
+  Widget build(BuildContext context) {
+    final YunongTokens tokens = context.tokens;
+    return SizedBox(
+      key: const Key('phone-app-bar'),
+      height: _HomeShellState.kStatusRowHeight,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 16, right: 12),
+        child: Row(
+          children: <Widget>[
+            SizedBox(
+              width: 48,
+              height: 44,
+              child: IconButton(
+                key: const Key('sidebar-toggle'),
+                padding: EdgeInsets.zero,
+                iconSize: 20,
+                constraints: const BoxConstraints.tightFor(width: 48, height: 44),
+                tooltip: '打开导航菜单',
+                onPressed: onMenu,
+                icon: Icon(Icons.menu, color: tokens.inkSoft),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '云农之窗',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                      color: tokens.ink,
+                      fontWeight: FontWeight.w600,
+                    ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 手机档全高覆盖抽屉（#90 方案 A）：宽 `min(320, w−56)`、行高 44、选中 `surfaceAlt` + 3dp 强调条。
+///
+/// 结构照 `design/android-adaptive-nav.md` §2：品牌行 44 + 分组标签 + 导航项 + 底部设置。
+class _CoverDrawer extends StatelessWidget {
+  const _CoverDrawer({
+    required this.selected,
+    required this.entries,
+    required this.onSelect,
+    required this.onOpenSettings,
+  });
+
+  final int selected;
+  final List<CampusEntry> entries;
+  final ValueChanged<int> onSelect;
+  final VoidCallback onOpenSettings;
+
+  @override
+  Widget build(BuildContext context) {
+    final YunongTokens tokens = context.tokens;
+    final double screenWidth = MediaQuery.sizeOf(context).width;
+    final double drawerWidth = math.min(320, screenWidth - 56).toDouble();
+    return Drawer(
+      key: const Key('nav-drawer'),
+      width: drawerWidth,
+      backgroundColor: tokens.surface,
+      // 「整块侧壁」：直角，不要 M3 默认的圆角（会显得像浮起的面板）。
+      shape: const RoundedRectangleBorder(),
+      child: SafeArea(
+        top: true,
+        bottom: true,
+        left: false,
+        right: false,
+        child: Builder(builder: (BuildContext ctx) {
+          final void Function() close = () => Scaffold.of(ctx).closeDrawer();
+          return DecoratedBox(
+            decoration: BoxDecoration(
+              border: Border(right: BorderSide(color: tokens.hairline)),
+            ),
+            child: Column(
+              children: <Widget>[
+                SizedBox(
+                  height: _HomeShellState.kStatusRowHeight,
+                  child: Padding(
+                    padding: const EdgeInsets.only(left: 16, right: 8),
+                    child: Row(
+                      children: <Widget>[
+                        Expanded(
+                          child: Text(
+                            '云农之窗',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(ctx).textTheme.titleSmall?.copyWith(
+                                  color: tokens.ink,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                          ),
+                        ),
+                        IconButton(
+                          key: const Key('nav-drawer-close'),
+                          tooltip: '关闭导航菜单',
+                          iconSize: 20,
+                          onPressed: close,
+                          icon: Icon(Icons.close, color: tokens.inkSoft),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: ListView(
+                    padding: EdgeInsets.zero,
+                    children: <Widget>[
+                      _drawerSectionLabel(ctx, tokens, '功能'),
+                      _drawerRow(
+                        context,
+                        tokens,
+                        rowKey: const Key('drawer-item-chat'),
+                        icon: Icons.chat_bubble_outline,
+                        label: '对话',
+                        selected: selected == 0,
+                        onTap: () {
+                          onSelect(0);
+                          close();
+                        },
+                      ),
+                      _drawerSectionLabel(ctx, tokens, '校园 · ${entries.length}'),
+                      for (int i = 0; i < entries.length; i++)
+                        _drawerRow(
+                          context,
+                          tokens,
+                          rowKey: Key('drawer-item-${entries[i].name}'),
+                          icon: entries[i].icon,
+                          label: entries[i].label,
+                          selected: selected == i + 1,
+                          onTap: () {
+                            onSelect(i + 1);
+                            close();
+                          },
+                        ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: _drawerRow(
+                    context,
+                    tokens,
+                    rowKey: const Key('drawer-item-settings'),
+                    icon: Icons.settings_outlined,
+                    label: '设置',
+                    selected: false,
+                    onTap: () {
+                      close();
+                      onOpenSettings();
+                    },
+                  ),
+                ),
+              ],
+            ),
+          );
+        }),
+      ),
+    );
+  }
+
+  Widget _drawerSectionLabel(BuildContext context, YunongTokens tokens, String text) => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+        child: Text(
+          text,
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: tokens.inkSoft,
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 1.2,
+              ),
+        ),
+      );
+
+  Widget _drawerRow(
+    BuildContext context,
+    YunongTokens tokens, {
+    Key? rowKey,
+    required IconData icon,
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return Semantics(
+      selected: selected,
+      button: true,
+      label: label,
+      child: SizedBox(
+        height: 44,
+        child: Material(
+          color: selected ? tokens.surfaceAlt : Colors.transparent,
+          child: InkWell(
+            key: rowKey,
+            onTap: onTap,
+            child: Stack(
+              children: <Widget>[
+                if (selected)
+                  Positioned(
+                    left: 0,
+                    top: 10,
+                    bottom: 10,
+                    child: Container(
+                      width: 3,
+                      decoration: BoxDecoration(
+                        color: tokens.accent,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                Row(
+                  children: <Widget>[
+                    const SizedBox(width: 16),
+                    Icon(icon, size: 20, color: selected ? tokens.ink : tokens.inkSoft),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: selected ? tokens.ink : tokens.inkSoft,
+                          fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                  ],
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );

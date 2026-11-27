@@ -51,10 +51,10 @@ void main() {
       expect(find.byType(AppBar), findsNothing);
       final Rect toggle = tester.getRect(find.byKey(const Key('sidebar-toggle')));
       final Rect sidebar = tester.getRect(find.byKey(const Key('app-sidebar')));
-      // 三条断言之一：汉堡在 rail 顶部（y 与侧栏顶部同高，且在 48 宽列内）
+      // 三条断言之一：汉堡在 rail 顶部（y 与侧栏顶部同高，且在 64 宽列内，中心 x=32）
       expect(toggle.top, lessThan(sidebar.top + 44), reason: '汉堡应在左栏顶部');
-      expect(toggle.center.dx, closeTo(24, 0.5));
-      expect(tester.getCenter(find.byKey(const Key('sidebar-settings'))).dx, closeTo(24, 0.5));
+      expect(toggle.center.dx, closeTo(32, 0.5));
+      expect(tester.getCenter(find.byKey(const Key('sidebar-settings'))).dx, closeTo(32, 0.5));
     });
 
     testWidgets('状态行就是内容区第一行（y≈0）', (WidgetTester tester) async {

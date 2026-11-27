@@ -73,16 +73,17 @@ void main() {
       expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, closeTo(224, 1));
     });
 
-    testWidgets('700 宽：侧栏 200 ±1', (WidgetTester tester) async {
+    testWidgets('700 宽：平板档常驻 rail 64', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(700, 800));
-      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, closeTo(200, 1));
+      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, closeTo(64, 1));
     });
   });
 
   group('图标列对齐 x=32（t171 #4）', () {
-    testWidgets('窄屏：汉堡与底部设置同一条竖线', (WidgetTester tester) async {
+    testWidgets('手机 360：无侧栏，汉堡在状态行（y<60）', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(360, 800));
-      expect(_dx(tester, 'sidebar-toggle'), closeTo(_dx(tester, 'sidebar-settings'), 1));
+      expect(find.byKey(const Key('app-sidebar')), findsNothing);
+      expect(tester.getRect(find.byKey(const Key('sidebar-toggle'))).top, lessThan(60));
     });
 
     testWidgets('宽屏折叠态：同一条竖线', (WidgetTester tester) async {
@@ -101,10 +102,10 @@ void main() {
   });
 
   group('窄屏内容不被遮挡（t171）', () {
-    testWidgets('360×800：内容左边界 ≥ 64', (WidgetTester tester) async {
+    testWidgets('360×800：内容全宽（手机档无 rail，左边界≈0）', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(360, 800));
       final Rect content = tester.getRect(find.byType(IndexedStack).first);
-      expect(content.left, greaterThanOrEqualTo(48));
+      expect(content.left, lessThan(1));
     });
   });
 }

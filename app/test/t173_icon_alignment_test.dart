@@ -19,35 +19,35 @@ double _dx(WidgetTester tester, String key) =>
     tester.getCenter(find.byKey(Key(key))).dx;
 
 void main() {
-  group('图标列像素级对齐 x=24（t173）', () {
-    testWidgets('窄屏 360：toggle 与 settings 都是 24', (WidgetTester tester) async {
+  group('图标列像素级对齐 x=32（t173 → t6）', () {
+    testWidgets('手机 360：无 rail；汉堡在状态行、抽屉设置项可开', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(360, 800));
-      final double toggle = _dx(tester, 'sidebar-toggle');
-      final double settings = _dx(tester, 'sidebar-settings');
-      expect(toggle, closeTo(24, 0.5), reason: 'toggle=$toggle');
-      expect(settings, closeTo(24, 0.5), reason: 'settings=$settings');
-      expect(toggle, closeTo(settings, 0.5));
+      expect(find.byKey(const Key('app-sidebar')), findsNothing);
+      expect(tester.getRect(find.byKey(const Key('sidebar-toggle'))).top, lessThan(60));
+      await tester.tap(find.byKey(const Key('sidebar-toggle')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('drawer-item-settings')), findsOneWidget);
     });
 
-    testWidgets('宽屏 1280 展开：两者都是 24', (WidgetTester tester) async {
+    testWidgets('宽屏 1280 展开：两者都是 32', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(1280, 800));
       final double toggle = _dx(tester, 'sidebar-toggle');
       final double settings = _dx(tester, 'sidebar-settings');
       expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, closeTo(224, 1));
-      expect(toggle, closeTo(24, 0.5), reason: 'toggle=$toggle');
-      expect(settings, closeTo(24, 0.5), reason: 'settings=$settings');
+      expect(toggle, closeTo(32, 0.5), reason: 'toggle=$toggle');
+      expect(settings, closeTo(32, 0.5), reason: 'settings=$settings');
       expect(toggle, closeTo(settings, 0.5));
     });
 
-    testWidgets('宽屏 1280 折叠：两者都是 24', (WidgetTester tester) async {
+    testWidgets('宽屏 1280 折叠：两者都是 32', (WidgetTester tester) async {
       await _pumpApp(tester, const Size(1280, 800));
       await tester.tap(find.byKey(const Key('sidebar-toggle')));
       await tester.pumpAndSettle();
       final double toggle = _dx(tester, 'sidebar-toggle');
       final double settings = _dx(tester, 'sidebar-settings');
-      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, closeTo(48, 1));
-      expect(toggle, closeTo(24, 0.5), reason: 'toggle=$toggle');
-      expect(settings, closeTo(24, 0.5), reason: 'settings=$settings');
+      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, closeTo(64, 1));
+      expect(toggle, closeTo(32, 0.5), reason: 'toggle=$toggle');
+      expect(settings, closeTo(32, 0.5), reason: 'settings=$settings');
       expect(toggle, closeTo(settings, 0.5));
     });
 
