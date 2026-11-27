@@ -33,7 +33,7 @@ async fn token_row(pool: &PgPool, table: &str, token_hash: &str) -> Option<Token
         "只允许这两张令牌表：{table}"
     );
     let sql = format!("SELECT user_id, expires_at, revoked_at FROM {table} WHERE token_hash = $1");
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(token_hash)
         .fetch_optional(pool)
         .await
@@ -117,7 +117,7 @@ async fn register_writes_argon2id_hash_and_only_token_digests() {
         ("refresh_tokens", session.refresh_token.as_str()),
     ] {
         let sql = format!("SELECT count(*) FROM {table} WHERE token_hash = $1");
-        let hits: i64 = sqlx::query_scalar(&sql)
+        let hits: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
             .bind(token)
             .fetch_one(&db.pool)
             .await
