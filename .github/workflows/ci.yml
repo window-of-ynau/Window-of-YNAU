@@ -55,7 +55,11 @@ jobs:
       - name: 安装 Flutter（stable + 缓存 SDK）
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # 钉死 Flutter 版本（#t14）：subosito 的 `channel: stable` 不钉版本，会随 stable
+          # 漂移（11-09=3.47.4，11-26 已漂到 3.50.1）——3.50.x 把 package:flutter/material.dart
+          # 标记为 deprecated（新增 70 条 info）使 `flutter analyze` 变红，并要求 Gradle ≥9.3.1
+          # 使 Android job 变红。本机/基线为 3.47.4，故钉到 3.47.4，杜绝"仓库没改、CI 自己变红"。
+          flutter-version: '3.47.4'
           cache: true
       - name: flutter pub get
         run: flutter pub get
@@ -88,7 +92,11 @@ jobs:
           ls -l target/debug/libyunong_core.so target/debug/examples/fake_sse
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # 钉死 Flutter 版本（#t14）：subosito 的 `channel: stable` 不钉版本，会随 stable
+          # 漂移（11-09=3.47.4，11-26 已漂到 3.50.1）——3.50.x 把 package:flutter/material.dart
+          # 标记为 deprecated（新增 70 条 info）使 `flutter analyze` 变红，并要求 Gradle ≥9.3.1
+          # 使 Android job 变红。本机/基线为 3.47.4，故钉到 3.47.4，杜绝"仓库没改、CI 自己变红"。
+          flutter-version: '3.47.4'
           cache: true
       - name: flutter pub get
         working-directory: app
@@ -738,7 +746,11 @@ jobs:
           java-version: "21"
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # 钉死 Flutter 版本（#t14）：subosito 的 `channel: stable` 不钉版本，会随 stable
+          # 漂移（11-09=3.47.4，11-26 已漂到 3.50.1）——3.50.x 把 package:flutter/material.dart
+          # 标记为 deprecated（新增 70 条 info）使 `flutter analyze` 变红，并要求 Gradle ≥9.3.1
+          # 使 Android job 变红。本机/基线为 3.47.4，故钉到 3.47.4，杜绝"仓库没改、CI 自己变红"。
+          flutter-version: '3.47.4'
           cache: true
       # 【t180】gradle 分发（wrapper 下载 gradle-8.14.3-all.zip）会因 GitHub Release 504 直接失败。
       # setup-gradle 负责缓存/复用 ~/.gradle；wrapper 自身的下载在下一步用 curl 重试兜住。

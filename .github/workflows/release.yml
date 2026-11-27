@@ -187,7 +187,9 @@ jobs:
       - name: 安装 Flutter（stable + 缓存 SDK）
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # 钉死 Flutter 版本（#t14）：避免 stable 漂移到 3.50.x 后要求 Gradle ≥9.3.1、
+          # 并把 package:flutter/material.dart 标记 deprecated。基线版本 3.47.4。
+          flutter-version: '3.47.4'
           cache: true
       - name: flutter pub get
         working-directory: app
@@ -347,7 +349,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # 钉死 Flutter 版本（#t14）：避免 stable 漂移到 3.50.x 后要求 Gradle ≥9.3.1、
+          # 并把 package:flutter/material.dart 标记 deprecated。基线版本 3.47.4。
+          flutter-version: '3.47.4'
           cache: true
       # Windows 构建不需要 gradle：这里不需要 setup-gradle / 分发预热。
       # （曾误把 Android 的预热步骤插进本 job，在 PowerShell 下解析 bash 语法直接 ParserError。）
