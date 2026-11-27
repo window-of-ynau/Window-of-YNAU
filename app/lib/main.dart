@@ -299,11 +299,28 @@ class _HomeShellState extends State<HomeShell> {
     final bool tablet = mode == NavMode.tabletRail;
     final bool collapsed = mode == NavMode.desktopSidebar && (_collapsedOverride ?? false);
 
+    // t25 F4/F6：手机档的操作放进各 pane 既有状态行，HomeShell 不再另起一条顶栏。
+    final Widget? phoneMenu = phone ? _PhoneMenuButton(onTap: _openDrawer) : null;
+    final Widget? phoneSettings = phone ? _PhoneSettingsButton(onTap: _openSettings) : null;
+
     final Widget panes = IndexedStack(
       index: destination == null ? 0 : 1,
       children: <Widget>[
-        _ChatPane(chatSettings: _chatSettings, secrets: _secrets, auth: _auth),
-        if (destination == null) const SizedBox.shrink() else _CampusPane(entry: destination),
+        _ChatPane(
+          chatSettings: _chatSettings,
+          secrets: _secrets,
+          auth: _auth,
+          statusLeading: phoneMenu,
+          statusTrailing: phoneSettings,
+        ),
+        if (destination == null)
+          const SizedBox.shrink()
+        else
+          _CampusPane(
+            entry: destination,
+            statusLeading: phoneMenu,
+            statusTrailing: phoneSettings,
+          ),
       ],
     );
 
@@ -315,20 +332,22 @@ class _HomeShellState extends State<HomeShell> {
     final Widget rail = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        SizedBox(
-          height: kStatusRowHeight,
-          // Column 的 crossAxisAlignment.stretch 会把子项拉到整栏宽 —— 用 Align 包一层，
-          // 让 64dp 图标列保持 64（汉堡图标中心 x=32，与侧栏项同一竖线）。
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: _IconColumnButton(
-              buttonKey: const Key('sidebar-toggle'),
-              icon: tablet ? Icons.menu : (collapsed ? Icons.menu : Icons.menu_open),
-              tooltip: tablet ? '导航' : (collapsed ? '展开侧栏' : '折叠侧栏'),
-              onTap: tablet ? () {} : _toggleSidebar,
+        // t25 F5：平板档 rail 常驻，汉堡没有可折叠对象 → 不渲染（不做死按钮）。
+        if (!tablet)
+          SizedBox(
+            height: kStatusRowHeight,
+            // Column 的 crossAxisAlignment.stretch 会把子项拉到整栏宽 —— 用 Align 包一层，
+            // 让 64dp 图标列保持 64（汉堡图标中心 x=32，与侧栏项同一竖线）。
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: _IconColumnButton(
+                buttonKey: const Key('sidebar-toggle'),
+                icon: collapsed ? Icons.menu : Icons.menu_open,
+                tooltip: collapsed ? '展开侧栏' : '折叠侧栏',
+                onTap: _toggleSidebar,
+              ),
             ),
           ),
-        ),
         Expanded(
           child: _Sidebar(
             collapsed: collapsed,
@@ -346,18 +365,14 @@ class _HomeShellState extends State<HomeShell> {
 
     final Widget body;
     if (phone) {
-      // 手机：没有常驻侧栏；汉堡在状态行左侧，点开全高抽屉（Drawer 自带 246ms/200ms 动效）。
+      // t25 F4：手机只有 pane 自己的那一行状态行（汉堡/⚙ 已注入 ChatTopBar / 页头），
+      // HomeShell 不再额外渲染 _PhoneAppBar；内容不再白吃 44dp。
       body = SafeArea(
         top: true,
         bottom: true,
         left: false,
         right: false,
-        child: Column(
-          children: <Widget>[
-            _PhoneAppBar(onMenu: _openDrawer),
-            Expanded(child: panes),
-          ],
-        ),
+        child: panes,
       );
     } else {
       body = Row(
@@ -476,11 +491,19 @@ class _HomeShellState extends State<HomeShell> {
 
 /// 对话主区：真正的流式对话（`ChatPage`）。
 class _ChatPane extends StatelessWidget {
-  const _ChatPane({required this.chatSettings, this.secrets, this.auth});
+  const _ChatPane({
+    required this.chatSettings,
+    this.secrets,
+    this.auth,
+    this.statusLeading,
+    this.statusTrailing,
+  });
 
   final ChatSettingsController chatSettings;
   final SecretService? secrets;
   final AuthService? auth;
+  final Widget? statusLeading;
+  final Widget? statusTrailing;
 
   @override
   Widget build(BuildContext context) =>
@@ -489,14 +512,24 @@ class _ChatPane extends StatelessWidget {
         chatSettings: chatSettings,
         secretService: secrets,
         authService: auth,
+        statusLeading: statusLeading,
+        statusTrailing: statusTrailing,
       );
 }
 
 /// 校务入口（后续替换为真实 WebView；Cookie 只留在本机，ADR-11）。
 class _CampusPane extends StatelessWidget {
-  const _CampusPane({required this.entry});
+  const _CampusPane({
+    required this.entry,
+    this.statusLeading,
+    this.statusTrailing,
+  });
 
   final CampusEntry entry;
+
+  /// t25 F4：手机档把汉堡/⚙ 并进校务页自己的页头（一行 44）。
+  final Widget? statusLeading;
+  final Widget? statusTrailing;
 
   /// 课表服务：进程内复用一个实例（核心库只加载一次）。
   static final TimetableService _service = TimetableService();
@@ -507,11 +540,47 @@ class _CampusPane extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     // 课表入口：真实链路（WebView 抓取 / 调试导入 → Rust 解析 → SQLite → 列表）
+    final Widget page;
     if (entry == CampusEntry.timetable) {
-      return TimetablePage(service: _service, fetcher: _fetcher);
+      page = TimetablePage(service: _service, fetcher: _fetcher);
+    } else {
+      // t52 P0-2：其余入口显示**自己的占位页**（带 URL），绝不能落到对话页
+      page = _EntryPlaceholder(entry: entry);
     }
-    // t52 P0-2：其余入口显示**自己的占位页**（带 URL），绝不能落到对话页
-    return _EntryPlaceholder(entry: entry);
+    if (statusLeading == null && statusTrailing == null) {
+      return page;
+    }
+    final YunongTokens tokens = context.tokens;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        SizedBox(
+          key: const Key('phone-campus-header'),
+          height: _HomeShellState.kStatusRowHeight,
+          child: Material(
+            color: tokens.surface,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Row(
+                children: <Widget>[
+                  if (statusLeading != null) ...<Widget>[statusLeading!, const SizedBox(width: 4)],
+                  Expanded(
+                    child: Text(
+                      entry.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(color: tokens.ink),
+                    ),
+                  ),
+                  if (statusTrailing != null) statusTrailing!,
+                ],
+              ),
+            ),
+          ),
+        ),
+        Expanded(child: page),
+      ],
+    );
   }
 }
 
@@ -803,54 +872,48 @@ class _DrawerSectionLabel extends StatelessWidget {
   }
 }
 
-/// 手机档顶部状态行（高度 44）：汉堡 48×48（左 padding 16，中心 x=40）+ 品牌名。
-///
-/// 手机没有 rail，所以汉堡从 rail 顶部移到这里；点击打开 [Scaffold] 的 drawer。
-class _PhoneAppBar extends StatelessWidget {
-  const _PhoneAppBar({required this.onMenu});
+/// t25 F4/F6：手机档的状态行按钮（汉堡 / ⚙），由 HomeShell 注入各 pane 已有顶栏。
+/// 它们自身不是一行，只是 44×44 的按钮，避免「两条顶栏」白吃竖向空间。
+class _PhoneMenuButton extends StatelessWidget {
+  const _PhoneMenuButton({required this.onTap});
 
-  final VoidCallback onMenu;
+  final VoidCallback onTap;
 
   @override
-  Widget build(BuildContext context) {
-    final YunongTokens tokens = context.tokens;
-    return SizedBox(
-      key: const Key('phone-app-bar'),
-      height: _HomeShellState.kStatusRowHeight,
-      child: Padding(
-        padding: const EdgeInsets.only(left: 16, right: 12),
-        child: Row(
-          children: <Widget>[
-            SizedBox(
-              width: 48,
-              height: 44,
-              child: IconButton(
-                key: const Key('sidebar-toggle'),
-                padding: EdgeInsets.zero,
-                iconSize: 20,
-                constraints: const BoxConstraints.tightFor(width: 48, height: 44),
-                tooltip: '打开导航菜单',
-                onPressed: onMenu,
-                icon: Icon(Icons.menu, color: tokens.inkSoft),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                '云农之窗',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                      color: tokens.ink,
-                      fontWeight: FontWeight.w600,
-                    ),
-              ),
-            ),
-          ],
+  Widget build(BuildContext context) => SizedBox(
+        width: 44,
+        height: 44,
+        child: IconButton(
+          key: const Key('sidebar-toggle'),
+          padding: EdgeInsets.zero,
+          iconSize: 20,
+          constraints: const BoxConstraints.tightFor(width: 44, height: 44),
+          tooltip: '打开导航菜单',
+          onPressed: onTap,
+          icon: Icon(Icons.menu, color: context.tokens.inkSoft),
         ),
-      ),
-    );
-  }
+      );
+}
+
+class _PhoneSettingsButton extends StatelessWidget {
+  const _PhoneSettingsButton({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+        width: 44,
+        height: 44,
+        child: IconButton(
+          key: const Key('phone-settings'),
+          padding: EdgeInsets.zero,
+          iconSize: 20,
+          constraints: const BoxConstraints.tightFor(width: 44, height: 44),
+          tooltip: '设置',
+          onPressed: onTap,
+          icon: Icon(Icons.settings_outlined, color: context.tokens.inkSoft),
+        ),
+      );
 }
 
 /// 手机档全高覆盖抽屉（#90 方案 A）：宽 `min(320, w−56)`、行高 44、选中 `surfaceAlt` + 3dp 强调条。

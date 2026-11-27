@@ -33,6 +33,9 @@ class ChatTopBar extends StatelessWidget {
     required this.onInfo,
     this.showDebugEntries,
     required this.onClearConversation,
+    this.leading,
+    this.trailing,
+    this.compact = false,
   });
 
   final String channel;
@@ -64,6 +67,11 @@ class ChatTopBar extends StatelessWidget {
   /// 清空当前对话历史（t112：二次确认在页面里做）
   final VoidCallback onClearConversation;
 
+  /// t25 F4/F6：手机档把汉堡/设置按钮并入这一行（不再额外一条 _PhoneAppBar）。
+  final Widget? leading;
+  final Widget? trailing;
+  final bool compact;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -73,63 +81,79 @@ class ChatTopBar extends StatelessWidget {
 
   Widget _buildBar(BuildContext context, ThemeData theme) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      child: Row(
-        children: <Widget>[
-          // t132：顶栏不再放「直连/套餐」切换（与模型选择器里的「套餐通道」重复）。
-          // 通道选择只保留在模型选择器弹层里；顶栏左侧用标题占位，右侧是 ⓘ 与 ⋮。
-          Expanded(
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                statusLabel,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+      padding: compact
+          ? const EdgeInsets.fromLTRB(8, 0, 8, 0)
+          : const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: SizedBox(
+        height: compact ? kCompactStatusHeight : null,
+        child: Row(
+          children: <Widget>[
+            // t25 F4：手机档的汉堡直接在这一行里（左侧）。
+            if (leading != null) ...<Widget>[leading!, const SizedBox(width: 4)],
+            // t132：顶栏不再放「直连/套餐」切换（与模型选择器里的「套餐通道」重复）。
+            // 通道选择只保留在模型选择器弹层里；顶栏左侧用标题占位，右侧是 ⓘ 与 ⋮。
+            Expanded(
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  statusLabel,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                ),
               ),
             ),
-          ),
-          const SizedBox(width: 4),
-          // t132：搜索/Key/状态信息统一收进 ⓘ（不再占一整条横幅）。
-          IconButton(
-            key: const Key('chat-info'),
-            tooltip: ChatS.statusTooltip,
-            onPressed: onInfo,
-            iconSize: 20,
-            icon: Icon(
-              keyDegraded ? Icons.warning_amber_outlined : Icons.info_outline,
-              color: keyDegraded ? theme.colorScheme.tertiary : theme.hintColor,
+            const SizedBox(width: 4),
+            // t25 F6：手机档的 ⚙ 设置快捷入口（与 ⓘ/⋮ 同排）。
+            if (trailing != null) ...<Widget>[trailing!, const SizedBox(width: 2)],
+            // t132：搜索/Key/状态信息统一收进 ⓘ（不再占一整条横幅）。
+            IconButton(
+              key: const Key('chat-info'),
+              tooltip: ChatS.statusTooltip,
+              onPressed: onInfo,
+              iconSize: 20,
+              padding: compact ? EdgeInsets.zero : null,
+              constraints: compact ? const BoxConstraints.tightFor(width: 44, height: 44) : null,
+              icon: Icon(
+                keyDegraded ? Icons.warning_amber_outlined : Icons.info_outline,
+                color: keyDegraded ? theme.colorScheme.tertiary : theme.hintColor,
+              ),
             ),
-          ),
-          const SizedBox(width: 4),
-          PopupMenuButton<String>(
-            key: const Key('chat-menu'),
-            tooltip: ChatS.more,
-            icon: const Icon(Icons.more_vert),
-            onSelected: (String value) {
-              switch (value) {
-                case 'local':
-                  onLocalSearch();
-                case 'memory':
-                  onMemory();
-                case 'diagnostics':
-                  onDiagnostics();
-                case 'clear':
-                  onClearConversation();
-              }
-            },
-            itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
-              const PopupMenuItem<String>(value: 'local', child: Text(ChatS.menuLocalSearch)),
-              const PopupMenuItem<String>(value: 'memory', child: Text(ChatS.menuMemory)),
-              // t153：诊断入口在 **release 构建里隐藏**（调试用途），代码保留。
-              if (_showDebug)
-                const PopupMenuItem<String>(value: 'diagnostics', child: Text(ChatS.menuDiagnostics)),
-              const PopupMenuDivider(),
-              const PopupMenuItem<String>(value: 'clear', child: Text(ChatS.menuClear)),
-            ],
-          ),
-        ],
+            const SizedBox(width: 2),
+            PopupMenuButton<String>(
+              key: const Key('chat-menu'),
+              tooltip: ChatS.more,
+              icon: const Icon(Icons.more_vert),
+              constraints: compact ? const BoxConstraints.tightFor(width: 44, height: 44) : null,
+              onSelected: (String value) {
+                switch (value) {
+                  case 'local':
+                    onLocalSearch();
+                  case 'memory':
+                    onMemory();
+                  case 'diagnostics':
+                    onDiagnostics();
+                  case 'clear':
+                    onClearConversation();
+                }
+              },
+              itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+                const PopupMenuItem<String>(value: 'local', child: Text(ChatS.menuLocalSearch)),
+                const PopupMenuItem<String>(value: 'memory', child: Text(ChatS.menuMemory)),
+                // t153：诊断入口在 **release 构建里隐藏**（调试用途），代码保留。
+                if (_showDebug)
+                  const PopupMenuItem<String>(
+                      value: 'diagnostics', child: Text(ChatS.menuDiagnostics)),
+                const PopupMenuDivider(),
+                const PopupMenuItem<String>(value: 'clear', child: Text(ChatS.menuClear)),
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }
+
+  /// d1 §3.1：手机状态行 44dp（含安全区外的这一行本身）。
+  static const double kCompactStatusHeight = 44;
 }

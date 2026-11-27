@@ -84,6 +84,8 @@ class ChatPage extends StatefulWidget {
     this.authService,
     this.dbPath = '',
     this.providerStore,
+    this.statusLeading,
+    this.statusTrailing,
   });
 
   final ChatService? service;
@@ -105,6 +107,10 @@ class ChatPage extends StatefulWidget {
 
   /// t172：测试可注入（默认自己建一个）。
   final ProviderStore? providerStore;
+
+  /// t25 F4/F6：手机档并入 ChatTopBar 的汉堡/设置按钮（由 HomeShell 注入）。
+  final Widget? statusLeading;
+  final Widget? statusTrailing;
 
   @override
   State<ChatPage> createState() => ChatPageState();
@@ -738,6 +744,10 @@ class ChatPageState extends State<ChatPage> {
           onInfo: () => unawaited(_showInfoDialog()),
           // t112：Key 与套餐账号入口已移到设置页
           onClearConversation: () => unawaited(_clearConversation()),
+          leading: widget.statusLeading,
+          trailing: widget.statusTrailing,
+          compact: widget.statusLeading != null &&
+              MediaQuery.sizeOf(context).width < 600,
         ),
         if (_keyStatus.degraded)
           Padding(
