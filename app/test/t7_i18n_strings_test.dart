@@ -43,7 +43,7 @@ const Map<String, int> _pendingMigration = <String, int>{
   'lib/src/core/memory_service.dart': 8,
   'lib/src/core/search_service.dart': 7,
   'lib/src/core/secret_service.dart': 7,
-  'lib/src/core/timetable_service.dart': 34,
+  'lib/src/core/timetable_service.dart': 33,
   'lib/src/memory/memory_page.dart': 22,
   'lib/src/settings/key_account_group.dart': 14,
   'lib/src/settings/settings_page.dart': 37,

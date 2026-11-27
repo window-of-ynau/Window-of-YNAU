@@ -4,7 +4,7 @@
 //
 // | 平台 | 存放位置 | 谁管 |
 // |---|---|---|
-// | Windows | `%LOCALAPPDATA%\yunong\webview\`（WebView2 user data folder） | 操作系统账户隔离 |
+// | Windows | `%LOCALAPPDATA%\yunong\webview2\`（WebView2 user data folder） | 操作系统账户隔离 |
 // | Android | 应用私有数据目录（系统管理，`.../app_webview/`） | 应用沙箱 |
 //
 // **不在** SQLite、**不在**任何 JSON、**不进**日志、**不上传**。

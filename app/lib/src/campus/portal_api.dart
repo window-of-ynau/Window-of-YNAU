@@ -666,7 +666,7 @@ const String kPortalScheduleScript = r'''
   var DIAG = {
     xhrSeen: 0, cardIdSource: '', cardIdPrefix: '', autoTried: 0,
     hookInstalled: true, candidates: 0, years: '', probeFailed: false, probeResults: [], probeParams: null, steps: [], probeAttempts: 0,
-    silentErrors: []
+    silentErrors: [], probeBadJson: 0
   };
   // **没有任何"从页面打开算起"的绝对超时**：只有"无进展兜底"（见 watchdog）
   var LAST_PROGRESS = { at: Date.now(), what: 'start' };
@@ -861,6 +861,7 @@ const String kPortalScheduleScript = r'''
       probeParams: DIAG.probeParams,
       steps: DIAG.steps,
       probeAttempts: DIAG.probeAttempts,
+      probeBadJson: DIAG.probeBadJson || 0,
       silentErrors: DIAG.silentErrors || []
     });
   };
@@ -1184,7 +1185,13 @@ const String kPortalScheduleScript = r'''
           var body = JSON.parse(trimmed);
           var data = body && body.data ? body.data : null;
           return !!(data && data.resultsJsonArr && data.resultsJsonArr.length);
-        } catch (e) { noteError('probe.json', e); return false; }
+        } catch (e) {
+          // t12 F9：探测返回非课表 JSON（或坏 JSON）只是"这个候选不命中"，
+          // 不是静默错误；单独计数/归类，不写进用户可见的 silentErrors。
+          DIAG.probeBadJson = (DIAG.probeBadJson || 0) + 1;
+          DIAG.probeResults.push(prefix + ':0:badjson');
+          return false;
+        }
       });
     }).catch(function (err) {
       DIAG.probeResults.push((cardId ? cardId.slice(0, 8) : '(none)') + ':ERR');
