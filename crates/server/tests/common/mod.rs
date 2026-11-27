@@ -21,8 +21,9 @@
 #![allow(dead_code)] // 每个测试二进制只用到其中一部分
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
@@ -34,7 +35,16 @@ use uuid::Uuid;
 const REQUIRE_ENV: &str = "YUNONG_PG_TESTS_REQUIRED";
 
 /// 真实迁移目录。集成测试里的 `CARGO_MANIFEST_DIR` 正是 `crates/server`。
-const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+///
+/// 允许用 `YUNONG_MIGRATIONS_DIR` 覆盖：本地没有 pgvector 时，可以指向一份去掉
+/// `vector` 类型 / hnsw 索引的**迁移副本**，用它在真库上跑不依赖向量的 SQL 用例
+/// （CI 永远用真实迁移，不会设置这个变量）。默认仍是 `crates/server/migrations`。
+fn migrations_dir() -> PathBuf {
+    match env::var("YUNONG_MIGRATIONS_DIR") {
+        Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
+        _ => PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")),
+    }
+}
 
 /// 串行化"建扩展 + 建 schema"：并发 `CREATE EXTENSION IF NOT EXISTS` 会撞
 /// `pg_extension` 的唯一索引，用事务级 advisory lock 排队最省事。
@@ -104,7 +114,18 @@ impl TestDb {
         .await;
         // 迁移 0001 的第一句就是 CREATE EXTENSION vector：装在 public 一次，
         // 后面每个测试 schema 的迁移就只是一句无害的 no-op。
-        if let Err(error) = sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+        //
+        // 例外：设置了 `YUNONG_MIGRATIONS_DIR`（本地无 pgvector、用免向量迁移副本跑
+        // 非向量用例）时，装不上扩展不算失败——那份副本根本不用 vector。CI 从不设置
+        // 这个变量，所以 CI 里缺 pgvector 仍然会硬失败（不会变成静默跳过）。
+        let using_local_migrations = env::var("YUNONG_MIGRATIONS_DIR")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if using_local_migrations {
+            // 本地模式：迁移副本里已经去掉了 `CREATE EXTENSION vector`，这里也**不要**去装
+            // （装不上会把当前事务置为 aborted，后面 CREATE SCHEMA 全失败）。
+            eprintln!("本地模式：跳过 vector 扩展（YUNONG_MIGRATIONS_DIR 指定了免向量迁移副本）");
+        } else if let Err(error) = sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
             .execute(&mut admin)
             .await
         {
@@ -179,8 +200,9 @@ async fn exec(conn: &mut PgConnection, sql: &str) {
 /// 一个文件一次执行（`raw_sql` 走简单查询协议，支持多语句），
 /// 迁移里有 `CREATE EXTENSION` / `CREATE INDEX` 这类必须按序执行的 DDL。
 async fn apply_migrations(pool: &PgPool) {
-    let mut files = migration_files();
-    assert!(!files.is_empty(), "迁移目录里没有 .sql：{MIGRATIONS_DIR}");
+    let dir = migrations_dir();
+    let mut files = migration_files(&dir);
+    assert!(!files.is_empty(), "迁移目录里没有 .sql：{}", dir.display());
     files.sort();
     for file in files {
         let sql = std::fs::read_to_string(&file)
@@ -192,9 +214,9 @@ async fn apply_migrations(pool: &PgPool) {
     }
 }
 
-fn migration_files() -> Vec<PathBuf> {
-    std::fs::read_dir(MIGRATIONS_DIR)
-        .unwrap_or_else(|error| panic!("读迁移目录 {MIGRATIONS_DIR} 失败：{error}"))
+fn migration_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("读迁移目录 {} 失败：{error}", dir.display()))
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
         .collect()
@@ -212,8 +234,49 @@ pub fn sha256_hex(token: &str) -> String {
 /// 用编译期路径会把本地测试直接卡在 `CREATE EXTENSION vector` 上。
 #[allow(dead_code)]
 pub fn migration_sql(name: &str) -> String {
-    let path = std::path::Path::new(MIGRATIONS_DIR).join(name);
+    let path = migrations_dir().join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("读 {path:?} 失败：{error}"))
+}
+
+/// 迁移目录里所有 `.sql` 文件名（升序）。给"全部重跑一遍"这类幂等用例用。
+pub fn migration_names() -> Vec<String> {
+    let dir = migrations_dir();
+    let mut names: Vec<String> = migration_files(&dir)
+        .into_iter()
+        .filter_map(|path| path.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+        .collect();
+    names.sort();
+    names
+}
+
+/// 轮询等待某条 `count(*)` 查询至少达到 `expected`（最多 5s），返回是否达成。
+///
+/// 审计、记账这类写入是 **fire-and-forget**（`tokio::spawn` / detached），
+/// HTTP 响应返回时对应的行可能还没落库。凡是"响应后立刻断言行数"的地方都必须走
+/// 轮询，否则就是抢跑：本地常绿、CI 偶发红（rag 审计断言实测 3 跑挂 1 跑）。
+///
+/// 这个 helper 原本散落在 `chat_stream.rs` / `rag.rs` 各自一份，现上移到 `common`，
+/// 全仓库共用同一实现（固定 20ms 间隔 + 5s 上限，不靠 `sleep` 赌时间）。
+pub async fn wait_for_rows(pool: &PgPool, sql: &str, expected: i64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = count(pool, sql).await;
+        if rows >= expected {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// [`wait_for_rows`] 的断言版：5s 内没等到就直接让用例失败并说明是哪条 SQL。
+pub async fn wait_for_rows_or_panic(pool: &PgPool, sql: &str, expected: i64) {
+    assert!(
+        wait_for_rows(pool, sql, expected).await,
+        "5s 内没等到异步写入落库（期望 >= {expected}）：{sql}"
+    );
 }
 
 /// 只查一个 `bigint` 的 `SELECT`（用例里都是 count）。
