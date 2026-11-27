@@ -137,7 +137,7 @@ impl TestDb {
 
     /// 在测试 schema 里执行一条 DDL/任意 SQL（用例需要"制造故障"时用）。
     pub async fn execute(&self, sql: &str) {
-        sqlx::query(sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(&self.pool)
             .await
             .unwrap_or_else(|error| panic!("执行 SQL 失败（{sql}）：{error}"));
@@ -148,9 +148,11 @@ impl TestDb {
         let Self { pool, url, schema } = self;
         pool.close().await;
         let mut admin = connect(&url).await;
-        if let Err(error) = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-            .execute(&mut admin)
-            .await
+        if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE"
+        )))
+        .execute(&mut admin)
+        .await
         {
             eprintln!("清理测试 schema {schema} 失败（不影响结论）：{error}");
         }
@@ -164,7 +166,10 @@ async fn connect(url: &str) -> PgConnection {
 }
 
 async fn exec(conn: &mut PgConnection, sql: &str) {
-    if let Err(error) = sqlx::query(sql).execute(&mut *conn).await {
+    if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .execute(&mut *conn)
+        .await
+    {
         panic!("执行 SQL 失败（{sql}）：{error}");
     }
 }
@@ -180,7 +185,7 @@ async fn apply_migrations(pool: &PgPool) {
     for file in files {
         let sql = std::fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("读迁移文件 {} 失败：{error}", file.display()));
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(&*sql))
             .execute(pool)
             .await
             .unwrap_or_else(|error| panic!("执行迁移 {} 失败：{error}", file.display()));
@@ -213,7 +218,7 @@ pub fn migration_sql(name: &str) -> String {
 
 /// 只查一个 `bigint` 的 `SELECT`（用例里都是 count）。
 pub async fn count(pool: &PgPool, sql: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(sql)
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
         .fetch_one(pool)
         .await
         .unwrap_or_else(|error| panic!("查询失败（{sql}）：{error}"))
@@ -221,7 +226,7 @@ pub async fn count(pool: &PgPool, sql: &str) -> i64 {
 
 /// 取一行里某个 `text` 列（没有行就返回 `None`）。
 pub async fn text_column(pool: &PgPool, sql: &str) -> Option<String> {
-    sqlx::query(sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .fetch_optional(pool)
         .await
         .unwrap_or_else(|error| panic!("查询失败（{sql}）：{error}"))
