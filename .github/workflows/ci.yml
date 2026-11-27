@@ -806,7 +806,7 @@ jobs:
       - name: 构建 APK
         working-directory: app
         run: flutter build apk --release --target-platform android-arm64
-      - name: 验证 APK 内含 lib/arm64-v8a/libyunong_core.so
+      - name: 验证 APK 含 lib/arm64-v8a/libyunong_core.so 且为严格单 ABI
         run: |
           set -euo pipefail
           apk=app/build/app/outputs/flutter-apk/app-release.apk
@@ -818,7 +818,15 @@ jobs:
             echo "::error::APK 里没有 lib/arm64-v8a/libyunong_core.so —— 装上去 FFI 会加载失败"
             exit 1
           fi
-          echo "OK：APK 内含 lib/arm64-v8a/libyunong_core.so"
+          # #82：混合 ABI（如 jni 包带来的 armeabi-v7a/x86_64 libdartjni.so）必须被
+          # packaging.jniLibs.excludes 剔除；这里断言最终 APK 有且仅有 arm64-v8a 一个 ABI。
+          abis=$(unzip -l "$apk" | awk '$4 ~ /^lib\// {split($4,a,"/"); print a[2]}' | sort -u | tr '\n' ' ')
+          echo "ABI：$abis"
+          if [ "$(echo $abis | wc -w)" -ne 1 ] || [ "$(echo $abis | tr -d ' ')" != "arm64-v8a" ]; then
+            echo "::error::APK 出现多个/非 arm64 ABI（$abis）：必须严格只有 arm64-v8a"
+            exit 1
+          fi
+          echo "OK：APK 内含 lib/arm64-v8a/libyunong_core.so，且只有 arm64-v8a"
       - name: 上传 APK
         uses: actions/upload-artifact@v7
         with:
