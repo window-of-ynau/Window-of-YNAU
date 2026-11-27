@@ -7,6 +7,8 @@
 
 import 'package:flutter/foundation.dart';
 
+import '../l10n/strings.dart';
+
 /// 一次成功抓取留下的标识缓存。
 @immutable
 class CaptureCacheEntry {
@@ -22,7 +24,7 @@ class CaptureCacheEntry {
 
   /// 脱敏展示：前 6 位 + … + 后 4 位。
   String get maskedCardId => cardId.length <= 10
-      ? '（过短）'
+      ? CampusS.captureCacheTooShort
       : '${cardId.substring(0, 6)}…${cardId.substring(cardId.length - 4)}';
 
   String get capturedAtLabel {
@@ -31,8 +33,7 @@ class CaptureCacheEntry {
   }
 
   /// 探针/设置里显示的一行文案。
-  String get summary => 'cardId: $maskedCardId（来自上次抓取，缓存于 $capturedAtLabel）'
-      ' · 学期: $years';
+  String get summary => CampusS.captureCacheSummary(maskedCardId, capturedAtLabel, years);
 }
 
 /// 进程内缓存（单实例；不落盘）。
@@ -78,7 +79,7 @@ class CampusCaptureCache {
 String describeCachedCardId() {
   final CaptureCacheEntry? entry = CampusCaptureCache.instance.entry;
   if (entry == null || entry.cardId.isEmpty) {
-    return 'cardId: 尚未抓取过（需要先成功抓取一次课表，之后这里会显示缓存值）';
+    return CampusS.captureCacheNever;
   }
   return entry.summary;
 }
